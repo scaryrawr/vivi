@@ -1,0 +1,31 @@
+{
+  "name": "vivi",
+  "image": "mcr.microsoft.com/devcontainers/base:noble",
+  "features": {
+    "ghcr.io/devcontainers/features/common-utils:2": {},
+    "ghcr.io/devcontainers/features/node:1": {},
+    "ghcr.io/devcontainers/features/rust:1": {
+      "profile": "default",
+      "targets": "wasm32-unknown-unknown"
+    },
+    "ghcr.io/devcontainers/features/git:1": {},
+    "ghcr.io/devcontainers/features/github-cli:1": {},
+    "ghcr.io/devcontainers/features/sshd:1": {}
+  },
+  "containerEnv": {
+    "CARGO_HOME": "/home/vscode/.cargo"
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "github.vscode-github-actions",
+        "rust-lang.rust-analyzer",
+        "fill-labs.dependi",
+        "vadimcn.vscode-lldb",
+        "tauri-apps.tauri-vscode",
+        "dioxuslabs.dioxus"
+      ]
+    }
+  },
+  "onCreateCommand": "${containerWorkspaceFolder}/.devcontainer/onCreate.sh"
+}
