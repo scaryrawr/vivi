@@ -1,0 +1,12 @@
+.DS_Store
+.zig-cache/
+.build/
+zig-pkg/
+zig-out/
+
+macos/**/xcuserdata/
+macos/**/*.xcuserstate
+DerivedData/
+
+*.result
+*.xcresult

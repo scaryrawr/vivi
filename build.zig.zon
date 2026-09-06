@@ -1,0 +1,19 @@
+.{
+    .name = .vivi,
+    .version = "0.1.0",
+    .fingerprint = 0x651dd77ffeda97b2, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .copilot_sdk = .{
+            .url = "git+https://github.com/scaryrawr/copilot-sdk-zig#14ad1feca3d178b92174c1693c496b4f3b764ce9",
+            .hash = "copilot_sdk-0.1.0-PjGl0alwAQASUugatY0b-MC_VLeormpNfAqoE1LPn1kO",
+        },
+    },
+    .paths = .{
+        "README.md",
+        "build.zig",
+        "build.zig.zon",
+        "backend",
+        "cli",
+    },
+}
