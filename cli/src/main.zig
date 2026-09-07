@@ -1,9 +1,11 @@
 const std = @import("std");
 const backend = @import("vivi_backend");
+const chat = @import("chat.zig");
 
 const Command = enum {
     help,
     version,
+    chat,
 
     fn parse(args: []const []const u8) error{InvalidArguments}!Command {
         if (args.len <= 1) return .help;
@@ -19,6 +21,7 @@ const Command = enum {
         {
             return .version;
         }
+        if (std.mem.eql(u8, args[1], "chat")) return .chat;
         return error.InvalidArguments;
     }
 };
@@ -40,16 +43,22 @@ pub fn main(init: std.process.Init) !void {
     switch (command) {
         .help => try writeHelp(stdout),
         .version => try stdout.print("vivi {s}\n", .{backend.version}),
+        .chat => {
+            try stdout.flush();
+            return chat.run(init);
+        },
     }
     try stdout.flush();
 }
 
 fn writeHelp(writer: *std.Io.Writer) !void {
     try writer.writeAll(
-        \\Usage: vivi [--help] [--version]
+        \\Usage: vivi [--help] [--version] [chat]
         \\
         \\Vivi command-line interface.
-        \\Copilot operations are not implemented in this scaffold.
+        \\
+        \\Commands:
+        \\  chat       Start an interactive streaming Vivi chat.
         \\
     );
 }
@@ -67,11 +76,8 @@ test "command parser accepts scaffold commands" {
         Command.version,
         try Command.parse(&.{ "vivi", "--version" }),
     );
-}
-
-test "command parser rejects product commands" {
-    try std.testing.expectError(
-        error.InvalidArguments,
-        Command.parse(&.{ "vivi", "chat" }),
+    try std.testing.expectEqual(
+        Command.chat,
+        try Command.parse(&.{ "vivi", "chat" }),
     );
 }

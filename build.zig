@@ -13,6 +13,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const vaxis = b.dependency("vaxis", .{
+        .target = target,
+        .optimize = optimize,
+    });
 
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", "0.1.0");
@@ -55,6 +59,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     cli_module.addImport("vivi_backend", backend);
+    cli_module.addImport("vaxis", vaxis.module("vaxis"));
 
     const cli = b.addExecutable(.{
         .name = "vivi",

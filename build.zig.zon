@@ -8,6 +8,10 @@
             .url = "git+https://github.com/scaryrawr/copilot-sdk-zig#14ad1feca3d178b92174c1693c496b4f3b764ce9",
             .hash = "copilot_sdk-0.1.0-PjGl0alwAQASUugatY0b-MC_VLeormpNfAqoE1LPn1kO",
         },
+        .vaxis = .{
+            .url = "git+https://github.com/rockorager/libvaxis.git#44dbbb7802801d11b22ce6eabe22f56550dc26c6",
+            .hash = "vaxis-0.6.0-BWNV_HvTCwC_rv3qyvPMcOZfBIGcB417fJ6xqcYxpAIy",
+        },
     },
     .paths = .{
         "README.md",
