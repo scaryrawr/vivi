@@ -60,3 +60,7 @@ user-visible behavior. It then uses exactly four H2 sections in this order:
   streamed Copilot output, and return to the ready state.
 - [Chat shutdown](./chat-shutdown.md) covers cooperative Ctrl-C shutdown and
   the explicit second-Ctrl-C escape path.
+- [OMLX models](./omlx-models.md) covers live model discovery, token-limit
+  detection, and an OMLX-backed chat session.
+- [Slash model menu](./slash-model-menu.md) covers slash completion, the model
+  picker, explicit hosted/local switching, and transcript/history behavior.

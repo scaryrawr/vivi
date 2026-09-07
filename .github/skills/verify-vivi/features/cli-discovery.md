@@ -8,6 +8,7 @@ command without starting Copilot.
 - `help-default` shows help when Vivi has no arguments.
 - `help-explicit` shows the same command list with `--help`.
 - `version` prints the installed Vivi version.
+- `models-listed` identifies OMLX model discovery and token-limit reporting.
 - `chat-listed` identifies `chat` as an interactive streaming command.
 
 ## How to get to it (user POV)
@@ -26,6 +27,7 @@ Preconditions:
 - **Capture discovery output.** Run
   `.github/skills/verify-vivi/bin/verify-vivi cli-discovery <run-id>`.
   `help.stdout` contains
+  `models     List available Copilot and OMLX models.` and
   `chat       Start an interactive streaming Vivi chat.`, `version.stdout`
   starts with `vivi `, and both exit statuses are `0`.
 - **Proof.** Retain `help.stdout`, `help.stderr`, `version.stdout`,
