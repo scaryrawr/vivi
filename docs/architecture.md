@@ -88,6 +88,58 @@ failure messages reach the model rather than being reduced to Zig error names.
 The tool layer does not truncate output or create spill files because Copilot
 owns large-result handling.
 
+`backend/src/models.zig` owns the first local-model integration: OMLX discovery
+through `/v1/models/status`, response validation, stable `omlx/<model-id>`
+identities, and model metadata ownership. It preserves OMLX's
+`max_context_window`, `max_tokens`, and `llm`/`vlm` classification, with
+131072-token context and 32768-token output defaults when the server omits
+those values. The CLI may list these SDK-free domain values, but only
+`backend/src/root.zig` translates a selected model into
+`copilot.ProviderConfig`.
+
+An OMLX conversation owns a copied selection and endpoint configuration in
+the conversation runner context. The SDK worker rediscovers the exact model
+before session creation and passes its detected prompt and output limits in
+the initial provider configuration. Session creation fails when the selected
+model or endpoint is unavailable; Vivi does not retry as a hosted model.
+Provider credentials are copied into the runner context, never logged, and
+zeroed before release.
+
+Hosted-model discovery and slash-command discovery also cross the SDK boundary
+only in `backend/src/root.zig`. The worker translates typed
+`Client.listModels` results into provider-qualified `copilot/<model-id>`
+entries, filters policy-disabled models, and preserves `copilot/default` as
+the no-explicit-selection identity. Explicit hosted plans retain the raw SDK
+model ID and pass it through `SessionConfig.model`; OMLX plans continue to use
+`ProviderConfig`.
+
+The SDK's generic `Client.callRpc` adapts `session.commands.list` into the
+SDK-free command catalog owned by
+`backend/src/conversation.zig`. It refreshes that catalog after session
+creation, after session replacement, when an unknown SDK event identifies
+`commands.changed`, and whenever the terminal opens `/`. The explicit open-time refresh is
+required because the single SDK-owning worker waits on Vivi's command mailbox
+while idle and cannot concurrently wait for SDK events from late-registering
+extensions.
+
+`cli/src/chat.zig` owns the generic slash menu, filtering, selection,
+navigation, viewport, and responsive layout. `TextInput` remains the sole
+owner of composer text; the menu stores only catalog entries and filtered
+indices. `/model` opens a backend-supplied catalog containing
+`copilot/default`, authenticated and policy-eligible hosted models, and
+discovered local models with context, output, and vision metadata. Other
+SDK-contributed commands remain visible but are not invoked in this
+implementation slice.
+
+Model replacement is a transaction on the SDK worker. It resolves the target
+and creates a candidate session before disconnecting the active session. A
+creation failure leaves the original session active; selecting the active
+identity performs no work. After successful candidate creation, the worker
+disconnects the old session and commits the candidate session and provider
+plan together. The terminal preserves its visible transcript while explicitly
+reporting that the new server-side session has no prior conversational
+history.
+
 Cancellation is cooperative because the pinned SDK has no documented
 cross-thread operation that interrupts a blocked `Session.nextEvent`.
 `requestStop` is observed by the SDK-owning worker at an event boundary, where
@@ -140,6 +192,17 @@ requests remain fail-closed because Vivi has no approval UI yet.
   truncation and large-result transport to Copilot.
 - We accept synchronous tool execution on the SDK worker in exchange for one
   clear owner and serialized file mutations.
+- We accept rediscovering the selected OMLX model at conversation startup in
+  exchange for never launching with stale context limits or a removed model.
+- We accept OMLX as the first local provider slice in exchange for proving the
+  provider/session path before generalizing discovery across more protocols.
+- We accept explicit command refresh when `/` opens in exchange for preserving
+  one SDK-owning thread and still observing late extension registration.
+- We accept resetting server-side history during model replacement in exchange
+  for an atomic create-before-disconnect transition with no provider-specific
+  transcript replay.
+- We accept displaying unsupported SDK commands in exchange for honest command
+  discovery while invocation semantics are designed separately.
 
 ## Alternatives considered
 

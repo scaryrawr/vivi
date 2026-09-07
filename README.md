@@ -24,7 +24,9 @@ credentials are not required for builds or tests.
 ```sh
 zig build
 zig build run -- --help
+zig build run -- models
 zig build run -- chat
+zig build run -- chat --model omlx/Qwen3.5-9B-mxfp4
 zig build test
 zig build install-c-api
 ```
@@ -36,6 +38,27 @@ Copilot's built-in tools, built-in MCP servers, custom instructions, and
 ask-user capability, then supplies a small replacement system prompt and four
 Vivi-owned tools: `read`, `bash`, `edit`, and `write`. Tool output is returned
 whole; Copilot owns any large-result handling.
+
+`vivi models` lists the authenticated Copilot model catalog alongside OMLX
+models discovered from `http://localhost:8000/v1/models/status`. Each row
+reports its qualified ID, context window, maximum output tokens, and vision
+capability when known. Start chat with an explicit hosted model using
+`vivi chat --model copilot/<model-id>` or a discovered local model using
+`vivi chat --model omlx/<model-id>`. Set `OMLX_BASE_URL` and `OMLX_API_KEY` to
+override the local endpoint and credential. Vivi passes OMLX's
+`max_context_window` and `max_tokens` values into the Copilot SDK provider
+configuration; missing values default to 131072 and 32768 respectively.
+
+During an active chat, type `/` to open Vivi's slash-command menu. The menu
+refreshes the Copilot SDK command catalog each time it opens so commands from
+late-registering extensions can appear without restarting Vivi. Select
+`/model` to switch among the Copilot default, authenticated Copilot models,
+and discovered OMLX models. Selecting the active model is a no-op. A successful switch keeps the
+visible Vivi transcript but starts a fresh server-side session, so prior turns
+are not part of the replacement model's context. Vivi currently executes
+`/model`; other SDK-contributed commands are discoverable in the menu but
+report that they are not supported yet.
+
 Use Page Up and Page Down to inspect the transcript. Press Ctrl-C to stop. If
 Copilot is blocked and cannot reach an SDK event boundary, press Ctrl-C again
 to restore the terminal and force exit.
