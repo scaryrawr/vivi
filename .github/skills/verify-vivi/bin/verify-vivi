@@ -11,10 +11,11 @@ Usage:
   verify-vivi doctor
   verify-vivi cli-discovery <run-id>
   verify-vivi chat-streaming <run-id>
+  verify-vivi chat-streaming-input <run-id>
   verify-vivi chat-model-menu <run-id>
   verify-vivi chat-shutdown <run-id>
-  verify-vivi extract-frames <run-id> <chat-streaming|chat-model-menu|chat-shutdown>
-  verify-vivi frame-check <run-id> <chat-streaming|chat-model-menu|chat-shutdown>
+  verify-vivi extract-frames <run-id> <chat-streaming|chat-streaming-input|chat-model-menu|chat-shutdown>
+  verify-vivi frame-check <run-id> <chat-streaming|chat-streaming-input|chat-model-menu|chat-shutdown>
   verify-vivi cleanup <run-id>
 EOF
 }
@@ -115,9 +116,9 @@ cli_discovery() {
 
 validate_capture_name() {
     case "$1" in
-        chat-streaming|chat-model-menu|chat-shutdown) ;;
+        chat-streaming|chat-streaming-input|chat-model-menu|chat-shutdown) ;;
         *)
-            printf 'capture must be chat-streaming, chat-model-menu, or chat-shutdown\n' >&2
+            printf 'capture must be chat-streaming, chat-streaming-input, chat-model-menu, or chat-shutdown\n' >&2
             exit 1
             ;;
     esac
@@ -309,6 +310,109 @@ chat_streaming() {
     test -s "$run_dir/chat-streaming.contact-sheet.png"
 }
 
+write_streaming_input_tape() {
+    run_dir=$1
+    cat >"$run_dir/chat-streaming-input.tape" <<EOF
+Output "$run_dir/chat-streaming-input.gif"
+Require copilot
+Set Shell "bash"
+Set Width 1200
+Set Height 720
+Set FontSize 22
+Set TypingSpeed 10ms
+
+Type "./zig-out/bin/vivi chat"
+Enter
+Sleep 3s
+Type "Run bash with command sleep 6, then reply with ORIGINAL_STEER_RESPONSE."
+Enter
+Sleep 3s
+Type "Ignore the original reply. Concatenate VIVI, _STEER, and _OK, then reply with only that text."
+Enter
+Sleep 35s
+Type "Run bash with command sleep 6, then concatenate VIVI, _QUEUE, and _FIRST and reply with only that text."
+Enter
+Sleep 3s
+Type "Concatenate VIVI, _QUEUE, and _OK, then reply with only that text."
+Ctrl+Enter
+Sleep 35s
+Ctrl+C
+Sleep 3s
+Ctrl+C
+Sleep 1s
+EOF
+}
+
+chat_streaming_input() {
+    run_dir=$(prepare_run "$1")
+    build_vivi
+    write_streaming_input_tape "$run_dir"
+
+    (cd "$repo_root" && VIVI_KEEP_GIF=1 vhs "$run_dir/chat-streaming-input.tape")
+    VIVI_KEEP_GIF=1 extract_frames "$1" chat-streaming-input
+
+    (
+        sleep 3
+        printf 'Run bash with command sleep 6, then reply with ORIGINAL_STEER_RESPONSE.\r'
+        sleep 3
+        printf 'Ignore the original reply. Concatenate VIVI, _STEER, and _OK, then reply with only that text.\r'
+        sleep 35
+        printf 'Run bash with command sleep 6, then concatenate VIVI, _QUEUE, and _FIRST and reply with only that text.\r'
+        sleep 3
+        printf 'Concatenate VIVI, _QUEUE, and _OK, then reply with only that text.\033[13;5u'
+        sleep 35
+        printf '\003'
+        sleep 3
+        printf '\003'
+    ) | script -q "$run_dir/chat-streaming-input.terminal.log" sh -c \
+        "stty cols 100 rows 30; '$binary' chat" &
+    pty_pid=$!
+    printf '%s\n' "$pty_pid" >"$run_dir/pty.pid"
+    trap 'kill "$pty_pid" 2>/dev/null || true; wait "$pty_pid" 2>/dev/null || true' EXIT INT TERM
+
+    if wait "$pty_pid"; then
+        status=0
+    else
+        status=$?
+    fi
+    rm -f "$run_dir/pty.pid"
+    trap - EXIT INT TERM
+
+    perl -0pe \
+        's/\e\[[0-?]*[ -\/]*[@-~]//g; s/\e\][^\a]*(?:\a|\e\\)//g' \
+        "$run_dir/chat-streaming-input.terminal.log" |
+        tr -d '\r\b' >"$run_dir/chat-streaming-input.normalized.txt"
+
+    {
+        printf 'exit=%s\n' "$status"
+        printf 'steer_response_seen='
+        if grep -q 'VIVI_STEER_OK' "$run_dir/chat-streaming-input.normalized.txt"; then
+            printf 'yes\n'
+        else
+            printf 'no\n'
+        fi
+        printf 'first_response_seen='
+        if grep -q 'IVI_QUEUE_FIRST' "$run_dir/chat-streaming-input.normalized.txt"; then
+            printf 'yes\n'
+        else
+            printf 'no\n'
+        fi
+        printf 'queued_response_seen='
+        if grep -q 'VIVI_QUEUE_OK' "$run_dir/chat-streaming-input.normalized.txt"; then
+            printf 'yes\n'
+        else
+            printf 'no\n'
+        fi
+        printf 'streaming_input_hint=visual-review\n'
+    } >"$run_dir/chat-streaming-input.assertions.txt"
+
+    test "$status" -eq 0
+    grep -q 'VIVI_STEER_OK' "$run_dir/chat-streaming-input.normalized.txt"
+    grep -q 'IVI_QUEUE_FIRST' "$run_dir/chat-streaming-input.normalized.txt"
+    grep -q 'VIVI_QUEUE_OK' "$run_dir/chat-streaming-input.normalized.txt"
+    test -s "$run_dir/chat-streaming-input.contact-sheet.png"
+}
+
 write_model_menu_tape() {
     run_dir=$1
     startup_wait=${VIVI_MODEL_MENU_STARTUP_WAIT:-60s}
@@ -473,6 +577,13 @@ case "${1:-}" in
             exit 2
         }
         chat_streaming "$2"
+        ;;
+    chat-streaming-input)
+        test "$#" -eq 2 || {
+            usage >&2
+            exit 2
+        }
+        chat_streaming_input "$2"
         ;;
     chat-model-menu)
         test "$#" -eq 2 || {

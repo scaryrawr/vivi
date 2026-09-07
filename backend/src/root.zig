@@ -10,6 +10,7 @@ pub const abi_version: u32 = 1;
 pub const Conversation = conversation.Conversation;
 pub const ConversationEvent = conversation.Event;
 pub const ConversationWake = conversation.Wake;
+pub const PromptDelivery = conversation.PromptDelivery;
 pub const CommandCatalog = conversation.CommandCatalog;
 pub const ModelCatalog = conversation.ModelCatalog;
 pub const ModelInfo = conversation.ModelInfo;
@@ -203,6 +204,111 @@ const MinimalCodingAgent = struct {
 };
 
 const hosted_model_id = "copilot/default";
+
+fn sendPrompt(
+    session: copilot.Session,
+    prompt: []const u8,
+    delivery: conversation.PromptDelivery,
+) !void {
+    const parsed = try session.client.callRpc(
+        struct { messageId: []const u8 },
+        "session.send",
+        .{
+            .sessionId = session.id,
+            .prompt = prompt,
+            .mode = @tagName(delivery),
+        },
+    );
+    parsed.deinit();
+}
+
+const ForwardResult = enum {
+    none,
+    sent,
+    stop,
+};
+
+fn forwardReasoningEvent(
+    worker: *conversation.Worker,
+    event_type: []const u8,
+    data_json: []const u8,
+) !bool {
+    if (std.mem.eql(u8, event_type, "assistant.reasoning_delta")) {
+        const Data = struct {
+            deltaContent: []const u8,
+        };
+        const parsed = try std.json.parseFromSlice(
+            Data,
+            worker.allocator(),
+            data_json,
+            .{ .ignore_unknown_fields = true },
+        );
+        defer parsed.deinit();
+        try worker.reasoningDelta(parsed.value.deltaContent);
+        return true;
+    }
+    if (std.mem.eql(u8, event_type, "assistant.reasoning")) {
+        const Data = struct {
+            content: []const u8,
+        };
+        const parsed = try std.json.parseFromSlice(
+            Data,
+            worker.allocator(),
+            data_json,
+            .{ .ignore_unknown_fields = true },
+        );
+        defer parsed.deinit();
+        try worker.reasoningComplete(parsed.value.content);
+        return true;
+    }
+    return false;
+}
+
+fn forwardImmediatePrompts(
+    worker: *conversation.Worker,
+    session: copilot.Session,
+) !ForwardResult {
+    var result: ForwardResult = .none;
+    while (worker.tryTakeImmediateCommand()) |command_value| {
+        var command = command_value;
+        defer command.deinit();
+        switch (command) {
+            .prompt => |prompt| {
+                try sendPrompt(
+                    session,
+                    prompt.text.bytes,
+                    prompt.delivery,
+                );
+                result = .sent;
+            },
+            .stop => return .stop,
+            .refresh_commands, .refresh_models, .switch_model => {
+                return error.UnexpectedStreamingCommand;
+            },
+        }
+    }
+    return result;
+}
+
+fn startNextQueuedPrompt(
+    worker: *conversation.Worker,
+    session: copilot.Session,
+) !ForwardResult {
+    const command_value = worker.tryTakeCommand() orelse return .none;
+    var command = command_value;
+    defer command.deinit();
+    switch (command) {
+        .prompt => |prompt| {
+            try sendPrompt(session, prompt.text.bytes, .immediate);
+            try worker.assistantStarted();
+            return .sent;
+        },
+        .stop => return .stop,
+        .refresh_commands, .refresh_models, .switch_model => {
+            return error.UnexpectedStreamingCommand;
+        },
+    }
+}
 
 const SessionPlan = union(enum) {
     hosted,
@@ -888,13 +994,23 @@ fn runSdkConversation(
                 } else |_| {}
             },
             .prompt => |prompt| {
-                const message_id = session.send(.{
-                    .prompt = prompt.bytes,
-                }) catch |err| {
+                sendPrompt(
+                    session,
+                    prompt.text.bytes,
+                    prompt.delivery,
+                ) catch |err| {
                     worker.closeFailure(.stream, @errorName(err));
                     return;
                 };
-                worker.allocator().free(message_id);
+                if (prompt.delivery == .enqueue) {
+                    worker.assistantStarted() catch {
+                        worker.closeFailure(
+                            .stream,
+                            "Unable to start the queued response.",
+                        );
+                        return;
+                    };
+                }
 
                 while (true) {
                     var event = session.nextEvent() catch |err| {
@@ -931,6 +1047,28 @@ fn runSdkConversation(
                                 ))
                             {
                                 continue;
+                            }
+                            switch (startNextQueuedPrompt(
+                                worker,
+                                session,
+                            ) catch |err| {
+                                worker.closeFailure(.stream, @errorName(err));
+                                return;
+                            }) {
+                                .sent => continue,
+                                .stop => {
+                                    session.disconnect() catch |err| {
+                                        worker.closeFailure(
+                                            .stream,
+                                            @errorName(err),
+                                        );
+                                        return;
+                                    };
+                                    session_connected = false;
+                                    worker.closeRequested();
+                                    return;
+                                },
+                                .none => {},
                             }
                             worker.idle() catch {
                                 worker.closeFailure(
@@ -994,7 +1132,15 @@ fn runSdkConversation(
                             }
                         },
                         .unknown => |unknown| {
-                            if (std.mem.eql(
+                            const reasoning_forwarded = forwardReasoningEvent(
+                                worker,
+                                unknown.event_type,
+                                unknown.data_json,
+                            ) catch |err| {
+                                worker.closeFailure(.stream, @errorName(err));
+                                return;
+                            };
+                            if (!reasoning_forwarded and std.mem.eql(
                                 u8,
                                 unknown.event_type,
                                 "commands.changed",
@@ -1013,14 +1159,23 @@ fn runSdkConversation(
                         },
                     }
 
-                    if (worker.stopRequested()) {
-                        session.disconnect() catch |err| {
-                            worker.closeFailure(.stream, @errorName(err));
-                            return;
-                        };
-                        session_connected = false;
-                        worker.closeRequested();
+                    switch (forwardImmediatePrompts(
+                        worker,
+                        session,
+                    ) catch |err| {
+                        worker.closeFailure(.stream, @errorName(err));
                         return;
+                    }) {
+                        .none, .sent => {},
+                        .stop => {
+                            session.disconnect() catch |err| {
+                                worker.closeFailure(.stream, @errorName(err));
+                                return;
+                            };
+                            session_connected = false;
+                            worker.closeRequested();
+                            return;
+                        },
                     }
                 }
             },
