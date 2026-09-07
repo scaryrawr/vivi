@@ -8,6 +8,8 @@ const accent = vaxis.Color{ .rgb = .{ 110, 231, 183 } };
 const user_color = vaxis.Color{ .rgb = .{ 125, 211, 252 } };
 const assistant_color = vaxis.Color{ .rgb = .{ 196, 181, 253 } };
 const composer_background = vaxis.Color{ .index = 236 };
+const menu_background = vaxis.Color{ .index = 234 };
+const menu_selected_background = vaxis.Color{ .index = 238 };
 
 const AppEvent = union(enum) {
     key_press: vaxis.Key,
@@ -103,14 +105,18 @@ const Transcript = struct {
 const UiPhase = enum {
     connecting,
     ready,
+    loading_commands,
     responding,
+    switching,
     stopping,
 
     fn label(self: UiPhase) []const u8 {
         return switch (self) {
             .connecting => "Connecting...",
             .ready => "Ready",
+            .loading_commands => "Refreshing commands...",
             .responding => "Responding...",
+            .switching => "Switching model...",
             .stopping => "Stopping...",
         };
     }
@@ -135,13 +141,15 @@ const Region = struct {
 const FrameLayout = struct {
     transcript: Region,
     context: ?Region,
+    menu: ?Region,
     composer: Region,
     footer: ?Region,
 
-    fn compute(width: u16, height: u16) FrameLayout {
+    fn compute(width: u16, height: u16, desired_menu_rows: u16) FrameLayout {
         if (width == 0 or height == 0) return .{
             .transcript = .{},
             .context = null,
+            .menu = null,
             .composer = .{},
             .footer = null,
         };
@@ -149,7 +157,13 @@ const FrameLayout = struct {
         const composer_height: u16 = if (height >= 8 and width >= 24) 3 else 1;
         const footer_height: u16 = if (height >= 3 and width >= 12) 1 else 0;
         const context_height: u16 = if (height >= 5 and width >= 24) 1 else 0;
-        const chrome_height = composer_height + footer_height + context_height;
+        const fixed_chrome_height =
+            composer_height + footer_height + context_height;
+        const menu_height = @min(
+            desired_menu_rows,
+            height -| fixed_chrome_height -| 1,
+        );
+        const chrome_height = fixed_chrome_height + menu_height;
         const transcript_height = height -| chrome_height;
         const margin: u16 = if (width >= 40) 2 else 0;
         const transcript_width = width -| margin * 2;
@@ -161,6 +175,14 @@ const FrameLayout = struct {
                 .y = y,
                 .width = width,
                 .height = context_height,
+            };
+        } else null;
+        const menu: ?Region = if (menu_height > 0) blk: {
+            defer y += menu_height;
+            break :blk .{
+                .y = y,
+                .width = width,
+                .height = menu_height,
             };
         } else null;
         const composer = Region{
@@ -182,6 +204,7 @@ const FrameLayout = struct {
                 .height = transcript_height,
             },
             .context = context,
+            .menu = menu,
             .composer = composer,
             .footer = footer,
         };
@@ -314,12 +337,195 @@ const KeyOutcome = enum {
     force_exit,
 };
 
+const MenuDetail = union(enum) {
+    text: []const u8,
+    model: struct {
+        context_tokens: u64,
+        output_tokens: u64,
+        supports_vision: bool,
+    },
+};
+
+const MenuEntry = struct {
+    key: []const u8,
+    primary: []const u8,
+    detail: MenuDetail,
+    current: bool = false,
+    enabled: bool = true,
+    source_index: usize,
+};
+
+const MenuDirection = enum {
+    previous,
+    next,
+};
+
+const MenuState = struct {
+    entries: std.ArrayList(MenuEntry) = .empty,
+    matches: std.ArrayList(usize) = .empty,
+    selected_match: usize = 0,
+    first_visible_match: usize = 0,
+
+    fn deinit(self: *MenuState, allocator: std.mem.Allocator) void {
+        self.entries.deinit(allocator);
+        self.matches.deinit(allocator);
+        self.* = undefined;
+    }
+
+    fn rebuild(
+        self: *MenuState,
+        allocator: std.mem.Allocator,
+        entries: []const MenuEntry,
+        query: []const u8,
+    ) !void {
+        const previous_key = if (self.selected()) |entry| entry.key else null;
+        self.entries.clearRetainingCapacity();
+        self.matches.clearRetainingCapacity();
+        try self.entries.appendSlice(allocator, entries);
+
+        var ranks: std.ArrayList(u2) = .empty;
+        defer ranks.deinit(allocator);
+        for (self.entries.items, 0..) |entry, index| {
+            if (!entry.enabled) continue;
+            const rank = matchRank(entry, query) orelse continue;
+            try self.matches.append(allocator, index);
+            try ranks.append(allocator, rank);
+        }
+        stableRank(self.matches.items, ranks.items);
+
+        self.selected_match = 0;
+        if (previous_key) |key| {
+            for (self.matches.items, 0..) |entry_index, match_index| {
+                if (std.mem.eql(u8, self.entries.items[entry_index].key, key)) {
+                    self.selected_match = match_index;
+                    break;
+                }
+            }
+        }
+        self.first_visible_match = @min(
+            self.first_visible_match,
+            self.selected_match,
+        );
+    }
+
+    fn move(self: *MenuState, direction: MenuDirection) void {
+        if (self.matches.items.len == 0) return;
+        self.selected_match = switch (direction) {
+            .previous => if (self.selected_match == 0)
+                self.matches.items.len - 1
+            else
+                self.selected_match - 1,
+            .next => (self.selected_match + 1) % self.matches.items.len,
+        };
+    }
+
+    fn selected(self: *const MenuState) ?MenuEntry {
+        if (self.matches.items.len == 0) return null;
+        return self.entries.items[self.matches.items[self.selected_match]];
+    }
+
+    fn visibleRange(
+        self: *MenuState,
+        row_count: usize,
+    ) struct { first: usize, last: usize } {
+        if (row_count == 0 or self.matches.items.len == 0) {
+            return .{ .first = 0, .last = 0 };
+        }
+        if (self.selected_match < self.first_visible_match) {
+            self.first_visible_match = self.selected_match;
+        } else if (self.selected_match >= self.first_visible_match + row_count) {
+            self.first_visible_match = self.selected_match - row_count + 1;
+        }
+        const last = @min(
+            self.first_visible_match + row_count,
+            self.matches.items.len,
+        );
+        return .{ .first = self.first_visible_match, .last = last };
+    }
+};
+
+fn matchRank(entry: MenuEntry, query: []const u8) ?u2 {
+    if (query.len == 0) return 0;
+    if (asciiStartsWithIgnoreCase(entry.key, query)) return 0;
+    if (wordStartsWithIgnoreCase(entry.primary, query)) return 1;
+    if (asciiContainsIgnoreCase(entry.key, query) or
+        asciiContainsIgnoreCase(entry.primary, query) or
+        switch (entry.detail) {
+            .text => |text| asciiContainsIgnoreCase(text, query),
+            .model => false,
+        })
+    {
+        return 2;
+    }
+    return null;
+}
+
+fn asciiStartsWithIgnoreCase(value: []const u8, prefix: []const u8) bool {
+    return value.len >= prefix.len and
+        std.ascii.eqlIgnoreCase(value[0..prefix.len], prefix);
+}
+
+fn asciiContainsIgnoreCase(value: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > value.len) return false;
+    for (0..value.len - needle.len + 1) |index| {
+        if (std.ascii.eqlIgnoreCase(
+            value[index .. index + needle.len],
+            needle,
+        )) return true;
+    }
+    return false;
+}
+
+fn wordStartsWithIgnoreCase(value: []const u8, prefix: []const u8) bool {
+    var at_word_start = true;
+    for (value, 0..) |byte, index| {
+        if (at_word_start and index + prefix.len <= value.len and
+            std.ascii.eqlIgnoreCase(value[index .. index + prefix.len], prefix))
+        {
+            return true;
+        }
+        at_word_start = byte == ' ' or byte == '-' or byte == '_';
+    }
+    return false;
+}
+
+fn stableRank(indices: []usize, ranks: []u2) void {
+    var index: usize = 1;
+    while (index < indices.len) : (index += 1) {
+        const saved_index = indices[index];
+        const saved_rank = ranks[index];
+        var insertion = index;
+        while (insertion > 0 and ranks[insertion - 1] > saved_rank) {
+            indices[insertion] = indices[insertion - 1];
+            ranks[insertion] = ranks[insertion - 1];
+            insertion -= 1;
+        }
+        indices[insertion] = saved_index;
+        ranks[insertion] = saved_rank;
+    }
+}
+
+const MenuMode = enum {
+    closed,
+    commands,
+    loading_models,
+    models,
+};
+
 const ChatUi = struct {
     allocator: std.mem.Allocator,
     input: TextInput,
     transcript: Transcript = .{},
     cwd: []u8,
     phase: UiPhase = .connecting,
+    commands: ?backend.CommandCatalog = null,
+    models: ?backend.ModelCatalog = null,
+    menu_mode: MenuMode = .closed,
+    menu: MenuState = .{},
+    input_revision: u64 = 0,
+    dismissed_revision: ?u64 = null,
+    menu_detail_storage: [8][96]u8 = undefined,
     rows_from_tail: usize = 0,
     last_total_rows: usize = 0,
     last_viewport_rows: usize = 0,
@@ -349,6 +555,9 @@ const ChatUi = struct {
     }
 
     fn deinit(self: *ChatUi) void {
+        self.menu.deinit(self.allocator);
+        if (self.models) |*catalog| catalog.deinit();
+        if (self.commands) |*catalog| catalog.deinit();
         self.allocator.free(self.cwd);
         self.transcript.deinit(self.allocator);
         self.input.deinit();
@@ -380,6 +589,34 @@ const ChatUi = struct {
             self.pageDown();
             return .keep_running;
         }
+        if (self.menu_mode != .closed) {
+            if (key.matches(vaxis.Key.escape, .{})) {
+                self.menu_mode = .closed;
+                self.dismissed_revision = self.input_revision;
+                return .keep_running;
+            }
+            if (self.menu_mode != .loading_models and
+                key.matches(vaxis.Key.up, .{}))
+            {
+                self.menu.move(.previous);
+                return .keep_running;
+            }
+            if (self.menu_mode != .loading_models and
+                key.matches(vaxis.Key.down, .{}))
+            {
+                self.menu.move(.next);
+                return .keep_running;
+            }
+            if (key.matches(vaxis.Key.enter, .{})) {
+                if (self.phase != .ready or
+                    self.menu_mode == .loading_models)
+                {
+                    return .keep_running;
+                }
+                try self.activateMenu(conversation);
+                return .keep_running;
+            }
+        }
         if (self.phase != .ready) return .keep_running;
 
         if (key.matches(vaxis.Key.enter, .{})) {
@@ -395,8 +632,120 @@ const ChatUi = struct {
             self.followTail();
             return .keep_running;
         }
+        const previous_menu_mode = self.menu_mode;
         try self.input.update(.{ .key_press = key });
+        self.input_revision +%= 1;
+        try self.syncSlashMenu();
+        if (previous_menu_mode == .closed and self.menu_mode == .commands) {
+            conversation.refreshCommands() catch |err| switch (err) {
+                error.Busy => return .keep_running,
+                else => return err,
+            };
+            self.phase = .loading_commands;
+        }
         return .keep_running;
+    }
+
+    fn syncSlashMenu(self: *ChatUi) !void {
+        if (self.menu_mode == .loading_models) return;
+        if (self.menu_mode == .models) {
+            return self.rebuildModelMenu();
+        }
+        const contents = try self.input.toOwnedContents(self.allocator);
+        defer self.allocator.free(contents);
+        if (contents.len == 0 or contents[0] != '/' or
+            std.mem.indexOfAny(u8, contents, " \t\r\n") != null or
+            self.dismissed_revision == self.input_revision)
+        {
+            self.menu_mode = .closed;
+            return;
+        }
+        self.menu_mode = .commands;
+        try self.rebuildCommandMenu(contents[1..]);
+    }
+
+    fn rebuildCommandMenu(self: *ChatUi, query: []const u8) !void {
+        const catalog = self.commands orelse return;
+        const entries = try self.allocator.alloc(
+            MenuEntry,
+            catalog.commands.len,
+        );
+        defer self.allocator.free(entries);
+        for (catalog.commands, 0..) |command, index| {
+            entries[index] = .{
+                .key = command.name,
+                .primary = command.name,
+                .detail = .{ .text = command.description },
+                .source_index = index,
+            };
+        }
+        try self.menu.rebuild(self.allocator, entries, query);
+    }
+
+    fn rebuildModelMenu(self: *ChatUi) !void {
+        const catalog = self.models orelse return;
+        const query = try self.input.toOwnedContents(self.allocator);
+        defer self.allocator.free(query);
+        const entries = try self.allocator.alloc(MenuEntry, catalog.models.len);
+        defer self.allocator.free(entries);
+        for (catalog.models, 0..) |model, index| {
+            entries[index] = .{
+                .key = model.id,
+                .primary = model.display_name,
+                .detail = .{ .model = .{
+                    .context_tokens = model.max_context_window_tokens,
+                    .output_tokens = model.max_output_tokens,
+                    .supports_vision = model.supports_vision,
+                } },
+                .current = std.mem.eql(u8, catalog.selected_id, model.id),
+                .source_index = index,
+            };
+        }
+        try self.menu.rebuild(self.allocator, entries, query);
+    }
+
+    fn activateMenu(
+        self: *ChatUi,
+        conversation: *backend.Conversation,
+    ) !void {
+        const selected = self.menu.selected() orelse return;
+        switch (self.menu_mode) {
+            .commands => {
+                const catalog = self.commands orelse return;
+                const command = catalog.commands[selected.source_index];
+                if (!std.ascii.eqlIgnoreCase(command.name, "model")) {
+                    try self.transcript.append(
+                        self.allocator,
+                        .status,
+                        "This slash command is not supported by Vivi yet.",
+                    );
+                    self.input.clearRetainingCapacity();
+                    self.menu_mode = .closed;
+                    return;
+                }
+                self.input.clearRetainingCapacity();
+                self.menu_mode = .loading_models;
+                conversation.refreshModels() catch |err| switch (err) {
+                    error.Busy => {
+                        self.menu_mode = .closed;
+                        return;
+                    },
+                    else => return err,
+                };
+            },
+            .models => {
+                const catalog = self.models orelse return;
+                const model = catalog.models[selected.source_index];
+                conversation.switchModel(model.id) catch |err| switch (err) {
+                    error.Busy => return,
+                    else => return err,
+                };
+                self.input.clearRetainingCapacity();
+                self.menu_mode = .closed;
+                self.phase = .switching;
+            },
+            .closed, .loading_models => {},
+        }
     }
 
     fn applyConversationEvent(
@@ -405,6 +754,73 @@ const ChatUi = struct {
     ) !ConversationOutcome {
         switch (event.*) {
             .ready => self.phase = .ready,
+            .command_catalog => |catalog| {
+                const replacement = try catalog.clone(self.allocator);
+                if (self.commands) |*current| current.deinit();
+                self.commands = replacement;
+                if (self.phase == .loading_commands) self.phase = .ready;
+                if (self.menu_mode == .commands) try self.syncSlashMenu();
+            },
+            .model_catalog => |catalog| {
+                const replacement = try catalog.clone(self.allocator);
+                if (self.models) |*current| current.deinit();
+                self.models = replacement;
+                if (self.menu_mode == .loading_models) {
+                    self.menu_mode = .models;
+                    self.phase = .ready;
+                    try self.rebuildModelMenu();
+                } else if (self.menu_mode == .models) {
+                    try self.rebuildModelMenu();
+                }
+            },
+            .model_catalog_failed => |failure| {
+                self.phase = .ready;
+                if (self.models != null and
+                    self.menu_mode == .loading_models)
+                {
+                    self.menu_mode = .models;
+                    try self.rebuildModelMenu();
+                } else {
+                    self.menu_mode = .closed;
+                }
+                try self.transcript.append(
+                    self.allocator,
+                    .status,
+                    failure.bytes,
+                );
+            },
+            .model_switch => |result| {
+                self.phase = .ready;
+                switch (result) {
+                    .unchanged => |model| {
+                        try self.updateSelectedModel(model.id);
+                        try self.transcript.append(
+                            self.allocator,
+                            .status,
+                            "Already using the selected model.",
+                        );
+                    },
+                    .switched => |success| {
+                        try self.updateSelectedModel(success.model.id);
+                        const message = try std.fmt.allocPrint(
+                            self.allocator,
+                            "Switched to {s}. Server-side conversation history was reset; the visible Vivi transcript remains.",
+                            .{success.model.display_name},
+                        );
+                        defer self.allocator.free(message);
+                        try self.transcript.append(
+                            self.allocator,
+                            .status,
+                            message,
+                        );
+                    },
+                    .failed => |failure| try self.transcript.append(
+                        self.allocator,
+                        .status,
+                        failure.bytes,
+                    ),
+                }
+            },
             .assistant_delta => |text| {
                 try self.transcript.appendDelta(self.allocator, text.bytes);
             },
@@ -433,8 +849,24 @@ const ChatUi = struct {
         return .keep_running;
     }
 
+    fn updateSelectedModel(self: *ChatUi, model_id: []const u8) !void {
+        if (self.models) |*catalog| {
+            const replacement = try self.allocator.dupe(u8, model_id);
+            self.allocator.free(catalog.selected_id);
+            catalog.selected_id = replacement;
+        }
+    }
+
     fn draw(self: *ChatUi, root: vaxis.Window) !void {
-        const layout = FrameLayout.compute(root.width, root.height);
+        const desired_menu_rows: u16 = switch (self.menu_mode) {
+            .commands, .models => @intCast(@min(self.menu.matches.items.len, 8)),
+            .closed, .loading_models => 0,
+        };
+        const layout = FrameLayout.compute(
+            root.width,
+            root.height,
+            desired_menu_rows,
+        );
         if (layout.transcript.height > 0) {
             const transcript_window = layout.transcript.child(root);
             if (self.transcript.entries.items.len == 0) {
@@ -452,10 +884,115 @@ const ChatUi = struct {
             }
         }
         if (layout.context) |region| self.drawContext(region.child(root));
+        if (layout.menu) |region| self.drawMenu(region.child(root));
         if (layout.composer.height > 0) {
             self.drawComposer(layout.composer.child(root));
         }
         if (layout.footer) |region| self.drawFooter(region.child(root));
+    }
+
+    fn drawMenu(self: *ChatUi, window: vaxis.Window) void {
+        window.fill(.{
+            .char = .{ .grapheme = " ", .width = 1 },
+            .style = .{ .bg = menu_background },
+        });
+        const range = self.menu.visibleRange(window.height);
+        for (range.first..range.last, 0..) |match_index, row| {
+            const entry_index = self.menu.matches.items[match_index];
+            const entry = self.menu.entries.items[entry_index];
+            const selected = match_index == self.menu.selected_match;
+            const style = vaxis.Style{
+                .bg = if (selected)
+                    menu_selected_background
+                else
+                    menu_background,
+            };
+            const marker = if (selected) ">" else if (entry.current) "*" else " ";
+            var segments = [_]vaxis.Segment{
+                .{ .text = marker, .style = style },
+                .{ .text = " ", .style = style },
+                .{
+                    .text = entry.primary,
+                    .style = .{
+                        .bg = style.bg,
+                        .bold = selected or entry.current,
+                    },
+                },
+            };
+            const detail_col: u16 = if (window.width >= 28)
+                @min(window.width / 2, 44)
+            else
+                window.width;
+            const label_window = window.child(.{ .width = detail_col -| 1 });
+            _ = label_window.print(&segments, .{
+                .row_offset = @intCast(row),
+                .col_offset = 1,
+                .wrap = .none,
+            });
+            if (window.width < 28) continue;
+            self.drawMenuDetail(
+                window,
+                @intCast(row),
+                entry,
+                style,
+            );
+        }
+    }
+
+    fn drawMenuDetail(
+        self: *ChatUi,
+        window: vaxis.Window,
+        row: u16,
+        entry: MenuEntry,
+        style: vaxis.Style,
+    ) void {
+        switch (entry.detail) {
+            .text => |detail| {
+                var segments = [_]vaxis.Segment{.{
+                    .text = detail,
+                    .style = .{ .bg = style.bg, .dim = true },
+                }};
+                _ = window.print(&segments, .{
+                    .row_offset = row,
+                    .col_offset = @intCast(@min(window.width / 2, 36)),
+                    .wrap = .none,
+                });
+            },
+            .model => |model| {
+                const buffer = &self.menu_detail_storage[row];
+                const rendered = if (model.context_tokens == 0)
+                    std.fmt.bufPrint(buffer, "hosted", .{}) catch return
+                else if (window.width >= 56)
+                    std.fmt.bufPrint(
+                        buffer,
+                        "context {d}  output {d}{s}",
+                        .{
+                            model.context_tokens,
+                            model.output_tokens,
+                            if (model.supports_vision) "  vision" else "",
+                        },
+                    ) catch return
+                else
+                    std.fmt.bufPrint(
+                        buffer,
+                        "{d} / {d}{s}",
+                        .{
+                            model.context_tokens,
+                            model.output_tokens,
+                            if (model.supports_vision) "  vision" else "",
+                        },
+                    ) catch return;
+                var segments = [_]vaxis.Segment{.{
+                    .text = rendered,
+                    .style = .{ .bg = style.bg, .dim = true },
+                }};
+                _ = window.print(&segments, .{
+                    .row_offset = row,
+                    .col_offset = @intCast(@min(window.width / 2, 36)),
+                    .wrap = .none,
+                });
+            },
+        }
     }
 
     fn drawWelcome(self: *ChatUi, window: vaxis.Window) void {
@@ -598,7 +1135,7 @@ const ChatUi = struct {
             .height = 1,
         });
         const text_style = vaxis.Style{ .bg = composer_background };
-        if (self.phase == .ready) {
+        if (self.phase == .ready or self.phase == .loading_commands) {
             self.input.drawWithStyle(content, text_style);
         } else {
             content.hideCursor();
@@ -615,18 +1152,18 @@ const ChatUi = struct {
         const hints = if (window.width >= 48)
             switch (self.phase) {
                 .ready => "Enter send  ·  PgUp/PgDn scroll  ·  Ctrl-C quit  ·  Vivi",
-                .connecting, .responding => "PgUp/PgDn scroll  ·  Ctrl-C stop  ·  Vivi",
+                .connecting, .loading_commands, .responding, .switching => "PgUp/PgDn scroll  ·  Ctrl-C stop  ·  Vivi",
                 .stopping => "Ctrl-C again force exit  ·  Vivi",
             }
         else if (window.width >= 24)
             switch (self.phase) {
                 .ready => "Enter send  ·  Ctrl-C quit",
-                .connecting, .responding => "Ctrl-C stop",
+                .connecting, .loading_commands, .responding, .switching => "Ctrl-C stop",
                 .stopping => "Ctrl-C again force exit",
             }
         else switch (self.phase) {
             .ready => "Ctrl-C quit",
-            .connecting, .responding => "Ctrl-C stop",
+            .connecting, .loading_commands, .responding, .switching => "Ctrl-C stop",
             .stopping => "Ctrl-C again",
         };
         var segments = [_]vaxis.Segment{.{
@@ -667,7 +1204,11 @@ const App = struct {
     ui: ChatUi,
     closed: bool = false,
 
-    fn init(self: *App, init_args: std.process.Init) !void {
+    fn init(
+        self: *App,
+        init_args: std.process.Init,
+        model: ?[]const u8,
+    ) !void {
         self.allocator = init_args.gpa;
         self.io = init_args.io;
 
@@ -695,6 +1236,15 @@ const App = struct {
             init_args.gpa,
             init_args.io,
             .{ .context = self, .notify = wake },
+            .{
+                .model = model,
+                .omlx = .{
+                    .base_url = init_args.environ_map.get("OMLX_BASE_URL") orelse
+                        backend.default_omlx_base_url,
+                    .api_key = init_args.environ_map.get("OMLX_API_KEY") orelse
+                        "omlx",
+                },
+            },
         );
     }
 
@@ -768,10 +1318,10 @@ const App = struct {
     }
 };
 
-pub fn run(init: std.process.Init) !void {
+pub fn run(init: std.process.Init, model: ?[]const u8) !void {
     const app = try init.gpa.create(App);
     defer init.gpa.destroy(app);
-    try app.init(init);
+    try app.init(init, model);
     defer app.deinit();
     try app.run();
 }
@@ -801,13 +1351,27 @@ test "frame layout keeps chrome in bounds" {
         .{ .width = 120, .height = 30 },
     };
     for (sizes) |size| {
-        const layout = FrameLayout.compute(size.width, size.height);
+        const layout = FrameLayout.compute(size.width, size.height, 8);
         try std.testing.expect(
             layout.composer.y + layout.composer.height <= size.height,
         );
         if (layout.context) |context| {
             try std.testing.expect(context.y + context.height <= size.height);
-            try std.testing.expect(context.y + context.height <= layout.composer.y);
+            if (layout.menu) |menu| {
+                try std.testing.expect(
+                    context.y + context.height <= menu.y,
+                );
+            } else {
+                try std.testing.expect(
+                    context.y + context.height <= layout.composer.y,
+                );
+            }
+        }
+        if (layout.menu) |menu| {
+            try std.testing.expect(menu.y + menu.height <= size.height);
+            try std.testing.expect(
+                menu.y + menu.height <= layout.composer.y,
+            );
         }
         if (layout.footer) |footer| {
             try std.testing.expect(footer.y + footer.height <= size.height);
@@ -816,4 +1380,78 @@ test "frame layout keeps chrome in bounds" {
             );
         }
     }
+}
+
+test "menu ranks prefixes and preserves deterministic navigation" {
+    const entries = [_]MenuEntry{
+        .{
+            .key = "model",
+            .primary = "Model",
+            .detail = .{ .text = "Switch the active model" },
+            .source_index = 0,
+        },
+        .{
+            .key = "memory",
+            .primary = "Memory",
+            .detail = .{ .text = "Manage memories" },
+            .source_index = 1,
+        },
+        .{
+            .key = "show-model",
+            .primary = "Show Model",
+            .detail = .{ .text = "Inspect model information" },
+            .source_index = 2,
+        },
+    };
+    var menu: MenuState = .{};
+    defer menu.deinit(std.testing.allocator);
+
+    try menu.rebuild(std.testing.allocator, &entries, "mod");
+    try std.testing.expectEqual(@as(usize, 2), menu.matches.items.len);
+    try std.testing.expectEqualStrings("model", menu.selected().?.key);
+    menu.move(.next);
+    try std.testing.expectEqualStrings("show-model", menu.selected().?.key);
+    menu.move(.next);
+    try std.testing.expectEqualStrings("model", menu.selected().?.key);
+}
+
+test "model menu detail owns no composer text" {
+    var menu: MenuState = .{};
+    defer menu.deinit(std.testing.allocator);
+    var query = [_]u8{ 'q', 'w', 'e', 'n' };
+    const entries = [_]MenuEntry{.{
+        .key = "omlx/qwen",
+        .primary = "Qwen",
+        .detail = .{ .model = .{
+            .context_tokens = 131_072,
+            .output_tokens = 32_768,
+            .supports_vision = false,
+        } },
+        .source_index = 0,
+    }};
+
+    try menu.rebuild(std.testing.allocator, &entries, &query);
+    @memset(&query, 'x');
+    try std.testing.expectEqualStrings("omlx/qwen", menu.selected().?.key);
+}
+
+test "model menu matches provider-qualified identifiers" {
+    const entries = [_]MenuEntry{.{
+        .key = "copilot/gpt-5.6-sol",
+        .primary = "GPT-5.6 Sol",
+        .detail = .{ .model = .{
+            .context_tokens = 1_050_000,
+            .output_tokens = 128_000,
+            .supports_vision = true,
+        } },
+        .source_index = 0,
+    }};
+    var menu: MenuState = .{};
+    defer menu.deinit(std.testing.allocator);
+
+    try menu.rebuild(std.testing.allocator, &entries, "gpt-5.6-sol");
+    try std.testing.expectEqualStrings(
+        "copilot/gpt-5.6-sol",
+        menu.selected().?.key,
+    );
 }

@@ -2,26 +2,42 @@ const std = @import("std");
 const backend = @import("vivi_backend");
 const chat = @import("chat.zig");
 
-const Command = enum {
+const ChatOptions = struct {
+    model: ?[]const u8 = null,
+};
+
+const Command = union(enum) {
     help,
     version,
-    chat,
+    models,
+    chat: ChatOptions,
 
     fn parse(args: []const []const u8) error{InvalidArguments}!Command {
         if (args.len <= 1) return .help;
-        if (args.len != 2) return error.InvalidArguments;
 
-        if (std.mem.eql(u8, args[1], "--help") or
-            std.mem.eql(u8, args[1], "-h"))
+        if (args.len == 2 and
+            (std.mem.eql(u8, args[1], "--help") or
+                std.mem.eql(u8, args[1], "-h")))
         {
             return .help;
         }
-        if (std.mem.eql(u8, args[1], "--version") or
-            std.mem.eql(u8, args[1], "-V"))
+        if (args.len == 2 and
+            (std.mem.eql(u8, args[1], "--version") or
+                std.mem.eql(u8, args[1], "-V")))
         {
             return .version;
         }
-        if (std.mem.eql(u8, args[1], "chat")) return .chat;
+        if (args.len == 2 and std.mem.eql(u8, args[1], "models")) {
+            return .models;
+        }
+        if (std.mem.eql(u8, args[1], "chat")) {
+            if (args.len == 2) return .{ .chat = .{} };
+            if (args.len == 4 and
+                std.mem.eql(u8, args[2], "--model"))
+            {
+                return .{ .chat = .{ .model = args[3] } };
+            }
+        }
         return error.InvalidArguments;
     }
 };
@@ -43,9 +59,10 @@ pub fn main(init: std.process.Init) !void {
     switch (command) {
         .help => try writeHelp(stdout),
         .version => try stdout.print("vivi {s}\n", .{backend.version}),
-        .chat => {
+        .models => try listModels(init, stdout),
+        .chat => |options| {
             try stdout.flush();
-            return chat.run(init);
+            return chat.run(init, options.model);
         },
     }
     try stdout.flush();
@@ -53,14 +70,42 @@ pub fn main(init: std.process.Init) !void {
 
 fn writeHelp(writer: *std.Io.Writer) !void {
     try writer.writeAll(
-        \\Usage: vivi [--help] [--version] [chat]
+        \\Usage: vivi [--help] [--version] [models] [chat [--model MODEL]]
         \\
         \\Vivi command-line interface.
         \\
         \\Commands:
+        \\  models     List available Copilot and OMLX models.
         \\  chat       Start an interactive streaming Vivi chat.
         \\
     );
+}
+
+fn listModels(init: std.process.Init, writer: *std.Io.Writer) !void {
+    var catalog = try backend.discoverModels(
+        init.gpa,
+        init.io,
+        init.environ_map.get("PWD") orelse ".",
+        .{
+            .base_url = init.environ_map.get("OMLX_BASE_URL") orelse
+                backend.default_omlx_base_url,
+            .api_key = init.environ_map.get("OMLX_API_KEY") orelse "omlx",
+        },
+    );
+    defer catalog.deinit();
+
+    for (catalog.models) |model| {
+        try writer.print(
+            "{s}\t{s}\tcontext={d}\toutput={d}\tvision={s}\n",
+            .{
+                model.id,
+                model.display_name,
+                model.max_context_window_tokens,
+                model.max_output_tokens,
+                if (model.supports_vision) "yes" else "no",
+            },
+        );
+    }
 }
 
 test "command parser accepts scaffold commands" {
@@ -77,7 +122,18 @@ test "command parser accepts scaffold commands" {
         try Command.parse(&.{ "vivi", "--version" }),
     );
     try std.testing.expectEqual(
-        Command.chat,
+        Command{ .chat = .{} },
         try Command.parse(&.{ "vivi", "chat" }),
+    );
+    try std.testing.expectEqual(
+        Command.models,
+        try Command.parse(&.{ "vivi", "models" }),
+    );
+    const chat_model = try Command.parse(
+        &.{ "vivi", "chat", "--model", "omlx/model" },
+    );
+    try std.testing.expectEqualStrings(
+        "omlx/model",
+        chat_model.chat.model.?,
     );
 }

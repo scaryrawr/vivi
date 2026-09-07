@@ -37,6 +37,143 @@ pub const Failure = struct {
     }
 };
 
+pub const CommandInfo = struct {
+    name: []u8,
+    description: []u8,
+
+    fn deinit(self: *CommandInfo, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.description);
+        self.* = undefined;
+    }
+};
+
+pub const CommandCatalog = struct {
+    allocator: std.mem.Allocator,
+    commands: []CommandInfo,
+
+    pub fn deinit(self: *CommandCatalog) void {
+        for (self.commands) |*command| command.deinit(self.allocator);
+        self.allocator.free(self.commands);
+        self.* = undefined;
+    }
+
+    pub fn clone(
+        self: *const CommandCatalog,
+        allocator: std.mem.Allocator,
+    ) !CommandCatalog {
+        const commands = try allocator.alloc(CommandInfo, self.commands.len);
+        errdefer allocator.free(commands);
+        var initialized: usize = 0;
+        errdefer for (commands[0..initialized]) |*command| {
+            command.deinit(allocator);
+        };
+        for (self.commands, 0..) |command, index| {
+            commands[index] = .{
+                .name = try allocator.dupe(u8, command.name),
+                .description = undefined,
+            };
+            errdefer allocator.free(commands[index].name);
+            commands[index].description = try allocator.dupe(
+                u8,
+                command.description,
+            );
+            initialized += 1;
+        }
+        return .{ .allocator = allocator, .commands = commands };
+    }
+};
+
+pub const ModelInfo = struct {
+    allocator: std.mem.Allocator,
+    id: []u8,
+    display_name: []u8,
+    max_context_window_tokens: u64,
+    max_output_tokens: u64,
+    supports_vision: bool,
+
+    pub fn deinit(self: *ModelInfo) void {
+        self.allocator.free(self.id);
+        self.allocator.free(self.display_name);
+        self.* = undefined;
+    }
+
+    pub fn clone(
+        self: *const ModelInfo,
+        allocator: std.mem.Allocator,
+    ) !ModelInfo {
+        const id = try allocator.dupe(u8, self.id);
+        errdefer allocator.free(id);
+        return .{
+            .allocator = allocator,
+            .id = id,
+            .display_name = try allocator.dupe(u8, self.display_name),
+            .max_context_window_tokens = self.max_context_window_tokens,
+            .max_output_tokens = self.max_output_tokens,
+            .supports_vision = self.supports_vision,
+        };
+    }
+};
+
+pub const ModelCatalog = struct {
+    allocator: std.mem.Allocator,
+    selected_id: []u8,
+    models: []ModelInfo,
+
+    pub fn deinit(self: *ModelCatalog) void {
+        allocatorFreeModels(self.allocator, self.models);
+        self.allocator.free(self.selected_id);
+        self.* = undefined;
+    }
+
+    pub fn clone(
+        self: *const ModelCatalog,
+        allocator: std.mem.Allocator,
+    ) !ModelCatalog {
+        const values = try allocator.alloc(ModelInfo, self.models.len);
+        errdefer allocator.free(values);
+        var initialized: usize = 0;
+        errdefer for (values[0..initialized]) |*value| value.deinit();
+        for (self.models, 0..) |model, index| {
+            values[index] = try model.clone(allocator);
+            initialized += 1;
+        }
+        return .{
+            .allocator = allocator,
+            .selected_id = try allocator.dupe(u8, self.selected_id),
+            .models = values,
+        };
+    }
+};
+
+fn allocatorFreeModels(allocator: std.mem.Allocator, values: []ModelInfo) void {
+    for (values) |*value| value.deinit();
+    allocator.free(values);
+}
+
+pub const HistoryEffect = enum {
+    preserved,
+    reset_visible_transcript_preserved,
+};
+
+pub const ModelSwitchResult = union(enum) {
+    unchanged: ModelInfo,
+    switched: struct {
+        model: ModelInfo,
+        history: HistoryEffect,
+    },
+    failed: OwnedText,
+
+    pub fn deinit(self: *ModelSwitchResult) void {
+        switch (self.*) {
+            .unchanged => |*model| model.deinit(),
+            .switched => |*result| result.model.deinit(),
+            .failed => |*message| message.deinit(),
+        }
+        self.* = undefined;
+    }
+};
+
 pub const Closed = union(enum) {
     requested,
     failed: Failure,
@@ -52,6 +189,10 @@ pub const Closed = union(enum) {
 
 pub const Event = union(enum) {
     ready,
+    command_catalog: CommandCatalog,
+    model_catalog: ModelCatalog,
+    model_catalog_failed: OwnedText,
+    model_switch: ModelSwitchResult,
     assistant_delta: OwnedText,
     assistant_complete: OwnedText,
     idle,
@@ -60,6 +201,10 @@ pub const Event = union(enum) {
     pub fn deinit(self: *Event) void {
         switch (self.*) {
             .assistant_delta, .assistant_complete => |*text| text.deinit(),
+            .command_catalog => |*catalog| catalog.deinit(),
+            .model_catalog => |*catalog| catalog.deinit(),
+            .model_catalog_failed => |*text| text.deinit(),
+            .model_switch => |*result| result.deinit(),
             .closed => |*closed| closed.deinit(),
             .ready, .idle => {},
         }
@@ -69,12 +214,15 @@ pub const Event = union(enum) {
 
 pub const Command = union(enum) {
     prompt: OwnedText,
+    refresh_commands,
+    refresh_models,
+    switch_model: OwnedText,
     stop,
 
     pub fn deinit(self: *Command) void {
         switch (self.*) {
-            .prompt => |*prompt| prompt.deinit(),
-            .stop => {},
+            .prompt, .switch_model => |*text| text.deinit(),
+            .refresh_commands, .refresh_models, .stop => {},
         }
         self.* = undefined;
     }
@@ -84,17 +232,32 @@ const State = enum {
     starting,
     idle,
     streaming,
+    controlling,
     stopping,
     closed,
 };
 
 const Runner = *const fn (worker: *Worker) void;
+const ContextRunner = *const fn (worker: *Worker, context: *anyopaque) void;
+const ContextDestroy = *const fn (
+    allocator: std.mem.Allocator,
+    context: *anyopaque,
+) void;
+
+const RunnerConfig = union(enum) {
+    plain: Runner,
+    context: struct {
+        pointer: *anyopaque,
+        run: ContextRunner,
+        destroy: ContextDestroy,
+    },
+};
 
 const Core = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     wake: Wake,
-    runner: Runner,
+    runner: RunnerConfig,
     mutex: std.Io.Mutex = .init,
     command_ready: std.Io.Condition = .init,
     state: State = .starting,
@@ -158,6 +321,56 @@ pub const Worker = struct {
         });
     }
 
+    pub fn commandCatalog(self: *Worker, catalog: CommandCatalog) !void {
+        try self.publish(.{ .command_catalog = catalog });
+    }
+
+    pub fn modelCatalog(self: *Worker, catalog: ModelCatalog) !void {
+        try self.publish(.{ .model_catalog = catalog });
+    }
+
+    pub fn modelCatalogFailed(self: *Worker, message: []const u8) !void {
+        try self.publish(.{
+            .model_catalog_failed = try OwnedText.init(
+                self.core.allocator,
+                message,
+            ),
+        });
+    }
+
+    pub fn completeModelRefresh(
+        self: *Worker,
+        catalog: ModelCatalog,
+    ) !void {
+        try self.completeControl(.{ .model_catalog = catalog });
+    }
+
+    pub fn completeCommandRefresh(
+        self: *Worker,
+        catalog: CommandCatalog,
+    ) !void {
+        try self.completeControl(.{ .command_catalog = catalog });
+    }
+
+    pub fn completeModelRefreshFailure(
+        self: *Worker,
+        message: []const u8,
+    ) !void {
+        try self.completeControl(.{
+            .model_catalog_failed = try OwnedText.init(
+                self.core.allocator,
+                message,
+            ),
+        });
+    }
+
+    pub fn completeModelSwitch(
+        self: *Worker,
+        result: ModelSwitchResult,
+    ) !void {
+        try self.completeControl(.{ .model_switch = result });
+    }
+
     pub fn assistantComplete(self: *Worker, text: []const u8) !void {
         try self.publish(.{
             .assistant_complete = try OwnedText.init(self.core.allocator, text),
@@ -169,6 +382,13 @@ pub const Worker = struct {
         if (!self.core.stop_requested) self.core.state = .idle;
         self.core.mutex.unlock(self.core.io);
         try self.publish(.idle);
+    }
+
+    fn completeControl(self: *Worker, event: Event) !void {
+        try self.core.mutex.lock(self.core.io);
+        if (!self.core.stop_requested) self.core.state = .idle;
+        self.core.mutex.unlock(self.core.io);
+        try self.publish(event);
     }
 
     pub fn closeRequested(self: *Worker) void {
@@ -231,7 +451,7 @@ pub const Conversation = struct {
 
         switch (self.core.state) {
             .idle => {},
-            .starting, .streaming => return error.Busy,
+            .starting, .streaming, .controlling => return error.Busy,
             .stopping => return error.Stopping,
             .closed => return error.Closed,
         }
@@ -240,6 +460,42 @@ pub const Conversation = struct {
             .prompt = try OwnedText.init(self.core.allocator, prompt),
         };
         self.core.state = .streaming;
+        self.core.command_ready.signal(self.core.io);
+    }
+
+    pub fn refreshModels(self: *Conversation) !void {
+        try self.enqueueControl(.refresh_models);
+    }
+
+    pub fn refreshCommands(self: *Conversation) !void {
+        try self.enqueueControl(.refresh_commands);
+    }
+
+    pub fn switchModel(self: *Conversation, model_id: []const u8) !void {
+        if (std.mem.trim(u8, model_id, " \t\r\n").len == 0) {
+            return error.EmptyModel;
+        }
+        try self.enqueueControl(.{
+            .switch_model = try OwnedText.init(self.core.allocator, model_id),
+        });
+    }
+
+    fn enqueueControl(self: *Conversation, command: Command) !void {
+        var owned_command = command;
+        errdefer owned_command.deinit();
+
+        try self.core.mutex.lock(self.core.io);
+        defer self.core.mutex.unlock(self.core.io);
+
+        switch (self.core.state) {
+            .idle => {},
+            .starting, .streaming, .controlling => return error.Busy,
+            .stopping => return error.Stopping,
+            .closed => return error.Closed,
+        }
+        std.debug.assert(self.core.command == null);
+        self.core.command = owned_command;
+        self.core.state = .controlling;
         self.core.command_ready.signal(self.core.io);
     }
 
@@ -276,6 +532,13 @@ pub const Conversation = struct {
         for (self.core.events.items) |*event| event.deinit();
         self.core.events.deinit(self.core.allocator);
         const allocator = self.core.allocator;
+        switch (self.core.runner) {
+            .plain => {},
+            .context => |context| context.destroy(
+                allocator,
+                context.pointer,
+            ),
+        }
         allocator.destroy(self.core);
         self.* = undefined;
     }
@@ -293,7 +556,31 @@ pub fn openWithRunner(
         .allocator = allocator,
         .io = io,
         .wake = wake,
-        .runner = runner,
+        .runner = .{ .plain = runner },
+    };
+    core.worker = try io.concurrent(runWorker, .{core});
+    return .{ .core = core };
+}
+
+pub fn openWithContextRunner(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    wake: Wake,
+    context: *anyopaque,
+    runner: ContextRunner,
+    destroy: ContextDestroy,
+) !Conversation {
+    const core = try allocator.create(Core);
+    errdefer allocator.destroy(core);
+    core.* = .{
+        .allocator = allocator,
+        .io = io,
+        .wake = wake,
+        .runner = .{ .context = .{
+            .pointer = context,
+            .run = runner,
+            .destroy = destroy,
+        } },
     };
     core.worker = try io.concurrent(runWorker, .{core});
     return .{ .core = core };
@@ -301,7 +588,10 @@ pub fn openWithRunner(
 
 fn runWorker(core: *Core) void {
     var worker: Worker = .{ .core = core };
-    core.runner(&worker);
+    switch (core.runner) {
+        .plain => |runner| runner(&worker),
+        .context => |context| context.run(&worker, context.pointer),
+    }
 }
 
 test "conversation transfers streamed events without SDK access" {
@@ -321,6 +611,10 @@ test "conversation transfers streamed events without SDK access" {
                 },
                 .stop => {
                     worker.closeRequested();
+                    return;
+                },
+                .refresh_commands, .refresh_models, .switch_model => {
+                    worker.closeFailure(.stream, "Unexpected control command.");
                     return;
                 },
             }
