@@ -5,9 +5,9 @@
 Vivi is intended for Windows, Linux, and macOS with a native experience on
 each platform. A shared Zig core and the cross-platform `vivi` CLI converge on
 one backend built on `copilot-sdk-zig`, whose API is blocking, single-threaded,
-and starts Copilot CLI over stdio. The scaffold must preserve platform-native
-UX without duplicating sessions, prompts, tools, persistence, or transport
-policy in each application.
+and starts Copilot CLI over stdio. The implementation must preserve
+platform-native UX without duplicating sessions, prompts, tools, persistence,
+or transport policy in each application.
 
 ## Usage
 
@@ -45,7 +45,9 @@ Zig 0.16 currently fails while cross-compiling its `libubsan` support for
 ARM64 Windows Debug from macOS. Treat that as a toolchain verification item,
 not as a reason to add target conditionals to domain code.
 
-The C ABI intentionally exposes one status function. Product operations will
+The C ABI intentionally exposes one status function. The CLI's first product
+operation is a backend-owned conversation worker with a libvaxis terminal
+adapter. Product operations will
 be added only after a real caller defines their domain shape. Extensible
 structs must carry `abi_version` and `struct_size`; text crosses as UTF-8 bytes
 with explicit lengths; state uses opaque handles with matching destroy
@@ -59,6 +61,39 @@ eventually needs OS services such as process discovery or credential storage,
 add private `backend/src/runtime/<os>.zig` adapters only when required; core
 and CLI code must continue compiling without a UI adapter.
 
+For the CLI chat, `backend/src/conversation.zig` owns the worker, one-command
+mailbox, owned event queue, and lifecycle state. `backend/src/root.zig` owns
+the SDK adapter and remains the only production module that imports
+`copilot_sdk`. The libvaxis loop receives only a payload-free wake; the CLI
+then transfers owned domain events from the backend and reduces them into a
+private `ChatUi`. `ChatUi` owns the transcript, composer, responsive frame
+layout, and a wrapped-row viewport used for Page Up and Page Down scrolling.
+This keeps SDK values and their allocator lifetimes off the UI thread while
+keeping terminal policy out of the backend.
+
+The initial coding-agent policy is private to `backend/src/root.zig`. Copilot
+CLI starts with the source-qualified `builtin:*` tool class excluded, built-in
+MCP servers disabled, custom instructions disabled, and `ask_user` disabled.
+The SDK session registers Vivi-owned `read`, `bash`, `edit`, and `write` tools
+and replaces Copilot's system message with Vivi's concise workspace-aware
+prompt. Excluding only the built-in source keeps Copilot's tools unavailable
+without suppressing Vivi or future extension tools.
+
+`backend/src/tools.zig` owns SDK-free tool behavior: JSON argument validation,
+workspace-relative path resolution, text reads, Bash execution, exact
+multi-edit planning, line-ending/BOM preservation, and file writes. It returns
+owned text or an actionable failure. `backend/src/root.zig` owns the four SDK
+declarations and explicitly resolves `external_tool_requested` events so full
+failure messages reach the model rather than being reduced to Zig error names.
+The tool layer does not truncate output or create spill files because Copilot
+owns large-result handling.
+
+Cancellation is cooperative because the pinned SDK has no documented
+cross-thread operation that interrupts a blocked `Session.nextEvent`.
+`requestStop` is observed by the SDK-owning worker at an event boundary, where
+it calls `Session.disconnect`. A second Ctrl-C is a deliberate hard-exit path
+for a permanently blocked Copilot process.
+
 ## Synthesis decision
 
 The real macOS project lives in top-level `macos/`. Top-level
@@ -67,6 +102,20 @@ buildable. This keeps the repository truthful while establishing native
 ownership early. All native build systems call the root `install-c-api` step;
 the macOS staging script is not a template for Windows because Windows ships
 separate architecture-specific binaries rather than a fat archive.
+
+The CLI chat uses a backend conversation broker rather than a CLI-owned SDK
+worker. The broker was chosen because its small submit/take/stop/deinit
+surface hides SDK sequencing, single-thread ownership, event copying, and
+teardown. libvaxis remains a CLI-only dependency, and the native C ABI remains
+unchanged until a native caller defines its callback and ownership contract.
+
+The minimal agent configuration stays private to the SDK-owning root module
+rather than becoming caller-supplied conversation options. This keeps tool
+availability and prompt policy consistent across every host. The process-level
+built-in exclusion is authoritative for Copilot-provided capabilities while
+leaving extension/custom tool sources eligible. The SDK declarations use the
+same four descriptors that drive the SDK-free dispatcher, and permission
+requests remain fail-closed because Vivi has no approval UI yet.
 
 ## Tradeoffs accepted
 
@@ -81,6 +130,16 @@ separate architecture-specific binaries rather than a fat archive.
   operation.
 - We accept separate native build systems and duplicated view code in exchange
   for first-class platform UX instead of a least-common-denominator UI layer.
+- We accept copied streaming text in exchange for explicit ownership across
+  the backend worker and terminal thread.
+- We accept cooperative cancellation in exchange for never calling the
+  single-threaded SDK concurrently.
+- We accept CLI launch flags alongside SDK session configuration because the
+  pinned Zig SDK does not expose Copilot's built-in tool allowlist.
+- We accept unbounded in-memory tool results in exchange for leaving
+  truncation and large-result transport to Copilot.
+- We accept synchronous tool execution on the SDK worker in exchange for one
+  clear owner and serialized file mutations.
 
 ## Alternatives considered
 
@@ -90,17 +149,34 @@ separate architecture-specific binaries rather than a fat archive.
   and wire protocol before any core behavior exists.
 - Symmetric placeholder applications were rejected because empty WinUI and
   GNOME targets would falsely claim product support.
+- A CLI-owned SDK worker was rejected because every future native host would
+  have to recreate SDK sequencing, thread ownership, and event lifetime policy.
+- A callback-based stream was rejected because callback lifetime and thread
+  affinity would become part of every caller's contract.
+- An SDK-only empty `tools` list was rejected because it controls external
+  handlers registered by Vivi, not Copilot's built-in tool inventory.
+- Enumerating current Copilot tool names was rejected because newly shipped
+  built-ins could bypass it; the source-qualified `builtin:*` exclusion covers
+  the complete built-in class while preserving extension tools.
+- Caller-supplied agent configuration was rejected because it would leak
+  Copilot process and prompt policy into every CLI and native host.
+- SDK auto-handlers were rejected because they reduce operational failures to
+  Zig error names and still return the external-tool event to the caller.
+- Pi's tool-side truncation and spill files were rejected because Copilot
+  already owns large tool-result handling.
 
 ## Open questions
 
-- What is the first user-visible operation that should define the opaque
-  backend handle and event contract?
 - Should a distributed app bundle Copilot CLI or expose a preference that maps
   to `ClientOptions.cli_path`?
 - Which process-launch and credential-storage differences require the first
   private OS runtime adapters?
+- What transcript retention limit should replace the current process-lifetime
+  in-memory history if long-running conversations make one necessary?
+- What authorization and approval UI should eventually replace the current
+  `skip_permission` policy for Vivi-owned tools?
 
 ## Next implementation step
 
-Verify the core and dynamic C library for Linux and Windows targets, then
-define the first conversation use case from CLI and native-host caller views.
+Use the first native-host caller to define the C ABI conversation handle and
+callback contract.

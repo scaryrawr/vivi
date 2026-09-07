@@ -1,0 +1,404 @@
+#!/bin/sh
+set -eu
+
+repo_root=$(git rev-parse --show-toplevel)
+artifact_root="$repo_root/.verify/vivi"
+binary="$repo_root/zig-out/bin/vivi"
+
+usage() {
+    cat <<'EOF'
+Usage:
+  verify-vivi doctor
+  verify-vivi cli-discovery <run-id>
+  verify-vivi chat-streaming <run-id>
+  verify-vivi chat-shutdown <run-id>
+  verify-vivi extract-frames <run-id> <chat-streaming|chat-shutdown>
+  verify-vivi frame-check <run-id> <chat-streaming|chat-shutdown>
+  verify-vivi cleanup <run-id>
+EOF
+}
+
+require_command() {
+    command -v "$1" >/dev/null 2>&1 || {
+        printf 'missing required command: %s\n' "$1" >&2
+        exit 1
+    }
+}
+
+validate_run_id() {
+    case "${1:-}" in
+        ""|*[!A-Za-z0-9._-]*)
+            printf 'run-id must use only letters, digits, dots, underscores, or hyphens\n' >&2
+            exit 1
+            ;;
+    esac
+}
+
+prepare_run() {
+    run_id=$1
+    validate_run_id "$run_id"
+    run_dir="$artifact_root/$run_id"
+    mkdir -p "$run_dir"
+    printf '%s\n' "$run_dir"
+}
+
+build_vivi() {
+    (cd "$repo_root" && zig build)
+}
+
+doctor() {
+    require_command zig
+    require_command vhs
+    require_command script
+    require_command copilot
+    require_command ffmpeg
+    require_command ffprobe
+    build_vivi
+
+    "$binary" --version
+    zig version
+    vhs --version
+    copilot --version
+    ffmpeg -version | sed -n '1p'
+
+    auth_output=$(
+        copilot \
+            --silent \
+            --no-custom-instructions \
+            --disable-builtin-mcps \
+            --no-ask-user \
+            -p 'Reply with exactly VIVI_DOCTOR_OK.'
+    )
+    test "$auth_output" = "VIVI_DOCTOR_OK"
+    printf 'doctor: ready\n'
+}
+
+cli_discovery() {
+    run_dir=$(prepare_run "$1")
+    build_vivi
+
+    if "$binary" --help >"$run_dir/help.stdout" 2>"$run_dir/help.stderr"; then
+        help_status=0
+    else
+        help_status=$?
+    fi
+    if "$binary" --version >"$run_dir/version.stdout" 2>"$run_dir/version.stderr"; then
+        version_status=0
+    else
+        version_status=$?
+    fi
+
+    {
+        printf 'help_exit=%s\n' "$help_status"
+        printf 'version_exit=%s\n' "$version_status"
+        printf 'help_contains_chat='
+        if grep -q 'chat       Start an interactive streaming Vivi chat.' "$run_dir/help.stdout"; then
+            printf 'yes\n'
+        else
+            printf 'no\n'
+        fi
+    } >"$run_dir/cli-discovery.assertions.txt"
+
+    test "$help_status" -eq 0
+    test "$version_status" -eq 0
+    grep -q 'chat       Start an interactive streaming Vivi chat.' "$run_dir/help.stdout"
+    grep -q '^vivi ' "$run_dir/version.stdout"
+}
+
+validate_capture_name() {
+    case "$1" in
+        chat-streaming|chat-shutdown) ;;
+        *)
+            printf 'capture must be chat-streaming or chat-shutdown\n' >&2
+            exit 1
+            ;;
+    esac
+}
+
+extract_frames() {
+    run_dir=$(prepare_run "$1")
+    capture=$2
+    validate_capture_name "$capture"
+    gif="$run_dir/$capture.gif"
+    frame_dir="$run_dir/$capture.frames"
+
+    test -s "$gif" || {
+        printf 'missing GIF: %s\n' "$gif" >&2
+        exit 1
+    }
+
+    mkdir -p "$frame_dir"
+    find "$frame_dir" -type f -name 'frame-*.png' -delete
+    ffmpeg -loglevel error -y -i "$gif" -vf fps=1 \
+        "$frame_dir/frame-%03d.png"
+    ffmpeg -loglevel error -y -i "$gif" \
+        -vf 'fps=1/2,scale=600:-1,tile=4x4' -frames:v 1 \
+        "$run_dir/$capture.contact-sheet.png"
+
+    frame_count=$(
+        find "$frame_dir" -type f -name 'frame-*.png' | wc -l |
+            tr -d ' '
+    )
+    ffprobe -v error -select_streams v:0 \
+        -show_entries stream=width,height -show_entries format=duration \
+        -of default=noprint_wrappers=1 "$gif" \
+        >"$run_dir/$capture.frames.txt"
+    printf 'extracted_frames=%s\n' "$frame_count" \
+        >>"$run_dir/$capture.frames.txt"
+
+    if ! test -f "$run_dir/$capture.visual-review.md"; then
+        cat >"$run_dir/$capture.visual-review.md" <<EOF
+# $capture visual review
+
+status: pending
+
+- [ ] The Vivi welcome or transcript role labels are readable and not clipped.
+- [ ] The accented composer is intact and does not overlap the transcript.
+- [ ] The typed user action is visible before or during submission.
+- [ ] Transcript labels and content remain legible during redraws.
+- [ ] The expected feature-specific state is visible in at least one frame.
+- [ ] No frame shows stale text, severe flicker, broken borders, or layout corruption.
+
+Reviewed artifacts:
+
+- $capture.contact-sheet.png
+- $capture.frames/frame-*.png
+
+Notes:
+
+- Replace this line with the inspected frame numbers and observations.
+EOF
+    fi
+
+    test "$frame_count" -ge 3
+    test -s "$run_dir/$capture.contact-sheet.png"
+    if test "${VIVI_KEEP_GIF:-0}" != "1"; then
+        rm -f "$gif"
+    fi
+}
+
+frame_check() {
+    run_dir=$(prepare_run "$1")
+    capture=$2
+    validate_capture_name "$capture"
+    review="$run_dir/$capture.visual-review.md"
+    metadata="$run_dir/$capture.frames.txt"
+
+    test -s "$run_dir/$capture.contact-sheet.png"
+    test -s "$metadata"
+    test -s "$review"
+    grep -q '^width=1200$' "$metadata"
+    grep -q '^height=720$' "$metadata"
+    frame_count=$(sed -n 's/^extracted_frames=//p' "$metadata")
+    test "$frame_count" -ge 3
+    grep -q '^status: pass$' "$review"
+    if grep -q '^- \[ \]' "$review"; then
+        printf 'visual review still has unchecked expectations: %s\n' "$review" >&2
+        exit 1
+    fi
+    if grep -q '^- \[!\]' "$review"; then
+        printf 'visual review records a failed expectation: %s\n' "$review" >&2
+        exit 1
+    fi
+    assertions="$run_dir/$capture.assertions.txt"
+    if test -f "$assertions" &&
+        ! grep -q '^visual_review=pass$' "$assertions"
+    then
+        printf 'visual_review=pass\n' >>"$assertions"
+    fi
+}
+
+write_streaming_tape() {
+    run_dir=$1
+    cat >"$run_dir/chat-streaming.tape" <<EOF
+Output "$run_dir/chat-streaming.gif"
+Require copilot
+Set Shell "bash"
+Set Width 1200
+Set Height 720
+Set FontSize 22
+Set TypingSpeed 20ms
+
+Type "./zig-out/bin/vivi chat"
+Enter
+Sleep 3s
+Type "Return the uppercase spelling of vivi_stream_ok and nothing else."
+Enter
+Sleep 20s
+Ctrl+C
+Sleep 3s
+Ctrl+C
+Sleep 1s
+EOF
+}
+
+chat_streaming() {
+    run_dir=$(prepare_run "$1")
+    build_vivi
+    write_streaming_tape "$run_dir"
+
+    (cd "$repo_root" && vhs "$run_dir/chat-streaming.tape")
+    extract_frames "$1" chat-streaming
+
+    (
+        sleep 3
+        printf 'Return the uppercase spelling of vivi_stream_ok and nothing else.\r'
+        sleep 20
+        printf '\003'
+        sleep 3
+        printf '\003'
+    ) | script -q "$run_dir/chat-streaming.terminal.log" sh -c \
+        "stty cols 100 rows 30; '$binary' chat" &
+    pty_pid=$!
+    printf '%s\n' "$pty_pid" >"$run_dir/pty.pid"
+    trap 'kill "$pty_pid" 2>/dev/null || true; wait "$pty_pid" 2>/dev/null || true' EXIT INT TERM
+
+    if wait "$pty_pid"; then
+        status=0
+    else
+        status=$?
+    fi
+    rm -f "$run_dir/pty.pid"
+    trap - EXIT INT TERM
+
+    perl -0pe \
+        's/\e\[[0-?]*[ -\/]*[@-~]//g; s/\e\][^\a]*(?:\a|\e\\)//g' \
+        "$run_dir/chat-streaming.terminal.log" |
+        tr -d '\r\b' >"$run_dir/chat-streaming.normalized.txt"
+
+    {
+        printf 'exit=%s\n' "$status"
+        printf 'expected_response=VIVI_STREAM_OK\n'
+        printf 'response_seen='
+        if grep -q 'VIVI_STREAM_OK' "$run_dir/chat-streaming.normalized.txt"; then
+            printf 'yes\n'
+        else
+            printf 'no\n'
+        fi
+        printf 'frames_extracted='
+        if test -s "$run_dir/chat-streaming.frames.txt"; then
+            printf 'yes\n'
+        else
+            printf 'no\n'
+        fi
+        printf 'contact_sheet_nonempty='
+        if test -s "$run_dir/chat-streaming.contact-sheet.png"; then
+            printf 'yes\n'
+        else
+            printf 'no\n'
+        fi
+        printf 'recording_retained='
+        if test -s "$run_dir/chat-streaming.gif"; then
+            printf 'yes\n'
+        else
+            printf 'no\n'
+        fi
+    } >"$run_dir/chat-streaming.assertions.txt"
+
+    test "$status" -eq 0
+    grep -q 'VIVI_STREAM_OK' "$run_dir/chat-streaming.normalized.txt"
+    test -s "$run_dir/chat-streaming.frames.txt"
+    test -s "$run_dir/chat-streaming.contact-sheet.png"
+}
+
+write_shutdown_tape() {
+    run_dir=$1
+    cat >"$run_dir/chat-shutdown.tape" <<EOF
+Output "$run_dir/chat-shutdown.gif"
+Require copilot
+Set Shell "bash"
+Set Width 1200
+Set Height 720
+Set FontSize 22
+
+Type "./zig-out/bin/vivi chat"
+Enter
+Sleep 3s
+Ctrl+C
+Sleep 3s
+EOF
+}
+
+chat_shutdown() {
+    run_dir=$(prepare_run "$1")
+    build_vivi
+    write_shutdown_tape "$run_dir"
+    (cd "$repo_root" && vhs "$run_dir/chat-shutdown.tape")
+    extract_frames "$1" chat-shutdown
+    test -s "$run_dir/chat-shutdown.frames.txt"
+    test -s "$run_dir/chat-shutdown.contact-sheet.png"
+    printf 'frames_extracted=yes\ncontact_sheet_nonempty=yes\nshutdown=ctrl-c\n' \
+        >"$run_dir/chat-shutdown.assertions.txt"
+}
+
+cleanup() {
+    run_dir=$(prepare_run "$1")
+    if test -f "$run_dir/pty.pid"; then
+        pid=$(cat "$run_dir/pty.pid")
+        case "$pid" in
+            ""|*[!0-9]*) ;;
+            *)
+                kill "$pid" 2>/dev/null || true
+                wait "$pid" 2>/dev/null || true
+                ;;
+        esac
+        rm -f "$run_dir/pty.pid"
+    fi
+    find "$run_dir" -type f -name '*.tape' -size 0 -delete
+}
+
+case "${1:-}" in
+    doctor)
+        test "$#" -eq 1 || {
+            usage >&2
+            exit 2
+        }
+        doctor
+        ;;
+    cli-discovery)
+        test "$#" -eq 2 || {
+            usage >&2
+            exit 2
+        }
+        cli_discovery "$2"
+        ;;
+    chat-streaming)
+        test "$#" -eq 2 || {
+            usage >&2
+            exit 2
+        }
+        chat_streaming "$2"
+        ;;
+    chat-shutdown)
+        test "$#" -eq 2 || {
+            usage >&2
+            exit 2
+        }
+        chat_shutdown "$2"
+        ;;
+    extract-frames)
+        test "$#" -eq 3 || {
+            usage >&2
+            exit 2
+        }
+        extract_frames "$2" "$3"
+        ;;
+    frame-check)
+        test "$#" -eq 3 || {
+            usage >&2
+            exit 2
+        }
+        frame_check "$2" "$3"
+        ;;
+    cleanup)
+        test "$#" -eq 2 || {
+            usage >&2
+            exit 2
+        }
+        cleanup "$2"
+        ;;
+    *)
+        usage >&2
+        exit 2
+        ;;
+esac

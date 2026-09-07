@@ -3,6 +3,7 @@
 .build/
 zig-pkg/
 zig-out/
+.verify/
 
 macos/**/xcuserdata/
 macos/**/*.xcuserstate
