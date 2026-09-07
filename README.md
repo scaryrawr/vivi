@@ -110,5 +110,13 @@ x64/ARM64 DLLs without claiming that those GUI applications exist yet.
 ./scripts/check.sh
 ```
 
+The full check composes three independently runnable CI domains:
+
+```sh
+./scripts/check-zig.sh
+./scripts/check-c-api-cross.sh
+./scripts/check-macos.sh
+```
+
 Architecture and ownership decisions are documented in
 [`docs/architecture.md`](docs/architecture.md).
