@@ -174,6 +174,11 @@ pub const ModelSwitchResult = union(enum) {
     }
 };
 
+pub const PromptDelivery = enum {
+    immediate,
+    enqueue,
+};
+
 pub const Closed = union(enum) {
     requested,
     failed: Failure,
@@ -193,6 +198,9 @@ pub const Event = union(enum) {
     model_catalog: ModelCatalog,
     model_catalog_failed: OwnedText,
     model_switch: ModelSwitchResult,
+    assistant_started,
+    reasoning_delta: OwnedText,
+    reasoning_complete: OwnedText,
     assistant_delta: OwnedText,
     assistant_complete: OwnedText,
     idle,
@@ -200,20 +208,27 @@ pub const Event = union(enum) {
 
     pub fn deinit(self: *Event) void {
         switch (self.*) {
-            .assistant_delta, .assistant_complete => |*text| text.deinit(),
+            .reasoning_delta,
+            .reasoning_complete,
+            .assistant_delta,
+            .assistant_complete,
+            => |*text| text.deinit(),
             .command_catalog => |*catalog| catalog.deinit(),
             .model_catalog => |*catalog| catalog.deinit(),
             .model_catalog_failed => |*text| text.deinit(),
             .model_switch => |*result| result.deinit(),
             .closed => |*closed| closed.deinit(),
-            .ready, .idle => {},
+            .ready, .assistant_started, .idle => {},
         }
         self.* = undefined;
     }
 };
 
 pub const Command = union(enum) {
-    prompt: OwnedText,
+    prompt: struct {
+        text: OwnedText,
+        delivery: PromptDelivery,
+    },
     refresh_commands,
     refresh_models,
     switch_model: OwnedText,
@@ -221,7 +236,8 @@ pub const Command = union(enum) {
 
     pub fn deinit(self: *Command) void {
         switch (self.*) {
-            .prompt, .switch_model => |*text| text.deinit(),
+            .prompt => |*prompt| prompt.text.deinit(),
+            .switch_model => |*text| text.deinit(),
             .refresh_commands, .refresh_models, .stop => {},
         }
         self.* = undefined;
@@ -261,7 +277,7 @@ const Core = struct {
     mutex: std.Io.Mutex = .init,
     command_ready: std.Io.Condition = .init,
     state: State = .starting,
-    command: ?Command = null,
+    commands: std.ArrayList(Command) = .empty,
     events: std.ArrayList(Event) = .empty,
     wake_pending: bool = false,
     stop_requested: bool = false,
@@ -296,7 +312,9 @@ pub const Worker = struct {
         self.core.mutex.lock(self.core.io) catch return .stop;
         defer self.core.mutex.unlock(self.core.io);
 
-        while (self.core.command == null and !self.core.stop_requested) {
+        while (self.core.commands.items.len == 0 and
+            !self.core.stop_requested)
+        {
             self.core.command_ready.wait(
                 self.core.io,
                 &self.core.mutex,
@@ -304,21 +322,60 @@ pub const Worker = struct {
         }
         if (self.core.stop_requested) return .stop;
 
-        const command = self.core.command.?;
-        self.core.command = null;
-        return command;
+        return self.core.commands.orderedRemove(0);
     }
 
-    pub fn stopRequested(self: *Worker) bool {
-        self.core.mutex.lock(self.core.io) catch return true;
+    pub fn tryTakeCommand(self: *Worker) ?Command {
+        self.core.mutex.lock(self.core.io) catch return .stop;
         defer self.core.mutex.unlock(self.core.io);
-        return self.core.stop_requested;
+
+        if (self.core.stop_requested) return .stop;
+        if (self.core.commands.items.len == 0) return null;
+        return self.core.commands.orderedRemove(0);
+    }
+
+    pub fn tryTakeImmediateCommand(self: *Worker) ?Command {
+        self.core.mutex.lock(self.core.io) catch return .stop;
+        defer self.core.mutex.unlock(self.core.io);
+
+        if (self.core.stop_requested) return .stop;
+        for (self.core.commands.items, 0..) |command, index| {
+            switch (command) {
+                .prompt => |prompt| {
+                    if (prompt.delivery == .immediate) {
+                        return self.core.commands.orderedRemove(index);
+                    }
+                },
+                .stop => return self.core.commands.orderedRemove(index),
+                .refresh_commands, .refresh_models, .switch_model => {},
+            }
+        }
+        return null;
     }
 
     pub fn assistantDelta(self: *Worker, text: []const u8) !void {
         try self.publish(.{
             .assistant_delta = try OwnedText.init(self.core.allocator, text),
         });
+    }
+
+    pub fn reasoningDelta(self: *Worker, text: []const u8) !void {
+        try self.publish(.{
+            .reasoning_delta = try OwnedText.init(self.core.allocator, text),
+        });
+    }
+
+    pub fn reasoningComplete(self: *Worker, text: []const u8) !void {
+        try self.publish(.{
+            .reasoning_complete = try OwnedText.init(
+                self.core.allocator,
+                text,
+            ),
+        });
+    }
+
+    pub fn assistantStarted(self: *Worker) !void {
+        try self.publish(.assistant_started);
     }
 
     pub fn commandCatalog(self: *Worker, catalog: CommandCatalog) !void {
@@ -441,7 +498,11 @@ pub const Worker = struct {
 pub const Conversation = struct {
     core: *Core,
 
-    pub fn submit(self: *Conversation, prompt: []const u8) !void {
+    pub fn submit(
+        self: *Conversation,
+        prompt: []const u8,
+        delivery: PromptDelivery,
+    ) !void {
         if (std.mem.trim(u8, prompt, " \t\r\n").len == 0) {
             return error.EmptyPrompt;
         }
@@ -450,15 +511,22 @@ pub const Conversation = struct {
         defer self.core.mutex.unlock(self.core.io);
 
         switch (self.core.state) {
-            .idle => {},
-            .starting, .streaming, .controlling => return error.Busy,
+            .idle, .streaming => {},
+            .starting, .controlling => return error.Busy,
             .stopping => return error.Stopping,
             .closed => return error.Closed,
         }
-        std.debug.assert(self.core.command == null);
-        self.core.command = .{
-            .prompt = try OwnedText.init(self.core.allocator, prompt),
-        };
+        const owned_prompt = try OwnedText.init(self.core.allocator, prompt);
+        errdefer {
+            var mutable = owned_prompt;
+            mutable.deinit();
+        }
+        try self.core.commands.append(self.core.allocator, .{
+            .prompt = .{
+                .text = owned_prompt,
+                .delivery = delivery,
+            },
+        });
         self.core.state = .streaming;
         self.core.command_ready.signal(self.core.io);
     }
@@ -493,8 +561,7 @@ pub const Conversation = struct {
             .stopping => return error.Stopping,
             .closed => return error.Closed,
         }
-        std.debug.assert(self.core.command == null);
-        self.core.command = owned_command;
+        try self.core.commands.append(self.core.allocator, owned_command);
         self.core.state = .controlling;
         self.core.command_ready.signal(self.core.io);
     }
@@ -528,7 +595,8 @@ pub const Conversation = struct {
             worker.await(self.core.io);
         }
 
-        if (self.core.command) |*command| command.deinit();
+        for (self.core.commands.items) |*command| command.deinit();
+        self.core.commands.deinit(self.core.allocator);
         for (self.core.events.items) |*event| event.deinit();
         self.core.events.deinit(self.core.allocator);
         const allocator = self.core.allocator;
@@ -604,7 +672,11 @@ test "conversation transfers streamed events without SDK access" {
             var command = worker.waitCommand();
             defer command.deinit();
             switch (command) {
-                .prompt => {
+                .prompt => |prompt| {
+                    if (prompt.delivery != .enqueue) {
+                        worker.closeFailure(.stream, "Unexpected prompt delivery.");
+                        return;
+                    }
                     worker.assistantDelta("hel") catch return;
                     worker.assistantComplete("hello") catch return;
                     worker.idle() catch return;
@@ -652,7 +724,7 @@ test "conversation transfers streamed events without SDK access" {
         }
     }
 
-    try conversation.submit("hello");
+    try conversation.submit("hello", .enqueue);
     var received: usize = 0;
     while (received < 3) {
         if (try conversation.tryTakeEvent()) |event_value| {
@@ -664,4 +736,98 @@ test "conversation transfers streamed events without SDK access" {
         }
     }
     try std.testing.expect(wake_counter.count.load(.monotonic) > 0);
+}
+
+test "conversation accepts steering and queued prompts while streaming" {
+    const Script = struct {
+        fn run(worker: *Worker) void {
+            if (!(worker.ready() catch return)) {
+                worker.closeRequested();
+                return;
+            }
+            var first = worker.waitCommand();
+            defer first.deinit();
+            const first_prompt = switch (first) {
+                .prompt => |prompt| prompt,
+                else => {
+                    worker.closeFailure(.stream, "Expected first prompt.");
+                    return;
+                },
+            };
+            if (first_prompt.delivery != .enqueue or
+                !std.mem.eql(u8, first_prompt.text.bytes, "first"))
+            {
+                worker.closeFailure(.stream, "Unexpected first prompt.");
+                return;
+            }
+
+            var steer = worker.waitCommand();
+            defer steer.deinit();
+            const steer_prompt = switch (steer) {
+                .prompt => |prompt| prompt,
+                else => {
+                    worker.closeFailure(.stream, "Expected steering prompt.");
+                    return;
+                },
+            };
+            if (steer_prompt.delivery != .immediate or
+                !std.mem.eql(u8, steer_prompt.text.bytes, "steer"))
+            {
+                worker.closeFailure(.stream, "Unexpected steering prompt.");
+                return;
+            }
+
+            var queued = worker.waitCommand();
+            defer queued.deinit();
+            const queued_prompt = switch (queued) {
+                .prompt => |prompt| prompt,
+                else => {
+                    worker.closeFailure(.stream, "Expected queued prompt.");
+                    return;
+                },
+            };
+            if (queued_prompt.delivery != .enqueue or
+                !std.mem.eql(u8, queued_prompt.text.bytes, "later"))
+            {
+                worker.closeFailure(.stream, "Unexpected queued prompt.");
+                return;
+            }
+            worker.idle() catch return;
+
+            var stop = worker.waitCommand();
+            stop.deinit();
+            worker.closeRequested();
+        }
+    };
+    const WakeCounter = struct {
+        count: std.atomic.Value(usize) = .init(0),
+
+        fn notify(context: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            _ = self.count.fetchAdd(1, .monotonic);
+        }
+    };
+
+    var wake_counter: WakeCounter = .{};
+    var conversation = try openWithRunner(
+        std.testing.allocator,
+        std.testing.io,
+        .{ .context = &wake_counter, .notify = WakeCounter.notify },
+        Script.run,
+    );
+    defer conversation.deinit();
+
+    while (true) {
+        if (try conversation.tryTakeEvent()) |event_value| {
+            var event = event_value;
+            defer event.deinit();
+            if (event == .ready) break;
+        } else {
+            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+    }
+
+    try conversation.submit("first", .enqueue);
+    try conversation.submit("steer", .immediate);
+    try conversation.submit("later", .enqueue);
 }

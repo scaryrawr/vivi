@@ -1,7 +1,8 @@
 # Streaming chat
 
-Streaming chat lets a user type one prompt, submit it, see Vivi's response
-arrive in the transcript, and regain the composer when the turn completes.
+Streaming chat lets a user submit prompts, see Vivi's response arrive in the
+transcript, steer the active turn, queue a follow-up, and keep composing until
+the session returns to the ready state.
 
 ## Sub-features
 
@@ -9,6 +10,11 @@ arrive in the transcript, and regain the composer when the turn completes.
 - `prompt-entry` accepts typed text through the libvaxis text input.
 - `prompt-submit` adds the submitted text under `You:`.
 - `response-stream` shows the responding state and Vivi output.
+- `reasoning-stream` shows model reasoning as a dim, italic `Thinking` entry
+  before the corresponding Vivi response.
+- `response-steer` keeps the composer active and sends Enter submissions into
+  the current turn.
+- `response-queue` sends Ctrl+Enter submissions as FIFO follow-up turns.
 - `turn-ready` returns the context state to `Ready` after completion.
 
 ## How to get to it (user POV)
@@ -16,6 +22,10 @@ arrive in the transcript, and regain the composer when the turn completes.
 - Run `vivi chat`.
 - Type a prompt in the bottom composer.
 - Press Enter.
+- While Vivi is responding, type a correction and press Enter to steer.
+- While Vivi is responding, type a follow-up and press Ctrl+Enter to queue it.
+- Models that expose reasoning stream it into a muted `Thinking` transcript
+  entry while the final response remains under `Vivi`.
 
 ## Driving it with verify-vivi
 
@@ -46,6 +56,20 @@ Preconditions:
   response, transcript assertion, and frame-extraction assertions. Frame
   metadata, the contact sheet, extracted PNGs, and the completed visual review
   prove appearance and state progression.
+- **Drive streaming input.** Run
+  `.github/skills/verify-vivi/bin/verify-vivi chat-streaming-input <run-id>`.
+  The helper starts a delayed response, sends an Enter-delivered steering
+  correction while it is active, then starts another delayed response and
+  sends a Ctrl+Enter queued follow-up.
+- **Observe streaming input.** Confirm the composer remains editable while the
+  context reads `Responding...`, the footer shows `Enter steer` and
+  `Ctrl+Enter queue`, and both submitted messages appear in the transcript.
+  The normalized transcript must contain `VIVI_STEER_OK`,
+  `VIVI_QUEUE_FIRST`, and `VIVI_QUEUE_OK`.
+- **Record streaming-input review.** Complete
+  `chat-streaming-input.visual-review.md`, set `status: pass`, name the
+  inspected frame numbers, then run
+  `.github/skills/verify-vivi/bin/verify-vivi frame-check <run-id> chat-streaming-input`.
 
 ## Gotchas
 
@@ -59,3 +83,5 @@ Preconditions:
   idle.
 - A retained GIF is for presentation only. It does not replace normalized text
   assertions or a passing frame review.
+- Steering is best effort. If the active turn reaches idle before Vivi forwards
+  the message, Copilot processes it as the next queued turn.

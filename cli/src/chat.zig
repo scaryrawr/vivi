@@ -7,6 +7,7 @@ const TextInput = vaxis.widgets.TextInput;
 const accent = vaxis.Color{ .rgb = .{ 110, 231, 183 } };
 const user_color = vaxis.Color{ .rgb = .{ 125, 211, 252 } };
 const assistant_color = vaxis.Color{ .rgb = .{ 196, 181, 253 } };
+const reasoning_color = vaxis.Color{ .rgb = .{ 148, 163, 184 } };
 const composer_background = vaxis.Color{ .index = 236 };
 const menu_background = vaxis.Color{ .index = 234 };
 const menu_selected_background = vaxis.Color{ .index = 238 };
@@ -19,9 +20,15 @@ const AppEvent = union(enum) {
 
 const Role = enum {
     user,
+    queued,
+    reasoning,
     assistant,
     status,
 };
+
+fn isBlank(text: []const u8) bool {
+    return std.mem.trim(u8, text, " \t\r\n").len == 0;
+}
 
 const Entry = struct {
     role: Role,
@@ -46,7 +53,9 @@ const Entry = struct {
 
 const Transcript = struct {
     entries: std.ArrayList(Entry) = .empty,
+    active_reasoning: ?usize = null,
     active_assistant: ?usize = null,
+    last_reasoning: ?usize = null,
 
     fn deinit(self: *Transcript, allocator: std.mem.Allocator) void {
         for (self.entries.items) |*entry| entry.deinit(allocator);
@@ -73,13 +82,48 @@ const Transcript = struct {
         allocator: std.mem.Allocator,
         text: []const u8,
     ) !void {
-        const index = self.active_assistant orelse blk: {
-            try self.append(allocator, .assistant, "");
-            const new_index = self.entries.items.len - 1;
-            self.active_assistant = new_index;
-            break :blk new_index;
-        };
+        if (self.active_assistant == null and isBlank(text)) return;
+        self.finishReasoning();
+        const index = self.active_assistant orelse
+            try self.startEntry(allocator, .assistant);
         try self.entries.items[index].text.appendSlice(allocator, text);
+    }
+
+    fn appendReasoningDelta(
+        self: *Transcript,
+        allocator: std.mem.Allocator,
+        text: []const u8,
+    ) !void {
+        if (self.active_reasoning == null and isBlank(text)) return;
+        self.finishAssistant();
+        const index = self.active_reasoning orelse
+            try self.startEntry(allocator, .reasoning);
+        try self.entries.items[index].text.appendSlice(allocator, text);
+    }
+
+    fn startEntry(
+        self: *Transcript,
+        allocator: std.mem.Allocator,
+        role: Role,
+    ) !usize {
+        const entry = try Entry.init(allocator, role, "");
+        errdefer {
+            var mutable = entry;
+            mutable.deinit(allocator);
+        }
+        const index = for (self.entries.items, 0..) |existing, queued_index| {
+            if (existing.role == .queued) break queued_index;
+        } else self.entries.items.len;
+        try self.entries.insert(allocator, index, entry);
+        switch (role) {
+            .reasoning => {
+                self.active_reasoning = index;
+                self.last_reasoning = index;
+            },
+            .assistant => self.active_assistant = index,
+            .user, .queued, .status => unreachable,
+        }
+        return index;
     }
 
     fn completeAssistant(
@@ -87,18 +131,72 @@ const Transcript = struct {
         allocator: std.mem.Allocator,
         text: []const u8,
     ) !void {
-        const index = self.active_assistant orelse blk: {
-            try self.append(allocator, .assistant, "");
-            const new_index = self.entries.items.len - 1;
-            self.active_assistant = new_index;
-            break :blk new_index;
-        };
+        if (isBlank(text)) return;
+        self.finishReasoning();
+        const index = self.active_assistant orelse
+            try self.startEntry(allocator, .assistant);
         self.entries.items[index].text.clearRetainingCapacity();
         try self.entries.items[index].text.appendSlice(allocator, text);
     }
 
-    fn finishTurn(self: *Transcript) void {
+    fn completeReasoning(
+        self: *Transcript,
+        allocator: std.mem.Allocator,
+        text: []const u8,
+    ) !void {
+        if (isBlank(text)) return;
+        const index = self.active_reasoning orelse self.last_reasoning orelse
+            create: {
+                self.finishAssistant();
+                break :create try self.startEntry(allocator, .reasoning);
+            };
+        self.entries.items[index].text.clearRetainingCapacity();
+        try self.entries.items[index].text.appendSlice(allocator, text);
+    }
+
+    fn finishAssistant(self: *Transcript) void {
         self.active_assistant = null;
+    }
+
+    fn finishReasoning(self: *Transcript) void {
+        self.active_reasoning = null;
+    }
+
+    fn finishTurn(self: *Transcript) void {
+        self.finishReasoning();
+        self.finishAssistant();
+    }
+
+    fn endTurn(self: *Transcript) void {
+        self.finishTurn();
+        self.last_reasoning = null;
+    }
+
+    fn beginQueuedTurn(self: *Transcript) void {
+        self.finishTurn();
+        self.promoteNextQueuedPrompt();
+    }
+
+    fn promoteNextQueuedPrompt(self: *Transcript) void {
+        const selected_index = for (self.entries.items, 0..) |entry, index| {
+            if (entry.role == .queued) break index;
+        } else return;
+
+        var selected = self.entries.orderedRemove(selected_index);
+        selected.role = .user;
+        self.entries.appendAssumeCapacity(selected);
+
+        var index: usize = 0;
+        var remaining = self.entries.items.len;
+        while (index < remaining) {
+            if (self.entries.items[index].role != .queued) {
+                index += 1;
+                continue;
+            }
+            const queued = self.entries.orderedRemove(index);
+            self.entries.appendAssumeCapacity(queued);
+            remaining -= 1;
+        }
     }
 };
 
@@ -249,7 +347,7 @@ const Projection = struct {
                 });
             }
             switch (entry.role) {
-                .user, .assistant => {
+                .user, .queued, .reasoning, .assistant => {
                     try projection.lines.append(allocator, .{
                         .kind = .role,
                         .entry_index = entry_index,
@@ -617,12 +715,14 @@ const ChatUi = struct {
                 return .keep_running;
             }
         }
-        if (self.phase != .ready) return .keep_running;
+        if (self.phase != .ready and self.phase != .responding) {
+            return .keep_running;
+        }
 
         if (key.matches(vaxis.Key.enter, .{})) {
             const prompt = try self.input.toOwnedContents(self.allocator);
             defer self.allocator.free(prompt);
-            conversation.submit(prompt) catch |err| switch (err) {
+            conversation.submit(prompt, .immediate) catch |err| switch (err) {
                 error.EmptyPrompt, error.Busy => return .keep_running,
                 else => return err,
             };
@@ -632,10 +732,27 @@ const ChatUi = struct {
             self.followTail();
             return .keep_running;
         }
+        if (key.matches(vaxis.Key.enter, .{ .ctrl = true })) {
+            const prompt = try self.input.toOwnedContents(self.allocator);
+            defer self.allocator.free(prompt);
+            conversation.submit(prompt, .enqueue) catch |err| switch (err) {
+                error.EmptyPrompt, error.Busy => return .keep_running,
+                else => return err,
+            };
+            try self.transcript.append(self.allocator, .queued, prompt);
+            self.input.clearRetainingCapacity();
+            self.phase = .responding;
+            self.followTail();
+            return .keep_running;
+        }
         const previous_menu_mode = self.menu_mode;
         try self.input.update(.{ .key_press = key });
         self.input_revision +%= 1;
-        try self.syncSlashMenu();
+        if (self.phase == .ready) {
+            try self.syncSlashMenu();
+        } else {
+            self.menu_mode = .closed;
+        }
         if (previous_menu_mode == .closed and self.menu_mode == .commands) {
             conversation.refreshCommands() catch |err| switch (err) {
                 error.Busy => return .keep_running,
@@ -821,6 +938,22 @@ const ChatUi = struct {
                     ),
                 }
             },
+            .assistant_started => {
+                self.transcript.beginQueuedTurn();
+            },
+            .reasoning_delta => |text| {
+                try self.transcript.appendReasoningDelta(
+                    self.allocator,
+                    text.bytes,
+                );
+            },
+            .reasoning_complete => |text| {
+                try self.transcript.completeReasoning(
+                    self.allocator,
+                    text.bytes,
+                );
+                if (text.bytes.len > 0) self.transcript.finishReasoning();
+            },
             .assistant_delta => |text| {
                 try self.transcript.appendDelta(self.allocator, text.bytes);
             },
@@ -829,9 +962,10 @@ const ChatUi = struct {
                     self.allocator,
                     text.bytes,
                 );
+                if (text.bytes.len > 0) self.transcript.finishTurn();
             },
             .idle => {
-                self.transcript.finishTurn();
+                self.transcript.endTurn();
                 self.phase = .ready;
             },
             .closed => |closed| {
@@ -1052,17 +1186,24 @@ const ChatUi = struct {
             .role => {
                 const role_text = switch (entry.role) {
                     .user => "You",
+                    .queued => "Queued",
+                    .reasoning => "Thinking",
                     .assistant => "Vivi",
                     .status => unreachable,
                 };
                 const role_color = switch (entry.role) {
                     .user => user_color,
+                    .queued => accent,
+                    .reasoning => reasoning_color,
                     .assistant => assistant_color,
                     .status => unreachable,
                 };
                 var segments = [_]vaxis.Segment{.{
                     .text = role_text,
-                    .style = .{ .fg = role_color, .bold = true },
+                    .style = if (entry.role == .reasoning)
+                        .{ .fg = role_color, .dim = true, .italic = true }
+                    else
+                        .{ .fg = role_color, .bold = true },
                 }};
                 _ = window.print(&segments, .{
                     .row_offset = row,
@@ -1072,6 +1213,14 @@ const ChatUi = struct {
             .body => {
                 var segments = [_]vaxis.Segment{.{
                     .text = entry.text.items[line.start..line.end],
+                    .style = if (entry.role == .reasoning)
+                        .{
+                            .fg = reasoning_color,
+                            .dim = true,
+                            .italic = true,
+                        }
+                    else
+                        .{},
                 }};
                 _ = window.print(&segments, .{
                     .row_offset = row,
@@ -1135,7 +1284,10 @@ const ChatUi = struct {
             .height = 1,
         });
         const text_style = vaxis.Style{ .bg = composer_background };
-        if (self.phase == .ready or self.phase == .loading_commands) {
+        if (self.phase == .ready or
+            self.phase == .loading_commands or
+            self.phase == .responding)
+        {
             self.input.drawWithStyle(content, text_style);
         } else {
             content.hideCursor();
@@ -1152,18 +1304,21 @@ const ChatUi = struct {
         const hints = if (window.width >= 48)
             switch (self.phase) {
                 .ready => "Enter send  ·  PgUp/PgDn scroll  ·  Ctrl-C quit  ·  Vivi",
-                .connecting, .loading_commands, .responding, .switching => "PgUp/PgDn scroll  ·  Ctrl-C stop  ·  Vivi",
+                .responding => "Enter steer  ·  Ctrl+Enter queue  ·  PgUp/PgDn scroll  ·  Ctrl-C stop",
+                .connecting, .loading_commands, .switching => "PgUp/PgDn scroll  ·  Ctrl-C stop  ·  Vivi",
                 .stopping => "Ctrl-C again force exit  ·  Vivi",
             }
         else if (window.width >= 24)
             switch (self.phase) {
                 .ready => "Enter send  ·  Ctrl-C quit",
-                .connecting, .loading_commands, .responding, .switching => "Ctrl-C stop",
+                .responding => "Enter steer  ·  ^Enter queue",
+                .connecting, .loading_commands, .switching => "Ctrl-C stop",
                 .stopping => "Ctrl-C again force exit",
             }
         else switch (self.phase) {
             .ready => "Ctrl-C quit",
-            .connecting, .loading_commands, .responding, .switching => "Ctrl-C stop",
+            .responding => "Enter steer",
+            .connecting, .loading_commands, .switching => "Ctrl-C stop",
             .stopping => "Ctrl-C again",
         };
         var segments = [_]vaxis.Segment{.{
@@ -1339,6 +1494,172 @@ test "transcript replaces streamed draft with completed response" {
         "hello",
         transcript.entries.items[0].text.items,
     );
+}
+
+test "empty assistant completion does not create or clear a draft" {
+    var transcript: Transcript = .{};
+    defer transcript.deinit(std.testing.allocator);
+
+    try transcript.completeAssistant(std.testing.allocator, "");
+    try std.testing.expectEqual(0, transcript.entries.items.len);
+    try transcript.appendDelta(std.testing.allocator, "partial");
+    try transcript.completeAssistant(std.testing.allocator, "");
+    try transcript.completeAssistant(std.testing.allocator, "hello");
+
+    try std.testing.expectEqual(1, transcript.entries.items.len);
+    try std.testing.expectEqualStrings(
+        "hello",
+        transcript.entries.items[0].text.items,
+    );
+}
+
+test "assistant message boundary preserves queued turn order" {
+    var transcript: Transcript = .{};
+    defer transcript.deinit(std.testing.allocator);
+
+    try transcript.appendDelta(std.testing.allocator, "first");
+    transcript.finishTurn();
+    try transcript.append(std.testing.allocator, .user, "queued");
+    try transcript.appendDelta(std.testing.allocator, "second");
+    try transcript.completeAssistant(std.testing.allocator, "second");
+
+    try std.testing.expectEqual(3, transcript.entries.items.len);
+    try std.testing.expectEqualStrings(
+        "first",
+        transcript.entries.items[0].text.items,
+    );
+    try std.testing.expectEqualStrings(
+        "queued",
+        transcript.entries.items[1].text.items,
+    );
+    try std.testing.expectEqualStrings(
+        "second",
+        transcript.entries.items[2].text.items,
+    );
+}
+
+test "queued prompts are promoted in FIFO order" {
+    var transcript: Transcript = .{};
+    defer transcript.deinit(std.testing.allocator);
+
+    try transcript.append(std.testing.allocator, .queued, "first");
+    try transcript.append(std.testing.allocator, .queued, "second");
+
+    transcript.promoteNextQueuedPrompt();
+    try std.testing.expectEqual(Role.user, transcript.entries.items[0].role);
+    try std.testing.expectEqual(Role.queued, transcript.entries.items[1].role);
+
+    transcript.promoteNextQueuedPrompt();
+    try std.testing.expectEqual(Role.user, transcript.entries.items[1].role);
+}
+
+test "queued prompt moves behind the response it waited for" {
+    var transcript: Transcript = .{};
+    defer transcript.deinit(std.testing.allocator);
+
+    try transcript.append(std.testing.allocator, .user, "first prompt");
+    try transcript.append(std.testing.allocator, .queued, "queued prompt");
+    try transcript.appendDelta(std.testing.allocator, "first response");
+    transcript.beginQueuedTurn();
+
+    try std.testing.expectEqual(3, transcript.entries.items.len);
+    try std.testing.expectEqualStrings(
+        "first response",
+        transcript.entries.items[1].text.items,
+    );
+    try std.testing.expectEqual(Role.user, transcript.entries.items[2].role);
+    try std.testing.expectEqualStrings(
+        "queued prompt",
+        transcript.entries.items[2].text.items,
+    );
+}
+
+test "response arriving after queue submission is inserted before the queue" {
+    var transcript: Transcript = .{};
+    defer transcript.deinit(std.testing.allocator);
+
+    try transcript.append(std.testing.allocator, .user, "first prompt");
+    try transcript.append(std.testing.allocator, .queued, "queued prompt");
+    try transcript.appendDelta(std.testing.allocator, "first response");
+
+    try std.testing.expectEqual(3, transcript.entries.items.len);
+    try std.testing.expectEqual(Role.assistant, transcript.entries.items[1].role);
+    try std.testing.expectEqualStrings(
+        "first response",
+        transcript.entries.items[1].text.items,
+    );
+    try std.testing.expectEqual(Role.queued, transcript.entries.items[2].role);
+}
+
+test "reasoning and response stay ordered before a queued prompt" {
+    var transcript: Transcript = .{};
+    defer transcript.deinit(std.testing.allocator);
+
+    try transcript.append(std.testing.allocator, .user, "first prompt");
+    try transcript.append(std.testing.allocator, .queued, "queued prompt");
+    try transcript.appendReasoningDelta(std.testing.allocator, "thinking");
+    try transcript.completeReasoning(std.testing.allocator, "thought through");
+    transcript.finishReasoning();
+    try transcript.appendDelta(std.testing.allocator, "first response");
+    transcript.beginQueuedTurn();
+    try transcript.appendDelta(std.testing.allocator, "queued response");
+
+    try std.testing.expectEqual(5, transcript.entries.items.len);
+    try std.testing.expectEqual(Role.reasoning, transcript.entries.items[1].role);
+    try std.testing.expectEqualStrings(
+        "thought through",
+        transcript.entries.items[1].text.items,
+    );
+    try std.testing.expectEqual(Role.assistant, transcript.entries.items[2].role);
+    try std.testing.expectEqualStrings(
+        "first response",
+        transcript.entries.items[2].text.items,
+    );
+    try std.testing.expectEqual(Role.user, transcript.entries.items[3].role);
+    try std.testing.expectEqualStrings(
+        "queued prompt",
+        transcript.entries.items[3].text.items,
+    );
+    try std.testing.expectEqual(Role.assistant, transcript.entries.items[4].role);
+    try std.testing.expectEqualStrings(
+        "queued response",
+        transcript.entries.items[4].text.items,
+    );
+}
+
+test "late reasoning completion updates its entry before the response" {
+    var transcript: Transcript = .{};
+    defer transcript.deinit(std.testing.allocator);
+
+    try transcript.appendReasoningDelta(std.testing.allocator, "partial thought");
+    transcript.finishReasoning();
+    try transcript.appendDelta(std.testing.allocator, "answer");
+    try transcript.completeReasoning(std.testing.allocator, "complete thought");
+    try transcript.appendDelta(std.testing.allocator, "!");
+
+    try std.testing.expectEqual(2, transcript.entries.items.len);
+    try std.testing.expectEqual(Role.reasoning, transcript.entries.items[0].role);
+    try std.testing.expectEqualStrings(
+        "complete thought",
+        transcript.entries.items[0].text.items,
+    );
+    try std.testing.expectEqual(Role.assistant, transcript.entries.items[1].role);
+    try std.testing.expectEqualStrings(
+        "answer!",
+        transcript.entries.items[1].text.items,
+    );
+}
+
+test "blank reasoning and assistant deltas do not create entries" {
+    var transcript: Transcript = .{};
+    defer transcript.deinit(std.testing.allocator);
+
+    try transcript.appendReasoningDelta(std.testing.allocator, "\n");
+    try transcript.completeReasoning(std.testing.allocator, " \t");
+    try transcript.appendDelta(std.testing.allocator, "\r\n");
+    try transcript.completeAssistant(std.testing.allocator, "");
+
+    try std.testing.expectEqual(0, transcript.entries.items.len);
 }
 
 test "frame layout keeps chrome in bounds" {

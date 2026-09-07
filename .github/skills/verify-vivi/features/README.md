@@ -57,7 +57,8 @@ user-visible behavior. It then uses exactly four H2 sections in this order:
 - [CLI discovery](./cli-discovery.md) covers help, version, and chat command
   discoverability.
 - [Streaming chat](./streaming-chat.md) covers composer input, submission,
-  streamed Copilot output, and return to the ready state.
+  streamed Copilot output, steering, queued follow-ups, and return to the
+  ready state.
 - [Chat shutdown](./chat-shutdown.md) covers cooperative Ctrl-C shutdown and
   the explicit second-Ctrl-C escape path.
 - [OMLX models](./omlx-models.md) covers live model discovery, token-limit

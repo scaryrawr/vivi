@@ -57,6 +57,7 @@ Use the executable helper:
 ```sh
 .github/skills/verify-vivi/bin/verify-vivi cli-discovery <run-id>
 .github/skills/verify-vivi/bin/verify-vivi chat-streaming <run-id>
+.github/skills/verify-vivi/bin/verify-vivi chat-streaming-input <run-id>
 .github/skills/verify-vivi/bin/verify-vivi chat-shutdown <run-id>
 .github/skills/verify-vivi/bin/verify-vivi frame-check <run-id> chat-streaming
 ```
