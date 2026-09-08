@@ -3,6 +3,7 @@ const build_options = @import("build_options");
 const copilot = @import("copilot_sdk");
 const conversation = @import("conversation.zig");
 const models = @import("models.zig");
+const settings = @import("settings.zig");
 const tools = @import("tools.zig");
 
 pub const version = build_options.version;
@@ -18,6 +19,9 @@ pub const OmlxCatalog = models.Catalog;
 pub const OmlxModel = models.Model;
 pub const OmlxOptions = models.OmlxOptions;
 pub const default_omlx_base_url = models.default_omlx_base_url;
+pub const Settings = settings.Settings;
+pub const loadSettings = settings.load;
+pub const saveDefaultModel = settings.saveDefaultModel;
 
 pub const Lifecycle = enum(u32) {
     scaffold = 0,
@@ -34,11 +38,13 @@ pub fn scaffoldStatus() Status {
 
 pub const ConversationOptions = struct {
     model: ?[]const u8 = null,
+    settings_path: ?[]const u8 = null,
     omlx: OmlxOptions = .{},
 };
 
 const ConversationContext = struct {
     model: ?[]u8,
+    settings_path: ?[]u8,
     omlx_base_url: []u8,
     omlx_api_key: ?[]u8,
 
@@ -53,10 +59,15 @@ const ConversationContext = struct {
                 try allocator.dupe(u8, model)
             else
                 null,
+            .settings_path = if (options.settings_path) |path|
+                try allocator.dupe(u8, path)
+            else
+                null,
             .omlx_base_url = undefined,
             .omlx_api_key = null,
         };
         errdefer if (context.model) |model| allocator.free(model);
+        errdefer if (context.settings_path) |path| allocator.free(path);
         context.omlx_base_url = try allocator.dupe(
             u8,
             options.omlx.base_url,
@@ -75,6 +86,7 @@ const ConversationContext = struct {
     ) void {
         const self: *ConversationContext = @ptrCast(@alignCast(pointer));
         if (self.model) |model| allocator.free(model);
+        if (self.settings_path) |path| allocator.free(path);
         allocator.free(self.omlx_base_url);
         if (self.omlx_api_key) |api_key| {
             std.crypto.secureZero(u8, api_key);
@@ -204,6 +216,46 @@ const MinimalCodingAgent = struct {
 };
 
 const hosted_model_id = "copilot/default";
+
+fn effectiveStartupModel(
+    model_override: ?[]const u8,
+    persisted_model: ?[]const u8,
+) ?[]const u8 {
+    return model_override orelse persisted_model;
+}
+
+const SameModelAction = enum {
+    unchanged,
+    update_default,
+};
+
+fn sameModelAction(
+    active_model: []const u8,
+    persisted_model: ?[]const u8,
+    requested_model: []const u8,
+    can_persist: bool,
+) ?SameModelAction {
+    if (!std.mem.eql(u8, active_model, requested_model)) return null;
+    if (!can_persist) return .unchanged;
+    if (persisted_model) |persisted| {
+        if (std.mem.eql(u8, persisted, requested_model)) return .unchanged;
+    }
+    return .update_default;
+}
+
+fn settingsFailure(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    err: anyerror,
+) !conversation.OwnedText {
+    const message = try std.fmt.allocPrint(
+        allocator,
+        "Unable to update Vivi settings at {s}: {s}",
+        .{ path, @errorName(err) },
+    );
+    defer allocator.free(message);
+    return conversation.OwnedText.init(allocator, message);
+}
 
 fn sendPrompt(
     session: copilot.Session,
@@ -775,11 +827,29 @@ fn runSdkConversation(
         .base_url = context.omlx_base_url,
         .api_key = context.omlx_api_key,
     };
+    var persisted_settings = if (context.settings_path) |path|
+        settings.load(worker.allocator(), worker.io(), path) catch |err| {
+            const message = std.fmt.allocPrint(
+                worker.allocator(),
+                "Unable to load Vivi settings at {s}: {s}",
+                .{ path, @errorName(err) },
+            ) catch {
+                worker.closeFailure(.startup, @errorName(err));
+                return;
+            };
+            defer worker.allocator().free(message);
+            worker.closeFailure(.startup, message);
+            return;
+        }
+    else
+        settings.Settings{ .allocator = worker.allocator() };
+    defer persisted_settings.deinit();
+
     var active_plan = resolveSessionPlan(
         worker.allocator(),
         &client,
         worker.io(),
-        context.model,
+        effectiveStartupModel(context.model, persisted_settings.default_model),
         omlx_options,
     ) catch |err| {
         worker.closeFailure(.startup, @errorName(err));
@@ -912,14 +982,70 @@ fn runSdkConversation(
                     };
                     continue;
                 };
-                if (std.mem.eql(u8, target_plan.id(), active_plan.id())) {
+                if (sameModelAction(
+                    active_plan.id(),
+                    persisted_settings.default_model,
+                    target_plan.id(),
+                    context.settings_path != null,
+                )) |action| {
                     const info = target_plan.info(worker.allocator()) catch |err| {
                         target_plan.deinit(worker.allocator());
                         worker.closeFailure(.stream, @errorName(err));
                         return;
                     };
+                    if (action == .update_default) {
+                        const path = context.settings_path.?;
+                        const persisted_model = worker.allocator().dupe(
+                            u8,
+                            target_plan.id(),
+                        ) catch |err| {
+                            target_plan.deinit(worker.allocator());
+                            var mutable = info;
+                            mutable.deinit();
+                            worker.closeFailure(.stream, @errorName(err));
+                            return;
+                        };
+                        settings.saveDefaultModel(
+                            worker.allocator(),
+                            worker.io(),
+                            path,
+                            target_plan.id(),
+                        ) catch |err| {
+                            worker.allocator().free(persisted_model);
+                            target_plan.deinit(worker.allocator());
+                            var mutable = info;
+                            mutable.deinit();
+                            worker.completeModelSwitch(.{
+                                .failed = settingsFailure(
+                                    worker.allocator(),
+                                    path,
+                                    err,
+                                ) catch {
+                                    worker.closeFailure(
+                                        .stream,
+                                        "Unable to report the settings failure.",
+                                    );
+                                    return;
+                                },
+                            }) catch {
+                                worker.closeFailure(
+                                    .stream,
+                                    "Unable to report the settings failure.",
+                                );
+                                return;
+                            };
+                            continue;
+                        };
+                        if (persisted_settings.default_model) |current| {
+                            worker.allocator().free(current);
+                        }
+                        persisted_settings.default_model = persisted_model;
+                    }
                     target_plan.deinit(worker.allocator());
-                    worker.completeModelSwitch(.{ .unchanged = info }) catch {
+                    worker.completeModelSwitch(if (action == .unchanged)
+                        .{ .unchanged = info }
+                    else
+                        .{ .default_updated = info }) catch {
                         var mutable = info;
                         mutable.deinit();
                         worker.closeFailure(
@@ -953,26 +1079,80 @@ fn runSdkConversation(
                     };
                     continue;
                 };
-                session.disconnect() catch |err| {
+                const info = target_plan.info(worker.allocator()) catch |err| {
                     candidate.disconnect() catch {};
                     target_plan.deinit(worker.allocator());
-                    session_connected = false;
                     worker.closeFailure(.stream, @errorName(err));
                     return;
                 };
+                const persisted_model = if (context.settings_path) |path| blk: {
+                    const value = worker.allocator().dupe(
+                        u8,
+                        target_plan.id(),
+                    ) catch |err| {
+                        candidate.disconnect() catch {};
+                        target_plan.deinit(worker.allocator());
+                        var mutable = info;
+                        mutable.deinit();
+                        worker.closeFailure(.stream, @errorName(err));
+                        return;
+                    };
+                    settings.saveDefaultModel(
+                        worker.allocator(),
+                        worker.io(),
+                        path,
+                        target_plan.id(),
+                    ) catch |err| {
+                        worker.allocator().free(value);
+                        candidate.disconnect() catch {};
+                        target_plan.deinit(worker.allocator());
+                        var mutable = info;
+                        mutable.deinit();
+                        worker.completeModelSwitch(.{
+                            .failed = settingsFailure(
+                                worker.allocator(),
+                                path,
+                                err,
+                            ) catch {
+                                worker.closeFailure(
+                                    .stream,
+                                    "Unable to report the settings failure.",
+                                );
+                                return;
+                            },
+                        }) catch {
+                            worker.closeFailure(
+                                .stream,
+                                "Unable to report the settings failure.",
+                            );
+                            return;
+                        };
+                        continue;
+                    };
+                    break :blk value;
+                } else null;
+
+                const previous_session = session;
                 session_connected = false;
                 session = candidate;
                 session_connected = true;
                 active_plan.deinit(worker.allocator());
                 active_plan = target_plan;
-
-                const info = active_plan.info(worker.allocator()) catch |err| {
-                    worker.closeFailure(.stream, @errorName(err));
-                    return;
-                };
+                if (persisted_model) |value| {
+                    if (persisted_settings.default_model) |current| {
+                        worker.allocator().free(current);
+                    }
+                    persisted_settings.default_model = value;
+                }
+                const cleanup_failed = if (previous_session.disconnect())
+                    false
+                else |_|
+                    true;
                 worker.completeModelSwitch(.{ .switched = .{
                     .model = info,
                     .history = .reset_visible_transcript_preserved,
+                    .default_saved = persisted_model != null,
+                    .cleanup_failed = cleanup_failed,
                 } }) catch {
                     var mutable = info;
                     mutable.deinit();
@@ -1207,6 +1387,58 @@ test "automatic hosted model is a selectable no-provider plan" {
     try std.testing.expectEqualStrings(hosted_model_id, info.id);
     try std.testing.expectEqualStrings("Copilot default", info.display_name);
     try std.testing.expectEqual(@as(u64, 0), info.max_context_window_tokens);
+}
+
+test "explicit model overrides persisted startup default" {
+    try std.testing.expectEqualStrings(
+        "copilot/override",
+        effectiveStartupModel(
+            "copilot/override",
+            "omlx/persisted",
+        ).?,
+    );
+    try std.testing.expectEqualStrings(
+        "omlx/persisted",
+        effectiveStartupModel(null, "omlx/persisted").?,
+    );
+}
+
+test "active launch override can be promoted to the default" {
+    try std.testing.expectEqual(
+        SameModelAction.update_default,
+        sameModelAction(
+            "copilot/override",
+            "omlx/persisted",
+            "copilot/override",
+            true,
+        ).?,
+    );
+    try std.testing.expectEqual(
+        SameModelAction.unchanged,
+        sameModelAction(
+            "copilot/override",
+            "copilot/override",
+            "copilot/override",
+            true,
+        ).?,
+    );
+    try std.testing.expectEqual(
+        SameModelAction.unchanged,
+        sameModelAction(
+            "copilot/override",
+            null,
+            "copilot/override",
+            false,
+        ).?,
+    );
+    try std.testing.expect(
+        sameModelAction(
+            "copilot/current",
+            null,
+            "copilot/other",
+            true,
+        ) == null,
+    );
 }
 
 test "hosted model mapping preserves raw SDK identity and capabilities" {

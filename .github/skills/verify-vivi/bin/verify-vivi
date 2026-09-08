@@ -450,8 +450,21 @@ chat_model_menu() {
     run_dir=$(prepare_run "$1")
     build_vivi
     write_model_menu_tape "$run_dir"
+    settings_home="$run_dir/home"
+    mkdir -p "$settings_home"
+    rm -f "$settings_home/.vivi/settings.json"
+    if test -n "${HOME:-}" &&
+        test -d "$HOME/.copilot" &&
+        ! test -e "$settings_home/.copilot"
+    then
+        ln -s "$HOME/.copilot" "$settings_home/.copilot"
+    fi
 
-    (cd "$repo_root" && VIVI_KEEP_GIF=1 vhs "$run_dir/chat-model-menu.tape")
+    (
+        cd "$repo_root" &&
+            HOME="$settings_home" VIVI_KEEP_GIF=1 \
+                vhs "$run_dir/chat-model-menu.tape"
+    )
     VIVI_KEEP_GIF=1 extract_frames "$1" chat-model-menu
 
     (
@@ -469,7 +482,8 @@ chat_model_menu() {
         printf '\003'
         sleep 3
         printf '\003'
-    ) | script -q "$run_dir/chat-model-menu.terminal.log" sh -c \
+    ) | HOME="$settings_home" \
+        script -q "$run_dir/chat-model-menu.terminal.log" sh -c \
         "stty cols 100 rows 30; '$binary' chat" &
     pty_pid=$!
     printf '%s\n' "$pty_pid" >"$run_dir/pty.pid"
@@ -490,8 +504,8 @@ chat_model_menu() {
 
     {
         printf 'exit=%s\n' "$status"
-        printf 'switch_seen='
-        if grep -q 'Switched to GPT-5.6 Sol.' "$run_dir/chat-model-menu.normalized.txt"; then
+        printf 'persisted_default_seen='
+        if grep -q 'Already using the selected model.' "$run_dir/chat-model-menu.normalized.txt"; then
             printf 'yes\n'
         else
             printf 'no\n'
@@ -505,8 +519,10 @@ chat_model_menu() {
     } >"$run_dir/chat-model-menu.assertions.txt"
 
     test "$status" -eq 0
-    grep -q 'Switched to GPT-5.6 Sol.' "$run_dir/chat-model-menu.normalized.txt"
+    grep -q 'Already using the selected model.' "$run_dir/chat-model-menu.normalized.txt"
     grep -q 'VIVI_HOSTED_MODEL_SWITCH_OK' "$run_dir/chat-model-menu.normalized.txt"
+    grep -q '"default_model": "copilot/gpt-5.6-sol"' \
+        "$settings_home/.vivi/settings.json"
     test -s "$run_dir/chat-model-menu.contact-sheet.png"
 }
 

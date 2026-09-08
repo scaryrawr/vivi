@@ -48,6 +48,9 @@ capability when known. Start chat with an explicit hosted model using
 override the local endpoint and credential. Vivi passes OMLX's
 `max_context_window` and `max_tokens` values into the Copilot SDK provider
 configuration; missing values default to 131072 and 32768 respectively.
+The most recently selected `/model` is stored in `~/.vivi/settings.json` and
+used by new chats. An explicit `--model` overrides that default for one launch
+without changing the stored preference.
 
 During an active chat, type `/` to open Vivi's slash-command menu. The menu
 refreshes the Copilot SDK command catalog each time it opens so commands from

@@ -135,10 +135,20 @@ Model replacement is a transaction on the SDK worker. It resolves the target
 and creates a candidate session before disconnecting the active session. A
 creation failure leaves the original session active; selecting the active
 identity performs no work. After successful candidate creation, the worker
-disconnects the old session and commits the candidate session and provider
-plan together. The terminal preserves its visible transcript while explicitly
-reporting that the new server-side session has no prior conversational
-history.
+atomically stores the canonical model identity in `~/.vivi/settings.json`,
+commits the candidate session and provider plan, and then detaches the previous
+session as cleanup. The terminal preserves its visible transcript while
+explicitly reporting that the new server-side session has no prior
+conversational history. An explicit CLI `--model` overrides the stored default
+for one launch; selecting that already-active override through `/model`
+promotes it to the persisted default without replacing the SDK session.
+
+`backend/src/settings.zig` owns the versioned, SDK-free settings document and
+atomic replacement. Hosts resolve the user's home directory and pass the
+settings path into conversation options; they do not parse the document or
+coordinate model-switch persistence. Copilot CLI continues to own its session
+storage. The SDK can create or join sessions by ID, but does not expose a
+custom session-storage backend.
 
 Cancellation is cooperative because the pinned SDK has no documented
 cross-thread operation that interrupts a blocked `Session.nextEvent`.
