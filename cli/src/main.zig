@@ -77,9 +77,8 @@ fn defaultSettingsPath(
     allocator: std.mem.Allocator,
     environ_map: *const std.process.Environ.Map,
 ) !?[]u8 {
-    const home = environ_map.get("HOME") orelse
-        environ_map.get("USERPROFILE") orelse
-        return null;
+    const home = usableHome(environ_map.get("HOME")) orelse
+        usableHome(environ_map.get("USERPROFILE")) orelse return null;
     return @as(
         ?[]u8,
         try std.fs.path.join(
@@ -87,6 +86,11 @@ fn defaultSettingsPath(
             &.{ home, ".vivi", "settings.json" },
         ),
     );
+}
+
+fn usableHome(value: ?[]const u8) ?[]const u8 {
+    const path = value orelse return null;
+    return if (path.len == 0) null else path;
 }
 
 fn writeHelp(writer: *std.Io.Writer) !void {
@@ -176,5 +180,18 @@ test "settings persistence is optional without a home directory" {
     defer environment.deinit();
     try std.testing.expect(
         try defaultSettingsPath(std.testing.allocator, &environment) == null,
+    );
+}
+
+test "empty HOME falls back to USERPROFILE" {
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try environment.put("HOME", "");
+    try environment.put("USERPROFILE", "C:\\Users\\vivi");
+    const path = try defaultSettingsPath(std.testing.allocator, &environment);
+    defer std.testing.allocator.free(path.?);
+    try std.testing.expectEqualStrings(
+        "C:\\Users\\vivi/.vivi/settings.json",
+        path.?,
     );
 }

@@ -1349,7 +1349,10 @@ const ChatUi = struct {
         const model_width = if (model_name) |name| window.gwidth(name) else 0;
         const model_gap: u16 = if (model_width > 0 and
             model_width + 2 < window.width) 2 else 0;
-        const hints_width = window.width -| model_width -| model_gap;
+        const hints_width = if (model_gap > 0)
+            window.width - model_width - model_gap
+        else
+            window.width;
         var hint_segments = [_]vaxis.Segment{.{
             .text = hints,
             .style = .{ .dim = true },

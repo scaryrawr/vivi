@@ -54,20 +54,24 @@ const ConversationContext = struct {
     ) !*ConversationContext {
         const context = try allocator.create(ConversationContext);
         errdefer allocator.destroy(context);
+
+        const model = if (options.model) |value|
+            try allocator.dupe(u8, value)
+        else
+            null;
+        errdefer if (model) |value| allocator.free(value);
+        const settings_path = if (options.settings_path) |value|
+            try allocator.dupe(u8, value)
+        else
+            null;
+        errdefer if (settings_path) |value| allocator.free(value);
+
         context.* = .{
-            .model = if (options.model) |model|
-                try allocator.dupe(u8, model)
-            else
-                null,
-            .settings_path = if (options.settings_path) |path|
-                try allocator.dupe(u8, path)
-            else
-                null,
+            .model = model,
+            .settings_path = settings_path,
             .omlx_base_url = undefined,
             .omlx_api_key = null,
         };
-        errdefer if (context.model) |model| allocator.free(model);
-        errdefer if (context.settings_path) |path| allocator.free(path);
         context.omlx_base_url = try allocator.dupe(
             u8,
             options.omlx.base_url,
@@ -982,6 +986,37 @@ fn runSdkConversation(
                     };
                     continue;
                 };
+                if (context.settings_path) |path| {
+                    const current_settings = settings.load(
+                        worker.allocator(),
+                        worker.io(),
+                        path,
+                    ) catch |err| {
+                        target_plan.deinit(worker.allocator());
+                        worker.completeModelSwitch(.{
+                            .failed = settingsFailure(
+                                worker.allocator(),
+                                path,
+                                err,
+                            ) catch {
+                                worker.closeFailure(
+                                    .stream,
+                                    "Unable to report the settings failure.",
+                                );
+                                return;
+                            },
+                        }) catch {
+                            worker.closeFailure(
+                                .stream,
+                                "Unable to report the settings failure.",
+                            );
+                            return;
+                        };
+                        continue;
+                    };
+                    persisted_settings.deinit();
+                    persisted_settings = current_settings;
+                }
                 if (sameModelAction(
                     active_plan.id(),
                     persisted_settings.default_model,
