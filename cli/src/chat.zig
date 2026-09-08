@@ -917,12 +917,36 @@ const ChatUi = struct {
                             "Already using the selected model.",
                         );
                     },
+                    .default_updated => |model| {
+                        try self.updateSelectedModel(model.id);
+                        const message = try std.fmt.allocPrint(
+                            self.allocator,
+                            "{s} is now the default for future Vivi chats.",
+                            .{model.display_name},
+                        );
+                        defer self.allocator.free(message);
+                        try self.transcript.append(
+                            self.allocator,
+                            .status,
+                            message,
+                        );
+                    },
                     .switched => |success| {
                         try self.updateSelectedModel(success.model.id);
                         const message = try std.fmt.allocPrint(
                             self.allocator,
-                            "Switched to {s}. Server-side conversation history was reset; the visible Vivi transcript remains.",
-                            .{success.model.display_name},
+                            "Switched to {s}{s}. Server-side conversation history was reset; the visible Vivi transcript remains.{s}",
+                            .{
+                                success.model.display_name,
+                                if (success.default_saved)
+                                    " and saved it as the default"
+                                else
+                                    "",
+                                if (success.cleanup_failed)
+                                    " The previous session could not be detached cleanly."
+                                else
+                                    "",
+                            },
                         );
                         defer self.allocator.free(message);
                         try self.transcript.append(
@@ -1303,10 +1327,10 @@ const ChatUi = struct {
         if (window.width == 0) return;
         const hints = if (window.width >= 48)
             switch (self.phase) {
-                .ready => "Enter send  ·  PgUp/PgDn scroll  ·  Ctrl-C quit  ·  Vivi",
+                .ready => "Enter send  ·  PgUp/PgDn scroll  ·  Ctrl-C quit",
                 .responding => "Enter steer  ·  Ctrl+Enter queue  ·  PgUp/PgDn scroll  ·  Ctrl-C stop",
-                .connecting, .loading_commands, .switching => "PgUp/PgDn scroll  ·  Ctrl-C stop  ·  Vivi",
-                .stopping => "Ctrl-C again force exit  ·  Vivi",
+                .connecting, .loading_commands, .switching => "PgUp/PgDn scroll  ·  Ctrl-C stop",
+                .stopping => "Ctrl-C again force exit",
             }
         else if (window.width >= 24)
             switch (self.phase) {
@@ -1321,11 +1345,45 @@ const ChatUi = struct {
             .connecting, .loading_commands, .switching => "Ctrl-C stop",
             .stopping => "Ctrl-C again",
         };
-        var segments = [_]vaxis.Segment{.{
+        const model_name = self.selectedModelDisplayName();
+        const model_width = if (model_name) |name| window.gwidth(name) else 0;
+        const model_gap: u16 = if (model_width > 0 and
+            model_width + 2 < window.width) 2 else 0;
+        const hints_width = if (model_gap > 0)
+            window.width - model_width - model_gap
+        else
+            window.width;
+        var hint_segments = [_]vaxis.Segment{.{
             .text = hints,
             .style = .{ .dim = true },
         }};
-        _ = window.print(&segments, .{ .wrap = .none });
+        if (hints_width > 0) {
+            _ = window.child(.{ .width = hints_width }).print(
+                &hint_segments,
+                .{ .wrap = .none },
+            );
+        }
+        if (model_name) |name| {
+            if (model_gap == 0) return;
+            var model_segments = [_]vaxis.Segment{.{
+                .text = name,
+                .style = .{ .dim = true },
+            }};
+            _ = window.print(&model_segments, .{
+                .col_offset = window.width - model_width,
+                .wrap = .none,
+            });
+        }
+    }
+
+    fn selectedModelDisplayName(self: *const ChatUi) ?[]const u8 {
+        const catalog = self.models orelse return null;
+        for (catalog.models) |model| {
+            if (std.mem.eql(u8, model.id, catalog.selected_id)) {
+                return model.display_name;
+            }
+        }
+        return catalog.selected_id;
     }
 
     fn pageUp(self: *ChatUi) void {
@@ -1363,6 +1421,7 @@ const App = struct {
         self: *App,
         init_args: std.process.Init,
         model: ?[]const u8,
+        settings_path: ?[]const u8,
     ) !void {
         self.allocator = init_args.gpa;
         self.io = init_args.io;
@@ -1393,6 +1452,7 @@ const App = struct {
             .{ .context = self, .notify = wake },
             .{
                 .model = model,
+                .settings_path = settings_path,
                 .omlx = .{
                     .base_url = init_args.environ_map.get("OMLX_BASE_URL") orelse
                         backend.default_omlx_base_url,
@@ -1473,10 +1533,14 @@ const App = struct {
     }
 };
 
-pub fn run(init: std.process.Init, model: ?[]const u8) !void {
+pub fn run(
+    init: std.process.Init,
+    model: ?[]const u8,
+    settings_path: ?[]const u8,
+) !void {
     const app = try init.gpa.create(App);
     defer init.gpa.destroy(app);
-    try app.init(init, model);
+    try app.init(init, model, settings_path);
     defer app.deinit();
     try app.run();
 }

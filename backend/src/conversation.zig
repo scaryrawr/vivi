@@ -158,15 +158,19 @@ pub const HistoryEffect = enum {
 
 pub const ModelSwitchResult = union(enum) {
     unchanged: ModelInfo,
+    default_updated: ModelInfo,
     switched: struct {
         model: ModelInfo,
         history: HistoryEffect,
+        default_saved: bool,
+        cleanup_failed: bool,
     },
     failed: OwnedText,
 
     pub fn deinit(self: *ModelSwitchResult) void {
         switch (self.*) {
             .unchanged => |*model| model.deinit(),
+            .default_updated => |*model| model.deinit(),
             .switched => |*result| result.model.deinit(),
             .failed => |*message| message.deinit(),
         }

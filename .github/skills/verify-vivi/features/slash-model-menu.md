@@ -13,6 +13,10 @@ without restarting the TUI.
 - Hosted and OMLX rows show context, output, and vision metadata when known.
 - A successful switch keeps the visible transcript and explicitly reports that
   server-side conversation history was reset.
+- A successful selection becomes the default in `~/.vivi/settings.json`; the
+  helper's second PTY observes that persisted model as already active.
+- The footer shows the active model at the far right and updates after a
+  successful selection.
 
 ## How to get to it (user POV)
 
@@ -26,9 +30,13 @@ Enter to select a model. Escape dismisses either menu.
 .github/skills/verify-vivi/bin/verify-vivi frame-check <run-id> chat-model-menu
 ```
 
-The recipe filters for `gpt-5.6-sol`, switches to that explicit hosted model,
-sends a deterministic prompt through the replacement session, and captures
-the menu, picker, switch status, streamed answer, and shutdown.
+The recipe filters for `gpt-5.6-sol` twice. Its VHS drive switches to and
+persists that hosted model; its second `script` PTY confirms the new Vivi
+instance already uses it, then sends a deterministic prompt and captures the
+menu, persisted-default status, streamed answer, and shutdown.
+Both runs share an isolated home under the evidence directory, with only the
+Copilot credential directory linked through, so verification never modifies
+the user's real `~/.vivi/settings.json`.
 
 ## Gotchas
 

@@ -62,10 +62,35 @@ pub fn main(init: std.process.Init) !void {
         .models => try listModels(init, stdout),
         .chat => |options| {
             try stdout.flush();
-            return chat.run(init, options.model);
+            const settings_path = try defaultSettingsPath(
+                init.gpa,
+                init.environ_map,
+            );
+            defer if (settings_path) |path| init.gpa.free(path);
+            return chat.run(init, options.model, settings_path);
         },
     }
     try stdout.flush();
+}
+
+fn defaultSettingsPath(
+    allocator: std.mem.Allocator,
+    environ_map: *const std.process.Environ.Map,
+) !?[]u8 {
+    const home = usableHome(environ_map.get("HOME")) orelse
+        usableHome(environ_map.get("USERPROFILE")) orelse return null;
+    return @as(
+        ?[]u8,
+        try std.fs.path.join(
+            allocator,
+            &.{ home, ".vivi", "settings.json" },
+        ),
+    );
+}
+
+fn usableHome(value: ?[]const u8) ?[]const u8 {
+    const path = value orelse return null;
+    return if (path.len == 0) null else path;
 }
 
 fn writeHelp(writer: *std.Io.Writer) !void {
@@ -135,5 +160,38 @@ test "command parser accepts scaffold commands" {
     try std.testing.expectEqualStrings(
         "omlx/model",
         chat_model.chat.model.?,
+    );
+}
+
+test "settings path uses the supplied home directory" {
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try environment.put("HOME", "/tmp/vivi-home");
+    const path = try defaultSettingsPath(std.testing.allocator, &environment);
+    defer std.testing.allocator.free(path.?);
+    try std.testing.expectEqualStrings(
+        "/tmp/vivi-home/.vivi/settings.json",
+        path.?,
+    );
+}
+
+test "settings persistence is optional without a home directory" {
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try std.testing.expect(
+        try defaultSettingsPath(std.testing.allocator, &environment) == null,
+    );
+}
+
+test "empty HOME falls back to USERPROFILE" {
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try environment.put("HOME", "");
+    try environment.put("USERPROFILE", "C:\\Users\\vivi");
+    const path = try defaultSettingsPath(std.testing.allocator, &environment);
+    defer std.testing.allocator.free(path.?);
+    try std.testing.expectEqualStrings(
+        "C:\\Users\\vivi/.vivi/settings.json",
+        path.?,
     );
 }
