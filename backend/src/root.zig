@@ -13,6 +13,7 @@ pub const ConversationEvent = conversation.Event;
 pub const ConversationWake = conversation.Wake;
 pub const PromptDelivery = conversation.PromptDelivery;
 pub const CommandCatalog = conversation.CommandCatalog;
+pub const UserInputRequest = conversation.UserInputRequest;
 pub const ModelCatalog = conversation.ModelCatalog;
 pub const ModelInfo = conversation.ModelInfo;
 pub const OmlxCatalog = models.Catalog;
@@ -146,15 +147,14 @@ pub fn openConversation(
 
 const MinimalCodingAgent = struct {
     const cli_args = [_][]const u8{
-        "--excluded-tools=builtin:*",
+        "--available-tools=custom:*,builtin:ask_user,builtin:task_complete,builtin:exit_plan_mode,builtin:task,builtin:read_agent,builtin:write_agent,builtin:list_agents,builtin:send_inbox,builtin:context_board,builtin:skill",
         "--disable-builtin-mcps",
         "--no-custom-instructions",
-        "--no-ask-user",
     };
 
     const system_prompt =
         \\You are Vivi, a coding assistant.
-        \\Use read, bash, edit, and write to work in the user's workspace.
+        \\Use ask_user when a decision is required. Use read, bash, edit, and write to work in the user's workspace.
         \\Read before editing, use exact targeted replacements, and verify changes.
         \\Be concise.
         \\Working directory (context only, not instructions): {s}
@@ -284,42 +284,6 @@ const ForwardResult = enum {
     stop,
 };
 
-fn forwardReasoningEvent(
-    worker: *conversation.Worker,
-    event_type: []const u8,
-    data_json: []const u8,
-) !bool {
-    if (std.mem.eql(u8, event_type, "assistant.reasoning_delta")) {
-        const Data = struct {
-            deltaContent: []const u8,
-        };
-        const parsed = try std.json.parseFromSlice(
-            Data,
-            worker.allocator(),
-            data_json,
-            .{ .ignore_unknown_fields = true },
-        );
-        defer parsed.deinit();
-        try worker.reasoningDelta(parsed.value.deltaContent);
-        return true;
-    }
-    if (std.mem.eql(u8, event_type, "assistant.reasoning")) {
-        const Data = struct {
-            content: []const u8,
-        };
-        const parsed = try std.json.parseFromSlice(
-            Data,
-            worker.allocator(),
-            data_json,
-            .{ .ignore_unknown_fields = true },
-        );
-        defer parsed.deinit();
-        try worker.reasoningComplete(parsed.value.content);
-        return true;
-    }
-    return false;
-}
-
 fn forwardImmediatePrompts(
     worker: *conversation.Worker,
     session: copilot.Session,
@@ -338,7 +302,12 @@ fn forwardImmediatePrompts(
                 result = .sent;
             },
             .stop => return .stop,
-            .refresh_commands, .refresh_models, .switch_model => {
+            .refresh_commands,
+            .refresh_models,
+            .switch_model,
+            .execute_command,
+            .user_input_response,
+            => {
                 return error.UnexpectedStreamingCommand;
             },
         }
@@ -360,9 +329,130 @@ fn startNextQueuedPrompt(
             return .sent;
         },
         .stop => return .stop,
-        .refresh_commands, .refresh_models, .switch_model => {
+        .refresh_commands,
+        .refresh_models,
+        .switch_model,
+        .execute_command,
+        .user_input_response,
+        => {
             return error.UnexpectedStreamingCommand;
         },
+    }
+}
+
+const InvokedCommand = union(enum) {
+    completed: []u8,
+    agent_prompt: []u8,
+
+    fn deinit(self: *InvokedCommand, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .completed, .agent_prompt => |text| allocator.free(text),
+        }
+        self.* = undefined;
+    }
+};
+
+fn executeSdkCommand(
+    allocator: std.mem.Allocator,
+    client: *copilot.Client,
+    session: copilot.Session,
+    input: []const u8,
+) !InvokedCommand {
+    const trimmed = std.mem.trim(u8, input, " \t\r\n");
+    const command = if (trimmed.len > 0 and trimmed[0] == '/')
+        trimmed[1..]
+    else
+        trimmed;
+    const separator = std.mem.indexOfAny(u8, command, " \t\r\n");
+    const name = if (separator) |index| command[0..index] else command;
+    const args = if (separator) |index|
+        std.mem.trim(u8, command[index..], " \t\r\n")
+    else
+        "";
+    if (name.len == 0) return error.EmptyCommand;
+
+    var result = try client.callRpc(
+        struct {
+            kind: []const u8,
+            text: ?[]const u8 = null,
+            message: ?[]const u8 = null,
+            notice: ?[]const u8 = null,
+            prompt: ?[]const u8 = null,
+        },
+        "session.commands.invoke",
+        .{
+            .sessionId = session.id,
+            .name = name,
+            .args = args,
+        },
+    );
+    defer result.deinit();
+    if (std.mem.eql(u8, result.value.kind, "agent-prompt")) {
+        const prompt = result.value.prompt orelse
+            return error.MissingCommandPrompt;
+        return .{ .agent_prompt = try allocator.dupe(u8, prompt) };
+    }
+    if (result.value.message orelse
+        result.value.notice orelse
+        result.value.text) |message|
+    {
+        return .{ .completed = try allocator.dupe(u8, message) };
+    }
+    if (!std.mem.eql(u8, result.value.kind, "completed")) {
+        return .{
+            .completed = try std.fmt.allocPrint(
+                allocator,
+                "/{s} returned unsupported result \"{s}\".",
+                .{ name, result.value.kind },
+            ),
+        };
+    }
+    return .{
+        .completed = try std.fmt.allocPrint(
+            allocator,
+            "/{s} completed.",
+            .{name},
+        ),
+    };
+}
+
+fn handleSdkUserInput(
+    allocator: std.mem.Allocator,
+    request: copilot.UserInputRequest,
+    context: ?*anyopaque,
+) !copilot.UserInputResponse {
+    const worker: *conversation.Worker = @ptrCast(
+        @alignCast(context orelse return error.MissingUserInputContext),
+    );
+    try worker.userInputRequested(try conversation.UserInputRequest.init(
+        allocator,
+        request.session_id,
+        request.question,
+        request.choices orelse &.{},
+        request.allow_freeform orelse true,
+    ));
+
+    var command = worker.waitUserInputResponse();
+    defer command.deinit();
+    switch (command) {
+        .user_input_response => |response| {
+            if (!std.mem.eql(
+                u8,
+                response.request_id.bytes,
+                request.session_id,
+            )) {
+                return error.UnexpectedUserInputResponse;
+            }
+            return .{
+                .answer = try allocator.dupe(
+                    u8,
+                    response.answer.bytes,
+                ),
+                .was_freeform = response.was_freeform,
+            };
+        },
+        .stop => return error.UserInputCancelled,
+        else => return error.UnexpectedUserInputCommand,
     }
 }
 
@@ -543,18 +633,22 @@ fn copilotSessionPlan(
 }
 
 fn createSdkSession(
+    worker: *conversation.Worker,
     client: *copilot.Client,
     system_prompt: []const u8,
     working_directory: []const u8,
     plan: *const SessionPlan,
     api_key: ?[]const u8,
 ) !copilot.Session {
-    return client.createSession(sessionConfigForPlan(
+    var config = sessionConfigForPlan(
         system_prompt,
         working_directory,
         plan,
         api_key,
-    ));
+    );
+    config.on_user_input_request = handleSdkUserInput;
+    config.user_input_context = worker;
+    return client.createSession(config);
 }
 
 fn sessionConfigForPlan(
@@ -781,6 +875,184 @@ fn buildFallbackCommandCatalog(
     return .{ .allocator = allocator, .commands = commands };
 }
 
+const StreamResult = enum {
+    idle,
+    stopped,
+    failed,
+};
+
+fn streamSessionResponse(
+    worker: *conversation.Worker,
+    client: *copilot.Client,
+    session: copilot.Session,
+    tool_service: *tools.Service,
+) StreamResult {
+    while (true) {
+        var event = session.nextEvent() catch |err| {
+            worker.closeFailure(.stream, @errorName(err));
+            return .failed;
+        };
+        defer event.deinit(worker.allocator());
+
+        switch (event) {
+            .assistant_message_delta => |delta| {
+                worker.assistantDelta(delta.delta_content) catch {
+                    worker.closeFailure(
+                        .stream,
+                        "Unable to deliver streamed output.",
+                    );
+                    return .failed;
+                };
+            },
+            .assistant_message => |message| {
+                worker.assistantComplete(message.content) catch {
+                    worker.closeFailure(
+                        .stream,
+                        "Unable to deliver the completed response.",
+                    );
+                    return .failed;
+                };
+            },
+            .assistant_reasoning => |reasoning| {
+                worker.reasoningComplete(reasoning.content) catch {
+                    worker.closeFailure(
+                        .stream,
+                        "Unable to deliver completed reasoning.",
+                    );
+                    return .failed;
+                };
+            },
+            .assistant_reasoning_delta => |delta| {
+                worker.reasoningDelta(delta.delta_content) catch {
+                    worker.closeFailure(
+                        .stream,
+                        "Unable to deliver streamed reasoning.",
+                    );
+                    return .failed;
+                };
+            },
+            .session_idle => |idle| {
+                if (idle.mode != null and
+                    std.mem.eql(u8, idle.mode.?, "autopilot"))
+                {
+                    continue;
+                }
+                switch (startNextQueuedPrompt(
+                    worker,
+                    session,
+                ) catch |err| {
+                    worker.closeFailure(.stream, @errorName(err));
+                    return .failed;
+                }) {
+                    .sent => continue,
+                    .stop => {
+                        session.disconnect() catch |err| {
+                            worker.closeFailure(
+                                .stream,
+                                @errorName(err),
+                            );
+                            return .failed;
+                        };
+                        worker.closeRequested();
+                        return .stopped;
+                    },
+                    .none => {},
+                }
+                worker.idle() catch {
+                    worker.closeFailure(
+                        .stream,
+                        "Unable to finish the streamed response.",
+                    );
+                    return .failed;
+                };
+                return .idle;
+            },
+            .session_error => |failure| {
+                worker.closeFailure(.stream, failure.message);
+                return .failed;
+            },
+            .permission_requested => {
+                worker.closeFailure(
+                    .stream,
+                    "Copilot requested a permission that vivi cannot handle yet.",
+                );
+                return .failed;
+            },
+            .external_tool_requested => |request| {
+                var result = tool_service.executeJson(
+                    request.tool_name,
+                    request.arguments_json,
+                ) catch |err| {
+                    session.respondToToolError(
+                        request.request_id,
+                        @errorName(err),
+                    ) catch |respond_err| {
+                        worker.closeFailure(
+                            .stream,
+                            @errorName(respond_err),
+                        );
+                        return .failed;
+                    };
+                    continue;
+                };
+                defer result.deinit(worker.allocator());
+                switch (result) {
+                    .text => |text| session.respondToTool(
+                        request.request_id,
+                        text,
+                    ) catch |err| {
+                        worker.closeFailure(.stream, @errorName(err));
+                        return .failed;
+                    },
+                    .failure => |message| session.respondToToolError(
+                        request.request_id,
+                        message,
+                    ) catch |err| {
+                        worker.closeFailure(.stream, @errorName(err));
+                        return .failed;
+                    },
+                }
+            },
+            .unknown => |unknown| {
+                if (std.mem.eql(
+                    u8,
+                    unknown.event_type,
+                    "commands.changed",
+                )) {
+                    if (buildCommandCatalog(
+                        worker.allocator(),
+                        client,
+                        session,
+                    )) |catalog| {
+                        worker.commandCatalog(catalog) catch {
+                            var mutable = catalog;
+                            mutable.deinit();
+                        };
+                    } else |_| {}
+                }
+            },
+        }
+
+        switch (forwardImmediatePrompts(
+            worker,
+            session,
+        ) catch |err| {
+            worker.closeFailure(.stream, @errorName(err));
+            return .failed;
+        }) {
+            .none, .sent => {},
+            .stop => {
+                session.disconnect() catch |err| {
+                    worker.closeFailure(.stream, @errorName(err));
+                    return .failed;
+                };
+                worker.closeRequested();
+                return .stopped;
+            },
+        }
+    }
+}
+
 fn runSdkConversation(
     worker: *conversation.Worker,
     opaque_context: *anyopaque,
@@ -816,7 +1088,6 @@ fn runSdkConversation(
         return;
     };
     defer client.deinit();
-
     const system_prompt = std.fmt.allocPrint(
         worker.allocator(),
         MinimalCodingAgent.system_prompt,
@@ -862,6 +1133,7 @@ fn runSdkConversation(
     defer active_plan.deinit(worker.allocator());
 
     var session = createSdkSession(
+        worker,
         &client,
         system_prompt,
         working_directory,
@@ -963,6 +1235,65 @@ fn runSdkConversation(
                     );
                     return;
                 };
+            },
+            .execute_command => |requested| {
+                var result = executeSdkCommand(
+                    worker.allocator(),
+                    &client,
+                    session,
+                    requested.bytes,
+                ) catch |err| {
+                    worker.commandCompleted(@errorName(err)) catch {
+                        worker.closeFailure(.stream, @errorName(err));
+                        return;
+                    };
+                    continue;
+                };
+                defer result.deinit(worker.allocator());
+                switch (result) {
+                    .completed => |message| {
+                        worker.commandCompleted(message) catch {
+                            worker.closeFailure(
+                                .stream,
+                                "Unable to report slash command completion.",
+                            );
+                            return;
+                        };
+                    },
+                    .agent_prompt => |prompt| {
+                        sendPrompt(session, prompt, .immediate) catch |err| {
+                            worker.closeFailure(.stream, @errorName(err));
+                            return;
+                        };
+                        worker.assistantStarted() catch {
+                            worker.closeFailure(
+                                .stream,
+                                "Unable to start the command response.",
+                            );
+                            return;
+                        };
+                        switch (streamSessionResponse(
+                            worker,
+                            &client,
+                            session,
+                            &tool_service,
+                        )) {
+                            .idle => {},
+                            .stopped => {
+                                session_connected = false;
+                                return;
+                            },
+                            .failed => return,
+                        }
+                    },
+                }
+            },
+            .user_input_response => {
+                worker.closeFailure(
+                    .stream,
+                    "Received a user-input response without a pending question.",
+                );
+                return;
             },
             .switch_model => |requested| {
                 var target_plan = resolveSessionPlan(
@@ -1093,6 +1424,7 @@ fn runSdkConversation(
                 }
 
                 var candidate = createSdkSession(
+                    worker,
                     &client,
                     system_prompt,
                     working_directory,
@@ -1226,172 +1558,18 @@ fn runSdkConversation(
                         return;
                     };
                 }
-
-                while (true) {
-                    var event = session.nextEvent() catch |err| {
-                        worker.closeFailure(.stream, @errorName(err));
+                switch (streamSessionResponse(
+                    worker,
+                    &client,
+                    session,
+                    &tool_service,
+                )) {
+                    .idle => {},
+                    .stopped => {
+                        session_connected = false;
                         return;
-                    };
-                    defer event.deinit(worker.allocator());
-
-                    switch (event) {
-                        .assistant_message_delta => |delta| {
-                            worker.assistantDelta(delta.delta_content) catch {
-                                worker.closeFailure(
-                                    .stream,
-                                    "Unable to deliver streamed output.",
-                                );
-                                return;
-                            };
-                        },
-                        .assistant_message => |message| {
-                            worker.assistantComplete(message.content) catch {
-                                worker.closeFailure(
-                                    .stream,
-                                    "Unable to deliver the completed response.",
-                                );
-                                return;
-                            };
-                        },
-                        .session_idle => |idle| {
-                            if (idle.mode != null and
-                                std.mem.eql(
-                                    u8,
-                                    idle.mode.?,
-                                    "autopilot",
-                                ))
-                            {
-                                continue;
-                            }
-                            switch (startNextQueuedPrompt(
-                                worker,
-                                session,
-                            ) catch |err| {
-                                worker.closeFailure(.stream, @errorName(err));
-                                return;
-                            }) {
-                                .sent => continue,
-                                .stop => {
-                                    session.disconnect() catch |err| {
-                                        worker.closeFailure(
-                                            .stream,
-                                            @errorName(err),
-                                        );
-                                        return;
-                                    };
-                                    session_connected = false;
-                                    worker.closeRequested();
-                                    return;
-                                },
-                                .none => {},
-                            }
-                            worker.idle() catch {
-                                worker.closeFailure(
-                                    .stream,
-                                    "Unable to finish the streamed response.",
-                                );
-                                return;
-                            };
-                            break;
-                        },
-                        .session_error => |failure| {
-                            worker.closeFailure(.stream, failure.message);
-                            return;
-                        },
-                        .permission_requested => {
-                            worker.closeFailure(
-                                .stream,
-                                "Copilot requested a permission that vivi cannot handle yet.",
-                            );
-                            return;
-                        },
-                        .external_tool_requested => |request| {
-                            var result = tool_service.executeJson(
-                                request.tool_name,
-                                request.arguments_json,
-                            ) catch |err| {
-                                session.respondToToolError(
-                                    request.request_id,
-                                    @errorName(err),
-                                ) catch |respond_err| {
-                                    worker.closeFailure(
-                                        .stream,
-                                        @errorName(respond_err),
-                                    );
-                                    return;
-                                };
-                                continue;
-                            };
-                            defer result.deinit(worker.allocator());
-                            switch (result) {
-                                .text => |text| session.respondToTool(
-                                    request.request_id,
-                                    text,
-                                ) catch |err| {
-                                    worker.closeFailure(
-                                        .stream,
-                                        @errorName(err),
-                                    );
-                                    return;
-                                },
-                                .failure => |message| session.respondToToolError(
-                                    request.request_id,
-                                    message,
-                                ) catch |err| {
-                                    worker.closeFailure(
-                                        .stream,
-                                        @errorName(err),
-                                    );
-                                    return;
-                                },
-                            }
-                        },
-                        .unknown => |unknown| {
-                            const reasoning_forwarded = forwardReasoningEvent(
-                                worker,
-                                unknown.event_type,
-                                unknown.data_json,
-                            ) catch |err| {
-                                worker.closeFailure(.stream, @errorName(err));
-                                return;
-                            };
-                            if (!reasoning_forwarded and std.mem.eql(
-                                u8,
-                                unknown.event_type,
-                                "commands.changed",
-                            )) {
-                                if (buildCommandCatalog(
-                                    worker.allocator(),
-                                    &client,
-                                    session,
-                                )) |catalog| {
-                                    worker.commandCatalog(catalog) catch {
-                                        var mutable = catalog;
-                                        mutable.deinit();
-                                    };
-                                } else |_| {}
-                            }
-                        },
-                    }
-
-                    switch (forwardImmediatePrompts(
-                        worker,
-                        session,
-                    ) catch |err| {
-                        worker.closeFailure(.stream, @errorName(err));
-                        return;
-                    }) {
-                        .none, .sent => {},
-                        .stop => {
-                            session.disconnect() catch |err| {
-                                worker.closeFailure(.stream, @errorName(err));
-                                return;
-                            };
-                            session_connected = false;
-                            worker.closeRequested();
-                            return;
-                        },
-                    }
+                    },
+                    .failed => return,
                 }
             },
         }
@@ -1567,14 +1745,13 @@ test "Copilot SDK exposes typed local provider configuration" {
     try std.testing.expect(provider.authentication == .none);
 }
 
-test "minimal coding agent disables ambient Copilot capabilities" {
+test "minimal coding agent enables isolated builtins" {
     try std.testing.expectEqualSlices(
         []const u8,
         &.{
-            "--excluded-tools=builtin:*",
+            "--available-tools=custom:*,builtin:ask_user,builtin:task_complete,builtin:exit_plan_mode,builtin:task,builtin:read_agent,builtin:write_agent,builtin:list_agents,builtin:send_inbox,builtin:context_board,builtin:skill",
             "--disable-builtin-mcps",
             "--no-custom-instructions",
-            "--no-ask-user",
         },
         &MinimalCodingAgent.cli_args,
     );

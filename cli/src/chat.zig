@@ -23,6 +23,7 @@ const Role = enum {
     queued,
     reasoning,
     assistant,
+    question,
     status,
 };
 
@@ -121,7 +122,7 @@ const Transcript = struct {
                 self.last_reasoning = index;
             },
             .assistant => self.active_assistant = index,
-            .user, .queued, .status => unreachable,
+            .user, .queued, .question, .status => unreachable,
         }
         return index;
     }
@@ -205,6 +206,8 @@ const UiPhase = enum {
     ready,
     loading_commands,
     responding,
+    awaiting_input,
+    running_command,
     switching,
     stopping,
 
@@ -214,6 +217,8 @@ const UiPhase = enum {
             .ready => "Ready",
             .loading_commands => "Refreshing commands...",
             .responding => "Responding...",
+            .awaiting_input => "Answer required",
+            .running_command => "Running command...",
             .switching => "Switching model...",
             .stopping => "Stopping...",
         };
@@ -347,7 +352,7 @@ const Projection = struct {
                 });
             }
             switch (entry.role) {
-                .user, .queued, .reasoning, .assistant => {
+                .user, .queued, .reasoning, .assistant, .question => {
                     try projection.lines.append(allocator, .{
                         .kind = .role,
                         .entry_index = entry_index,
@@ -619,6 +624,9 @@ const ChatUi = struct {
     phase: UiPhase = .connecting,
     commands: ?backend.CommandCatalog = null,
     models: ?backend.ModelCatalog = null,
+    pending_user_input: ?backend.UserInputRequest = null,
+    selected_user_input_choice: usize = 0,
+    invalid_user_input: bool = false,
     menu_mode: MenuMode = .closed,
     menu: MenuState = .{},
     input_revision: u64 = 0,
@@ -654,6 +662,7 @@ const ChatUi = struct {
 
     fn deinit(self: *ChatUi) void {
         self.menu.deinit(self.allocator);
+        if (self.pending_user_input) |*request| request.deinit();
         if (self.models) |*catalog| catalog.deinit();
         if (self.commands) |*catalog| catalog.deinit();
         self.allocator.free(self.cwd);
@@ -715,6 +724,25 @@ const ChatUi = struct {
                 return .keep_running;
             }
         }
+        if (self.phase == .awaiting_input) {
+            if (key.matches(vaxis.Key.up, .{})) {
+                self.moveUserInputSelection(.previous);
+            } else if (key.matches(vaxis.Key.down, .{})) {
+                self.moveUserInputSelection(.next);
+            } else if (key.matches(vaxis.Key.enter, .{})) {
+                try self.submitSelectedUserInput(conversation);
+            } else {
+                try self.input.update(.{ .key_press = key });
+                self.invalid_user_input = false;
+                const contents = try self.input.toOwnedContents(self.allocator);
+                defer self.allocator.free(contents);
+                if (self.hasFreeformChoice() and !isBlank(contents)) {
+                    self.selected_user_input_choice =
+                        self.pending_user_input.?.choices.len;
+                }
+            }
+            return .keep_running;
+        }
         if (self.phase != .ready and self.phase != .responding) {
             return .keep_running;
         }
@@ -732,6 +760,7 @@ const ChatUi = struct {
             self.followTail();
             return .keep_running;
         }
+
         if (key.matches(vaxis.Key.enter, .{ .ctrl = true })) {
             const prompt = try self.input.toOwnedContents(self.allocator);
             defer self.allocator.free(prompt);
@@ -761,6 +790,133 @@ const ChatUi = struct {
             self.phase = .loading_commands;
         }
         return .keep_running;
+    }
+
+    fn submitUserInput(
+        self: *ChatUi,
+        conversation: *backend.Conversation,
+    ) !void {
+        const request = self.pending_user_input orelse return;
+        const answer = try self.input.toOwnedContents(self.allocator);
+        defer self.allocator.free(answer);
+        const trimmed_answer = std.mem.trim(u8, answer, " \t\r\n");
+        if (trimmed_answer.len == 0) return;
+
+        var submitted_answer: []const u8 = trimmed_answer;
+        var was_freeform = true;
+        for (request.choices) |choice| {
+            if (std.mem.eql(u8, trimmed_answer, choice)) {
+                was_freeform = false;
+                break;
+            }
+        }
+        if (was_freeform and request.choices.len > 0) {
+            const selected = std.fmt.parseUnsigned(
+                usize,
+                trimmed_answer,
+                10,
+            ) catch 0;
+            if (selected > 0 and selected <= request.choices.len) {
+                submitted_answer = request.choices[selected - 1];
+                was_freeform = false;
+            }
+        }
+        if (was_freeform and !request.allow_freeform and
+            request.choices.len > 0)
+        {
+            self.invalid_user_input = true;
+            return;
+        }
+        try self.completeUserInput(
+            conversation,
+            request,
+            submitted_answer,
+            was_freeform,
+        );
+    }
+
+    fn submitSelectedUserInput(
+        self: *ChatUi,
+        conversation: *backend.Conversation,
+    ) !void {
+        const contents = try self.input.toOwnedContents(self.allocator);
+        defer self.allocator.free(contents);
+        if (!isBlank(contents)) return self.submitUserInput(conversation);
+
+        const request = self.pending_user_input orelse return;
+        if (self.selected_user_input_choice >= request.choices.len) return;
+        try self.completeUserInput(
+            conversation,
+            request,
+            request.choices[self.selected_user_input_choice],
+            false,
+        );
+    }
+
+    fn completeUserInput(
+        self: *ChatUi,
+        conversation: *backend.Conversation,
+        request: backend.UserInputRequest,
+        answer: []const u8,
+        was_freeform: bool,
+    ) !void {
+        conversation.respondToUserInput(
+            request.request_id,
+            answer,
+            was_freeform,
+        ) catch |err| switch (err) {
+            error.EmptyAnswer, error.NotAwaitingInput => return,
+            else => return err,
+        };
+        try self.appendUserInputQuestion(request);
+        try self.transcript.append(self.allocator, .user, answer);
+        self.input.clearRetainingCapacity();
+        var completed = self.pending_user_input.?;
+        completed.deinit();
+        self.pending_user_input = null;
+        self.selected_user_input_choice = 0;
+        self.invalid_user_input = false;
+        self.phase = .responding;
+        self.followTail();
+    }
+
+    fn appendUserInputQuestion(
+        self: *ChatUi,
+        request: backend.UserInputRequest,
+    ) !void {
+        var message: std.ArrayList(u8) = .empty;
+        defer message.deinit(self.allocator);
+        try message.appendSlice(self.allocator, request.question);
+        for (request.choices, 0..) |choice, index| {
+            const line = try std.fmt.allocPrint(
+                self.allocator,
+                "\n  {d}. {s}",
+                .{ index + 1, choice },
+            );
+            defer self.allocator.free(line);
+            try message.appendSlice(self.allocator, line);
+        }
+        try self.transcript.append(
+            self.allocator,
+            .question,
+            message.items,
+        );
+    }
+
+    fn moveUserInputSelection(
+        self: *ChatUi,
+        direction: MenuDirection,
+    ) void {
+        const option_count = self.userInputOptionCount();
+        if (option_count == 0) return;
+        self.selected_user_input_choice = switch (direction) {
+            .previous => if (self.selected_user_input_choice == 0)
+                option_count - 1
+            else
+                self.selected_user_input_choice - 1,
+            .next => (self.selected_user_input_choice + 1) % option_count,
+        };
+        self.invalid_user_input = false;
     }
 
     fn syncSlashMenu(self: *ChatUi) !void {
@@ -831,13 +987,13 @@ const ChatUi = struct {
                 const catalog = self.commands orelse return;
                 const command = catalog.commands[selected.source_index];
                 if (!std.ascii.eqlIgnoreCase(command.name, "model")) {
-                    try self.transcript.append(
-                        self.allocator,
-                        .status,
-                        "This slash command is not supported by Vivi yet.",
-                    );
+                    conversation.executeCommand(command.name) catch |err| switch (err) {
+                        error.EmptyCommand, error.Busy => return,
+                        else => return err,
+                    };
                     self.input.clearRetainingCapacity();
                     self.menu_mode = .closed;
+                    self.phase = .running_command;
                     return;
                 }
                 self.input.clearRetainingCapacity();
@@ -963,6 +1119,7 @@ const ChatUi = struct {
                 }
             },
             .assistant_started => {
+                self.phase = .responding;
                 self.transcript.beginQueuedTurn();
             },
             .reasoning_delta => |text| {
@@ -987,6 +1144,25 @@ const ChatUi = struct {
                     text.bytes,
                 );
                 if (text.bytes.len > 0) self.transcript.finishTurn();
+            },
+            .user_input_requested => |request| {
+                const replacement = try request.clone(self.allocator);
+                if (self.pending_user_input) |*current| current.deinit();
+                self.pending_user_input = replacement;
+                self.selected_user_input_choice = 0;
+                self.invalid_user_input = false;
+                self.menu_mode = .closed;
+                self.input.clearRetainingCapacity();
+                self.phase = .awaiting_input;
+                self.followTail();
+            },
+            .command_completed => |message| {
+                self.phase = .ready;
+                try self.transcript.append(
+                    self.allocator,
+                    .status,
+                    message.bytes,
+                );
             },
             .idle => {
                 self.transcript.endTurn();
@@ -1016,7 +1192,9 @@ const ChatUi = struct {
     }
 
     fn draw(self: *ChatUi, root: vaxis.Window) !void {
-        const desired_menu_rows: u16 = switch (self.menu_mode) {
+        const desired_menu_rows: u16 = if (self.phase == .awaiting_input)
+            self.userInputPanelRows()
+        else switch (self.menu_mode) {
             .commands, .models => @intCast(@min(self.menu.matches.items.len, 8)),
             .closed, .loading_models => 0,
         };
@@ -1041,8 +1219,18 @@ const ChatUi = struct {
                 self.drawTranscript(transcript_window, &projection);
             }
         }
-        if (layout.context) |region| self.drawContext(region.child(root));
-        if (layout.menu) |region| self.drawMenu(region.child(root));
+        if (layout.context) |region| {
+            if (self.phase == .awaiting_input)
+                self.drawQuestionDivider(region.child(root))
+            else
+                self.drawContext(region.child(root));
+        }
+        if (layout.menu) |region| {
+            if (self.phase == .awaiting_input)
+                self.drawQuestionPanel(region.child(root))
+            else
+                self.drawMenu(region.child(root));
+        }
         if (layout.composer.height > 0) {
             self.drawComposer(layout.composer.child(root));
         }
@@ -1095,6 +1283,113 @@ const ChatUi = struct {
                 style,
             );
         }
+    }
+
+    fn drawQuestionDivider(_: *ChatUi, window: vaxis.Window) void {
+        if (window.width == 0) return;
+        window.fill(.{
+            .char = .{ .grapheme = "─", .width = 1 },
+            .style = .{ .fg = reasoning_color, .dim = true },
+        });
+        const label = " Answer required ";
+        const label_width = window.gwidth(label);
+        if (label_width > window.width) return;
+        var segments = [_]vaxis.Segment{.{
+            .text = label,
+            .style = .{ .bold = true },
+        }};
+        _ = window.print(&segments, .{
+            .col_offset = window.width - label_width,
+            .wrap = .none,
+        });
+    }
+
+    fn drawQuestionPanel(self: *ChatUi, window: vaxis.Window) void {
+        const request = self.pending_user_input orelse return;
+        if (window.height == 0 or window.width == 0) return;
+
+        var title = [_]vaxis.Segment{.{
+            .text = "Vivi needs information.",
+            .style = .{ .bold = true },
+        }};
+        _ = window.print(&title, .{
+            .row_offset = 0,
+            .col_offset = 1,
+            .wrap = .none,
+        });
+        if (window.height < 2) return;
+
+        var question = [_]vaxis.Segment{.{
+            .text = request.question,
+            .style = .{ .dim = true },
+        }};
+        _ = window.print(&question, .{
+            .row_offset = 1,
+            .col_offset = 1,
+            .wrap = .none,
+        });
+
+        const choice_row: u16 = 3;
+        for (request.choices, 0..) |choice, index| {
+            const row = choice_row + @as(u16, @intCast(index));
+            if (row >= window.height) break;
+            self.drawQuestionChoice(window, row, index, choice);
+        }
+        if (request.allow_freeform) {
+            const index = request.choices.len;
+            const row = choice_row + @as(u16, @intCast(index));
+            if (row < window.height) {
+                self.drawQuestionChoice(
+                    window,
+                    row,
+                    index,
+                    "Other (type your answer)",
+                );
+            }
+        }
+        if (self.invalid_user_input and window.height > 0) {
+            var error_message = [_]vaxis.Segment{.{
+                .text = "Choose one of the listed answers.",
+                .style = .{ .fg = assistant_color, .bold = true },
+            }};
+            _ = window.print(&error_message, .{
+                .row_offset = window.height - 1,
+                .col_offset = 1,
+                .wrap = .none,
+            });
+        }
+    }
+
+    fn drawQuestionChoice(
+        self: *const ChatUi,
+        window: vaxis.Window,
+        row: u16,
+        index: usize,
+        choice: []const u8,
+    ) void {
+        const selected = index == self.selected_user_input_choice;
+        const choice_style: vaxis.Style = if (selected)
+            .{ .fg = accent, .bold = true }
+        else
+            .{};
+        var segments = [_]vaxis.Segment{
+            .{
+                .text = if (selected) "› " else "  ",
+                .style = .{
+                    .fg = accent,
+                    .bold = selected,
+                },
+            },
+            .{
+                .text = choice,
+                .style = choice_style,
+            },
+        };
+        _ = window.print(&segments, .{
+            .row_offset = row,
+            .col_offset = 1,
+            .wrap = .none,
+        });
     }
 
     fn drawMenuDetail(
@@ -1213,6 +1508,7 @@ const ChatUi = struct {
                     .queued => "Queued",
                     .reasoning => "Thinking",
                     .assistant => "Vivi",
+                    .question => "Question",
                     .status => unreachable,
                 };
                 const role_color = switch (entry.role) {
@@ -1220,6 +1516,7 @@ const ChatUi = struct {
                     .queued => accent,
                     .reasoning => reasoning_color,
                     .assistant => assistant_color,
+                    .question => accent,
                     .status => unreachable,
                 };
                 var segments = [_]vaxis.Segment{.{
@@ -1273,16 +1570,38 @@ const ChatUi = struct {
 
     fn drawContext(self: *ChatUi, window: vaxis.Window) void {
         if (window.width == 0) return;
+        const phase = self.phase.label();
+        const phase_width = window.gwidth(phase);
+        if (phase_width >= window.width) {
+            var phase_segment = [_]vaxis.Segment{.{
+                .text = phase,
+                .style = .{ .bold = true },
+            }};
+            _ = window.print(&phase_segment, .{ .wrap = .none });
+            return;
+        }
         const cwd = if (window.width < 40)
             std.fs.path.basename(self.cwd)
         else
             self.cwd;
-        var segments = [_]vaxis.Segment{
-            .{ .text = cwd, .style = .{ .dim = true } },
-            .{ .text = "  ", .style = .{ .dim = true } },
-            .{ .text = self.phase.label(), .style = .{ .bold = true } },
-        };
-        _ = window.print(&segments, .{ .wrap = .none });
+        const gap: u16 = 2;
+        const cwd_width = window.width - phase_width - gap;
+        var cwd_segment = [_]vaxis.Segment{.{
+            .text = cwd,
+            .style = .{ .dim = true },
+        }};
+        _ = window.child(.{ .width = cwd_width }).print(
+            &cwd_segment,
+            .{ .wrap = .none },
+        );
+        var phase_segment = [_]vaxis.Segment{.{
+            .text = phase,
+            .style = .{ .bold = true },
+        }};
+        _ = window.print(&phase_segment, .{
+            .col_offset = window.width - phase_width,
+            .wrap = .none,
+        });
     }
 
     fn drawComposer(self: *ChatUi, window: vaxis.Window) void {
@@ -1310,7 +1629,8 @@ const ChatUi = struct {
         const text_style = vaxis.Style{ .bg = composer_background };
         if (self.phase == .ready or
             self.phase == .loading_commands or
-            self.phase == .responding)
+            self.phase == .responding or
+            self.phase == .awaiting_input)
         {
             self.input.drawWithStyle(content, text_style);
         } else {
@@ -1329,20 +1649,35 @@ const ChatUi = struct {
             switch (self.phase) {
                 .ready => "Enter send  ·  PgUp/PgDn scroll  ·  Ctrl-C quit",
                 .responding => "Enter steer  ·  Ctrl+Enter queue  ·  PgUp/PgDn scroll  ·  Ctrl-C stop",
-                .connecting, .loading_commands, .switching => "PgUp/PgDn scroll  ·  Ctrl-C stop",
+                .awaiting_input => if (self.hasInputChoices())
+                    if (self.hasFreeformChoice())
+                        "↑/↓ select  ·  Enter accept  ·  type for other  ·  Ctrl-C stop"
+                    else
+                        "↑/↓ select  ·  Enter accept  ·  Ctrl-C stop"
+                else
+                    "Enter answer  ·  PgUp/PgDn scroll  ·  Ctrl-C stop",
+                .connecting, .loading_commands, .running_command, .switching => "PgUp/PgDn scroll  ·  Ctrl-C stop",
                 .stopping => "Ctrl-C again force exit",
             }
         else if (window.width >= 24)
             switch (self.phase) {
                 .ready => "Enter send  ·  Ctrl-C quit",
                 .responding => "Enter steer  ·  ^Enter queue",
-                .connecting, .loading_commands, .switching => "Ctrl-C stop",
+                .awaiting_input => if (self.hasInputChoices())
+                    "↑/↓ select  ·  Enter accept"
+                else
+                    "Enter answer  ·  Ctrl-C stop",
+                .connecting, .loading_commands, .running_command, .switching => "Ctrl-C stop",
                 .stopping => "Ctrl-C again force exit",
             }
         else switch (self.phase) {
             .ready => "Ctrl-C quit",
             .responding => "Enter steer",
-            .connecting, .loading_commands, .switching => "Ctrl-C stop",
+            .awaiting_input => if (self.hasInputChoices())
+                "Enter choice"
+            else
+                "Enter answer",
+            .connecting, .loading_commands, .running_command, .switching => "Ctrl-C stop",
             .stopping => "Ctrl-C again",
         };
         const model_name = self.selectedModelDisplayName();
@@ -1384,6 +1719,33 @@ const ChatUi = struct {
             }
         }
         return catalog.selected_id;
+    }
+
+    fn hasInputChoices(self: *const ChatUi) bool {
+        return if (self.pending_user_input) |request|
+            request.choices.len > 0
+        else
+            false;
+    }
+
+    fn hasFreeformChoice(self: *const ChatUi) bool {
+        return if (self.pending_user_input) |request|
+            request.allow_freeform
+        else
+            false;
+    }
+
+    fn userInputOptionCount(self: *const ChatUi) usize {
+        return if (self.pending_user_input) |request|
+            request.choices.len + @intFromBool(request.allow_freeform)
+        else
+            0;
+    }
+
+    fn userInputPanelRows(self: *const ChatUi) u16 {
+        const rows = 3 + self.userInputOptionCount() +
+            @intFromBool(self.invalid_user_input);
+        return @intCast(@min(rows, std.math.maxInt(u16)));
     }
 
     fn pageUp(self: *ChatUi) void {

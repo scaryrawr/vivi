@@ -72,12 +72,13 @@ This keeps SDK values and their allocator lifetimes off the UI thread while
 keeping terminal policy out of the backend.
 
 The initial coding-agent policy is private to `backend/src/root.zig`. Copilot
-CLI starts with the source-qualified `builtin:*` tool class excluded, built-in
-MCP servers disabled, custom instructions disabled, and `ask_user` disabled.
-The SDK session registers Vivi-owned `read`, `bash`, `edit`, and `write` tools
-and replaces Copilot's system message with Vivi's concise workspace-aware
-prompt. Excluding only the built-in source keeps Copilot's tools unavailable
-without suppressing Vivi or future extension tools.
+CLI starts with the SDK's curated session-isolated built-in tools enabled for
+planning and subagent coordination, while built-in MCP servers and custom
+instructions remain disabled. The SDK provides its typed `ask_user` callback;
+the session registers Vivi-owned `read`, `bash`, `edit`, and `write` tools and
+replaces Copilot's system message with Vivi's concise workspace-aware prompt.
+Source-qualified tool filters keep host-affecting built-ins unavailable
+without suppressing Vivi tools.
 
 `backend/src/tools.zig` owns SDK-free tool behavior: JSON argument validation,
 workspace-relative path resolution, text reads, Bash execution, exact
@@ -128,8 +129,10 @@ owner of composer text; the menu stores only catalog entries and filtered
 indices. `/model` opens a backend-supplied catalog containing
 `copilot/default`, authenticated and policy-eligible hosted models, and
 discovered local models with context, output, and vision metadata. Other
-SDK-contributed commands remain visible but are not invoked in this
-implementation slice.
+compatible SDK-contributed commands execute through
+`session.commands.invoke`. Vivi's `ask_user` tool requests cross the backend as
+owned domain events; the terminal shows the question and choices, then returns
+the composer's answer as the tool result.
 
 Model replacement is a transaction on the SDK worker. It resolves the target
 and creates a candidate session before disconnecting the active session. A
@@ -197,7 +200,7 @@ requests remain fail-closed because Vivi has no approval UI yet.
 - We accept cooperative cancellation in exchange for never calling the
   single-threaded SDK concurrently.
 - We accept CLI launch flags alongside SDK session configuration because the
-  pinned Zig SDK does not expose Copilot's built-in tool allowlist.
+  pinned Zig SDK does not expose Copilot's source-qualified tool allowlist.
 - We accept unbounded in-memory tool results in exchange for leaving
   truncation and large-result transport to Copilot.
 - We accept synchronous tool execution on the SDK worker in exchange for one
@@ -211,8 +214,8 @@ requests remain fail-closed because Vivi has no approval UI yet.
 - We accept resetting server-side history during model replacement in exchange
   for an atomic create-before-disconnect transition with no provider-specific
   transcript replay.
-- We accept displaying unsupported SDK commands in exchange for honest command
-  discovery while invocation semantics are designed separately.
+- We accept rendering command completion as concise status text because the
+  terminal does not reproduce every interactive dialog owned by Copilot CLI.
 
 ## Alternatives considered
 
@@ -228,9 +231,9 @@ requests remain fail-closed because Vivi has no approval UI yet.
   affinity would become part of every caller's contract.
 - An SDK-only empty `tools` list was rejected because it controls external
   handlers registered by Vivi, not Copilot's built-in tool inventory.
-- Enumerating current Copilot tool names was rejected because newly shipped
-  built-ins could bypass it; the source-qualified `builtin:*` exclusion covers
-  the complete built-in class while preserving extension tools.
+- Allowing the complete `builtin:*` class was rejected because newly shipped
+  privileged tools could bypass Vivi's policy; the source-qualified allowlist
+  admits only the reviewed session-isolated built-ins.
 - Caller-supplied agent configuration was rejected because it would leak
   Copilot process and prompt policy into every CLI and native host.
 - SDK auto-handlers were rejected because they reduce operational failures to

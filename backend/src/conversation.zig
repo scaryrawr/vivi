@@ -183,6 +183,63 @@ pub const PromptDelivery = enum {
     enqueue,
 };
 
+pub const UserInputRequest = struct {
+    allocator: std.mem.Allocator,
+    request_id: []u8,
+    question: []u8,
+    choices: [][]u8,
+    allow_freeform: bool,
+
+    pub fn deinit(self: *UserInputRequest) void {
+        self.allocator.free(self.request_id);
+        self.allocator.free(self.question);
+        for (self.choices) |choice| self.allocator.free(choice);
+        self.allocator.free(self.choices);
+        self.* = undefined;
+    }
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        request_id: []const u8,
+        question: []const u8,
+        choices: []const []const u8,
+        allow_freeform: bool,
+    ) !UserInputRequest {
+        const owned_choices = try allocator.alloc([]u8, choices.len);
+        errdefer allocator.free(owned_choices);
+        var initialized: usize = 0;
+        errdefer for (owned_choices[0..initialized]) |choice| {
+            allocator.free(choice);
+        };
+        for (choices, 0..) |choice, index| {
+            owned_choices[index] = try allocator.dupe(u8, choice);
+            initialized += 1;
+        }
+        const owned_request_id = try allocator.dupe(u8, request_id);
+        errdefer allocator.free(owned_request_id);
+        return .{
+            .allocator = allocator,
+            .request_id = owned_request_id,
+            .question = try allocator.dupe(u8, question),
+            .choices = owned_choices,
+            .allow_freeform = allow_freeform,
+        };
+    }
+
+    pub fn clone(
+        self: *const UserInputRequest,
+        allocator: std.mem.Allocator,
+    ) !UserInputRequest {
+        return init(
+            allocator,
+            self.request_id,
+            self.question,
+            self.choices,
+            self.allow_freeform,
+        );
+    }
+};
+
 pub const Closed = union(enum) {
     requested,
     failed: Failure,
@@ -207,6 +264,8 @@ pub const Event = union(enum) {
     reasoning_complete: OwnedText,
     assistant_delta: OwnedText,
     assistant_complete: OwnedText,
+    user_input_requested: UserInputRequest,
+    command_completed: OwnedText,
     idle,
     closed: Closed,
 
@@ -216,7 +275,9 @@ pub const Event = union(enum) {
             .reasoning_complete,
             .assistant_delta,
             .assistant_complete,
+            .command_completed,
             => |*text| text.deinit(),
+            .user_input_requested => |*request| request.deinit(),
             .command_catalog => |*catalog| catalog.deinit(),
             .model_catalog => |*catalog| catalog.deinit(),
             .model_catalog_failed => |*text| text.deinit(),
@@ -236,12 +297,22 @@ pub const Command = union(enum) {
     refresh_commands,
     refresh_models,
     switch_model: OwnedText,
+    execute_command: OwnedText,
+    user_input_response: struct {
+        request_id: OwnedText,
+        answer: OwnedText,
+        was_freeform: bool,
+    },
     stop,
 
     pub fn deinit(self: *Command) void {
         switch (self.*) {
             .prompt => |*prompt| prompt.text.deinit(),
-            .switch_model => |*text| text.deinit(),
+            .switch_model, .execute_command => |*text| text.deinit(),
+            .user_input_response => |*response| {
+                response.request_id.deinit();
+                response.answer.deinit();
+            },
             .refresh_commands, .refresh_models, .stop => {},
         }
         self.* = undefined;
@@ -253,6 +324,7 @@ const State = enum {
     idle,
     streaming,
     controlling,
+    awaiting_user_input,
     stopping,
     closed,
 };
@@ -329,6 +401,27 @@ pub const Worker = struct {
         return self.core.commands.orderedRemove(0);
     }
 
+    pub fn waitUserInputResponse(self: *Worker) Command {
+        self.core.mutex.lock(self.core.io) catch return .stop;
+        defer self.core.mutex.unlock(self.core.io);
+
+        while (true) {
+            if (self.core.stop_requested) return .stop;
+            for (self.core.commands.items, 0..) |command, index| {
+                switch (command) {
+                    .user_input_response, .stop => {
+                        return self.core.commands.orderedRemove(index);
+                    },
+                    else => {},
+                }
+            }
+            self.core.command_ready.wait(
+                self.core.io,
+                &self.core.mutex,
+            ) catch return .stop;
+        }
+    }
+
     pub fn tryTakeCommand(self: *Worker) ?Command {
         self.core.mutex.lock(self.core.io) catch return .stop;
         defer self.core.mutex.unlock(self.core.io);
@@ -351,7 +444,12 @@ pub const Worker = struct {
                     }
                 },
                 .stop => return self.core.commands.orderedRemove(index),
-                .refresh_commands, .refresh_models, .switch_model => {},
+                .refresh_commands,
+                .refresh_models,
+                .switch_model,
+                .execute_command,
+                .user_input_response,
+                => {},
             }
         }
         return null;
@@ -379,11 +477,33 @@ pub const Worker = struct {
     }
 
     pub fn assistantStarted(self: *Worker) !void {
+        try self.core.mutex.lock(self.core.io);
+        if (!self.core.stop_requested) self.core.state = .streaming;
+        self.core.mutex.unlock(self.core.io);
         try self.publish(.assistant_started);
     }
 
     pub fn commandCatalog(self: *Worker, catalog: CommandCatalog) !void {
         try self.publish(.{ .command_catalog = catalog });
+    }
+
+    pub fn userInputRequested(
+        self: *Worker,
+        request: UserInputRequest,
+    ) !void {
+        try self.core.mutex.lock(self.core.io);
+        if (!self.core.stop_requested) self.core.state = .awaiting_user_input;
+        self.core.mutex.unlock(self.core.io);
+        try self.publish(.{ .user_input_requested = request });
+    }
+
+    pub fn commandCompleted(self: *Worker, message: []const u8) !void {
+        try self.completeControl(.{
+            .command_completed = try OwnedText.init(
+                self.core.allocator,
+                message,
+            ),
+        });
     }
 
     pub fn modelCatalog(self: *Worker, catalog: ModelCatalog) !void {
@@ -516,7 +636,7 @@ pub const Conversation = struct {
 
         switch (self.core.state) {
             .idle, .streaming => {},
-            .starting, .controlling => return error.Busy,
+            .starting, .controlling, .awaiting_user_input => return error.Busy,
             .stopping => return error.Stopping,
             .closed => return error.Closed,
         }
@@ -552,6 +672,58 @@ pub const Conversation = struct {
         });
     }
 
+    pub fn executeCommand(
+        self: *Conversation,
+        command: []const u8,
+    ) !void {
+        if (std.mem.trim(u8, command, " \t\r\n").len == 0) {
+            return error.EmptyCommand;
+        }
+        try self.enqueueControl(.{
+            .execute_command = try OwnedText.init(
+                self.core.allocator,
+                command,
+            ),
+        });
+    }
+
+    pub fn respondToUserInput(
+        self: *Conversation,
+        request_id: []const u8,
+        answer: []const u8,
+        was_freeform: bool,
+    ) !void {
+        if (std.mem.trim(u8, answer, " \t\r\n").len == 0) {
+            return error.EmptyAnswer;
+        }
+        const owned_request_id = try OwnedText.init(
+            self.core.allocator,
+            request_id,
+        );
+        errdefer {
+            var mutable = owned_request_id;
+            mutable.deinit();
+        }
+        const owned_answer = try OwnedText.init(self.core.allocator, answer);
+        errdefer {
+            var mutable = owned_answer;
+            mutable.deinit();
+        }
+
+        try self.core.mutex.lock(self.core.io);
+        defer self.core.mutex.unlock(self.core.io);
+        if (self.core.state != .awaiting_user_input) return error.NotAwaitingInput;
+        try self.core.commands.append(self.core.allocator, .{
+            .user_input_response = .{
+                .request_id = owned_request_id,
+                .answer = owned_answer,
+                .was_freeform = was_freeform,
+            },
+        });
+        self.core.state = .streaming;
+        self.core.command_ready.signal(self.core.io);
+    }
+
     fn enqueueControl(self: *Conversation, command: Command) !void {
         var owned_command = command;
         errdefer owned_command.deinit();
@@ -561,7 +733,11 @@ pub const Conversation = struct {
 
         switch (self.core.state) {
             .idle => {},
-            .starting, .streaming, .controlling => return error.Busy,
+            .starting,
+            .streaming,
+            .controlling,
+            .awaiting_user_input,
+            => return error.Busy,
             .stopping => return error.Stopping,
             .closed => return error.Closed,
         }
@@ -689,7 +865,12 @@ test "conversation transfers streamed events without SDK access" {
                     worker.closeRequested();
                     return;
                 },
-                .refresh_commands, .refresh_models, .switch_model => {
+                .refresh_commands,
+                .refresh_models,
+                .switch_model,
+                .execute_command,
+                .user_input_response,
+                => {
                     worker.closeFailure(.stream, "Unexpected control command.");
                     return;
                 },
@@ -834,4 +1015,155 @@ test "conversation accepts steering and queued prompts while streaming" {
     try conversation.submit("first", .enqueue);
     try conversation.submit("steer", .immediate);
     try conversation.submit("later", .enqueue);
+}
+
+test "conversation accepts an answer only while user input is pending" {
+    const Script = struct {
+        fn run(worker: *Worker) void {
+            if (!(worker.ready() catch return)) {
+                worker.closeRequested();
+                return;
+            }
+            var prompt = worker.waitCommand();
+            defer prompt.deinit();
+            if (prompt != .prompt) {
+                worker.closeFailure(.stream, "Expected prompt.");
+                return;
+            }
+            worker.userInputRequested(UserInputRequest.init(
+                worker.allocator(),
+                "request-1",
+                "Choose",
+                &.{ "one", "two" },
+                false,
+            ) catch return) catch return;
+
+            var response = worker.waitCommand();
+            defer response.deinit();
+            switch (response) {
+                .user_input_response => |value| {
+                    if (!std.mem.eql(
+                        u8,
+                        value.request_id.bytes,
+                        "request-1",
+                    ) or
+                        !std.mem.eql(u8, value.answer.bytes, "two") or
+                        value.was_freeform)
+                    {
+                        worker.closeFailure(.stream, "Unexpected answer.");
+                        return;
+                    }
+                },
+                else => {
+                    worker.closeFailure(.stream, "Expected user input.");
+                    return;
+                },
+            }
+            worker.idle() catch return;
+
+            var stop = worker.waitCommand();
+            stop.deinit();
+            worker.closeRequested();
+        }
+    };
+    const WakeCounter = struct {
+        count: std.atomic.Value(usize) = .init(0),
+
+        fn notify(context: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            _ = self.count.fetchAdd(1, .monotonic);
+        }
+    };
+
+    var wake_counter: WakeCounter = .{};
+    var conversation = try openWithRunner(
+        std.testing.allocator,
+        std.testing.io,
+        .{ .context = &wake_counter, .notify = WakeCounter.notify },
+        Script.run,
+    );
+    defer conversation.deinit();
+
+    while (true) {
+        if (try conversation.tryTakeEvent()) |event_value| {
+            var event = event_value;
+            defer event.deinit();
+            if (event == .ready) break;
+        } else {
+            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+    }
+
+    try std.testing.expectError(
+        error.NotAwaitingInput,
+        conversation.respondToUserInput("request-1", "two", false),
+    );
+    try conversation.submit("ask", .immediate);
+
+    while (true) {
+        if (try conversation.tryTakeEvent()) |event_value| {
+            var event = event_value;
+            defer event.deinit();
+            if (event == .user_input_requested) {
+                try std.testing.expectEqualStrings(
+                    "Choose",
+                    event.user_input_requested.question,
+                );
+                break;
+            }
+        } else {
+            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+    }
+
+    try conversation.respondToUserInput("request-1", "two", false);
+}
+
+test "waiting for user input preserves queued prompts" {
+    const Harness = struct {
+        fn run(_: *Worker) void {}
+
+        fn notify(_: *anyopaque) void {}
+    };
+
+    var wake_context: u8 = 0;
+    var core: Core = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .wake = .{
+            .context = &wake_context,
+            .notify = Harness.notify,
+        },
+        .runner = .{ .plain = Harness.run },
+    };
+    defer {
+        for (core.commands.items) |*command| command.deinit();
+        core.commands.deinit(std.testing.allocator);
+    }
+    try core.commands.append(std.testing.allocator, .{
+        .prompt = .{
+            .text = try OwnedText.init(std.testing.allocator, "later"),
+            .delivery = .enqueue,
+        },
+    });
+    try core.commands.append(std.testing.allocator, .{
+        .user_input_response = .{
+            .request_id = try OwnedText.init(
+                std.testing.allocator,
+                "request-1",
+            ),
+            .answer = try OwnedText.init(std.testing.allocator, "two"),
+            .was_freeform = false,
+        },
+    });
+
+    var worker: Worker = .{ .core = &core };
+    var response = worker.waitUserInputResponse();
+    defer response.deinit();
+    try std.testing.expect(response == .user_input_response);
+
+    var queued = worker.tryTakeCommand().?;
+    defer queued.deinit();
+    try std.testing.expect(queued == .prompt);
+    try std.testing.expectEqualStrings("later", queued.prompt.text.bytes);
 }
