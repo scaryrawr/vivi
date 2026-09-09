@@ -231,9 +231,12 @@ pub const Store = struct {
                 entry.name,
                 self.allocator,
                 .limited(max_shard_bytes),
-            ) catch {
-                skipped_invalid = true;
-                continue;
+            ) catch |err| switch (err) {
+                error.StreamTooLong => {
+                    skipped_invalid = true;
+                    continue;
+                },
+                else => return err,
             };
             defer self.allocator.free(content);
             var parsed = std.json.parseFromSlice(
@@ -241,9 +244,12 @@ pub const Store = struct {
                 self.allocator,
                 content,
                 .{ .ignore_unknown_fields = true },
-            ) catch {
-                skipped_invalid = true;
-                continue;
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => {
+                    skipped_invalid = true;
+                    continue;
+                },
             };
             defer parsed.deinit();
             if (!validDocument(entry.name, parsed.value)) {
@@ -257,9 +263,14 @@ pub const Store = struct {
                     stored.working_directory,
                     stored.model_id,
                     stored.last_used_unix_ms,
-                ) catch {
-                    skipped_invalid = true;
-                    continue;
+                ) catch |err| switch (err) {
+                    error.InvalidSessionText,
+                    error.InvalidSessionTimestamp,
+                    => {
+                        skipped_invalid = true;
+                        continue;
+                    },
+                    else => return err,
                 };
                 errdefer record.deinit();
                 try mergeRecord(self.allocator, &merged, record);

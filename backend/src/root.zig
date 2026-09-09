@@ -2116,10 +2116,11 @@ fn runSdkConversation(
                         unixMilliseconds(worker.io()),
                     ) catch |err| {
                         if (context.settings_path) |path| {
-                            settings.saveDefaultModel(
+                            _ = settings.restoreDefaultModelIfCurrent(
                                 worker.allocator(),
                                 worker.io(),
                                 path,
+                                target_plan.id(),
                                 persisted_settings.default_model,
                             ) catch |rollback_err| {
                                 candidate.disconnect() catch {};
