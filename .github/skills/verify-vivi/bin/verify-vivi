@@ -503,7 +503,9 @@ chat_ask_user() {
             printf 'no\n'
         fi
         printf 'answer_seen='
-        if grep -q 'ANSWER.*Beta' "$run_dir/chat-ask-user.normalized.txt"; then
+        if grep -Eq 'Vivi[[:space:]]*ANSWER[[:space:]]*Beta' \
+            "$run_dir/chat-ask-user.normalized.txt"
+        then
             printf 'yes\n'
         else
             printf 'no\n'
@@ -515,7 +517,8 @@ chat_ask_user() {
     grep -q 'Alpha' "$run_dir/chat-ask-user.normalized.txt"
     grep -q 'Beta' "$run_dir/chat-ask-user.normalized.txt"
     grep -q 'Answer required' "$run_dir/chat-ask-user.normalized.txt"
-    grep -q 'ANSWER.*Beta' "$run_dir/chat-ask-user.normalized.txt"
+    grep -Eq 'Vivi[[:space:]]*ANSWER[[:space:]]*Beta' \
+        "$run_dir/chat-ask-user.normalized.txt"
     test -s "$run_dir/chat-ask-user.contact-sheet.png"
 }
 
