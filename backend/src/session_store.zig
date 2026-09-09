@@ -247,10 +247,7 @@ pub const Store = struct {
                 self.allocator,
                 .limited(max_shard_bytes),
             ) catch |err| switch (err) {
-                error.StreamTooLong => {
-                    skipped_invalid = true;
-                    continue;
-                },
+                error.StreamTooLong => return error.SessionShardTooLarge,
                 else => return err,
             };
             defer self.allocator.free(content);
@@ -651,6 +648,46 @@ test "session store preserves unsupported version shards" {
         error.UnsupportedSessionShardVersion,
         store.list(),
     );
+    var future = try temporary.dir.openFile(
+        std.testing.io,
+        "sessions/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.json",
+        .{},
+    );
+    future.close(std.testing.io);
+}
+
+test "session store preserves oversized shards before version inspection" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.createDirPath(std.testing.io, "sessions");
+    const directory = try temporary.dir.realPathFileAlloc(
+        std.testing.io,
+        "sessions",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(directory);
+    var store = try Store.initWithWriterId(
+        std.testing.allocator,
+        std.testing.io,
+        directory,
+        [_]u8{'a'} ** writer_id_hex_len,
+    );
+    defer store.deinit();
+    try store.recordCreated("session-a", "/work/a", "copilot/default", 10);
+
+    const prefix = "{\"version\":2,\"padding\":\"";
+    const suffix = "\"}";
+    const content = try std.testing.allocator.alloc(u8, max_shard_bytes + 1);
+    defer std.testing.allocator.free(content);
+    @memcpy(content[0..prefix.len], prefix);
+    @memset(content[prefix.len .. content.len - suffix.len], 'x');
+    @memcpy(content[content.len - suffix.len ..], suffix);
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = "sessions/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.json",
+        .data = content,
+    });
+
+    try std.testing.expectError(error.SessionShardTooLarge, store.list());
     var future = try temporary.dir.openFile(
         std.testing.io,
         "sessions/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.json",
