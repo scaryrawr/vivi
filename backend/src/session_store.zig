@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const version: u32 = 1;
 pub const max_records_per_shard: usize = 200;
@@ -12,6 +13,16 @@ const max_shard_bytes =
 const writer_id_bytes: usize = 16;
 const writer_id_hex_len: usize = writer_id_bytes * 2;
 const lock_filename = ".lock";
+const private_file_permissions: std.Io.File.Permissions =
+    if (builtin.os.tag == .windows)
+        .default_file
+    else
+        .fromMode(0o600);
+const private_directory_permissions: std.Io.Dir.Permissions =
+    if (builtin.os.tag == .windows)
+        .default_dir
+    else
+        .fromMode(0o700);
 
 pub const Record = struct {
     allocator: std.mem.Allocator,
@@ -92,6 +103,10 @@ const Document = struct {
     version: u32,
     writer_id: []const u8,
     sessions: []const DocumentRecord,
+};
+
+const VersionHeader = struct {
+    version: u32,
 };
 
 pub const Store = struct {
@@ -239,6 +254,22 @@ pub const Store = struct {
                 else => return err,
             };
             defer self.allocator.free(content);
+            var header = std.json.parseFromSlice(
+                VersionHeader,
+                self.allocator,
+                content,
+                .{ .ignore_unknown_fields = true },
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => {
+                    skipped_invalid = true;
+                    continue;
+                },
+            };
+            defer header.deinit();
+            if (header.value.version != version) {
+                return error.UnsupportedSessionShardVersion;
+            }
             var parsed = std.json.parseFromSlice(
                 Document,
                 self.allocator,
@@ -312,12 +343,37 @@ pub const Store = struct {
     }
 
     fn acquireLock(self: *Store) !std.Io.File {
-        try std.Io.Dir.cwd().createDirPath(self.io, self.directory);
-        return std.Io.Dir.createFileAbsolute(
+        _ = try std.Io.Dir.cwd().createDirPathStatus(
+            self.io,
+            self.directory,
+            private_directory_permissions,
+        );
+        if (builtin.os.tag != .windows) {
+            var directory = try std.Io.Dir.openDirAbsolute(
+                self.io,
+                self.directory,
+                .{ .iterate = true },
+            );
+            defer directory.close(self.io);
+            try directory.setPermissions(
+                self.io,
+                private_directory_permissions,
+            );
+        }
+        const lock = try std.Io.Dir.createFileAbsolute(
             self.io,
             self.lock_path,
-            .{ .truncate = false, .lock = .exclusive },
+            .{
+                .truncate = false,
+                .lock = .exclusive,
+                .permissions = private_file_permissions,
+            },
         );
+        errdefer lock.close(self.io);
+        if (builtin.os.tag != .windows) {
+            try lock.setPermissions(self.io, private_file_permissions);
+        }
+        return lock;
     }
 
     fn compact(self: *Store, records: []const Record) !void {
@@ -373,7 +429,11 @@ pub const Store = struct {
         var atomic_file = try std.Io.Dir.cwd().createFileAtomic(
             self.io,
             self.shard_path,
-            .{ .make_path = true, .replace = true },
+            .{
+                .permissions = private_file_permissions,
+                .make_path = true,
+                .replace = true,
+            },
         );
         defer atomic_file.deinit(self.io);
         var buffer: [4096]u8 = undefined;
@@ -406,8 +466,7 @@ fn validateWorkingDirectory(value: []const u8) !void {
 }
 
 fn validDocument(filename: []const u8, document: Document) bool {
-    if (document.version != version or
-        document.writer_id.len != writer_id_hex_len or
+    if (document.writer_id.len != writer_id_hex_len or
         document.sessions.len > max_records_per_shard)
     {
         return false;
@@ -559,14 +618,45 @@ test "session store rejects mismatched writer identity" {
         "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.json",
         document,
     ));
-    try std.testing.expect(!validDocument(
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json",
-        .{
-            .version = version + 1,
-            .writer_id = document.writer_id,
-            .sessions = &.{},
-        },
-    ));
+}
+
+test "session store preserves unsupported version shards" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.createDirPath(std.testing.io, "sessions");
+    const directory = try temporary.dir.realPathFileAlloc(
+        std.testing.io,
+        "sessions",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(directory);
+    var store = try Store.initWithWriterId(
+        std.testing.allocator,
+        std.testing.io,
+        directory,
+        [_]u8{'a'} ** writer_id_hex_len,
+    );
+    defer store.deinit();
+    try store.recordCreated("session-a", "/work/a", "copilot/default", 10);
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = "sessions/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.json",
+        .data =
+        \\{
+        \\  "version": 2
+        \\}
+        ,
+    });
+
+    try std.testing.expectError(
+        error.UnsupportedSessionShardVersion,
+        store.list(),
+    );
+    var future = try temporary.dir.openFile(
+        std.testing.io,
+        "sessions/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.json",
+        .{},
+    );
+    future.close(std.testing.io);
 }
 
 test "session store releases moved records when saving fails" {
@@ -658,5 +748,62 @@ test "session store preserves filesystem-significant path whitespace" {
             "copilot/default",
             10,
         ),
+    );
+}
+
+test "session store uses owner-only POSIX permissions" {
+    if (builtin.os.tag == .windows) return;
+
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const temporary_root = try temporary.dir.realPathAlloc(
+        std.testing.io,
+        std.testing.allocator,
+        ".",
+    );
+    defer std.testing.allocator.free(temporary_root);
+    const directory = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ temporary_root, "sessions" },
+    );
+    defer std.testing.allocator.free(directory);
+    var store = try Store.initWithWriterId(
+        std.testing.allocator,
+        std.testing.io,
+        directory,
+        [_]u8{'a'} ** writer_id_hex_len,
+    );
+    defer store.deinit();
+    try store.recordCreated("session-a", "/work/a", "copilot/default", 10);
+
+    var sessions = try std.Io.Dir.openDirAbsolute(
+        std.testing.io,
+        directory,
+        .{ .iterate = true },
+    );
+    defer sessions.close(std.testing.io);
+    try std.testing.expectEqual(
+        @as(std.posix.mode_t, 0o700),
+        sessions.stat(std.testing.io).permissions.toMode() & 0o777,
+    );
+    var shard = try std.Io.Dir.openFileAbsolute(
+        std.testing.io,
+        store.shard_path,
+        .{},
+    );
+    defer shard.close(std.testing.io);
+    try std.testing.expectEqual(
+        @as(std.posix.mode_t, 0o600),
+        shard.stat(std.testing.io).permissions.toMode() & 0o777,
+    );
+    var lock = try std.Io.Dir.openFileAbsolute(
+        std.testing.io,
+        store.lock_path,
+        .{},
+    );
+    defer lock.close(std.testing.io);
+    try std.testing.expectEqual(
+        @as(std.posix.mode_t, 0o600),
+        lock.stat(std.testing.io).permissions.toMode() & 0o777,
     );
 }

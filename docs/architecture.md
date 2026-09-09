@@ -162,8 +162,12 @@ created. Processes coordinate through an advisory `.lock` file under
 versioned JSON shards by SDK session ID, incrementally bounds the catalog,
 atomically writes the merged catalog to the current process's shard, and
 removes sibling shards. Malformed shards are skipped and then removed during
-compaction. The store records only the session ID, working directory, model
-identity, and recency; Copilot CLI remains the sole transcript/history store.
+compaction. An unsupported document version aborts the operation so an older
+Vivi binary cannot delete a newer catalog. On POSIX systems, the directory,
+lock, and shards use owner-only permissions; Windows creation inherits the
+user profile's access-controlled directory permissions. The store records only
+the session ID, working directory, model identity, and recency; Copilot CLI
+remains the sole transcript/history store.
 
 `/resume` is a first-class broker control operation rather than an SDK slash
 command. The terminal receives display-ready rows with request-local numeric
