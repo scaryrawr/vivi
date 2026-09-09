@@ -31,6 +31,18 @@ fn isBlank(text: []const u8) bool {
     return std.mem.trim(u8, text, " \t\r\n").len == 0;
 }
 
+fn slashCommandQuery(input: []const u8) ?[]const u8 {
+    if (input.len == 0 or input[0] != '/') return null;
+    const command = input[1..];
+    const separator = std.mem.indexOfAny(u8, command, " \t\r\n");
+    return if (separator) |index| command[0..index] else command;
+}
+
+fn commandArgumentSuffix(input: []const u8) []const u8 {
+    const separator = std.mem.indexOfAny(u8, input, " \t\r\n");
+    return if (separator) |index| input[index..] else "";
+}
+
 const Entry = struct {
     role: Role,
     text: std.ArrayList(u8) = .empty,
@@ -911,6 +923,7 @@ const ChatUi = struct {
     ) void {
         const option_count = self.userInputOptionCount();
         if (option_count == 0) return;
+        self.input.clearRetainingCapacity();
         self.selected_user_input_choice = switch (direction) {
             .previous => if (self.selected_user_input_choice == 0)
                 option_count - 1
@@ -947,15 +960,16 @@ const ChatUi = struct {
         }
         const contents = try self.input.toOwnedContents(self.allocator);
         defer self.allocator.free(contents);
-        if (contents.len == 0 or contents[0] != '/' or
-            std.mem.indexOfAny(u8, contents, " \t\r\n") != null or
-            self.dismissed_revision == self.input_revision)
-        {
+        const query = slashCommandQuery(contents) orelse {
+            self.menu_mode = .closed;
+            return;
+        };
+        if (self.dismissed_revision == self.input_revision) {
             self.menu_mode = .closed;
             return;
         }
         self.menu_mode = .commands;
-        try self.rebuildCommandMenu(contents[1..]);
+        try self.rebuildCommandMenu(query);
     }
 
     fn rebuildCommandMenu(self: *ChatUi, query: []const u8) !void {
@@ -1008,7 +1022,17 @@ const ChatUi = struct {
                 const catalog = self.commands orelse return;
                 const command = catalog.commands[selected.source_index];
                 if (!std.ascii.eqlIgnoreCase(command.name, "model")) {
-                    conversation.executeCommand(command.name) catch |err| switch (err) {
+                    const contents = try self.input.toOwnedContents(
+                        self.allocator,
+                    );
+                    defer self.allocator.free(contents);
+                    const command_input = try std.fmt.allocPrint(
+                        self.allocator,
+                        "{s}{s}",
+                        .{ command.name, commandArgumentSuffix(contents) },
+                    );
+                    defer self.allocator.free(command_input);
+                    conversation.executeCommand(command_input) catch |err| switch (err) {
                         error.EmptyCommand, error.Busy => return,
                         else => return err,
                     };
@@ -1214,7 +1238,7 @@ const ChatUi = struct {
 
     fn draw(self: *ChatUi, root: vaxis.Window) !void {
         const desired_menu_rows: u16 = if (self.phase == .awaiting_input)
-            self.userInputPanelRows()
+            self.userInputPanelRows(root)
         else switch (self.menu_mode) {
             .commands, .models => @intCast(@min(self.menu.matches.items.len, 8)),
             .closed, .loading_models => 0,
@@ -1340,17 +1364,23 @@ const ChatUi = struct {
         });
         if (window.height < 2) return;
 
+        const question_rows = self.userInputQuestionRows(window);
+        const question_inset: u16 = @intFromBool(window.width > 2);
+        const question_window = window.child(.{
+            .x_off = @intCast(question_inset),
+            .y_off = 1,
+            .width = window.width -| question_inset * 2,
+            .height = @min(question_rows, window.height -| 1),
+        });
         var question = [_]vaxis.Segment{.{
             .text = request.question,
             .style = .{ .dim = true },
         }};
-        _ = window.print(&question, .{
-            .row_offset = 1,
-            .col_offset = 1,
-            .wrap = .none,
+        _ = question_window.print(&question, .{
+            .wrap = .grapheme,
         });
 
-        const choice_row: u16 = 3;
+        const choice_row = 2 + question_rows;
         for (request.choices, 0..) |choice, index| {
             const row = choice_row + @as(u16, @intCast(index));
             if (row >= window.height) break;
@@ -1763,10 +1793,46 @@ const ChatUi = struct {
             0;
     }
 
-    fn userInputPanelRows(self: *const ChatUi) u16 {
-        const rows = 3 + self.userInputOptionCount() +
+    fn userInputPanelRows(
+        self: *const ChatUi,
+        window: vaxis.Window,
+    ) u16 {
+        const rows = 2 + self.userInputQuestionRows(window) +
+            self.userInputOptionCount() +
             @intFromBool(self.invalid_user_input);
         return @intCast(@min(rows, std.math.maxInt(u16)));
+    }
+
+    fn userInputQuestionRows(
+        self: *const ChatUi,
+        window: vaxis.Window,
+    ) u16 {
+        const request = self.pending_user_input orelse return 1;
+        const question_inset: u16 = @intFromBool(window.width > 2);
+        const available_width = @max(
+            window.width -| question_inset * 2,
+            1,
+        );
+        var rows: u16 = 1;
+        var line_width: u16 = 0;
+        var iterator = vaxis.unicode.graphemeIterator(request.question);
+        while (iterator.next()) |grapheme| {
+            const bytes = grapheme.bytes(request.question);
+            if (std.mem.eql(u8, bytes, "\n")) {
+                rows +|= 1;
+                line_width = 0;
+                continue;
+            }
+            const grapheme_width = window.gwidth(bytes);
+            if (line_width > 0 and
+                line_width +| grapheme_width > available_width)
+            {
+                rows +|= 1;
+                line_width = 0;
+            }
+            line_width +|= grapheme_width;
+        }
+        return rows;
     }
 
     fn pageUp(self: *ChatUi) void {
@@ -2171,6 +2237,78 @@ test "ask-user input preserves the existing composer draft" {
     const restored = try ui.input.toOwnedContents(std.testing.allocator);
     defer std.testing.allocator.free(restored);
     try std.testing.expectEqualStrings("unfinished draft", restored);
+}
+
+test "slash command parsing preserves argument suffixes" {
+    try std.testing.expectEqualStrings(
+        "autopilot",
+        slashCommandQuery("/autopilot thorough").?,
+    );
+    try std.testing.expectEqualStrings(
+        " thorough",
+        commandArgumentSuffix("/autopilot thorough"),
+    );
+    try std.testing.expectEqualStrings("", slashCommandQuery("/").?);
+    try std.testing.expect(slashCommandQuery("not-a-command") == null);
+}
+
+test "arrow selection replaces typed ask-user input" {
+    var ui: ChatUi = .{
+        .allocator = std.testing.allocator,
+        .input = TextInput.init(std.testing.allocator),
+        .cwd = try std.testing.allocator.dupe(u8, "."),
+        .pending_user_input = try backend.UserInputRequest.init(
+            std.testing.allocator,
+            "request-1",
+            "Pick one",
+            &.{ "Alpha", "Beta" },
+            false,
+        ),
+    };
+    defer ui.deinit();
+
+    try ui.input.insertSliceAtCursor("1");
+    ui.moveUserInputSelection(.next);
+
+    const contents = try ui.input.toOwnedContents(std.testing.allocator);
+    defer std.testing.allocator.free(contents);
+    try std.testing.expectEqualStrings("", contents);
+    try std.testing.expectEqual(@as(usize, 1), ui.selected_user_input_choice);
+}
+
+test "ask-user panel reserves rows for wrapped questions" {
+    var ui: ChatUi = .{
+        .allocator = std.testing.allocator,
+        .input = TextInput.init(std.testing.allocator),
+        .cwd = try std.testing.allocator.dupe(u8, "."),
+        .pending_user_input = try backend.UserInputRequest.init(
+            std.testing.allocator,
+            "request-1",
+            "12345678901234567890",
+            &.{"Alpha"},
+            false,
+        ),
+    };
+    defer ui.deinit();
+    var screen: vaxis.Screen = .{ .width_method = .unicode };
+    const window: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 12,
+        .height = 20,
+        .screen = &screen,
+    };
+
+    try std.testing.expectEqual(
+        @as(u16, 2),
+        ui.userInputQuestionRows(window),
+    );
+    try std.testing.expectEqual(
+        @as(u16, 5),
+        ui.userInputPanelRows(window),
+    );
 }
 
 test "menu ranks prefixes and preserves deterministic navigation" {
