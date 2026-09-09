@@ -340,13 +340,56 @@ fn startNextQueuedPrompt(
     }
 }
 
+const SubcommandSelection = struct {
+    allocator: std.mem.Allocator,
+    command: []u8,
+    title: []u8,
+    options: [][]u8,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        command: []const u8,
+        title: []const u8,
+        options: []const []const u8,
+    ) !SubcommandSelection {
+        const owned_options = try allocator.alloc([]u8, options.len);
+        errdefer allocator.free(owned_options);
+        var initialized: usize = 0;
+        errdefer for (owned_options[0..initialized]) |option| {
+            allocator.free(option);
+        };
+        for (options, 0..) |option, index| {
+            owned_options[index] = try allocator.dupe(u8, option);
+            initialized += 1;
+        }
+        const owned_command = try allocator.dupe(u8, command);
+        errdefer allocator.free(owned_command);
+        return .{
+            .allocator = allocator,
+            .command = owned_command,
+            .title = try allocator.dupe(u8, title),
+            .options = owned_options,
+        };
+    }
+
+    fn deinit(self: *SubcommandSelection) void {
+        self.allocator.free(self.command);
+        self.allocator.free(self.title);
+        for (self.options) |option| self.allocator.free(option);
+        self.allocator.free(self.options);
+        self.* = undefined;
+    }
+};
+
 const InvokedCommand = union(enum) {
     completed: []u8,
     agent_prompt: []u8,
+    select_subcommand: SubcommandSelection,
 
     fn deinit(self: *InvokedCommand, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .completed, .agent_prompt => |text| allocator.free(text),
+            .select_subcommand => |*selection| selection.deinit(),
         }
         self.* = undefined;
     }
@@ -378,6 +421,13 @@ fn executeSdkCommand(
             message: ?[]const u8 = null,
             notice: ?[]const u8 = null,
             prompt: ?[]const u8 = null,
+            command: ?[]const u8 = null,
+            title: ?[]const u8 = null,
+            options: ?[]const struct {
+                name: []const u8,
+                description: ?[]const u8 = null,
+                group: ?[]const u8 = null,
+            } = null,
         },
         "session.commands.invoke",
         .{
@@ -392,12 +442,33 @@ fn executeSdkCommand(
             return error.MissingCommandPrompt;
         return .{ .agent_prompt = try allocator.dupe(u8, prompt) };
     }
+    if (std.mem.eql(u8, result.value.kind, "select-subcommand")) {
+        const parent = result.value.command orelse
+            return error.MissingSubcommandParent;
+        const title = result.value.title orelse
+            return error.MissingSubcommandTitle;
+        const options = result.value.options orelse
+            return error.MissingSubcommandOptions;
+        if (options.len == 0) return error.EmptySubcommandOptions;
+        const names = try allocator.alloc([]const u8, options.len);
+        defer allocator.free(names);
+        for (options, 0..) |option, index| names[index] = option.name;
+        return .{
+            .select_subcommand = try SubcommandSelection.init(
+                allocator,
+                parent,
+                title,
+                names,
+            ),
+        };
+    }
     if (result.value.message orelse
         result.value.notice orelse
         result.value.text) |message|
     {
         return .{ .completed = try allocator.dupe(u8, message) };
     }
+
     if (!std.mem.eql(u8, result.value.kind, "completed")) {
         return .{
             .completed = try std.fmt.allocPrint(
@@ -414,6 +485,23 @@ fn executeSdkCommand(
             .{name},
         ),
     };
+}
+
+fn selectedSubcommandInput(
+    allocator: std.mem.Allocator,
+    selection: SubcommandSelection,
+    answer: []const u8,
+) ![]u8 {
+    for (selection.options) |option| {
+        if (std.mem.eql(u8, option, answer)) {
+            return std.fmt.allocPrint(
+                allocator,
+                "{s} {s}",
+                .{ selection.command, option },
+            );
+        }
+    }
+    return error.InvalidSubcommandSelection;
 }
 
 fn handleSdkUserInput(
@@ -1237,55 +1325,137 @@ fn runSdkConversation(
                 };
             },
             .execute_command => |requested| {
-                var result = executeSdkCommand(
-                    worker.allocator(),
-                    &client,
-                    session,
+                var command_input = worker.allocator().dupe(
+                    u8,
                     requested.bytes,
                 ) catch |err| {
-                    worker.commandCompleted(@errorName(err)) catch {
-                        worker.closeFailure(.stream, @errorName(err));
-                        return;
-                    };
-                    continue;
+                    worker.closeFailure(.stream, @errorName(err));
+                    return;
                 };
-                defer result.deinit(worker.allocator());
-                switch (result) {
-                    .completed => |message| {
-                        worker.commandCompleted(message) catch {
-                            worker.closeFailure(
-                                .stream,
-                                "Unable to report slash command completion.",
-                            );
-                            return;
-                        };
-                    },
-                    .agent_prompt => |prompt| {
-                        sendPrompt(session, prompt, .immediate) catch |err| {
+                defer worker.allocator().free(command_input);
+                command_execution: while (true) {
+                    var result = executeSdkCommand(
+                        worker.allocator(),
+                        &client,
+                        session,
+                        command_input,
+                    ) catch |err| {
+                        worker.commandCompleted(@errorName(err)) catch {
                             worker.closeFailure(.stream, @errorName(err));
                             return;
                         };
-                        worker.assistantStarted() catch {
-                            worker.closeFailure(
-                                .stream,
-                                "Unable to start the command response.",
-                            );
-                            return;
-                        };
-                        switch (streamSessionResponse(
-                            worker,
-                            &client,
-                            session,
-                            &tool_service,
-                        )) {
-                            .idle => {},
-                            .stopped => {
-                                session_connected = false;
+                        break :command_execution;
+                    };
+                    defer result.deinit(worker.allocator());
+                    switch (result) {
+                        .completed => |message| {
+                            worker.commandCompleted(message) catch {
+                                worker.closeFailure(
+                                    .stream,
+                                    "Unable to report slash command completion.",
+                                );
                                 return;
-                            },
-                            .failed => return,
-                        }
-                    },
+                            };
+                            break :command_execution;
+                        },
+                        .agent_prompt => |prompt| {
+                            sendPrompt(session, prompt, .immediate) catch |err| {
+                                worker.closeFailure(.stream, @errorName(err));
+                                return;
+                            };
+                            worker.assistantStarted() catch {
+                                worker.closeFailure(
+                                    .stream,
+                                    "Unable to start the command response.",
+                                );
+                                return;
+                            };
+                            switch (streamSessionResponse(
+                                worker,
+                                &client,
+                                session,
+                                &tool_service,
+                            )) {
+                                .idle => {},
+                                .stopped => {
+                                    session_connected = false;
+                                    return;
+                                },
+                                .failed => return,
+                            }
+                            break :command_execution;
+                        },
+                        .select_subcommand => |selection| {
+                            const request = conversation.UserInputRequest.init(
+                                worker.allocator(),
+                                session.id,
+                                selection.title,
+                                selection.options,
+                                false,
+                            ) catch |err| {
+                                worker.closeFailure(.stream, @errorName(err));
+                                return;
+                            };
+                            worker.userInputRequested(request) catch |err| {
+                                worker.closeFailure(.stream, @errorName(err));
+                                return;
+                            };
+                            var response = worker.waitUserInputResponse();
+                            defer response.deinit();
+                            switch (response) {
+                                .stop => {
+                                    session.disconnect() catch |err| {
+                                        worker.closeFailure(
+                                            .stream,
+                                            @errorName(err),
+                                        );
+                                        return;
+                                    };
+                                    session_connected = false;
+                                    worker.closeRequested();
+                                    return;
+                                },
+                                .user_input_response => |answer| {
+                                    if (!std.mem.eql(
+                                        u8,
+                                        answer.request_id.bytes,
+                                        session.id,
+                                    )) {
+                                        worker.closeFailure(
+                                            .stream,
+                                            "Subcommand response ID mismatch.",
+                                        );
+                                        return;
+                                    }
+                                    const next_input = selectedSubcommandInput(
+                                        worker.allocator(),
+                                        selection,
+                                        answer.answer.bytes,
+                                    ) catch |err| {
+                                        worker.commandCompleted(
+                                            @errorName(err),
+                                        ) catch {
+                                            worker.closeFailure(
+                                                .stream,
+                                                @errorName(err),
+                                            );
+                                            return;
+                                        };
+                                        break :command_execution;
+                                    };
+                                    worker.allocator().free(command_input);
+                                    command_input = next_input;
+                                    continue :command_execution;
+                                },
+                                .prompt,
+                                .refresh_commands,
+                                .refresh_models,
+                                .switch_model,
+                                .execute_command,
+                                => unreachable,
+                            }
+                        },
+                    }
                 }
             },
             .user_input_response => {
@@ -1825,7 +1995,7 @@ const FakeCommandClient = struct {
     }
 };
 
-test "slash command invocation handles completion and agent prompts" {
+test "slash command invocation handles all interactive result kinds" {
     const session = .{ .id = "session-1" };
     var completed_client = FakeCommandClient{
         .allocator = std.testing.allocator,
@@ -1848,6 +2018,7 @@ test "slash command invocation handles completion and agent prompts" {
             message,
         ),
         .agent_prompt => return error.UnexpectedAgentPrompt,
+        .select_subcommand => return error.UnexpectedSubcommandSelection,
     }
 
     var prompt_client = FakeCommandClient{
@@ -1871,6 +2042,42 @@ test "slash command invocation handles completion and agent prompts" {
             "Continue in autopilot mode",
             text,
         ),
+        .select_subcommand => return error.UnexpectedSubcommandSelection,
+    }
+
+    var select_client = FakeCommandClient{
+        .allocator = std.testing.allocator,
+        .response_json =
+        \\{"kind":"select-subcommand","command":"chronicle","title":"Chronicle","options":[{"name":"list","description":"List entries"},{"name":"show","description":"Show an entry"}]}
+        ,
+        .expected_name = "chronicle",
+        .expected_input = "",
+    };
+    var selected = try executeSdkCommand(
+        std.testing.allocator,
+        &select_client,
+        session,
+        "/chronicle",
+    );
+    defer selected.deinit(std.testing.allocator);
+    switch (selected) {
+        .completed => return error.UnexpectedCompletedCommand,
+        .agent_prompt => return error.UnexpectedAgentPrompt,
+        .select_subcommand => |selection| {
+            try std.testing.expectEqualStrings(
+                "chronicle",
+                selection.command,
+            );
+            try std.testing.expectEqualStrings("Chronicle", selection.title);
+            try std.testing.expectEqual(@as(usize, 2), selection.options.len);
+            const next_input = try selectedSubcommandInput(
+                std.testing.allocator,
+                selection,
+                "show",
+            );
+            defer std.testing.allocator.free(next_input);
+            try std.testing.expectEqualStrings("chronicle show", next_input);
+        },
     }
 }
 
