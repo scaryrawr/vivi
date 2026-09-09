@@ -58,6 +58,7 @@ Use the executable helper:
 .github/skills/verify-vivi/bin/verify-vivi cli-discovery <run-id>
 .github/skills/verify-vivi/bin/verify-vivi chat-streaming <run-id>
 .github/skills/verify-vivi/bin/verify-vivi chat-streaming-input <run-id>
+.github/skills/verify-vivi/bin/verify-vivi chat-ask-user <run-id>
 .github/skills/verify-vivi/bin/verify-vivi chat-shutdown <run-id>
 .github/skills/verify-vivi/bin/verify-vivi frame-check <run-id> chat-streaming
 ```
@@ -166,9 +167,11 @@ executable and accepts:
 doctor
 cli-discovery <run-id>
 chat-streaming <run-id>
+chat-streaming-input <run-id>
+chat-ask-user <run-id>
 chat-shutdown <run-id>
-extract-frames <run-id> <chat-streaming|chat-shutdown>
-frame-check <run-id> <chat-streaming|chat-shutdown>
+extract-frames <run-id> <chat-streaming|chat-streaming-input|chat-ask-user|chat-model-menu|chat-shutdown>
+frame-check <run-id> <chat-streaming|chat-streaming-input|chat-ask-user|chat-model-menu|chat-shutdown>
 cleanup <run-id>
 ```
 

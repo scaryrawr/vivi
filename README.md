@@ -33,10 +33,13 @@ zig build install-c-api
 
 `vivi chat` opens a full-screen Vivi chat with a scrolling transcript,
 workspace context, and a compact bottom composer. It streams responses as they
-arrive and restores the composer after each completed turn. Vivi disables
-Copilot's built-in tools, built-in MCP servers, custom instructions, and
-ask-user capability, then supplies a small replacement system prompt and four
-Vivi-owned tools: `read`, `bash`, `edit`, and `write`. Tool output is returned
+arrive and restores the composer after each completed turn. Vivi enables
+Copilot's session-isolated built-in tools for planning and subagent
+coordination while keeping built-in MCP servers and custom instructions
+disabled. The SDK supplies `ask_user`, while Vivi supplies `read`, `bash`,
+`edit`, and `write`; the terminal presents questions in a separate decision
+panel with arrow-key choice selection. Typed choice numbers, exact choice text,
+and free-form input when allowed remain supported. Tool output is returned
 whole; Copilot owns any large-result handling.
 
 `vivi models` lists the authenticated Copilot model catalog alongside OMLX
@@ -59,8 +62,9 @@ late-registering extensions can appear without restarting Vivi. Select
 and discovered OMLX models. Selecting the active model is a no-op. A successful switch keeps the
 visible Vivi transcript but starts a fresh server-side session, so prior turns
 are not part of the replacement model's context. Vivi currently executes
-`/model`; other SDK-contributed commands are discoverable in the menu but
-report that they are not supported yet.
+`/model` with Vivi's model picker. Compatible SDK-contributed commands,
+including session-mode commands such as `/autopilot`, execute through
+Copilot's command API.
 
 Use Page Up and Page Down to inspect the transcript. Press Ctrl-C to stop. If
 Copilot is blocked and cannot reach an SDK event boundary, press Ctrl-C again

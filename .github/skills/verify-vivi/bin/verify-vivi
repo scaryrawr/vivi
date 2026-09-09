@@ -12,10 +12,11 @@ Usage:
   verify-vivi cli-discovery <run-id>
   verify-vivi chat-streaming <run-id>
   verify-vivi chat-streaming-input <run-id>
+  verify-vivi chat-ask-user <run-id>
   verify-vivi chat-model-menu <run-id>
   verify-vivi chat-shutdown <run-id>
-  verify-vivi extract-frames <run-id> <chat-streaming|chat-streaming-input|chat-model-menu|chat-shutdown>
-  verify-vivi frame-check <run-id> <chat-streaming|chat-streaming-input|chat-model-menu|chat-shutdown>
+  verify-vivi extract-frames <run-id> <chat-streaming|chat-streaming-input|chat-ask-user|chat-model-menu|chat-shutdown>
+  verify-vivi frame-check <run-id> <chat-streaming|chat-streaming-input|chat-ask-user|chat-model-menu|chat-shutdown>
   verify-vivi cleanup <run-id>
 EOF
 }
@@ -116,9 +117,9 @@ cli_discovery() {
 
 validate_capture_name() {
     case "$1" in
-        chat-streaming|chat-streaming-input|chat-model-menu|chat-shutdown) ;;
+        chat-streaming|chat-streaming-input|chat-ask-user|chat-model-menu|chat-shutdown) ;;
         *)
-            printf 'capture must be chat-streaming, chat-streaming-input, chat-model-menu, or chat-shutdown\n' >&2
+            printf 'capture must be chat-streaming, chat-streaming-input, chat-ask-user, chat-model-menu, or chat-shutdown\n' >&2
             exit 1
             ;;
     esac
@@ -413,6 +414,114 @@ chat_streaming_input() {
     test -s "$run_dir/chat-streaming-input.contact-sheet.png"
 }
 
+write_ask_user_tape() {
+    run_dir=$1
+    cat >"$run_dir/chat-ask-user.tape" <<EOF
+Output "$run_dir/chat-ask-user.gif"
+Require copilot
+Set Shell "bash"
+Set Width 1200
+Set Height 720
+Set FontSize 22
+Set TypingSpeed 10ms
+
+Type "./zig-out/bin/vivi chat --model copilot/default"
+Enter
+Sleep 10s
+Type "Use ask_user to ask exactly Pick one with choices Alpha and Beta and no freeform. After I answer, reply exactly ANSWER followed by the answer."
+Enter
+Sleep 25s
+Down
+Sleep 2s
+Enter
+Sleep 25s
+Ctrl+C
+Sleep 3s
+Ctrl+C
+Sleep 1s
+EOF
+}
+
+chat_ask_user() {
+    run_dir=$(prepare_run "$1")
+    build_vivi
+    write_ask_user_tape "$run_dir"
+
+    (cd "$repo_root" && VIVI_KEEP_GIF=1 vhs "$run_dir/chat-ask-user.tape")
+    VIVI_KEEP_GIF=1 extract_frames "$1" chat-ask-user
+
+    (
+        sleep 10
+        printf 'Use ask_user to ask exactly Pick one with choices Alpha and Beta and no freeform. After I answer, reply exactly ANSWER followed by the answer.\r'
+        sleep 25
+        printf '\033[B'
+        sleep 2
+        printf '\r'
+        sleep 25
+        printf '\003'
+        sleep 3
+        printf '\003'
+    ) | script -q "$run_dir/chat-ask-user.terminal.log" sh -c \
+        "stty cols 100 rows 30; '$binary' chat --model copilot/default" &
+    pty_pid=$!
+    printf '%s\n' "$pty_pid" >"$run_dir/pty.pid"
+    trap 'kill "$pty_pid" 2>/dev/null || true; wait "$pty_pid" 2>/dev/null || true' EXIT INT TERM
+
+    if wait "$pty_pid"; then
+        status=0
+    else
+        status=$?
+    fi
+    rm -f "$run_dir/pty.pid"
+    trap - EXIT INT TERM
+
+    perl -0pe \
+        's/\e\[[0-?]*[ -\/]*[@-~]//g; s/\e\][^\a]*(?:\a|\e\\)//g' \
+        "$run_dir/chat-ask-user.terminal.log" |
+        tr -d '\r\b' >"$run_dir/chat-ask-user.normalized.txt"
+
+    {
+        printf 'exit=%s\n' "$status"
+        printf 'question_seen='
+        if grep -q 'Pick one' "$run_dir/chat-ask-user.normalized.txt"; then
+            printf 'yes\n'
+        else
+            printf 'no\n'
+        fi
+        printf 'choices_seen='
+        if grep -q 'Alpha' "$run_dir/chat-ask-user.normalized.txt" &&
+            grep -q 'Beta' "$run_dir/chat-ask-user.normalized.txt"
+        then
+            printf 'yes\n'
+        else
+            printf 'no\n'
+        fi
+        printf 'question_panel_seen='
+        if grep -q 'Answer required' "$run_dir/chat-ask-user.normalized.txt"; then
+            printf 'yes\n'
+        else
+            printf 'no\n'
+        fi
+        printf 'answer_seen='
+        if grep -Eq 'Vivi[[:space:]]*ANSWER[[:space:]]*Beta' \
+            "$run_dir/chat-ask-user.normalized.txt"
+        then
+            printf 'yes\n'
+        else
+            printf 'no\n'
+        fi
+    } >"$run_dir/chat-ask-user.assertions.txt"
+
+    test "$status" -eq 0
+    grep -q 'Pick one' "$run_dir/chat-ask-user.normalized.txt"
+    grep -q 'Alpha' "$run_dir/chat-ask-user.normalized.txt"
+    grep -q 'Beta' "$run_dir/chat-ask-user.normalized.txt"
+    grep -q 'Answer required' "$run_dir/chat-ask-user.normalized.txt"
+    grep -Eq 'Vivi[[:space:]]*ANSWER[[:space:]]*Beta' \
+        "$run_dir/chat-ask-user.normalized.txt"
+    test -s "$run_dir/chat-ask-user.contact-sheet.png"
+}
+
 write_model_menu_tape() {
     run_dir=$1
     startup_wait=${VIVI_MODEL_MENU_STARTUP_WAIT:-60s}
@@ -600,6 +709,13 @@ case "${1:-}" in
             exit 2
         }
         chat_streaming_input "$2"
+        ;;
+    chat-ask-user)
+        test "$#" -eq 2 || {
+            usage >&2
+            exit 2
+        }
+        chat_ask_user "$2"
         ;;
     chat-model-menu)
         test "$#" -eq 2 || {
