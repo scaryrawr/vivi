@@ -383,7 +383,7 @@ fn executeSdkCommand(
         .{
             .sessionId = session.id,
             .name = name,
-            .args = args,
+            .input = args,
         },
     );
     defer result.deinit();

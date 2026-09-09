@@ -625,6 +625,7 @@ const ChatUi = struct {
     commands: ?backend.CommandCatalog = null,
     models: ?backend.ModelCatalog = null,
     pending_user_input: ?backend.UserInputRequest = null,
+    saved_input: ?TextInput = null,
     selected_user_input_choice: usize = 0,
     invalid_user_input: bool = false,
     menu_mode: MenuMode = .closed,
@@ -662,6 +663,7 @@ const ChatUi = struct {
 
     fn deinit(self: *ChatUi) void {
         self.menu.deinit(self.allocator);
+        if (self.saved_input) |*input| input.deinit();
         if (self.pending_user_input) |*request| request.deinit();
         if (self.models) |*catalog| catalog.deinit();
         if (self.commands) |*catalog| catalog.deinit();
@@ -870,7 +872,7 @@ const ChatUi = struct {
         };
         try self.appendUserInputQuestion(request);
         try self.transcript.append(self.allocator, .user, answer);
-        self.input.clearRetainingCapacity();
+        self.restoreInputAfterUserInput();
         var completed = self.pending_user_input.?;
         completed.deinit();
         self.pending_user_input = null;
@@ -917,6 +919,25 @@ const ChatUi = struct {
             .next => (self.selected_user_input_choice + 1) % option_count,
         };
         self.invalid_user_input = false;
+    }
+
+    fn prepareInputForUserQuestion(self: *ChatUi) void {
+        if (self.saved_input != null) {
+            self.input.clearRetainingCapacity();
+            return;
+        }
+        self.saved_input = self.input;
+        self.input = TextInput.init(self.allocator);
+    }
+
+    fn restoreInputAfterUserInput(self: *ChatUi) void {
+        self.input.deinit();
+        if (self.saved_input) |saved| {
+            self.input = saved;
+            self.saved_input = null;
+        } else {
+            self.input = TextInput.init(self.allocator);
+        }
     }
 
     fn syncSlashMenu(self: *ChatUi) !void {
@@ -1152,7 +1173,7 @@ const ChatUi = struct {
                 self.selected_user_input_choice = 0;
                 self.invalid_user_input = false;
                 self.menu_mode = .closed;
-                self.input.clearRetainingCapacity();
+                self.prepareInputForUserQuestion();
                 self.phase = .awaiting_input;
                 self.followTail();
             },
@@ -2127,6 +2148,29 @@ test "frame layout keeps chrome in bounds" {
             );
         }
     }
+}
+
+test "ask-user input preserves the existing composer draft" {
+    var ui: ChatUi = .{
+        .allocator = std.testing.allocator,
+        .input = TextInput.init(std.testing.allocator),
+        .cwd = try std.testing.allocator.dupe(u8, "."),
+    };
+    defer ui.deinit();
+
+    try ui.input.insertSliceAtCursor("unfinished draft");
+    ui.prepareInputForUserQuestion();
+
+    const answer_input = try ui.input.toOwnedContents(std.testing.allocator);
+    defer std.testing.allocator.free(answer_input);
+    try std.testing.expectEqualStrings("", answer_input);
+
+    try ui.input.insertSliceAtCursor("Beta");
+    ui.restoreInputAfterUserInput();
+
+    const restored = try ui.input.toOwnedContents(std.testing.allocator);
+    defer std.testing.allocator.free(restored);
+    try std.testing.expectEqualStrings("unfinished draft", restored);
 }
 
 test "menu ranks prefixes and preserves deterministic navigation" {

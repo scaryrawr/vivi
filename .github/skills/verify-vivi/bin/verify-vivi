@@ -427,14 +427,14 @@ Set TypingSpeed 10ms
 
 Type "./zig-out/bin/vivi chat --model copilot/default"
 Enter
-Sleep 5s
+Sleep 10s
 Type "Use ask_user to ask exactly Pick one with choices Alpha and Beta and no freeform. After I answer, reply exactly ANSWER followed by the answer."
 Enter
-Sleep 15s
+Sleep 25s
 Down
 Sleep 2s
 Enter
-Sleep 15s
+Sleep 25s
 Ctrl+C
 Sleep 3s
 Ctrl+C
@@ -451,13 +451,13 @@ chat_ask_user() {
     VIVI_KEEP_GIF=1 extract_frames "$1" chat-ask-user
 
     (
-        sleep 5
+        sleep 10
         printf 'Use ask_user to ask exactly Pick one with choices Alpha and Beta and no freeform. After I answer, reply exactly ANSWER followed by the answer.\r'
-        sleep 15
+        sleep 25
         printf '\033[B'
         sleep 2
         printf '\r'
-        sleep 15
+        sleep 25
         printf '\003'
         sleep 3
         printf '\003'
@@ -496,6 +496,12 @@ chat_ask_user() {
         else
             printf 'no\n'
         fi
+        printf 'question_panel_seen='
+        if grep -q 'Answer required' "$run_dir/chat-ask-user.normalized.txt"; then
+            printf 'yes\n'
+        else
+            printf 'no\n'
+        fi
         printf 'answer_seen='
         if grep -q 'ANSWER.*Beta' "$run_dir/chat-ask-user.normalized.txt"; then
             printf 'yes\n'
@@ -508,6 +514,7 @@ chat_ask_user() {
     grep -q 'Pick one' "$run_dir/chat-ask-user.normalized.txt"
     grep -q 'Alpha' "$run_dir/chat-ask-user.normalized.txt"
     grep -q 'Beta' "$run_dir/chat-ask-user.normalized.txt"
+    grep -q 'Answer required' "$run_dir/chat-ask-user.normalized.txt"
     grep -q 'ANSWER.*Beta' "$run_dir/chat-ask-user.normalized.txt"
     test -s "$run_dir/chat-ask-user.contact-sheet.png"
 }

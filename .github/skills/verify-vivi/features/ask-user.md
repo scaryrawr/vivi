@@ -1,17 +1,18 @@
 # Ask-user prompt
 
-Vivi presents Copilot's interactive question as a distinct transcript entry,
-keeps numbered choices readable, accepts a one-based numeric answer, and
-continues the same streamed response with the selected choice.
+Vivi presents Copilot's interactive question in a dedicated decision panel,
+supports arrow-key selection, and continues the same streamed response with
+the selected choice. After submission, the question and answer are added to
+the transcript.
 
 ## Sub-features
 
-- A question has its own `Question` transcript label.
-- Numbered choices are indented without status bullets.
+- A pending question is visually separate from the chat transcript.
+- The selected choice is highlighted and moves with the arrow keys.
 - The composer remains active while the context state says `Answer required`.
-- The footer tells the user that either a number or choice text is accepted.
-- A numeric answer is resolved to the corresponding choice before Copilot
-  continues.
+- The footer advertises arrow-key selection and Enter-to-accept.
+- Numeric answers and exact choice text remain accepted without adding noise
+  to the footer.
 
 ## How to get to it (user POV)
 
