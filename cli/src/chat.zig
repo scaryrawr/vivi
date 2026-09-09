@@ -1296,6 +1296,10 @@ const ChatUi = struct {
                 }
             },
             .session_catalog => |catalog| {
+                if (self.phase == .stopping) {
+                    self.menu_mode = .closed;
+                    return .keep_running;
+                }
                 const replacement = try catalog.clone(self.allocator);
                 if (self.sessions) |*current| current.deinit();
                 self.sessions = replacement;
@@ -1313,7 +1317,7 @@ const ChatUi = struct {
                 }
             },
             .session_resume => |result| {
-                self.phase = .ready;
+                if (self.phase == .resuming) self.phase = .ready;
                 self.menu_mode = .closed;
                 switch (result) {
                     .resumed => |success| {
@@ -2757,6 +2761,67 @@ test "session catalog completion restores ready after finder dismissal" {
         try ui.applyConversationEvent(&event),
     );
     try std.testing.expectEqual(UiPhase.ready, ui.phase);
+    try std.testing.expectEqual(MenuMode.closed, ui.menu_mode);
+}
+
+test "late session catalog preserves stopping phase" {
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    var ui = try ChatUi.init(
+        std.testing.allocator,
+        std.testing.io,
+        &environment,
+    );
+    defer ui.deinit();
+    ui.phase = .stopping;
+    ui.menu_mode = .loading_sessions;
+
+    var event: backend.ConversationEvent = .{
+        .session_catalog = .{
+            .allocator = std.testing.allocator,
+            .sessions = try std.testing.allocator.alloc(
+                backend.SessionSummary,
+                0,
+            ),
+            .skipped_invalid_shards = false,
+        },
+    };
+    defer event.deinit();
+    try std.testing.expectEqual(
+        ConversationOutcome.keep_running,
+        try ui.applyConversationEvent(&event),
+    );
+    try std.testing.expectEqual(UiPhase.stopping, ui.phase);
+    try std.testing.expectEqual(MenuMode.closed, ui.menu_mode);
+    try std.testing.expect(ui.sessions == null);
+}
+
+test "late session resume preserves stopping phase" {
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    var ui = try ChatUi.init(
+        std.testing.allocator,
+        std.testing.io,
+        &environment,
+    );
+    defer ui.deinit();
+    ui.phase = .stopping;
+    ui.menu_mode = .sessions;
+
+    var event: backend.ConversationEvent = .{
+        .session_resume = .{
+            .failed = try backend.OwnedText.init(
+                std.testing.allocator,
+                "resume failed",
+            ),
+        },
+    };
+    defer event.deinit();
+    try std.testing.expectEqual(
+        ConversationOutcome.keep_running,
+        try ui.applyConversationEvent(&event),
+    );
+    try std.testing.expectEqual(UiPhase.stopping, ui.phase);
     try std.testing.expectEqual(MenuMode.closed, ui.menu_mode);
 }
 
