@@ -18,7 +18,7 @@ the transcript.
 
 1. Run `vivi chat`.
 2. Ask Vivi to use `ask_user` with two or more choices.
-3. Wait for the `Question` entry and `Answer required` state.
+3. Wait for the dedicated `Answer required` panel.
 4. Select a choice with the arrow keys and press Enter.
 5. Confirm the chosen text appears as the user's answer and the response
    continues.

@@ -43,6 +43,38 @@ fn commandArgumentSuffix(input: []const u8) []const u8 {
     return if (separator) |index| input[index..] else "";
 }
 
+fn buildCommandInput(
+    allocator: std.mem.Allocator,
+    command_name: []const u8,
+    composer_input: []const u8,
+) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}{s}",
+        .{ command_name, commandArgumentSuffix(composer_input) },
+    );
+}
+
+fn visibleSelectionRange(
+    item_count: usize,
+    row_count: usize,
+    selected: usize,
+) struct { first: usize, last: usize } {
+    if (item_count == 0 or row_count == 0) {
+        return .{ .first = 0, .last = 0 };
+    }
+    const visible_count = @min(item_count, row_count);
+    const bounded_selected = @min(selected, item_count - 1);
+    const first = if (bounded_selected < visible_count)
+        0
+    else
+        bounded_selected - visible_count + 1;
+    return .{
+        .first = first,
+        .last = @min(first + visible_count, item_count),
+    };
+}
+
 const Entry = struct {
     role: Role,
     text: std.ArrayList(u8) = .empty,
@@ -1026,10 +1058,10 @@ const ChatUi = struct {
                         self.allocator,
                     );
                     defer self.allocator.free(contents);
-                    const command_input = try std.fmt.allocPrint(
+                    const command_input = try buildCommandInput(
                         self.allocator,
-                        "{s}{s}",
-                        .{ command.name, commandArgumentSuffix(contents) },
+                        command.name,
+                        contents,
                     );
                     defer self.allocator.free(command_input);
                     conversation.executeCommand(command_input) catch |err| switch (err) {
@@ -1353,52 +1385,74 @@ const ChatUi = struct {
         const request = self.pending_user_input orelse return;
         if (window.height == 0 or window.width == 0) return;
 
-        var title = [_]vaxis.Segment{.{
-            .text = "Vivi needs information.",
-            .style = .{ .bold = true },
-        }};
-        _ = window.print(&title, .{
-            .row_offset = 0,
-            .col_offset = 1,
-            .wrap = .none,
-        });
-        if (window.height < 2) return;
+        const option_count = self.userInputOptionCount();
+        const error_rows: u16 = @intFromBool(
+            self.invalid_user_input and window.height > 2,
+        );
+        const content_height = window.height -| error_rows;
+        const title_rows: u16 = @intFromBool(
+            option_count == 0 or content_height >= 2,
+        );
+        if (title_rows > 0) {
+            var title = [_]vaxis.Segment{.{
+                .text = "Vivi needs information.",
+                .style = .{ .bold = true },
+            }};
+            _ = window.print(&title, .{
+                .row_offset = 0,
+                .col_offset = 1,
+                .wrap = .none,
+            });
+        }
 
-        const question_rows = self.userInputQuestionRows(window);
+        const max_question_rows = if (option_count > 0)
+            content_height -| title_rows -| 1
+        else
+            content_height -| title_rows;
+        const question_rows = @min(
+            self.userInputQuestionRows(window),
+            max_question_rows,
+        );
         const question_inset: u16 = @intFromBool(window.width > 2);
-        const question_window = window.child(.{
-            .x_off = @intCast(question_inset),
-            .y_off = 1,
-            .width = window.width -| question_inset * 2,
-            .height = @min(question_rows, window.height -| 1),
-        });
-        var question = [_]vaxis.Segment{.{
-            .text = request.question,
-            .style = .{ .dim = true },
-        }};
-        _ = question_window.print(&question, .{
-            .wrap = .grapheme,
-        });
+        if (question_rows > 0) {
+            const question_window = window.child(.{
+                .x_off = @intCast(question_inset),
+                .y_off = @intCast(title_rows),
+                .width = window.width -| question_inset * 2,
+                .height = question_rows,
+            });
+            var question = [_]vaxis.Segment{.{
+                .text = request.question,
+                .style = .{ .dim = true },
+            }};
+            _ = question_window.print(&question, .{
+                .wrap = .grapheme,
+            });
+        }
 
-        const choice_row = 2 + question_rows;
-        for (request.choices, 0..) |choice, index| {
-            const row = choice_row + @as(u16, @intCast(index));
-            if (row >= window.height) break;
-            self.drawQuestionChoice(window, row, index, choice);
+        const room_for_gap =
+            content_height > title_rows + question_rows + 1;
+        const choice_row = title_rows + question_rows +
+            @as(u16, @intFromBool(room_for_gap));
+        const choice_rows = content_height -| choice_row;
+        const range = visibleSelectionRange(
+            option_count,
+            choice_rows,
+            self.selected_user_input_choice,
+        );
+        for (range.first..range.last, 0..) |index, visible_index| {
+            const choice = if (index < request.choices.len)
+                request.choices[index]
+            else
+                "Other (type your answer)";
+            self.drawQuestionChoice(
+                window,
+                choice_row + @as(u16, @intCast(visible_index)),
+                index,
+                choice,
+            );
         }
-        if (request.allow_freeform) {
-            const index = request.choices.len;
-            const row = choice_row + @as(u16, @intCast(index));
-            if (row < window.height) {
-                self.drawQuestionChoice(
-                    window,
-                    row,
-                    index,
-                    "Other (type your answer)",
-                );
-            }
-        }
-        if (self.invalid_user_input and window.height > 0) {
+        if (error_rows > 0) {
             var error_message = [_]vaxis.Segment{.{
                 .text = "Choose one of the listed answers.",
                 .style = .{ .fg = assistant_color, .bold = true },
@@ -2248,6 +2302,13 @@ test "slash command parsing preserves argument suffixes" {
         " thorough",
         commandArgumentSuffix("/autopilot thorough"),
     );
+    const command_input = try buildCommandInput(
+        std.testing.allocator,
+        "autopilot",
+        "/auto thorough",
+    );
+    defer std.testing.allocator.free(command_input);
+    try std.testing.expectEqualStrings("autopilot thorough", command_input);
     try std.testing.expectEqualStrings("", slashCommandQuery("/").?);
     try std.testing.expect(slashCommandQuery("not-a-command") == null);
 }
@@ -2309,6 +2370,20 @@ test "ask-user panel reserves rows for wrapped questions" {
         @as(u16, 5),
         ui.userInputPanelRows(window),
     );
+}
+
+test "ask-user choice range keeps the selection visible" {
+    const first = visibleSelectionRange(8, 3, 0);
+    try std.testing.expectEqual(@as(usize, 0), first.first);
+    try std.testing.expectEqual(@as(usize, 3), first.last);
+
+    const middle = visibleSelectionRange(8, 3, 4);
+    try std.testing.expectEqual(@as(usize, 2), middle.first);
+    try std.testing.expectEqual(@as(usize, 5), middle.last);
+
+    const last = visibleSelectionRange(8, 3, 7);
+    try std.testing.expectEqual(@as(usize, 5), last.first);
+    try std.testing.expectEqual(@as(usize, 8), last.last);
 }
 
 test "menu ranks prefixes and preserves deterministic navigation" {

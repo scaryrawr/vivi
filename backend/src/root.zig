@@ -354,8 +354,8 @@ const InvokedCommand = union(enum) {
 
 fn executeSdkCommand(
     allocator: std.mem.Allocator,
-    client: *copilot.Client,
-    session: copilot.Session,
+    client: anytype,
+    session: anytype,
     input: []const u8,
 ) !InvokedCommand {
     const trimmed = std.mem.trim(u8, input, " \t\r\n");
@@ -1795,6 +1795,83 @@ test "minimal coding agent replaces the system prompt with Vivi tools" {
         "minimal system prompt",
         config.system_message.?.content,
     );
+}
+
+const FakeCommandClient = struct {
+    allocator: std.mem.Allocator,
+    response_json: []const u8,
+    expected_name: []const u8,
+    expected_input: []const u8,
+
+    fn callRpc(
+        self: *FakeCommandClient,
+        comptime Result: type,
+        method: []const u8,
+        params: anytype,
+    ) !std.json.Parsed(Result) {
+        try std.testing.expectEqualStrings(
+            "session.commands.invoke",
+            method,
+        );
+        try std.testing.expectEqualStrings("session-1", params.sessionId);
+        try std.testing.expectEqualStrings(self.expected_name, params.name);
+        try std.testing.expectEqualStrings(self.expected_input, params.input);
+        return std.json.parseFromSlice(
+            Result,
+            self.allocator,
+            self.response_json,
+            .{ .ignore_unknown_fields = true },
+        );
+    }
+};
+
+test "slash command invocation handles completion and agent prompts" {
+    const session = .{ .id = "session-1" };
+    var completed_client = FakeCommandClient{
+        .allocator = std.testing.allocator,
+        .response_json =
+        \\{"kind":"completed","message":"Autopilot enabled"}
+        ,
+        .expected_name = "autopilot",
+        .expected_input = "thorough",
+    };
+    var completed = try executeSdkCommand(
+        std.testing.allocator,
+        &completed_client,
+        session,
+        "/autopilot thorough",
+    );
+    defer completed.deinit(std.testing.allocator);
+    switch (completed) {
+        .completed => |message| try std.testing.expectEqualStrings(
+            "Autopilot enabled",
+            message,
+        ),
+        .agent_prompt => return error.UnexpectedAgentPrompt,
+    }
+
+    var prompt_client = FakeCommandClient{
+        .allocator = std.testing.allocator,
+        .response_json =
+        \\{"kind":"agent-prompt","prompt":"Continue in autopilot mode"}
+        ,
+        .expected_name = "autopilot",
+        .expected_input = "thorough",
+    };
+    var prompt = try executeSdkCommand(
+        std.testing.allocator,
+        &prompt_client,
+        session,
+        "/autopilot thorough",
+    );
+    defer prompt.deinit(std.testing.allocator);
+    switch (prompt) {
+        .completed => return error.UnexpectedCompletedCommand,
+        .agent_prompt => |text| try std.testing.expectEqualStrings(
+            "Continue in autopilot mode",
+            text,
+        ),
+    }
 }
 
 test "OMLX model configuration carries detected token limits" {
