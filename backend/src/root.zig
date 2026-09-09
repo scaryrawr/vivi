@@ -1007,15 +1007,14 @@ fn buildFallbackCommandCatalog(
     errdefer allocator.free(commands);
     commands[0] = .{
         .name = try allocator.dupe(u8, "model"),
-        .description = try allocator.dupe(
-            u8,
-            "Switch the model for new turns",
-        ),
+        .description = undefined,
     };
-    errdefer {
-        allocator.free(commands[0].name);
-        allocator.free(commands[0].description);
-    }
+    errdefer allocator.free(commands[0].name);
+    commands[0].description = try allocator.dupe(
+        u8,
+        "Switch the model for new turns",
+    );
+    errdefer allocator.free(commands[0].description);
     commands[1] = .{
         .name = try allocator.dupe(u8, "resume"),
         .description = undefined,

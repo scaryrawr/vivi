@@ -5,6 +5,7 @@ pub const max_records_per_shard: usize = 200;
 const max_shard_bytes: usize = 1024 * 1024;
 const writer_id_bytes: usize = 16;
 const writer_id_hex_len: usize = writer_id_bytes * 2;
+const lock_filename = ".lock";
 
 pub const Record = struct {
     allocator: std.mem.Allocator,
@@ -93,6 +94,7 @@ pub const Store = struct {
     directory: []u8,
     writer_id: [writer_id_hex_len]u8,
     shard_path: []u8,
+    lock_path: []u8,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -124,21 +126,29 @@ pub const Store = struct {
             .{writer_id},
         );
         defer allocator.free(filename);
+        const shard_path = try std.fs.path.join(
+            allocator,
+            &.{ directory, filename },
+        );
+        errdefer allocator.free(shard_path);
+        const lock_path = try std.fs.path.join(
+            allocator,
+            &.{ directory, lock_filename },
+        );
         return .{
             .allocator = allocator,
             .io = io,
             .directory = owned_directory,
             .writer_id = writer_id,
-            .shard_path = try std.fs.path.join(
-                allocator,
-                &.{ directory, filename },
-            ),
+            .shard_path = shard_path,
+            .lock_path = lock_path,
         };
     }
 
     pub fn deinit(self: *Store) void {
         self.allocator.free(self.directory);
         self.allocator.free(self.shard_path);
+        self.allocator.free(self.lock_path);
         self.* = undefined;
     }
 
@@ -173,6 +183,16 @@ pub const Store = struct {
     }
 
     pub fn list(self: *Store) !Index {
+        const lock = try self.acquireLock();
+        defer lock.close(self.io);
+
+        var index = try self.loadMerged();
+        errdefer index.deinit();
+        try self.compact(index.records);
+        return index;
+    }
+
+    fn loadMerged(self: *Store) !Index {
         var merged: std.ArrayList(Record) = .empty;
         errdefer {
             for (merged.items) |*record| record.deinit();
@@ -237,6 +257,7 @@ pub const Store = struct {
                 };
                 errdefer record.deinit();
                 try mergeRecord(self.allocator, &merged, record);
+                trimRecords(&merged);
             }
         }
 
@@ -253,77 +274,58 @@ pub const Store = struct {
     }
 
     fn upsert(self: *Store, record: *const Record) !void {
-        var records = try self.loadOwnRecords();
+        const lock = try self.acquireLock();
+        defer lock.close(self.io);
+
+        var index = try self.loadMerged();
+        defer index.deinit();
+        var replacement = try record.clone(self.allocator);
+        var replacement_moved = false;
+        errdefer if (!replacement_moved) replacement.deinit();
+        var records = std.ArrayList(Record).fromOwnedSlice(index.records);
+        index.records = &.{};
         defer {
             for (records.items) |*value| value.deinit();
             records.deinit(self.allocator);
         }
-
-        var replacement = try record.clone(self.allocator);
-        var replacement_moved = false;
-        errdefer if (!replacement_moved) replacement.deinit();
-        var replaced = false;
-        for (records.items) |*existing| {
-            if (!std.mem.eql(u8, existing.id, record.id)) continue;
-            existing.deinit();
-            existing.* = replacement;
-            replacement_moved = true;
-            replaced = true;
-            break;
-        }
-        if (!replaced) {
-            try records.append(self.allocator, replacement);
-            replacement_moved = true;
-        }
-
-        sortRecords(records.items);
-        while (records.items.len > max_records_per_shard) {
-            var removed = records.pop().?;
-            removed.deinit();
-        }
-        try self.save(records.items);
+        try mergeRecord(self.allocator, &records, replacement);
+        replacement_moved = true;
+        trimRecords(&records);
+        try self.compact(records.items);
     }
 
-    fn loadOwnRecords(self: *Store) !std.ArrayList(Record) {
-        var records: std.ArrayList(Record) = .empty;
-        errdefer {
-            for (records.items) |*record| record.deinit();
-            records.deinit(self.allocator);
-        }
-        const content = std.Io.Dir.cwd().readFileAlloc(
+    fn acquireLock(self: *Store) !std.Io.File {
+        try std.Io.Dir.cwd().createDirPath(self.io, self.directory);
+        return std.Io.Dir.createFileAbsolute(
             self.io,
-            self.shard_path,
-            self.allocator,
-            .limited(max_shard_bytes),
-        ) catch |err| switch (err) {
-            error.FileNotFound => return records,
-            else => return err,
-        };
-        defer self.allocator.free(content);
-        const parsed = try std.json.parseFromSlice(
-            Document,
-            self.allocator,
-            content,
-            .{ .ignore_unknown_fields = true },
+            self.lock_path,
+            .{ .truncate = false, .lock = .exclusive },
         );
-        defer parsed.deinit();
-        const filename = std.fs.path.basename(self.shard_path);
-        if (!validDocument(filename, parsed.value)) {
-            return error.InvalidSessionShard;
+    }
+
+    fn compact(self: *Store, records: []const Record) !void {
+        try self.save(records);
+
+        var directory = try std.Io.Dir.openDirAbsolute(
+            self.io,
+            self.directory,
+            .{ .iterate = true },
+        );
+        defer directory.close(self.io);
+        const own_filename = std.fs.path.basename(self.shard_path);
+        var iterator = directory.iterate();
+        while (try iterator.next(self.io)) |entry| {
+            if (entry.kind != .file or
+                !std.mem.endsWith(u8, entry.name, ".json") or
+                std.mem.eql(u8, entry.name, own_filename))
+            {
+                continue;
+            }
+            directory.deleteFile(self.io, entry.name) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => return err,
+            };
         }
-        for (parsed.value.sessions) |stored| {
-            try records.append(
-                self.allocator,
-                try Record.init(
-                    self.allocator,
-                    stored.id,
-                    stored.working_directory,
-                    stored.model_id,
-                    stored.last_used_unix_ms,
-                ),
-            );
-        }
-        return records;
     }
 
     fn save(self: *Store, records: []const Record) !void {
@@ -424,6 +426,14 @@ fn sortRecords(records: []Record) void {
     }.lessThan);
 }
 
+fn trimRecords(records: *std.ArrayList(Record)) void {
+    sortRecords(records.items);
+    while (records.items.len > max_records_per_shard) {
+        var removed = records.pop().?;
+        removed.deinit();
+    }
+}
+
 test "session store merges shards and keeps newest record" {
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
@@ -464,6 +474,23 @@ test "session store merges shards and keeps newest record" {
     try std.testing.expectEqual(@as(usize, 2), merged.records.len);
     try std.testing.expectEqualStrings("session-a", merged.records[0].id);
     try std.testing.expectEqual(@as(i64, 30), merged.records[0].last_used_unix_ms);
+
+    var sessions = try temporary.dir.openDir(
+        std.testing.io,
+        "sessions",
+        .{ .iterate = true },
+    );
+    defer sessions.close(std.testing.io);
+    var shard_count: usize = 0;
+    var iterator = sessions.iterate();
+    while (try iterator.next(std.testing.io)) |entry| {
+        if (entry.kind == .file and
+            std.mem.endsWith(u8, entry.name, ".json"))
+        {
+            shard_count += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), shard_count);
 }
 
 test "session store skips corrupt sibling shards" {
@@ -516,10 +543,28 @@ test "session store rejects mismatched writer identity" {
 }
 
 test "session store releases moved records when saving fails" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = "regular-file",
+        .data = "",
+    });
+    const regular_file = try temporary.dir.realPathFileAlloc(
+        std.testing.io,
+        "regular-file",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(regular_file);
+    const directory = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ regular_file, "sessions" },
+    );
+    defer std.testing.allocator.free(directory);
+
     var store = try Store.initWithWriterId(
         std.testing.allocator,
         std.testing.io,
-        "/dev/null/sessions",
+        directory,
         [_]u8{'c'} ** writer_id_hex_len,
     );
     defer store.deinit();

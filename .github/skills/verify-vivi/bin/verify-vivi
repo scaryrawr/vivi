@@ -713,6 +713,12 @@ chat_session_resume() {
         printf '\003'
         sleep 3
         printf '\003'
+        sleep 2
+    ) | HOME="$resume_home" \
+        script -q "$run_dir/chat-session-resume-first.terminal.log" sh -c \
+        "stty cols 100 rows 30; '$binary' chat --model copilot/default"
+
+    (
         sleep 10
         printf '/resume'
         sleep 10
@@ -727,8 +733,8 @@ chat_session_resume() {
         printf '\003'
         sleep 2
     ) | HOME="$resume_home" \
-        script -q "$run_dir/chat-session-resume.terminal.log" sh -c \
-        "stty cols 100 rows 30; '$binary' chat --model copilot/default; '$binary' chat --model copilot/default" &
+        script -q "$run_dir/chat-session-resume-second.terminal.log" sh -c \
+        "stty cols 100 rows 30; '$binary' chat --model copilot/default" &
     pty_pid=$!
     printf '%s\n' "$pty_pid" >"$run_dir/pty.pid"
     trap 'kill "$pty_pid" 2>/dev/null || true; wait "$pty_pid" 2>/dev/null || true' EXIT INT TERM
@@ -740,6 +746,9 @@ chat_session_resume() {
     fi
     rm -f "$run_dir/pty.pid"
     trap - EXIT INT TERM
+    cat "$run_dir/chat-session-resume-first.terminal.log" \
+        "$run_dir/chat-session-resume-second.terminal.log" \
+        >"$run_dir/chat-session-resume.terminal.log"
 
     perl -0pe \
         's/\e\[[0-?]*[ -\/]*[@-~]//g; s/\e\][^\a]*(?:\a|\e\\)//g' \
