@@ -1652,24 +1652,6 @@ fn runSdkConversation(
                     continue;
                 };
                 const now = unixMilliseconds(worker.io());
-                if (store) |*value| value.touch(target, now) catch |err| {
-                    candidate.disconnect() catch {};
-                    candidate_tools.deinit();
-                    target_plan.deinit(worker.allocator());
-                    worker.completeSessionResume(.{
-                        .failed = conversation.OwnedText.init(
-                            worker.allocator(),
-                            @errorName(err),
-                        ) catch {
-                            worker.closeFailure(.stream, @errorName(err));
-                            return;
-                        },
-                    }) catch {
-                        worker.closeFailure(.stream, @errorName(err));
-                        return;
-                    };
-                    continue;
-                };
                 const candidate_working_directory = worker.allocator().dupe(
                     u8,
                     target.working_directory,
@@ -1709,6 +1691,26 @@ fn runSdkConversation(
                     target_plan.deinit(worker.allocator());
                     worker.closeFailure(.stream, @errorName(err));
                     return;
+                };
+                if (store) |*value| value.touch(target, now) catch |err| {
+                    summary.deinit();
+                    worker.allocator().free(candidate_working_directory);
+                    candidate.disconnect() catch {};
+                    candidate_tools.deinit();
+                    target_plan.deinit(worker.allocator());
+                    worker.completeSessionResume(.{
+                        .failed = conversation.OwnedText.init(
+                            worker.allocator(),
+                            @errorName(err),
+                        ) catch {
+                            worker.closeFailure(.stream, @errorName(err));
+                            return;
+                        },
+                    }) catch {
+                        worker.closeFailure(.stream, @errorName(err));
+                        return;
+                    };
+                    continue;
                 };
 
                 const previous_session = session;

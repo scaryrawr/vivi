@@ -516,7 +516,26 @@ const MenuDetail = union(enum) {
     },
 };
 
+const MenuIdentity = union(enum) {
+    text: []const u8,
+    number: u64,
+
+    fn eql(left: MenuIdentity, right: MenuIdentity) bool {
+        return switch (left) {
+            .text => |value| switch (right) {
+                .text => |other| std.mem.eql(u8, value, other),
+                .number => false,
+            },
+            .number => |value| switch (right) {
+                .text => false,
+                .number => |other| value == other,
+            },
+        };
+    }
+};
+
 const MenuEntry = struct {
+    identity: MenuIdentity,
     key: []const u8,
     primary: []const u8,
     detail: MenuDetail,
@@ -548,7 +567,10 @@ const MenuState = struct {
         entries: []const MenuEntry,
         query: []const u8,
     ) !void {
-        const previous_key = if (self.selected()) |entry| entry.key else null;
+        const previous_identity = if (self.selected()) |entry|
+            entry.identity
+        else
+            null;
         self.entries.clearRetainingCapacity();
         self.matches.clearRetainingCapacity();
         try self.entries.appendSlice(allocator, entries);
@@ -564,9 +586,9 @@ const MenuState = struct {
         stableRank(self.matches.items, ranks.items);
 
         self.selected_match = 0;
-        if (previous_key) |key| {
+        if (previous_identity) |identity| {
             for (self.matches.items, 0..) |entry_index, match_index| {
-                if (std.mem.eql(u8, self.entries.items[entry_index].key, key)) {
+                if (self.entries.items[entry_index].identity.eql(identity)) {
                     self.selected_match = match_index;
                     break;
                 }
@@ -1064,6 +1086,7 @@ const ChatUi = struct {
         defer self.allocator.free(entries);
         for (catalog.commands, 0..) |command, index| {
             entries[index] = .{
+                .identity = .{ .text = command.name },
                 .key = command.name,
                 .primary = command.name,
                 .detail = .{ .text = command.description },
@@ -1081,6 +1104,7 @@ const ChatUi = struct {
         defer self.allocator.free(entries);
         for (catalog.models, 0..) |model, index| {
             entries[index] = .{
+                .identity = .{ .text = model.id },
                 .key = model.id,
                 .primary = model.display_name,
                 .detail = .{ .model = .{
@@ -1106,6 +1130,7 @@ const ChatUi = struct {
         defer self.allocator.free(entries);
         for (catalog.sessions, 0..) |session, index| {
             entries[index] = .{
+                .identity = .{ .number = session.key },
                 .key = session.working_directory,
                 .primary = std.fs.path.basename(session.working_directory),
                 .detail = .{ .session = .{
@@ -1744,7 +1769,6 @@ const ChatUi = struct {
                 });
             },
             .session => |session| {
-                const buffer = &self.menu_detail_storage[row];
                 var age_buffer: [24]u8 = undefined;
                 const age_ms = @max(
                     @as(i64, 0),
@@ -1771,18 +1795,38 @@ const ChatUi = struct {
                         "{d}d ago",
                         .{@divTrunc(age_ms, 24 * 60 * 60 * 1000)},
                     ) catch "earlier";
-                const rendered = std.fmt.bufPrint(
-                    buffer,
-                    "{s} · {s}",
-                    .{ session.model_id, age },
-                ) catch return;
-                var segments = [_]vaxis.Segment{.{
-                    .text = rendered,
-                    .style = .{ .bg = style.bg, .dim = true },
-                }};
-                _ = window.print(&segments, .{
+                const detail_col = @min(window.width / 2, 36);
+                const age_width = window.gwidth(age);
+                const separator = " · ";
+                const separator_width = window.gwidth(separator);
+                const model_width = window.width -| detail_col -|
+                    age_width -| separator_width;
+                if (model_width > 0) {
+                    const model_window = window.child(.{
+                        .x_off = @intCast(detail_col),
+                        .y_off = @intCast(row),
+                        .width = model_width,
+                        .height = 1,
+                    });
+                    var model_segments = [_]vaxis.Segment{.{
+                        .text = session.model_id,
+                        .style = .{ .bg = style.bg, .dim = true },
+                    }};
+                    _ = model_window.print(&model_segments, .{ .wrap = .none });
+                }
+                var trailing_segments = [_]vaxis.Segment{
+                    .{
+                        .text = separator,
+                        .style = .{ .bg = style.bg, .dim = true },
+                    },
+                    .{
+                        .text = age,
+                        .style = .{ .bg = style.bg, .dim = true },
+                    },
+                };
+                _ = window.print(&trailing_segments, .{
                     .row_offset = row,
-                    .col_offset = @intCast(@min(window.width / 2, 36)),
+                    .col_offset = detail_col + model_width,
                     .wrap = .none,
                 });
             },
@@ -2662,18 +2706,21 @@ test "ask-user choice range keeps the selection visible" {
 test "menu ranks prefixes and preserves deterministic navigation" {
     const entries = [_]MenuEntry{
         .{
+            .identity = .{ .text = "model" },
             .key = "model",
             .primary = "Model",
             .detail = .{ .text = "Switch the active model" },
             .source_index = 0,
         },
         .{
+            .identity = .{ .text = "memory" },
             .key = "memory",
             .primary = "Memory",
             .detail = .{ .text = "Manage memories" },
             .source_index = 1,
         },
         .{
+            .identity = .{ .text = "show-model" },
             .key = "show-model",
             .primary = "Show Model",
             .detail = .{ .text = "Inspect model information" },
@@ -2697,6 +2744,7 @@ test "model menu detail owns no composer text" {
     defer menu.deinit(std.testing.allocator);
     var query = [_]u8{ 'q', 'w', 'e', 'n' };
     const entries = [_]MenuEntry{.{
+        .identity = .{ .text = "omlx/qwen" },
         .key = "omlx/qwen",
         .primary = "Qwen",
         .detail = .{ .model = .{
@@ -2714,6 +2762,7 @@ test "model menu detail owns no composer text" {
 
 test "model menu matches provider-qualified identifiers" {
     const entries = [_]MenuEntry{.{
+        .identity = .{ .text = "copilot/gpt-5.6-sol" },
         .key = "copilot/gpt-5.6-sol",
         .primary = "GPT-5.6 Sol",
         .detail = .{ .model = .{
@@ -2731,6 +2780,39 @@ test "model menu matches provider-qualified identifiers" {
         "copilot/gpt-5.6-sol",
         menu.selected().?.key,
     );
+}
+
+test "session menu preserves duplicate workspace selection by session key" {
+    const entries = [_]MenuEntry{
+        .{
+            .identity = .{ .number = 41 },
+            .key = "/work/project",
+            .primary = "project",
+            .detail = .{ .session = .{
+                .model_id = "copilot/first",
+                .last_used_unix_ms = 20,
+            } },
+            .source_index = 0,
+        },
+        .{
+            .identity = .{ .number = 42 },
+            .key = "/work/project",
+            .primary = "project",
+            .detail = .{ .session = .{
+                .model_id = "copilot/second",
+                .last_used_unix_ms = 10,
+            } },
+            .source_index = 1,
+        },
+    };
+    var menu: MenuState = .{};
+    defer menu.deinit(std.testing.allocator);
+
+    try menu.rebuild(std.testing.allocator, &entries, "");
+    menu.move(.next);
+    try std.testing.expectEqual(@as(usize, 1), menu.selected().?.source_index);
+    try menu.rebuild(std.testing.allocator, &entries, "project");
+    try std.testing.expectEqual(@as(usize, 1), menu.selected().?.source_index);
 }
 
 test "session catalog completion restores ready after finder dismissal" {
