@@ -9,6 +9,8 @@ history later through a filterable `/resume` finder.
   `~/.vivi/sessions/`.
 - `/resume` opens a workspace-oriented finder without exposing Copilot session
   IDs.
+- The finder explains when no earlier session is available or a filter has no
+  matches.
 - Selecting a row joins the saved Copilot session and preserves the visible
   Vivi transcript.
 - A resumed session retains the server-side history from its earlier run.

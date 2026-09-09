@@ -754,18 +754,24 @@ chat_session_resume() {
         's/\e\[[0-?]*[ -\/]*[@-~]//g; s/\e\][^\a]*(?:\a|\e\\)//g' \
         "$run_dir/chat-session-resume.terminal.log" |
         tr -d '\r\b' >"$run_dir/chat-session-resume.normalized.txt"
+    perl -0pe \
+        's/\e\[[0-?]*[ -\/]*[@-~]//g; s/\e\][^\a]*(?:\a|\e\\)//g' \
+        "$run_dir/chat-session-resume-second.terminal.log" |
+        tr -d '\r\b' >"$run_dir/chat-session-resume-second.normalized.txt"
 
     {
         printf 'exit=%s\n' "$status"
         printf 'resume_status_seen='
-        if grep -q 'Resumed ' "$run_dir/chat-session-resume.normalized.txt"; then
+        if grep -q 'Resumed ' \
+            "$run_dir/chat-session-resume-second.normalized.txt"
+        then
             printf 'yes\n'
         else
             printf 'no\n'
         fi
         printf 'history_seen='
         if grep -Eq 'Vivi[[:space:]]*VIVI_RESUME_MEMORY' \
-            "$run_dir/chat-session-resume.normalized.txt"
+            "$run_dir/chat-session-resume-second.normalized.txt"
         then
             printf 'yes\n'
         else
@@ -774,9 +780,9 @@ chat_session_resume() {
     } >"$run_dir/chat-session-resume.assertions.txt"
 
     test "$status" -eq 0
-    grep -q 'Resumed ' "$run_dir/chat-session-resume.normalized.txt"
+    grep -q 'Resumed ' "$run_dir/chat-session-resume-second.normalized.txt"
     grep -Eq 'Vivi[[:space:]]*VIVI_RESUME_MEMORY' \
-        "$run_dir/chat-session-resume.normalized.txt"
+        "$run_dir/chat-session-resume-second.normalized.txt"
     test -s "$run_dir/chat-session-resume.contact-sheet.png"
 }
 

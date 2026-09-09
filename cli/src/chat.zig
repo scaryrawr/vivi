@@ -1426,7 +1426,10 @@ const ChatUi = struct {
         const desired_menu_rows: u16 = if (self.phase == .awaiting_input)
             self.userInputPanelRows(root)
         else switch (self.menu_mode) {
-            .commands, .models, .sessions => @intCast(@min(self.menu.matches.items.len, 8)),
+            .commands, .models, .sessions => @intCast(@min(
+                @max(self.menu.matches.items.len, 1),
+                8,
+            )),
             .closed, .loading_models, .loading_sessions => 0,
         };
         const layout = FrameLayout.compute(
@@ -1473,6 +1476,31 @@ const ChatUi = struct {
             .char = .{ .grapheme = " ", .width = 1 },
             .style = .{ .bg = menu_background },
         });
+        if (self.menu.matches.items.len == 0) {
+            const text = if (self.menu_mode == .sessions)
+                sessionMenuEmptyMessage(blk: {
+                    const catalog = self.sessions orelse break :blk false;
+                    for (catalog.sessions) |session| {
+                        if (!session.current) break :blk true;
+                    }
+                    break :blk false;
+                })
+            else
+                "No matches.";
+            var segments = [_]vaxis.Segment{.{
+                .text = text,
+                .style = .{
+                    .bg = menu_background,
+                    .dim = true,
+                },
+            }};
+            _ = window.print(&segments, .{
+                .row_offset = 0,
+                .col_offset = 2,
+                .wrap = .none,
+            });
+            return;
+        }
         const range = self.menu.visibleRange(window.height);
         for (range.first..range.last, 0..) |match_index, row| {
             const entry_index = self.menu.matches.items[match_index];
@@ -1514,6 +1542,13 @@ const ChatUi = struct {
                 style,
             );
         }
+    }
+
+    fn sessionMenuEmptyMessage(has_resumable_sessions: bool) []const u8 {
+        return if (has_resumable_sessions)
+            "No matching sessions."
+        else
+            "No resumable sessions yet.";
     }
 
     fn drawQuestionDivider(_: *ChatUi, window: vaxis.Window) void {
@@ -2723,4 +2758,15 @@ test "session catalog completion restores ready after finder dismissal" {
     );
     try std.testing.expectEqual(UiPhase.ready, ui.phase);
     try std.testing.expectEqual(MenuMode.closed, ui.menu_mode);
+}
+
+test "session finder distinguishes empty catalog from empty filter" {
+    try std.testing.expectEqualStrings(
+        "No resumable sessions yet.",
+        ChatUi.sessionMenuEmptyMessage(false),
+    );
+    try std.testing.expectEqualStrings(
+        "No matching sessions.",
+        ChatUi.sessionMenuEmptyMessage(true),
+    );
 }
