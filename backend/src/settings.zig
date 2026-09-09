@@ -5,6 +5,7 @@ pub const version: u32 = 1;
 pub const Settings = struct {
     allocator: std.mem.Allocator,
     default_model: ?[]u8 = null,
+    revision: u64 = 0,
 
     pub fn deinit(self: *Settings) void {
         if (self.default_model) |model| self.allocator.free(model);
@@ -15,6 +16,18 @@ pub const Settings = struct {
 const Document = struct {
     version: u32,
     default_model: ?[]const u8 = null,
+    revision: u64 = 0,
+};
+
+pub const DefaultModelUpdate = struct {
+    allocator: std.mem.Allocator,
+    previous_model: ?[]u8,
+    written_revision: u64,
+
+    pub fn deinit(self: *DefaultModelUpdate) void {
+        if (self.previous_model) |model| self.allocator.free(model);
+        self.* = undefined;
+    }
 };
 
 pub fn load(
@@ -54,6 +67,7 @@ pub fn load(
     return .{
         .allocator = allocator,
         .default_model = model,
+        .revision = parsed.value.revision,
     };
 }
 
@@ -63,24 +77,50 @@ pub fn saveDefaultModel(
     path: []const u8,
     model_id: ?[]const u8,
 ) !void {
-    const lock = try acquireLock(allocator, io, path);
-    defer lock.close(io);
-    try saveDefaultModelUnlocked(allocator, io, path, model_id);
+    var update = try updateDefaultModel(allocator, io, path, model_id);
+    update.deinit();
 }
 
-pub fn restoreDefaultModelIfCurrent(
+pub fn updateDefaultModel(
     allocator: std.mem.Allocator,
     io: std.Io,
     path: []const u8,
-    expected_current: ?[]const u8,
-    replacement: ?[]const u8,
+    model_id: ?[]const u8,
+) !DefaultModelUpdate {
+    const lock = try acquireLock(allocator, io, path);
+    defer lock.close(io);
+    var current = try load(allocator, io, path);
+    errdefer current.deinit();
+    const revision = nextRevision(current.revision) catch |err| return err;
+    try saveDefaultModelUnlocked(allocator, io, path, model_id, revision);
+    const previous_model = current.default_model;
+    current.default_model = null;
+    current.deinit();
+    return .{
+        .allocator = allocator,
+        .previous_model = previous_model,
+        .written_revision = revision,
+    };
+}
+
+pub fn rollbackDefaultModel(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    update: *const DefaultModelUpdate,
 ) !bool {
     const lock = try acquireLock(allocator, io, path);
     defer lock.close(io);
     var current = try load(allocator, io, path);
     defer current.deinit();
-    if (!optionalEql(current.default_model, expected_current)) return false;
-    try saveDefaultModelUnlocked(allocator, io, path, replacement);
+    if (current.revision != update.written_revision) return false;
+    try saveDefaultModelUnlocked(
+        allocator,
+        io,
+        path,
+        update.previous_model,
+        try nextRevision(current.revision),
+    );
     return true;
 }
 
@@ -89,6 +129,7 @@ fn saveDefaultModelUnlocked(
     io: std.Io,
     path: []const u8,
     model_id: ?[]const u8,
+    revision: u64,
 ) !void {
     if (model_id) |value| {
         if (!std.unicode.utf8ValidateSlice(value) or
@@ -104,6 +145,7 @@ fn saveDefaultModelUnlocked(
         Document{
             .version = version,
             .default_model = model_id,
+            .revision = revision,
         },
         .{ .whitespace = .indent_2 },
     );
@@ -141,9 +183,11 @@ fn acquireLock(
     );
 }
 
-fn optionalEql(left: ?[]const u8, right: ?[]const u8) bool {
-    if (left == null or right == null) return left == null and right == null;
-    return std.mem.eql(u8, left.?, right.?);
+fn nextRevision(revision: u64) !u64 {
+    if (revision == std.math.maxInt(u64)) {
+        return error.SettingsRevisionOverflow;
+    }
+    return revision + 1;
 }
 
 test "missing settings use no explicit default model" {
@@ -215,7 +259,7 @@ test "settings reject invalid documents" {
     );
 }
 
-test "settings rollback only replaces its own current value" {
+test "settings rollback only replaces its exact revision" {
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
     const path = try temporary.dir.realPathAlloc(
@@ -225,43 +269,56 @@ test "settings rollback only replaces its own current value" {
     );
     defer std.testing.allocator.free(path);
 
-    try saveDefaultModel(
+    var update_a = try updateDefaultModel(
         std.testing.allocator,
         std.testing.io,
         path,
         "copilot/model-a",
     );
-    try saveDefaultModel(
+    defer update_a.deinit();
+    var update_b = try updateDefaultModel(
         std.testing.allocator,
         std.testing.io,
         path,
         "copilot/model-b",
     );
-    try std.testing.expect(!try restoreDefaultModelIfCurrent(
+    defer update_b.deinit();
+    try saveDefaultModel(
         std.testing.allocator,
         std.testing.io,
         path,
-        "copilot/model-a",
-        null,
+        "copilot/model-c",
+    );
+    try std.testing.expect(!try rollbackDefaultModel(
+        std.testing.allocator,
+        std.testing.io,
+        path,
+        &update_b,
     ));
     var preserved = try load(std.testing.allocator, std.testing.io, path);
     defer preserved.deinit();
     try std.testing.expectEqualStrings(
-        "copilot/model-b",
+        "copilot/model-c",
         preserved.default_model.?,
     );
 
-    try std.testing.expect(try restoreDefaultModelIfCurrent(
+    var update_d = try updateDefaultModel(
         std.testing.allocator,
         std.testing.io,
         path,
-        "copilot/model-b",
-        "copilot/model-a",
+        "copilot/model-d",
+    );
+    defer update_d.deinit();
+    try std.testing.expect(try rollbackDefaultModel(
+        std.testing.allocator,
+        std.testing.io,
+        path,
+        &update_d,
     ));
     var restored = try load(std.testing.allocator, std.testing.io, path);
     defer restored.deinit();
     try std.testing.expectEqualStrings(
-        "copilot/model-a",
+        "copilot/model-c",
         restored.default_model.?,
     );
 }

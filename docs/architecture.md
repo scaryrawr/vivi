@@ -148,12 +148,13 @@ promotes it to the persisted default without replacing the SDK session.
 
 `backend/src/settings.zig` owns the versioned, SDK-free settings document and
 atomic replacement. Writers coordinate through a sidecar lock, and rollback
-uses compare-and-swap semantics so a failed model switch cannot overwrite a
-newer default saved by another process. Hosts resolve the user's home directory
-and pass the settings path into conversation options; they do not parse the
-document or coordinate model-switch persistence. Copilot CLI continues to own
-its session storage. The SDK can create or join sessions by ID, but does not
-expose a custom session-storage backend.
+uses a monotonic document revision captured by the exact write, so a failed
+model switch cannot overwrite a newer default saved by another process or be
+fooled by the same model value appearing again. Hosts resolve the user's home
+directory and pass the settings path into conversation options; they do not
+parse the document or coordinate model-switch persistence. Copilot CLI
+continues to own its session storage. The SDK can create or join sessions by
+ID, but does not expose a custom session-storage backend.
 
 `backend/src/session_store.zig` owns Vivi's durable index of sessions it
 created. Processes coordinate through an advisory `.lock` file under

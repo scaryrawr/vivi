@@ -2062,6 +2062,7 @@ fn runSdkConversation(
                     worker.closeFailure(.stream, @errorName(err));
                     return;
                 };
+                var settings_update: ?settings.DefaultModelUpdate = null;
                 const persisted_model = if (context.settings_path) |path| blk: {
                     const value = worker.allocator().dupe(
                         u8,
@@ -2074,7 +2075,7 @@ fn runSdkConversation(
                         worker.closeFailure(.stream, @errorName(err));
                         return;
                     };
-                    settings.saveDefaultModel(
+                    settings_update = settings.updateDefaultModel(
                         worker.allocator(),
                         worker.io(),
                         path,
@@ -2115,14 +2116,15 @@ fn runSdkConversation(
                         target_plan.id(),
                         unixMilliseconds(worker.io()),
                     ) catch |err| {
-                        if (context.settings_path) |path| {
-                            _ = settings.restoreDefaultModelIfCurrent(
+                        if (settings_update) |*update| {
+                            _ = settings.rollbackDefaultModel(
                                 worker.allocator(),
                                 worker.io(),
-                                path,
-                                target_plan.id(),
-                                persisted_settings.default_model,
+                                context.settings_path.?,
+                                update,
                             ) catch |rollback_err| {
+                                update.deinit();
+                                settings_update = null;
                                 candidate.disconnect() catch {};
                                 target_plan.deinit(worker.allocator());
                                 var mutable = info;
@@ -2136,6 +2138,8 @@ fn runSdkConversation(
                                 );
                                 return;
                             };
+                            update.deinit();
+                            settings_update = null;
                         }
                         candidate.disconnect() catch {};
                         target_plan.deinit(worker.allocator());
@@ -2158,6 +2162,10 @@ fn runSdkConversation(
                         };
                         continue;
                     };
+                }
+                if (settings_update) |*update| {
+                    update.deinit();
+                    settings_update = null;
                 }
 
                 const previous_session = session;
