@@ -28,7 +28,7 @@ pub const Record = struct {
         last_used_unix_ms: i64,
     ) !Record {
         try validateText(id, 512);
-        try validateText(working_directory, std.Io.Dir.max_path_bytes);
+        try validateWorkingDirectory(working_directory);
         try validateText(model_id, 512);
         if (last_used_unix_ms < 0) return error.InvalidSessionTimestamp;
 
@@ -378,7 +378,17 @@ pub const Store = struct {
 fn validateText(value: []const u8, maximum: usize) !void {
     if (value.len == 0 or value.len > maximum or
         !std.unicode.utf8ValidateSlice(value) or
+        std.mem.indexOfScalar(u8, value, 0) != null or
         std.mem.trim(u8, value, " \t\r\n").len != value.len)
+    {
+        return error.InvalidSessionText;
+    }
+}
+
+fn validateWorkingDirectory(value: []const u8) !void {
+    if (value.len == 0 or value.len > std.Io.Dir.max_path_bytes or
+        !std.unicode.utf8ValidateSlice(value) or
+        std.mem.indexOfScalar(u8, value, 0) != null)
     {
         return error.InvalidSessionText;
     }
@@ -613,4 +623,29 @@ test "session store read cap accepts maximum serialized shard" {
     );
     defer std.testing.allocator.free(encoded);
     try std.testing.expect(encoded.len <= max_shard_bytes);
+}
+
+test "session store preserves filesystem-significant path whitespace" {
+    var record = try Record.init(
+        std.testing.allocator,
+        "session-a",
+        "/work/project \t",
+        "copilot/default",
+        10,
+    );
+    defer record.deinit();
+    try std.testing.expectEqualStrings(
+        "/work/project \t",
+        record.working_directory,
+    );
+    try std.testing.expectError(
+        error.InvalidSessionText,
+        Record.init(
+            std.testing.allocator,
+            " session-a",
+            "/work/project",
+            "copilot/default",
+            10,
+        ),
+    );
 }

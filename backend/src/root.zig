@@ -2054,30 +2054,6 @@ fn runSdkConversation(
                     };
                     continue;
                 };
-                if (store) |*value| {
-                    value.recordCreated(
-                        candidate.id,
-                        active_working_directory,
-                        target_plan.id(),
-                        unixMilliseconds(worker.io()),
-                    ) catch |err| {
-                        candidate.disconnect() catch {};
-                        target_plan.deinit(worker.allocator());
-                        worker.completeModelSwitch(.{
-                            .failed = conversation.OwnedText.init(
-                                worker.allocator(),
-                                @errorName(err),
-                            ) catch {
-                                worker.closeFailure(.stream, @errorName(err));
-                                return;
-                            },
-                        }) catch {
-                            worker.closeFailure(.stream, @errorName(err));
-                            return;
-                        };
-                        continue;
-                    };
-                }
                 const info = target_plan.info(worker.allocator()) catch |err| {
                     candidate.disconnect() catch {};
                     target_plan.deinit(worker.allocator());
@@ -2130,6 +2106,56 @@ fn runSdkConversation(
                     };
                     break :blk value;
                 } else null;
+                if (store) |*value| {
+                    value.recordCreated(
+                        candidate.id,
+                        active_working_directory,
+                        target_plan.id(),
+                        unixMilliseconds(worker.io()),
+                    ) catch |err| {
+                        if (context.settings_path) |path| {
+                            settings.saveDefaultModel(
+                                worker.allocator(),
+                                worker.io(),
+                                path,
+                                persisted_settings.default_model,
+                            ) catch |rollback_err| {
+                                candidate.disconnect() catch {};
+                                target_plan.deinit(worker.allocator());
+                                var mutable = info;
+                                mutable.deinit();
+                                if (persisted_model) |model| {
+                                    worker.allocator().free(model);
+                                }
+                                worker.closeFailure(
+                                    .stream,
+                                    @errorName(rollback_err),
+                                );
+                                return;
+                            };
+                        }
+                        candidate.disconnect() catch {};
+                        target_plan.deinit(worker.allocator());
+                        var mutable = info;
+                        mutable.deinit();
+                        if (persisted_model) |model| {
+                            worker.allocator().free(model);
+                        }
+                        worker.completeModelSwitch(.{
+                            .failed = conversation.OwnedText.init(
+                                worker.allocator(),
+                                @errorName(err),
+                            ) catch {
+                                worker.closeFailure(.stream, @errorName(err));
+                                return;
+                            },
+                        }) catch {
+                            worker.closeFailure(.stream, @errorName(err));
+                            return;
+                        };
+                        continue;
+                    };
+                }
 
                 const previous_session = session;
                 session_connected = false;

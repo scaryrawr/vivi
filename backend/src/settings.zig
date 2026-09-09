@@ -61,13 +61,15 @@ pub fn saveDefaultModel(
     allocator: std.mem.Allocator,
     io: std.Io,
     path: []const u8,
-    model_id: []const u8,
+    model_id: ?[]const u8,
 ) !void {
-    if (!std.unicode.utf8ValidateSlice(model_id) or
-        std.mem.trim(u8, model_id, " \t\r\n").len != model_id.len or
-        model_id.len == 0)
-    {
-        return error.InvalidSettingsModel;
+    if (model_id) |value| {
+        if (!std.unicode.utf8ValidateSlice(value) or
+            std.mem.trim(u8, value, " \t\r\n").len != value.len or
+            value.len == 0)
+        {
+            return error.InvalidSettingsModel;
+        }
     }
 
     const encoded = try std.json.Stringify.valueAlloc(
@@ -132,6 +134,16 @@ test "settings round trip a canonical model id" {
         "omlx/Qwen3.5-9B",
         value.default_model.?,
     );
+
+    try saveDefaultModel(
+        std.testing.allocator,
+        std.testing.io,
+        path,
+        null,
+    );
+    var cleared = try load(std.testing.allocator, std.testing.io, path);
+    defer cleared.deinit();
+    try std.testing.expect(cleared.default_model == null);
 }
 
 test "settings reject invalid documents" {
