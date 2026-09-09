@@ -153,6 +153,22 @@ coordinate model-switch persistence. Copilot CLI continues to own its session
 storage. The SDK can create or join sessions by ID, but does not expose a
 custom session-storage backend.
 
+`backend/src/session_store.zig` owns Vivi's durable index of sessions it
+created. Each process writes one bounded, versioned JSON shard under
+`~/.vivi/sessions/` and atomically replaces only that shard. Readers merge
+valid shards by SDK session ID and skip malformed siblings, avoiding
+cross-process lost updates without a shared lock. The store records only the
+session ID, working directory, model identity, and recency; Copilot CLI remains
+the sole transcript/history store.
+
+`/resume` is a first-class broker control operation rather than an SDK slash
+command. The terminal receives display-ready rows with request-local numeric
+keys, while `backend/src/root.zig` privately resolves the selected record and
+calls `Client.joinSession`. Joining, durable recency update, active-session
+commit, and previous-session cleanup form one backend transaction. Candidate
+tools and the system prompt are rebuilt for the recorded working directory;
+any failure before commit leaves the current session active.
+
 Cancellation is cooperative because the pinned SDK has no documented
 cross-thread operation that interrupts a blocked `Session.nextEvent`.
 `requestStop` is observed by the SDK-owning worker at an event boundary, where

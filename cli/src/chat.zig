@@ -270,6 +270,7 @@ const UiPhase = enum {
     awaiting_input,
     running_command,
     switching,
+    resuming,
     stopping,
 
     fn label(self: UiPhase) []const u8 {
@@ -281,6 +282,7 @@ const UiPhase = enum {
             .awaiting_input => "Answer required",
             .running_command => "Running command...",
             .switching => "Switching model...",
+            .resuming => "Resuming session...",
             .stopping => "Stopping...",
         };
     }
@@ -508,6 +510,10 @@ const MenuDetail = union(enum) {
         output_tokens: u64,
         supports_vision: bool,
     },
+    session: struct {
+        model_id: []const u8,
+        last_used_unix_ms: i64,
+    },
 };
 
 const MenuEntry = struct {
@@ -617,6 +623,10 @@ fn matchRank(entry: MenuEntry, query: []const u8) ?u2 {
         switch (entry.detail) {
             .text => |text| asciiContainsIgnoreCase(text, query),
             .model => false,
+            .session => |session| asciiContainsIgnoreCase(
+                session.model_id,
+                query,
+            ),
         })
     {
         return 2;
@@ -675,16 +685,20 @@ const MenuMode = enum {
     commands,
     loading_models,
     models,
+    loading_sessions,
+    sessions,
 };
 
 const ChatUi = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     input: TextInput,
     transcript: Transcript = .{},
     cwd: []u8,
     phase: UiPhase = .connecting,
     commands: ?backend.CommandCatalog = null,
     models: ?backend.ModelCatalog = null,
+    sessions: ?backend.SessionCatalog = null,
     pending_user_input: ?backend.UserInputRequest = null,
     saved_input: ?TextInput = null,
     selected_user_input_choice: usize = 0,
@@ -717,6 +731,7 @@ const ChatUi = struct {
 
         return .{
             .allocator = allocator,
+            .io = io,
             .input = TextInput.init(allocator),
             .cwd = cwd,
         };
@@ -727,6 +742,7 @@ const ChatUi = struct {
         if (self.saved_input) |*input| input.deinit();
         if (self.pending_user_input) |*request| request.deinit();
         if (self.models) |*catalog| catalog.deinit();
+        if (self.sessions) |*catalog| catalog.deinit();
         if (self.commands) |*catalog| catalog.deinit();
         self.allocator.free(self.cwd);
         self.transcript.deinit(self.allocator);
@@ -766,12 +782,14 @@ const ChatUi = struct {
                 return .keep_running;
             }
             if (self.menu_mode != .loading_models and
+                self.menu_mode != .loading_sessions and
                 key.matches(vaxis.Key.up, .{}))
             {
                 self.menu.move(.previous);
                 return .keep_running;
             }
             if (self.menu_mode != .loading_models and
+                self.menu_mode != .loading_sessions and
                 key.matches(vaxis.Key.down, .{}))
             {
                 self.menu.move(.next);
@@ -779,7 +797,8 @@ const ChatUi = struct {
             }
             if (key.matches(vaxis.Key.enter, .{})) {
                 if (self.phase != .ready or
-                    self.menu_mode == .loading_models)
+                    self.menu_mode == .loading_models or
+                    self.menu_mode == .loading_sessions)
                 {
                     return .keep_running;
                 }
@@ -806,7 +825,10 @@ const ChatUi = struct {
             }
             return .keep_running;
         }
-        if (self.phase != .ready and self.phase != .responding) {
+        if (self.phase != .ready and
+            self.phase != .responding and
+            self.phase != .loading_commands)
+        {
             return .keep_running;
         }
 
@@ -840,7 +862,7 @@ const ChatUi = struct {
         const previous_menu_mode = self.menu_mode;
         try self.input.update(.{ .key_press = key });
         self.input_revision +%= 1;
-        if (self.phase == .ready) {
+        if (self.phase == .ready or self.phase == .loading_commands) {
             try self.syncSlashMenu();
         } else {
             self.menu_mode = .closed;
@@ -1008,9 +1030,16 @@ const ChatUi = struct {
     }
 
     fn syncSlashMenu(self: *ChatUi) !void {
-        if (self.menu_mode == .loading_models) return;
+        if (self.menu_mode == .loading_models or
+            self.menu_mode == .loading_sessions)
+        {
+            return;
+        }
         if (self.menu_mode == .models) {
             return self.rebuildModelMenu();
+        }
+        if (self.menu_mode == .sessions) {
+            return self.rebuildSessionMenu();
         }
         const contents = try self.input.toOwnedContents(self.allocator);
         defer self.allocator.free(contents);
@@ -1066,6 +1095,31 @@ const ChatUi = struct {
         try self.menu.rebuild(self.allocator, entries, query);
     }
 
+    fn rebuildSessionMenu(self: *ChatUi) !void {
+        const catalog = self.sessions orelse return;
+        const query = try self.input.toOwnedContents(self.allocator);
+        defer self.allocator.free(query);
+        const entries = try self.allocator.alloc(
+            MenuEntry,
+            catalog.sessions.len,
+        );
+        defer self.allocator.free(entries);
+        for (catalog.sessions, 0..) |session, index| {
+            entries[index] = .{
+                .key = session.working_directory,
+                .primary = std.fs.path.basename(session.working_directory),
+                .detail = .{ .session = .{
+                    .model_id = session.model_id,
+                    .last_used_unix_ms = session.last_used_unix_ms,
+                } },
+                .current = session.current,
+                .enabled = !session.current,
+                .source_index = index,
+            };
+        }
+        try self.menu.rebuild(self.allocator, entries, query);
+    }
+
     fn activateMenu(
         self: *ChatUi,
         conversation: *backend.Conversation,
@@ -1075,6 +1129,19 @@ const ChatUi = struct {
             .commands => {
                 const catalog = self.commands orelse return;
                 const command = catalog.commands[selected.source_index];
+                if (std.ascii.eqlIgnoreCase(command.name, "resume")) {
+                    self.input.clearRetainingCapacity();
+                    self.menu_mode = .loading_sessions;
+                    conversation.refreshSessions() catch |err| switch (err) {
+                        error.Busy => {
+                            self.menu_mode = .closed;
+                            return;
+                        },
+                        else => return err,
+                    };
+                    self.phase = .resuming;
+                    return;
+                }
                 if (!std.ascii.eqlIgnoreCase(command.name, "model")) {
                     const contents = try self.input.toOwnedContents(
                         self.allocator,
@@ -1116,7 +1183,18 @@ const ChatUi = struct {
                 self.menu_mode = .closed;
                 self.phase = .switching;
             },
-            .closed, .loading_models => {},
+            .sessions => {
+                const catalog = self.sessions orelse return;
+                const target = catalog.sessions[selected.source_index];
+                conversation.resumeSession(target.key) catch |err| switch (err) {
+                    error.Busy => return,
+                    else => return err,
+                };
+                self.input.clearRetainingCapacity();
+                self.menu_mode = .closed;
+                self.phase = .resuming;
+            },
+            .closed, .loading_models, .loading_sessions => {},
         }
     }
 
@@ -1217,6 +1295,60 @@ const ChatUi = struct {
                     ),
                 }
             },
+            .session_catalog => |catalog| {
+                const replacement = try catalog.clone(self.allocator);
+                if (self.sessions) |*current| current.deinit();
+                self.sessions = replacement;
+                self.phase = .ready;
+                if (self.menu_mode == .loading_sessions) {
+                    self.menu_mode = .sessions;
+                    try self.rebuildSessionMenu();
+                    if (catalog.skipped_invalid_shards) {
+                        try self.transcript.append(
+                            self.allocator,
+                            .status,
+                            "Some saved sessions could not be listed.",
+                        );
+                    }
+                }
+            },
+            .session_resume => |result| {
+                self.phase = .ready;
+                self.menu_mode = .closed;
+                switch (result) {
+                    .resumed => |success| {
+                        const resumed_cwd = try self.allocator.dupe(
+                            u8,
+                            success.session.working_directory,
+                        );
+                        self.allocator.free(self.cwd);
+                        self.cwd = resumed_cwd;
+                        try self.updateSelectedModel(success.session.model_id);
+                        const message = try std.fmt.allocPrint(
+                            self.allocator,
+                            "Resumed {s}. Copilot history now comes from that session; the visible Vivi transcript remains.{s}",
+                            .{
+                                success.session.working_directory,
+                                if (success.cleanup_failed)
+                                    " The previous session could not be detached cleanly."
+                                else
+                                    "",
+                            },
+                        );
+                        defer self.allocator.free(message);
+                        try self.transcript.append(
+                            self.allocator,
+                            .status,
+                            message,
+                        );
+                    },
+                    .failed => |failure| try self.transcript.append(
+                        self.allocator,
+                        .status,
+                        failure.bytes,
+                    ),
+                }
+            },
             .assistant_started => {
                 self.phase = .responding;
                 self.transcript.beginQueuedTurn();
@@ -1294,8 +1426,8 @@ const ChatUi = struct {
         const desired_menu_rows: u16 = if (self.phase == .awaiting_input)
             self.userInputPanelRows(root)
         else switch (self.menu_mode) {
-            .commands, .models => @intCast(@min(self.menu.matches.items.len, 8)),
-            .closed, .loading_models => 0,
+            .commands, .models, .sessions => @intCast(@min(self.menu.matches.items.len, 8)),
+            .closed, .loading_models, .loading_sessions => 0,
         };
         const layout = FrameLayout.compute(
             root.width,
@@ -1572,6 +1704,49 @@ const ChatUi = struct {
                     .wrap = .none,
                 });
             },
+            .session => |session| {
+                const buffer = &self.menu_detail_storage[row];
+                var age_buffer: [24]u8 = undefined;
+                const age_ms = @max(
+                    @as(i64, 0),
+                    std.Io.Timestamp.now(self.io, .real).toMilliseconds() -
+                        session.last_used_unix_ms,
+                );
+                const age = if (age_ms < 60 * 1000)
+                    "now"
+                else if (age_ms < 60 * 60 * 1000)
+                    std.fmt.bufPrint(
+                        &age_buffer,
+                        "{d}m ago",
+                        .{@divTrunc(age_ms, 60 * 1000)},
+                    ) catch "recently"
+                else if (age_ms < 24 * 60 * 60 * 1000)
+                    std.fmt.bufPrint(
+                        &age_buffer,
+                        "{d}h ago",
+                        .{@divTrunc(age_ms, 60 * 60 * 1000)},
+                    ) catch "earlier"
+                else
+                    std.fmt.bufPrint(
+                        &age_buffer,
+                        "{d}d ago",
+                        .{@divTrunc(age_ms, 24 * 60 * 60 * 1000)},
+                    ) catch "earlier";
+                const rendered = std.fmt.bufPrint(
+                    buffer,
+                    "{s} · {s}",
+                    .{ session.model_id, age },
+                ) catch return;
+                var segments = [_]vaxis.Segment{.{
+                    .text = rendered,
+                    .style = .{ .bg = style.bg, .dim = true },
+                }};
+                _ = window.print(&segments, .{
+                    .row_offset = row,
+                    .col_offset = @intCast(@min(window.width / 2, 36)),
+                    .wrap = .none,
+                });
+            },
         }
     }
 
@@ -1783,7 +1958,7 @@ const ChatUi = struct {
                         "↑/↓ select  ·  Enter accept  ·  Ctrl-C stop"
                 else
                     "Enter answer  ·  PgUp/PgDn scroll  ·  Ctrl-C stop",
-                .connecting, .loading_commands, .running_command, .switching => "PgUp/PgDn scroll  ·  Ctrl-C stop",
+                .connecting, .loading_commands, .running_command, .switching, .resuming => "PgUp/PgDn scroll  ·  Ctrl-C stop",
                 .stopping => "Ctrl-C again force exit",
             }
         else if (window.width >= 24)
@@ -1794,7 +1969,7 @@ const ChatUi = struct {
                     "↑/↓ select  ·  Enter accept"
                 else
                     "Enter answer  ·  Ctrl-C stop",
-                .connecting, .loading_commands, .running_command, .switching => "Ctrl-C stop",
+                .connecting, .loading_commands, .running_command, .switching, .resuming => "Ctrl-C stop",
                 .stopping => "Ctrl-C again force exit",
             }
         else switch (self.phase) {
@@ -1804,7 +1979,7 @@ const ChatUi = struct {
                 "Enter choice"
             else
                 "Enter answer",
-            .connecting, .loading_commands, .running_command, .switching => "Ctrl-C stop",
+            .connecting, .loading_commands, .running_command, .switching, .resuming => "Ctrl-C stop",
             .stopping => "Ctrl-C again",
         };
         const model_name = self.selectedModelDisplayName();
@@ -1947,6 +2122,7 @@ const App = struct {
         init_args: std.process.Init,
         model: ?[]const u8,
         settings_path: ?[]const u8,
+        sessions_directory: ?[]const u8,
     ) !void {
         self.allocator = init_args.gpa;
         self.io = init_args.io;
@@ -1978,6 +2154,7 @@ const App = struct {
             .{
                 .model = model,
                 .settings_path = settings_path,
+                .sessions_directory = sessions_directory,
                 .omlx = .{
                     .base_url = init_args.environ_map.get("OMLX_BASE_URL") orelse
                         backend.default_omlx_base_url,
@@ -2062,10 +2239,11 @@ pub fn run(
     init: std.process.Init,
     model: ?[]const u8,
     settings_path: ?[]const u8,
+    sessions_directory: ?[]const u8,
 ) !void {
     const app = try init.gpa.create(App);
     defer init.gpa.destroy(app);
-    try app.init(init, model, settings_path);
+    try app.init(init, model, settings_path, sessions_directory);
     defer app.deinit();
     try app.run();
 }
@@ -2514,4 +2692,35 @@ test "model menu matches provider-qualified identifiers" {
         "copilot/gpt-5.6-sol",
         menu.selected().?.key,
     );
+}
+
+test "session catalog completion restores ready after finder dismissal" {
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    var ui = try ChatUi.init(
+        std.testing.allocator,
+        std.testing.io,
+        &environment,
+    );
+    defer ui.deinit();
+    ui.phase = .resuming;
+    ui.menu_mode = .closed;
+
+    var event: backend.ConversationEvent = .{
+        .session_catalog = .{
+            .allocator = std.testing.allocator,
+            .sessions = try std.testing.allocator.alloc(
+                backend.SessionSummary,
+                0,
+            ),
+            .skipped_invalid_shards = false,
+        },
+    };
+    defer event.deinit();
+    try std.testing.expectEqual(
+        ConversationOutcome.keep_running,
+        try ui.applyConversationEvent(&event),
+    );
+    try std.testing.expectEqual(UiPhase.ready, ui.phase);
+    try std.testing.expectEqual(MenuMode.closed, ui.menu_mode);
 }

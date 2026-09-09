@@ -67,10 +67,35 @@ pub fn main(init: std.process.Init) !void {
                 init.environ_map,
             );
             defer if (settings_path) |path| init.gpa.free(path);
-            return chat.run(init, options.model, settings_path);
+            const sessions_directory = try defaultSessionsDirectory(
+                init.gpa,
+                init.environ_map,
+            );
+            defer if (sessions_directory) |path| init.gpa.free(path);
+            return chat.run(
+                init,
+                options.model,
+                settings_path,
+                sessions_directory,
+            );
         },
     }
     try stdout.flush();
+}
+
+fn defaultSessionsDirectory(
+    allocator: std.mem.Allocator,
+    environ_map: *const std.process.Environ.Map,
+) !?[]u8 {
+    const home = usableHome(environ_map.get("HOME")) orelse
+        usableHome(environ_map.get("USERPROFILE")) orelse return null;
+    return @as(
+        ?[]u8,
+        try std.fs.path.join(
+            allocator,
+            &.{ home, ".vivi", "sessions" },
+        ),
+    );
 }
 
 fn defaultSettingsPath(
@@ -180,6 +205,21 @@ test "settings persistence is optional without a home directory" {
     defer environment.deinit();
     try std.testing.expect(
         try defaultSettingsPath(std.testing.allocator, &environment) == null,
+    );
+}
+
+test "sessions directory uses the supplied home directory" {
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try environment.put("HOME", "/tmp/vivi-home");
+    const path = try defaultSessionsDirectory(
+        std.testing.allocator,
+        &environment,
+    );
+    defer std.testing.allocator.free(path.?);
+    try std.testing.expectEqualStrings(
+        "/tmp/vivi-home/.vivi/sessions",
+        path.?,
     );
 }
 

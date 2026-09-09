@@ -3,6 +3,7 @@ const build_options = @import("build_options");
 const copilot = @import("copilot_sdk");
 const conversation = @import("conversation.zig");
 const models = @import("models.zig");
+const session_store = @import("session_store.zig");
 const settings = @import("settings.zig");
 const tools = @import("tools.zig");
 
@@ -16,6 +17,8 @@ pub const CommandCatalog = conversation.CommandCatalog;
 pub const UserInputRequest = conversation.UserInputRequest;
 pub const ModelCatalog = conversation.ModelCatalog;
 pub const ModelInfo = conversation.ModelInfo;
+pub const SessionCatalog = conversation.SessionCatalog;
+pub const SessionSummary = conversation.SessionSummary;
 pub const OmlxCatalog = models.Catalog;
 pub const OmlxModel = models.Model;
 pub const OmlxOptions = models.OmlxOptions;
@@ -40,12 +43,14 @@ pub fn scaffoldStatus() Status {
 pub const ConversationOptions = struct {
     model: ?[]const u8 = null,
     settings_path: ?[]const u8 = null,
+    sessions_directory: ?[]const u8 = null,
     omlx: OmlxOptions = .{},
 };
 
 const ConversationContext = struct {
     model: ?[]u8,
     settings_path: ?[]u8,
+    sessions_directory: ?[]u8,
     omlx_base_url: []u8,
     omlx_api_key: ?[]u8,
 
@@ -66,10 +71,16 @@ const ConversationContext = struct {
         else
             null;
         errdefer if (settings_path) |value| allocator.free(value);
+        const sessions_directory = if (options.sessions_directory) |value|
+            try allocator.dupe(u8, value)
+        else
+            null;
+        errdefer if (sessions_directory) |value| allocator.free(value);
 
         context.* = .{
             .model = model,
             .settings_path = settings_path,
+            .sessions_directory = sessions_directory,
             .omlx_base_url = undefined,
             .omlx_api_key = null,
         };
@@ -92,6 +103,7 @@ const ConversationContext = struct {
         const self: *ConversationContext = @ptrCast(@alignCast(pointer));
         if (self.model) |model| allocator.free(model);
         if (self.settings_path) |path| allocator.free(path);
+        if (self.sessions_directory) |path| allocator.free(path);
         allocator.free(self.omlx_base_url);
         if (self.omlx_api_key) |api_key| {
             std.crypto.secureZero(u8, api_key);
@@ -304,7 +316,9 @@ fn forwardImmediatePrompts(
             .stop => return .stop,
             .refresh_commands,
             .refresh_models,
+            .refresh_sessions,
             .switch_model,
+            .resume_session,
             .execute_command,
             .user_input_response,
             => {
@@ -331,7 +345,9 @@ fn startNextQueuedPrompt(
         .stop => return .stop,
         .refresh_commands,
         .refresh_models,
+        .refresh_sessions,
         .switch_model,
+        .resume_session,
         .execute_command,
         .user_input_response,
         => {
@@ -739,6 +755,26 @@ fn createSdkSession(
     return client.createSession(config);
 }
 
+fn joinSdkSession(
+    worker: *conversation.Worker,
+    client: *copilot.Client,
+    session_id: []const u8,
+    system_prompt: []const u8,
+    working_directory: []const u8,
+    plan: *const SessionPlan,
+    api_key: ?[]const u8,
+) !copilot.Session {
+    var config = sessionConfigForPlan(
+        system_prompt,
+        working_directory,
+        plan,
+        api_key,
+    );
+    config.on_user_input_request = handleSdkUserInput;
+    config.user_input_context = worker;
+    return client.joinSession(session_id, config);
+}
+
 fn sessionConfigForPlan(
     system_prompt: []const u8,
     working_directory: []const u8,
@@ -901,9 +937,13 @@ fn buildCommandCatalog(
     defer listed.deinit();
     const sdk_commands = listed.value.commands;
 
-    var count: usize = 1;
+    var count: usize = 2;
     for (sdk_commands) |command| {
-        if (!std.ascii.eqlIgnoreCase(command.name, "model")) count += 1;
+        if (!std.ascii.eqlIgnoreCase(command.name, "model") and
+            !std.ascii.eqlIgnoreCase(command.name, "resume"))
+        {
+            count += 1;
+        }
     }
     const commands = try allocator.alloc(conversation.CommandInfo, count);
     errdefer allocator.free(commands);
@@ -930,8 +970,22 @@ fn buildCommandCatalog(
         .description = model_description,
     };
     initialized += 1;
+    commands[1] = .{
+        .name = try allocator.dupe(u8, "resume"),
+        .description = undefined,
+    };
+    errdefer allocator.free(commands[1].name);
+    commands[1].description = try allocator.dupe(
+        u8,
+        "Resume a previous Vivi session",
+    );
+    initialized += 1;
     for (sdk_commands) |command| {
-        if (std.ascii.eqlIgnoreCase(command.name, "model")) continue;
+        if (std.ascii.eqlIgnoreCase(command.name, "model") or
+            std.ascii.eqlIgnoreCase(command.name, "resume"))
+        {
+            continue;
+        }
         commands[initialized] = .{
             .name = try allocator.dupe(u8, command.name),
             .description = undefined,
@@ -949,18 +1003,68 @@ fn buildCommandCatalog(
 fn buildFallbackCommandCatalog(
     allocator: std.mem.Allocator,
 ) !conversation.CommandCatalog {
-    const commands = try allocator.alloc(conversation.CommandInfo, 1);
+    const commands = try allocator.alloc(conversation.CommandInfo, 2);
     errdefer allocator.free(commands);
-    const name = try allocator.dupe(u8, "model");
-    errdefer allocator.free(name);
     commands[0] = .{
-        .name = name,
+        .name = try allocator.dupe(u8, "model"),
         .description = try allocator.dupe(
             u8,
             "Switch the model for new turns",
         ),
     };
+    errdefer {
+        allocator.free(commands[0].name);
+        allocator.free(commands[0].description);
+    }
+    commands[1] = .{
+        .name = try allocator.dupe(u8, "resume"),
+        .description = undefined,
+    };
+    errdefer allocator.free(commands[1].name);
+    commands[1].description = try allocator.dupe(
+        u8,
+        "Resume a previous Vivi session",
+    );
     return .{ .allocator = allocator, .commands = commands };
+}
+
+fn buildSessionCatalog(
+    allocator: std.mem.Allocator,
+    index: *const session_store.Index,
+    active_session_id: []const u8,
+) !conversation.SessionCatalog {
+    const sessions = try allocator.alloc(
+        conversation.SessionSummary,
+        index.records.len,
+    );
+    errdefer allocator.free(sessions);
+    var initialized: usize = 0;
+    errdefer for (sessions[0..initialized]) |*session| session.deinit();
+    for (index.records, 0..) |record, record_index| {
+        const working_directory = try allocator.dupe(
+            u8,
+            record.working_directory,
+        );
+        errdefer allocator.free(working_directory);
+        sessions[record_index] = .{
+            .allocator = allocator,
+            .key = record_index + 1,
+            .working_directory = working_directory,
+            .model_id = try allocator.dupe(u8, record.model_id),
+            .last_used_unix_ms = record.last_used_unix_ms,
+            .current = std.mem.eql(u8, active_session_id, record.id),
+        };
+        initialized += 1;
+    }
+    return .{
+        .allocator = allocator,
+        .sessions = sessions,
+        .skipped_invalid_shards = index.skipped_invalid_shards,
+    };
+}
+
+fn unixMilliseconds(io: std.Io) i64 {
+    return std.Io.Timestamp.now(io, .real).toMilliseconds();
 }
 
 const StreamResult = enum {
@@ -1156,11 +1260,18 @@ fn runSdkConversation(
         worker.closeFailure(.startup, @errorName(err));
         return;
     };
-    const working_directory = cwd_buffer[0..cwd_len];
+    var active_working_directory = worker.allocator().dupe(
+        u8,
+        cwd_buffer[0..cwd_len],
+    ) catch |err| {
+        worker.closeFailure(.startup, @errorName(err));
+        return;
+    };
+    defer worker.allocator().free(active_working_directory);
     var tool_service = tools.Service.init(
         worker.allocator(),
         worker.io(),
-        working_directory,
+        active_working_directory,
     ) catch |err| {
         worker.closeFailure(.startup, @errorName(err));
         return;
@@ -1170,7 +1281,7 @@ fn runSdkConversation(
     var client = copilot.Client.init(
         worker.allocator(),
         worker.io(),
-        MinimalCodingAgent.clientOptions(working_directory),
+        MinimalCodingAgent.clientOptions(active_working_directory),
     ) catch |err| {
         worker.closeFailure(.startup, @errorName(err));
         return;
@@ -1179,7 +1290,7 @@ fn runSdkConversation(
     const system_prompt = std.fmt.allocPrint(
         worker.allocator(),
         MinimalCodingAgent.system_prompt,
-        .{working_directory},
+        .{active_working_directory},
     ) catch |err| {
         worker.closeFailure(.startup, @errorName(err));
         return;
@@ -1190,6 +1301,20 @@ fn runSdkConversation(
         .base_url = context.omlx_base_url,
         .api_key = context.omlx_api_key,
     };
+    var store = if (context.sessions_directory) |directory|
+        session_store.Store.init(
+            worker.allocator(),
+            worker.io(),
+            directory,
+        ) catch |err| {
+            worker.closeFailure(.startup, @errorName(err));
+            return;
+        }
+    else
+        null;
+    defer if (store) |*value| value.deinit();
+    var resume_index: ?session_store.Index = null;
+    defer if (resume_index) |*index| index.deinit();
     var persisted_settings = if (context.settings_path) |path|
         settings.load(worker.allocator(), worker.io(), path) catch |err| {
             const message = std.fmt.allocPrint(
@@ -1224,7 +1349,7 @@ fn runSdkConversation(
         worker,
         &client,
         system_prompt,
-        working_directory,
+        active_working_directory,
         &active_plan,
         context.omlx_api_key,
     ) catch |err| {
@@ -1233,6 +1358,19 @@ fn runSdkConversation(
     };
     var session_connected = true;
     defer if (session_connected) session.disconnect() catch {};
+    if (store) |*value| {
+        value.recordCreated(
+            session.id,
+            active_working_directory,
+            active_plan.id(),
+            unixMilliseconds(worker.io()),
+        ) catch |err| {
+            session.disconnect() catch {};
+            session_connected = false;
+            worker.closeFailure(.startup, @errorName(err));
+            return;
+        };
+    }
 
     if (!(worker.ready() catch {
         worker.closeFailure(.startup, "Unable to publish conversation readiness.");
@@ -1323,6 +1461,298 @@ fn runSdkConversation(
                     );
                     return;
                 };
+            },
+            .refresh_sessions => {
+                if (resume_index) |*index| index.deinit();
+                resume_index = null;
+                resume_index = if (store) |*value|
+                    value.list() catch |err| {
+                        worker.completeSessionResume(.{
+                            .failed = conversation.OwnedText.init(
+                                worker.allocator(),
+                                @errorName(err),
+                            ) catch {
+                                worker.closeFailure(.stream, @errorName(err));
+                                return;
+                            },
+                        }) catch {
+                            worker.closeFailure(.stream, @errorName(err));
+                            return;
+                        };
+                        continue;
+                    }
+                else
+                    .{
+                        .allocator = worker.allocator(),
+                        .records = worker.allocator().alloc(
+                            session_store.Record,
+                            0,
+                        ) catch |err| {
+                            worker.closeFailure(.stream, @errorName(err));
+                            return;
+                        },
+                    };
+                const catalog = buildSessionCatalog(
+                    worker.allocator(),
+                    &resume_index.?,
+                    session.id,
+                ) catch |err| {
+                    worker.closeFailure(.stream, @errorName(err));
+                    return;
+                };
+                worker.completeSessionRefresh(catalog) catch {
+                    var mutable = catalog;
+                    mutable.deinit();
+                    worker.closeFailure(
+                        .stream,
+                        "Unable to deliver the session catalog.",
+                    );
+                    return;
+                };
+            },
+            .resume_session => |key| {
+                const index = if (resume_index) |*value| value else {
+                    worker.completeSessionResume(.{
+                        .failed = conversation.OwnedText.init(
+                            worker.allocator(),
+                            "Refresh the session list before resuming.",
+                        ) catch {
+                            worker.closeFailure(.stream, "Out of memory.");
+                            return;
+                        },
+                    }) catch {
+                        worker.closeFailure(.stream, "Unable to report resume failure.");
+                        return;
+                    };
+                    continue;
+                };
+                if (key == 0 or key > index.records.len) {
+                    worker.completeSessionResume(.{
+                        .failed = conversation.OwnedText.init(
+                            worker.allocator(),
+                            "The selected session is no longer available.",
+                        ) catch {
+                            worker.closeFailure(.stream, "Out of memory.");
+                            return;
+                        },
+                    }) catch {
+                        worker.closeFailure(.stream, "Unable to report resume failure.");
+                        return;
+                    };
+                    continue;
+                }
+                const target = &index.records[key - 1];
+                if (std.mem.eql(u8, target.id, session.id)) {
+                    const summary_working_directory = worker.allocator().dupe(
+                        u8,
+                        target.working_directory,
+                    ) catch |err| {
+                        worker.closeFailure(.stream, @errorName(err));
+                        return;
+                    };
+                    const summary_model_id = worker.allocator().dupe(
+                        u8,
+                        target.model_id,
+                    ) catch |err| {
+                        worker.allocator().free(summary_working_directory);
+                        worker.closeFailure(.stream, @errorName(err));
+                        return;
+                    };
+                    const summary = conversation.SessionSummary{
+                        .allocator = worker.allocator(),
+                        .key = key,
+                        .working_directory = summary_working_directory,
+                        .model_id = summary_model_id,
+                        .last_used_unix_ms = target.last_used_unix_ms,
+                        .current = true,
+                    };
+                    worker.completeSessionResume(.{ .resumed = .{
+                        .session = summary,
+                        .cleanup_failed = false,
+                    } }) catch {
+                        var mutable = summary;
+                        mutable.deinit();
+                        worker.closeFailure(.stream, "Unable to report resumed session.");
+                        return;
+                    };
+                    continue;
+                }
+
+                var target_plan = resolveSessionPlan(
+                    worker.allocator(),
+                    &client,
+                    worker.io(),
+                    target.model_id,
+                    omlx_options,
+                ) catch |err| {
+                    worker.completeSessionResume(.{
+                        .failed = conversation.OwnedText.init(
+                            worker.allocator(),
+                            @errorName(err),
+                        ) catch {
+                            worker.closeFailure(.stream, @errorName(err));
+                            return;
+                        },
+                    }) catch {
+                        worker.closeFailure(.stream, @errorName(err));
+                        return;
+                    };
+                    continue;
+                };
+                var candidate_tools = tools.Service.init(
+                    worker.allocator(),
+                    worker.io(),
+                    target.working_directory,
+                ) catch |err| {
+                    target_plan.deinit(worker.allocator());
+                    worker.completeSessionResume(.{
+                        .failed = conversation.OwnedText.init(
+                            worker.allocator(),
+                            @errorName(err),
+                        ) catch {
+                            worker.closeFailure(.stream, @errorName(err));
+                            return;
+                        },
+                    }) catch {
+                        worker.closeFailure(.stream, @errorName(err));
+                        return;
+                    };
+                    continue;
+                };
+                const candidate_prompt = std.fmt.allocPrint(
+                    worker.allocator(),
+                    MinimalCodingAgent.system_prompt,
+                    .{target.working_directory},
+                ) catch |err| {
+                    candidate_tools.deinit();
+                    target_plan.deinit(worker.allocator());
+                    worker.closeFailure(.stream, @errorName(err));
+                    return;
+                };
+                defer worker.allocator().free(candidate_prompt);
+                var candidate = joinSdkSession(
+                    worker,
+                    &client,
+                    target.id,
+                    candidate_prompt,
+                    target.working_directory,
+                    &target_plan,
+                    context.omlx_api_key,
+                ) catch |err| {
+                    candidate_tools.deinit();
+                    target_plan.deinit(worker.allocator());
+                    worker.completeSessionResume(.{
+                        .failed = conversation.OwnedText.init(
+                            worker.allocator(),
+                            @errorName(err),
+                        ) catch {
+                            worker.closeFailure(.stream, @errorName(err));
+                            return;
+                        },
+                    }) catch {
+                        worker.closeFailure(.stream, @errorName(err));
+                        return;
+                    };
+                    continue;
+                };
+                const now = unixMilliseconds(worker.io());
+                if (store) |*value| value.touch(target, now) catch |err| {
+                    candidate.disconnect() catch {};
+                    candidate_tools.deinit();
+                    target_plan.deinit(worker.allocator());
+                    worker.completeSessionResume(.{
+                        .failed = conversation.OwnedText.init(
+                            worker.allocator(),
+                            @errorName(err),
+                        ) catch {
+                            worker.closeFailure(.stream, @errorName(err));
+                            return;
+                        },
+                    }) catch {
+                        worker.closeFailure(.stream, @errorName(err));
+                        return;
+                    };
+                    continue;
+                };
+                const candidate_working_directory = worker.allocator().dupe(
+                    u8,
+                    target.working_directory,
+                ) catch |err| {
+                    candidate.disconnect() catch {};
+                    candidate_tools.deinit();
+                    target_plan.deinit(worker.allocator());
+                    worker.closeFailure(.stream, @errorName(err));
+                    return;
+                };
+                var summary = conversation.SessionSummary{
+                    .allocator = worker.allocator(),
+                    .key = key,
+                    .working_directory = worker.allocator().dupe(
+                        u8,
+                        target.working_directory,
+                    ) catch |err| {
+                        worker.allocator().free(candidate_working_directory);
+                        candidate.disconnect() catch {};
+                        candidate_tools.deinit();
+                        target_plan.deinit(worker.allocator());
+                        worker.closeFailure(.stream, @errorName(err));
+                        return;
+                    },
+                    .model_id = undefined,
+                    .last_used_unix_ms = now,
+                    .current = true,
+                };
+                summary.model_id = worker.allocator().dupe(
+                    u8,
+                    target.model_id,
+                ) catch |err| {
+                    worker.allocator().free(summary.working_directory);
+                    worker.allocator().free(candidate_working_directory);
+                    candidate.disconnect() catch {};
+                    candidate_tools.deinit();
+                    target_plan.deinit(worker.allocator());
+                    worker.closeFailure(.stream, @errorName(err));
+                    return;
+                };
+
+                const previous_session = session;
+                var previous_tools = tool_service;
+                const previous_working_directory = active_working_directory;
+                var previous_plan = active_plan;
+                session_connected = false;
+                session = candidate;
+                tool_service = candidate_tools;
+                active_working_directory = candidate_working_directory;
+                active_plan = target_plan;
+                session_connected = true;
+                const cleanup_failed = if (previous_session.disconnect())
+                    false
+                else |_|
+                    true;
+                previous_tools.deinit();
+                worker.allocator().free(previous_working_directory);
+                previous_plan.deinit(worker.allocator());
+                worker.completeSessionResume(.{ .resumed = .{
+                    .session = summary,
+                    .cleanup_failed = cleanup_failed,
+                } }) catch {
+                    summary.deinit();
+                    worker.closeFailure(
+                        .stream,
+                        "Unable to report the resumed session.",
+                    );
+                    return;
+                };
+                if (buildCommandCatalog(
+                    worker.allocator(),
+                    &client,
+                    session,
+                )) |catalog| {
+                    worker.commandCatalog(catalog) catch {
+                        var mutable = catalog;
+                        mutable.deinit();
+                    };
+                } else |_| {}
             },
             .execute_command => |requested| {
                 var command_input = worker.allocator().dupe(
@@ -1450,7 +1880,9 @@ fn runSdkConversation(
                                 .prompt,
                                 .refresh_commands,
                                 .refresh_models,
+                                .refresh_sessions,
                                 .switch_model,
+                                .resume_session,
                                 .execute_command,
                                 => unreachable,
                             }
@@ -1593,11 +2025,21 @@ fn runSdkConversation(
                     continue;
                 }
 
+                const candidate_prompt = std.fmt.allocPrint(
+                    worker.allocator(),
+                    MinimalCodingAgent.system_prompt,
+                    .{active_working_directory},
+                ) catch |err| {
+                    target_plan.deinit(worker.allocator());
+                    worker.closeFailure(.stream, @errorName(err));
+                    return;
+                };
+                defer worker.allocator().free(candidate_prompt);
                 var candidate = createSdkSession(
                     worker,
                     &client,
-                    system_prompt,
-                    working_directory,
+                    candidate_prompt,
+                    active_working_directory,
                     &target_plan,
                     context.omlx_api_key,
                 ) catch |err| {
@@ -1616,6 +2058,30 @@ fn runSdkConversation(
                     };
                     continue;
                 };
+                if (store) |*value| {
+                    value.recordCreated(
+                        candidate.id,
+                        active_working_directory,
+                        target_plan.id(),
+                        unixMilliseconds(worker.io()),
+                    ) catch |err| {
+                        candidate.disconnect() catch {};
+                        target_plan.deinit(worker.allocator());
+                        worker.completeModelSwitch(.{
+                            .failed = conversation.OwnedText.init(
+                                worker.allocator(),
+                                @errorName(err),
+                            ) catch {
+                                worker.closeFailure(.stream, @errorName(err));
+                                return;
+                            },
+                        }) catch {
+                            worker.closeFailure(.stream, @errorName(err));
+                            return;
+                        };
+                        continue;
+                    };
+                }
                 const info = target_plan.info(worker.allocator()) catch |err| {
                     candidate.disconnect() catch {};
                     target_plan.deinit(worker.allocator());

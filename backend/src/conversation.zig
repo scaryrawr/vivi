@@ -146,6 +146,90 @@ pub const ModelCatalog = struct {
     }
 };
 
+pub const SessionSummary = struct {
+    allocator: std.mem.Allocator,
+    key: u64,
+    working_directory: []u8,
+    model_id: []u8,
+    last_used_unix_ms: i64,
+    current: bool,
+
+    pub fn deinit(self: *SessionSummary) void {
+        self.allocator.free(self.working_directory);
+        self.allocator.free(self.model_id);
+        self.* = undefined;
+    }
+
+    pub fn clone(
+        self: *const SessionSummary,
+        allocator: std.mem.Allocator,
+    ) !SessionSummary {
+        const working_directory = try allocator.dupe(
+            u8,
+            self.working_directory,
+        );
+        errdefer allocator.free(working_directory);
+        return .{
+            .allocator = allocator,
+            .key = self.key,
+            .working_directory = working_directory,
+            .model_id = try allocator.dupe(u8, self.model_id),
+            .last_used_unix_ms = self.last_used_unix_ms,
+            .current = self.current,
+        };
+    }
+};
+
+pub const SessionCatalog = struct {
+    allocator: std.mem.Allocator,
+    sessions: []SessionSummary,
+    skipped_invalid_shards: bool,
+
+    pub fn deinit(self: *SessionCatalog) void {
+        for (self.sessions) |*session| session.deinit();
+        self.allocator.free(self.sessions);
+        self.* = undefined;
+    }
+
+    pub fn clone(
+        self: *const SessionCatalog,
+        allocator: std.mem.Allocator,
+    ) !SessionCatalog {
+        const sessions = try allocator.alloc(
+            SessionSummary,
+            self.sessions.len,
+        );
+        errdefer allocator.free(sessions);
+        var initialized: usize = 0;
+        errdefer for (sessions[0..initialized]) |*session| session.deinit();
+        for (self.sessions, 0..) |session, index| {
+            sessions[index] = try session.clone(allocator);
+            initialized += 1;
+        }
+        return .{
+            .allocator = allocator,
+            .sessions = sessions,
+            .skipped_invalid_shards = self.skipped_invalid_shards,
+        };
+    }
+};
+
+pub const SessionResumeResult = union(enum) {
+    resumed: struct {
+        session: SessionSummary,
+        cleanup_failed: bool,
+    },
+    failed: OwnedText,
+
+    pub fn deinit(self: *SessionResumeResult) void {
+        switch (self.*) {
+            .resumed => |*result| result.session.deinit(),
+            .failed => |*message| message.deinit(),
+        }
+        self.* = undefined;
+    }
+};
+
 fn allocatorFreeModels(allocator: std.mem.Allocator, values: []ModelInfo) void {
     for (values) |*value| value.deinit();
     allocator.free(values);
@@ -259,6 +343,8 @@ pub const Event = union(enum) {
     model_catalog: ModelCatalog,
     model_catalog_failed: OwnedText,
     model_switch: ModelSwitchResult,
+    session_catalog: SessionCatalog,
+    session_resume: SessionResumeResult,
     assistant_started,
     reasoning_delta: OwnedText,
     reasoning_complete: OwnedText,
@@ -282,6 +368,8 @@ pub const Event = union(enum) {
             .model_catalog => |*catalog| catalog.deinit(),
             .model_catalog_failed => |*text| text.deinit(),
             .model_switch => |*result| result.deinit(),
+            .session_catalog => |*catalog| catalog.deinit(),
+            .session_resume => |*result| result.deinit(),
             .closed => |*closed| closed.deinit(),
             .ready, .assistant_started, .idle => {},
         }
@@ -296,7 +384,9 @@ pub const Command = union(enum) {
     },
     refresh_commands,
     refresh_models,
+    refresh_sessions,
     switch_model: OwnedText,
+    resume_session: u64,
     execute_command: OwnedText,
     user_input_response: struct {
         request_id: OwnedText,
@@ -313,7 +403,12 @@ pub const Command = union(enum) {
                 response.request_id.deinit();
                 response.answer.deinit();
             },
-            .refresh_commands, .refresh_models, .stop => {},
+            .refresh_commands,
+            .refresh_models,
+            .refresh_sessions,
+            .resume_session,
+            .stop,
+            => {},
         }
         self.* = undefined;
     }
@@ -446,7 +541,9 @@ pub const Worker = struct {
                 .stop => return self.core.commands.orderedRemove(index),
                 .refresh_commands,
                 .refresh_models,
+                .refresh_sessions,
                 .switch_model,
+                .resume_session,
                 .execute_command,
                 .user_input_response,
                 => {},
@@ -550,6 +647,20 @@ pub const Worker = struct {
         result: ModelSwitchResult,
     ) !void {
         try self.completeControl(.{ .model_switch = result });
+    }
+
+    pub fn completeSessionRefresh(
+        self: *Worker,
+        catalog: SessionCatalog,
+    ) !void {
+        try self.completeControl(.{ .session_catalog = catalog });
+    }
+
+    pub fn completeSessionResume(
+        self: *Worker,
+        result: SessionResumeResult,
+    ) !void {
+        try self.completeControl(.{ .session_resume = result });
     }
 
     pub fn assistantComplete(self: *Worker, text: []const u8) !void {
@@ -663,6 +774,10 @@ pub const Conversation = struct {
         try self.enqueueControl(.refresh_commands);
     }
 
+    pub fn refreshSessions(self: *Conversation) !void {
+        try self.enqueueControl(.refresh_sessions);
+    }
+
     pub fn switchModel(self: *Conversation, model_id: []const u8) !void {
         if (std.mem.trim(u8, model_id, " \t\r\n").len == 0) {
             return error.EmptyModel;
@@ -685,6 +800,11 @@ pub const Conversation = struct {
                 command,
             ),
         });
+    }
+
+    pub fn resumeSession(self: *Conversation, key: u64) !void {
+        if (key == 0) return error.InvalidSessionKey;
+        try self.enqueueControl(.{ .resume_session = key });
     }
 
     pub fn respondToUserInput(
@@ -867,7 +987,9 @@ test "conversation transfers streamed events without SDK access" {
                 },
                 .refresh_commands,
                 .refresh_models,
+                .refresh_sessions,
                 .switch_model,
+                .resume_session,
                 .execute_command,
                 .user_input_response,
                 => {
