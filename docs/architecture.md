@@ -154,12 +154,13 @@ storage. The SDK can create or join sessions by ID, but does not expose a
 custom session-storage backend.
 
 `backend/src/session_store.zig` owns Vivi's durable index of sessions it
-created. Each process writes one bounded, versioned JSON shard under
-`~/.vivi/sessions/` and atomically replaces only that shard. Readers merge
-valid shards by SDK session ID and skip malformed siblings, avoiding
-cross-process lost updates without a shared lock. The store records only the
-session ID, working directory, model identity, and recency; Copilot CLI remains
-the sole transcript/history store.
+created. Processes coordinate through an advisory `.lock` file under
+`~/.vivi/sessions/`. While holding that lock, each read or write merges valid
+versioned JSON shards by SDK session ID, incrementally bounds the catalog,
+atomically writes the merged catalog to the current process's shard, and
+removes sibling shards. Malformed shards are skipped and then removed during
+compaction. The store records only the session ID, working directory, model
+identity, and recency; Copilot CLI remains the sole transcript/history store.
 
 `/resume` is a first-class broker control operation rather than an SDK slash
 command. The terminal receives display-ready rows with request-local numeric

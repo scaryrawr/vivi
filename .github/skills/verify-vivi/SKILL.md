@@ -59,8 +59,10 @@ Use the executable helper:
 .github/skills/verify-vivi/bin/verify-vivi chat-streaming <run-id>
 .github/skills/verify-vivi/bin/verify-vivi chat-streaming-input <run-id>
 .github/skills/verify-vivi/bin/verify-vivi chat-ask-user <run-id>
+.github/skills/verify-vivi/bin/verify-vivi chat-model-menu <run-id>
+.github/skills/verify-vivi/bin/verify-vivi chat-session-resume <run-id>
 .github/skills/verify-vivi/bin/verify-vivi chat-shutdown <run-id>
-.github/skills/verify-vivi/bin/verify-vivi frame-check <run-id> chat-streaming
+.github/skills/verify-vivi/bin/verify-vivi frame-check <run-id> chat-session-resume
 ```
 
 `<run-id>` must contain only letters, digits, dots, underscores, or hyphens.
@@ -169,9 +171,11 @@ cli-discovery <run-id>
 chat-streaming <run-id>
 chat-streaming-input <run-id>
 chat-ask-user <run-id>
+chat-model-menu <run-id>
+chat-session-resume <run-id>
 chat-shutdown <run-id>
-extract-frames <run-id> <chat-streaming|chat-streaming-input|chat-ask-user|chat-model-menu|chat-shutdown>
-frame-check <run-id> <chat-streaming|chat-streaming-input|chat-ask-user|chat-model-menu|chat-shutdown>
+extract-frames <run-id> <chat-streaming|chat-streaming-input|chat-ask-user|chat-model-menu|chat-session-resume|chat-shutdown>
+frame-check <run-id> <chat-streaming|chat-streaming-input|chat-ask-user|chat-model-menu|chat-session-resume|chat-shutdown>
 cleanup <run-id>
 ```
 

@@ -956,27 +956,18 @@ fn buildCommandCatalog(
     const sdk_model = for (sdk_commands) |command| {
         if (std.ascii.eqlIgnoreCase(command.name, "model")) break command;
     } else null;
-    const model_name = try allocator.dupe(u8, "model");
-    errdefer allocator.free(model_name);
-    const model_description = try allocator.dupe(
-        u8,
+    commands[initialized] = try initCommandInfo(
+        allocator,
+        "model",
         if (sdk_model) |command|
             command.description
         else
             "Switch the model for new turns",
     );
-    commands[0] = .{
-        .name = model_name,
-        .description = model_description,
-    };
     initialized += 1;
-    commands[1] = .{
-        .name = try allocator.dupe(u8, "resume"),
-        .description = undefined,
-    };
-    errdefer allocator.free(commands[1].name);
-    commands[1].description = try allocator.dupe(
-        u8,
+    commands[initialized] = try initCommandInfo(
+        allocator,
+        "resume",
         "Resume a previous Vivi session",
     );
     initialized += 1;
@@ -986,13 +977,9 @@ fn buildCommandCatalog(
         {
             continue;
         }
-        commands[initialized] = .{
-            .name = try allocator.dupe(u8, command.name),
-            .description = undefined,
-        };
-        errdefer allocator.free(commands[initialized].name);
-        commands[initialized].description = try allocator.dupe(
-            u8,
+        commands[initialized] = try initCommandInfo(
+            allocator,
+            command.name,
             command.description,
         );
         initialized += 1;
@@ -1005,26 +992,36 @@ fn buildFallbackCommandCatalog(
 ) !conversation.CommandCatalog {
     const commands = try allocator.alloc(conversation.CommandInfo, 2);
     errdefer allocator.free(commands);
-    commands[0] = .{
-        .name = try allocator.dupe(u8, "model"),
-        .description = undefined,
+    var initialized: usize = 0;
+    errdefer for (commands[0..initialized]) |*command| {
+        allocator.free(command.name);
+        allocator.free(command.description);
     };
-    errdefer allocator.free(commands[0].name);
-    commands[0].description = try allocator.dupe(
-        u8,
+    commands[initialized] = try initCommandInfo(
+        allocator,
+        "model",
         "Switch the model for new turns",
     );
-    errdefer allocator.free(commands[0].description);
-    commands[1] = .{
-        .name = try allocator.dupe(u8, "resume"),
-        .description = undefined,
-    };
-    errdefer allocator.free(commands[1].name);
-    commands[1].description = try allocator.dupe(
-        u8,
+    initialized += 1;
+    commands[initialized] = try initCommandInfo(
+        allocator,
+        "resume",
         "Resume a previous Vivi session",
     );
     return .{ .allocator = allocator, .commands = commands };
+}
+
+fn initCommandInfo(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    description: []const u8,
+) !conversation.CommandInfo {
+    const owned_name = try allocator.dupe(u8, name);
+    errdefer allocator.free(owned_name);
+    return .{
+        .name = owned_name,
+        .description = try allocator.dupe(u8, description),
+    };
 }
 
 fn buildSessionCatalog(

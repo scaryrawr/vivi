@@ -2,7 +2,13 @@ const std = @import("std");
 
 pub const version: u32 = 1;
 pub const max_records_per_shard: usize = 200;
-const max_shard_bytes: usize = 1024 * 1024;
+const max_record_text_bytes =
+    512 + std.Io.Dir.max_path_bytes + 512;
+const max_json_expansion = 6;
+const max_serialized_record_bytes =
+    max_record_text_bytes * max_json_expansion + 256;
+const max_shard_bytes =
+    max_records_per_shard * max_serialized_record_bytes + 1024;
 const writer_id_bytes: usize = 16;
 const writer_id_hex_len: usize = writer_id_bytes * 2;
 const lock_filename = ".lock";
@@ -576,4 +582,35 @@ test "session store releases moved records when saving fails" {
     )) |_| {
         return error.ExpectedSaveFailure;
     } else |_| {}
+}
+
+test "session store read cap accepts maximum serialized shard" {
+    const id = [_]u8{1} ** 512;
+    const working_directory =
+        [_]u8{1} ** std.Io.Dir.max_path_bytes;
+    const model_id = [_]u8{1} ** 512;
+    const records = try std.testing.allocator.alloc(
+        DocumentRecord,
+        max_records_per_shard,
+    );
+    defer std.testing.allocator.free(records);
+    for (records) |*record| {
+        record.* = .{
+            .id = &id,
+            .working_directory = &working_directory,
+            .model_id = &model_id,
+            .last_used_unix_ms = std.math.maxInt(i64),
+        };
+    }
+    const encoded = try std.json.Stringify.valueAlloc(
+        std.testing.allocator,
+        Document{
+            .version = version,
+            .writer_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            .sessions = records,
+        },
+        .{ .whitespace = .indent_2 },
+    );
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expect(encoded.len <= max_shard_bytes);
 }
