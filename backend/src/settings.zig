@@ -5,7 +5,7 @@ pub const version: u32 = 1;
 pub const Settings = struct {
     allocator: std.mem.Allocator,
     default_model: ?[]u8 = null,
-    revision: u64 = 0,
+    write_id: ?[write_id_hex_len]u8 = null,
 
     pub fn deinit(self: *Settings) void {
         if (self.default_model) |model| self.allocator.free(model);
@@ -16,13 +16,16 @@ pub const Settings = struct {
 const Document = struct {
     version: u32,
     default_model: ?[]const u8 = null,
-    revision: u64 = 0,
+    write_id: ?[]const u8 = null,
 };
+
+const write_id_bytes: usize = 16;
+const write_id_hex_len: usize = write_id_bytes * 2;
 
 pub const DefaultModelUpdate = struct {
     allocator: std.mem.Allocator,
     previous_model: ?[]u8,
-    written_revision: u64,
+    written_id: [write_id_hex_len]u8,
 
     pub fn deinit(self: *DefaultModelUpdate) void {
         if (self.previous_model) |model| self.allocator.free(model);
@@ -54,6 +57,7 @@ pub fn load(
     );
     defer parsed.deinit();
     if (parsed.value.version != version) return error.UnsupportedSettingsVersion;
+    const write_id = try parseWriteId(parsed.value.write_id);
 
     const model = if (parsed.value.default_model) |value| blk: {
         if (!std.unicode.utf8ValidateSlice(value)) return error.InvalidSettingsModel;
@@ -67,7 +71,7 @@ pub fn load(
     return .{
         .allocator = allocator,
         .default_model = model,
-        .revision = parsed.value.revision,
+        .write_id = write_id,
     };
 }
 
@@ -91,15 +95,15 @@ pub fn updateDefaultModel(
     defer lock.close(io);
     var current = try load(allocator, io, path);
     errdefer current.deinit();
-    const revision = nextRevision(current.revision) catch |err| return err;
-    try saveDefaultModelUnlocked(allocator, io, path, model_id, revision);
+    const write_id = newWriteId(io);
+    try saveDefaultModelUnlocked(allocator, io, path, model_id, write_id);
     const previous_model = current.default_model;
     current.default_model = null;
     current.deinit();
     return .{
         .allocator = allocator,
         .previous_model = previous_model,
-        .written_revision = revision,
+        .written_id = write_id,
     };
 }
 
@@ -113,13 +117,14 @@ pub fn rollbackDefaultModel(
     defer lock.close(io);
     var current = try load(allocator, io, path);
     defer current.deinit();
-    if (current.revision != update.written_revision) return false;
+    const current_write_id = current.write_id orelse return false;
+    if (!std.mem.eql(u8, &current_write_id, &update.written_id)) return false;
     try saveDefaultModelUnlocked(
         allocator,
         io,
         path,
         update.previous_model,
-        try nextRevision(current.revision),
+        newWriteId(io),
     );
     return true;
 }
@@ -129,7 +134,7 @@ fn saveDefaultModelUnlocked(
     io: std.Io,
     path: []const u8,
     model_id: ?[]const u8,
-    revision: u64,
+    write_id: [write_id_hex_len]u8,
 ) !void {
     if (model_id) |value| {
         if (!std.unicode.utf8ValidateSlice(value) or
@@ -145,7 +150,7 @@ fn saveDefaultModelUnlocked(
         Document{
             .version = version,
             .default_model = model_id,
-            .revision = revision,
+            .write_id = &write_id,
         },
         .{ .whitespace = .indent_2 },
     );
@@ -183,11 +188,24 @@ fn acquireLock(
     );
 }
 
-fn nextRevision(revision: u64) !u64 {
-    if (revision == std.math.maxInt(u64)) {
-        return error.SettingsRevisionOverflow;
+fn newWriteId(io: std.Io) [write_id_hex_len]u8 {
+    var random_bytes: [write_id_bytes]u8 = undefined;
+    std.Io.randomSecure(io, &random_bytes) catch
+        std.Io.random(io, &random_bytes);
+    return std.fmt.bytesToHex(random_bytes, .lower);
+}
+
+fn parseWriteId(value: ?[]const u8) !?[write_id_hex_len]u8 {
+    const bytes = value orelse return null;
+    if (bytes.len != write_id_hex_len) return error.InvalidSettingsWriteId;
+    for (bytes) |byte| {
+        if (!std.ascii.isHex(byte) or std.ascii.isUpper(byte)) {
+            return error.InvalidSettingsWriteId;
+        }
     }
-    return revision + 1;
+    var write_id: [write_id_hex_len]u8 = undefined;
+    @memcpy(&write_id, bytes);
+    return write_id;
 }
 
 test "missing settings use no explicit default model" {
@@ -259,7 +277,7 @@ test "settings reject invalid documents" {
     );
 }
 
-test "settings rollback only replaces its exact revision" {
+test "settings rollback only replaces its exact write" {
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
     const path = try temporary.dir.realPathAlloc(
@@ -320,5 +338,46 @@ test "settings rollback only replaces its exact revision" {
     try std.testing.expectEqualStrings(
         "copilot/model-c",
         restored.default_model.?,
+    );
+}
+
+test "settings rollback refuses a legacy rewrite" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporary.dir.realPathAlloc(
+        std.testing.io,
+        std.testing.allocator,
+        "settings.json",
+    );
+    defer std.testing.allocator.free(path);
+
+    var update = try updateDefaultModel(
+        std.testing.allocator,
+        std.testing.io,
+        path,
+        "copilot/model-a",
+    );
+    defer update.deinit();
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = "settings.json",
+        .data =
+        \\{
+        \\  "version": 1,
+        \\  "default_model": "copilot/model-b"
+        \\}
+        ,
+    });
+
+    try std.testing.expect(!try rollbackDefaultModel(
+        std.testing.allocator,
+        std.testing.io,
+        path,
+        &update,
+    ));
+    var preserved = try load(std.testing.allocator, std.testing.io, path);
+    defer preserved.deinit();
+    try std.testing.expectEqualStrings(
+        "copilot/model-b",
+        preserved.default_model.?,
     );
 }

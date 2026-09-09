@@ -1811,6 +1811,20 @@ fn runSdkConversation(
                                 },
                                 .failed => return,
                             }
+                            if (store) |*value| {
+                                value.recordCreated(
+                                    session.id,
+                                    active_working_directory,
+                                    active_plan.id(),
+                                    unixMilliseconds(worker.io()),
+                                ) catch |err| {
+                                    worker.closeFailure(
+                                        .stream,
+                                        @errorName(err),
+                                    );
+                                    return;
+                                };
+                            }
                             break :command_execution;
                         },
                         .select_subcommand => |selection| {
@@ -2239,6 +2253,17 @@ fn runSdkConversation(
                         return;
                     },
                     .failed => return,
+                }
+                if (store) |*value| {
+                    value.recordCreated(
+                        session.id,
+                        active_working_directory,
+                        active_plan.id(),
+                        unixMilliseconds(worker.io()),
+                    ) catch |err| {
+                        worker.closeFailure(.stream, @errorName(err));
+                        return;
+                    };
                 }
             },
         }

@@ -375,7 +375,10 @@ pub const Store = struct {
 
     fn compact(self: *Store, records: []const Record) !void {
         try self.save(records);
+        self.removeSiblingShards() catch {};
+    }
 
+    fn removeSiblingShards(self: *Store) !void {
         var directory = try std.Io.Dir.openDirAbsolute(
             self.io,
             self.directory,
