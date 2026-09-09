@@ -122,6 +122,23 @@ const Transcript = struct {
         try self.entries.append(allocator, entry);
     }
 
+    fn appendBeforeQueued(
+        self: *Transcript,
+        allocator: std.mem.Allocator,
+        role: Role,
+        text: []const u8,
+    ) !void {
+        const entry = try Entry.init(allocator, role, text);
+        errdefer {
+            var mutable = entry;
+            mutable.deinit(allocator);
+        }
+        const index = for (self.entries.items, 0..) |existing, queued_index| {
+            if (existing.role == .queued) break queued_index;
+        } else self.entries.items.len;
+        try self.entries.insert(allocator, index, entry);
+    }
+
     fn appendDelta(
         self: *Transcript,
         allocator: std.mem.Allocator,
@@ -914,8 +931,13 @@ const ChatUi = struct {
             error.EmptyAnswer, error.NotAwaitingInput => return,
             else => return err,
         };
+        self.transcript.endTurn();
         try self.appendUserInputQuestion(request);
-        try self.transcript.append(self.allocator, .user, answer);
+        try self.transcript.appendBeforeQueued(
+            self.allocator,
+            .user,
+            answer,
+        );
         self.restoreInputAfterUserInput();
         var completed = self.pending_user_input.?;
         completed.deinit();
@@ -942,7 +964,7 @@ const ChatUi = struct {
             defer self.allocator.free(line);
             try message.appendSlice(self.allocator, line);
         }
-        try self.transcript.append(
+        try self.transcript.appendBeforeQueued(
             self.allocator,
             .question,
             message.items,
@@ -2191,6 +2213,40 @@ test "reasoning and response stay ordered before a queued prompt" {
     try std.testing.expectEqualStrings(
         "queued response",
         transcript.entries.items[4].text.items,
+    );
+}
+
+test "ask-user exchange separates resumed output from active reasoning" {
+    var transcript: Transcript = .{};
+    defer transcript.deinit(std.testing.allocator);
+
+    try transcript.appendReasoningDelta(
+        std.testing.allocator,
+        "before question",
+    );
+    try transcript.append(std.testing.allocator, .queued, "later prompt");
+    transcript.endTurn();
+    try transcript.appendBeforeQueued(
+        std.testing.allocator,
+        .question,
+        "Pick one\n  1. Alpha\n  2. Beta",
+    );
+    try transcript.appendBeforeQueued(
+        std.testing.allocator,
+        .user,
+        "Beta",
+    );
+    try transcript.appendDelta(std.testing.allocator, "after answer");
+
+    try std.testing.expectEqual(@as(usize, 5), transcript.entries.items.len);
+    try std.testing.expectEqual(Role.reasoning, transcript.entries.items[0].role);
+    try std.testing.expectEqual(Role.question, transcript.entries.items[1].role);
+    try std.testing.expectEqual(Role.user, transcript.entries.items[2].role);
+    try std.testing.expectEqual(Role.assistant, transcript.entries.items[3].role);
+    try std.testing.expectEqual(Role.queued, transcript.entries.items[4].role);
+    try std.testing.expectEqualStrings(
+        "after answer",
+        transcript.entries.items[3].text.items,
     );
 }
 
