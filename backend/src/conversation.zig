@@ -705,10 +705,14 @@ pub const Worker = struct {
     }
 
     fn completeControl(self: *Worker, event: Event) !void {
-        try self.core.mutex.lock(self.core.io);
+        self.core.mutex.lock(self.core.io) catch |err| {
+            var owned_event = event;
+            owned_event.deinit();
+            return err;
+        };
         if (!self.core.stop_requested) self.core.state = .idle;
         self.core.mutex.unlock(self.core.io);
-        try self.publish(event);
+        return self.publish(event);
     }
 
     pub fn closeRequested(self: *Worker) void {

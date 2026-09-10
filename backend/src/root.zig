@@ -1239,10 +1239,7 @@ fn streamSessionResponse(
                         client,
                         session,
                     )) |catalog| {
-                        worker.commandCatalog(catalog) catch {
-                            var mutable = catalog;
-                            mutable.deinit();
-                        };
+                        worker.commandCatalog(catalog) catch {};
                     } else |_| {}
                 }
             },
@@ -1411,10 +1408,7 @@ fn runSdkConversation(
         &client,
         session,
     ) catch buildFallbackCommandCatalog(worker.allocator()) catch null;
-    if (initial_commands) |catalog| worker.commandCatalog(catalog) catch {
-        var mutable = catalog;
-        mutable.deinit();
-    };
+    if (initial_commands) |catalog| worker.commandCatalog(catalog) catch {};
     if (buildModelCatalog(
         worker.allocator(),
         &client,
@@ -1422,10 +1416,7 @@ fn runSdkConversation(
         &active_plan,
         omlx_options,
     )) |catalog| {
-        worker.modelCatalog(catalog) catch {
-            var mutable = catalog;
-            mutable.deinit();
-        };
+        worker.modelCatalog(catalog) catch {};
     } else |_| {}
 
     while (true) {
@@ -1453,8 +1444,6 @@ fn runSdkConversation(
                     return;
                 };
                 worker.completeCommandRefresh(catalog) catch {
-                    var mutable = catalog;
-                    mutable.deinit();
                     worker.closeFailure(
                         .stream,
                         "Unable to deliver slash commands.",
@@ -1477,8 +1466,6 @@ fn runSdkConversation(
                     continue;
                 };
                 worker.completeModelRefresh(catalog) catch {
-                    var mutable = catalog;
-                    mutable.deinit();
                     worker.closeFailure(
                         .stream,
                         "Unable to deliver the model catalog.",
@@ -1518,8 +1505,6 @@ fn runSdkConversation(
                     return;
                 };
                 worker.completeSessionRefresh(catalog) catch {
-                    var mutable = catalog;
-                    mutable.deinit();
                     new_index.deinit();
                     worker.closeFailure(
                         .stream,
@@ -1590,8 +1575,6 @@ fn runSdkConversation(
                         .session = summary,
                         .cleanup_failed = false,
                     } }) catch {
-                        var mutable = summary;
-                        mutable.deinit();
                         worker.closeFailure(.stream, "Unable to report resumed session.");
                         return;
                     };
@@ -1763,7 +1746,6 @@ fn runSdkConversation(
                     .session = summary,
                     .cleanup_failed = cleanup_failed,
                 } }) catch {
-                    summary.deinit();
                     worker.closeFailure(
                         .stream,
                         "Unable to report the resumed session.",
@@ -1775,10 +1757,7 @@ fn runSdkConversation(
                     &client,
                     session,
                 )) |catalog| {
-                    worker.commandCatalog(catalog) catch {
-                        var mutable = catalog;
-                        mutable.deinit();
-                    };
+                    worker.commandCatalog(catalog) catch {};
                 } else |_| {}
             },
             .execute_command => |requested| {
@@ -2049,8 +2028,6 @@ fn runSdkConversation(
                         .{ .unchanged = info }
                     else
                         .{ .default_updated = info }) catch {
-                        var mutable = info;
-                        mutable.deinit();
                         worker.closeFailure(
                             .stream,
                             "Unable to report the selected model.",
@@ -2229,8 +2206,6 @@ fn runSdkConversation(
                     .default_saved = persisted_model != null,
                     .cleanup_failed = cleanup_failed,
                 } }) catch {
-                    var mutable = info;
-                    mutable.deinit();
                     worker.closeFailure(
                         .stream,
                         "Unable to report the model switch.",
@@ -2242,10 +2217,7 @@ fn runSdkConversation(
                     &client,
                     session,
                 )) |catalog| {
-                    worker.commandCatalog(catalog) catch {
-                        var mutable = catalog;
-                        mutable.deinit();
-                    };
+                    worker.commandCatalog(catalog) catch {};
                 } else |_| {}
             },
             .prompt => |prompt| {
