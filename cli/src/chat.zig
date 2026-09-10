@@ -1386,14 +1386,7 @@ const ChatUi = struct {
                     return .keep_running;
                 }
                 self.phase = .ready;
-                if (self.sessions != null and
-                    self.menu_mode == .loading_sessions)
-                {
-                    self.menu_mode = .sessions;
-                    try self.rebuildSessionMenu();
-                } else {
-                    self.menu_mode = .closed;
-                }
+                self.menu_mode = .closed;
                 try self.transcript.append(
                     self.allocator,
                     .status,
@@ -2933,6 +2926,14 @@ test "session catalog failure restores ready state" {
     defer ui.deinit();
     ui.phase = .resuming;
     ui.menu_mode = .loading_sessions;
+    ui.sessions = .{
+        .allocator = std.testing.allocator,
+        .sessions = try std.testing.allocator.alloc(
+            backend.SessionSummary,
+            0,
+        ),
+        .skipped_invalid_shards = false,
+    };
 
     var event: backend.ConversationEvent = .{
         .session_catalog_failed = try backend.OwnedText.init(
