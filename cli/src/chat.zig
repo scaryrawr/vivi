@@ -98,44 +98,122 @@ const MessageEntry = struct {
 };
 
 const ToolEntry = struct {
-    activity: backend.ToolActivity,
+    call_id: backend.ToolCallId,
+    invocation_hash: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+    completion: ?Completion = null,
     compact: []u8,
+
+    const Completion = union(enum) {
+        succeeded: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+        failed: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+
+        fn eql(self: Completion, other: Completion) bool {
+            return switch (self) {
+                .succeeded => |hash| switch (other) {
+                    .succeeded => |candidate| std.mem.eql(
+                        u8,
+                        hash[0..],
+                        candidate[0..],
+                    ),
+                    .failed => false,
+                },
+                .failed => |hash| switch (other) {
+                    .succeeded => false,
+                    .failed => |candidate| std.mem.eql(
+                        u8,
+                        hash[0..],
+                        candidate[0..],
+                    ),
+                },
+            };
+        }
+    };
 
     fn init(
         allocator: std.mem.Allocator,
         started: *const backend.ToolStarted,
     ) !ToolEntry {
-        const activity = try backend.ToolActivity.init(allocator, started);
+        const call_id = try started.call_id.clone(allocator);
         errdefer {
-            var mutable = activity;
-            mutable.deinit();
+            var mutable = call_id;
+            mutable.deinit(allocator);
         }
         return .{
-            .activity = activity,
-            .compact = try tool_renderer.renderCompact(allocator, &activity),
+            .call_id = call_id,
+            .invocation_hash = hashToolInvocation(started),
+            .compact = try tool_renderer.renderCompact(
+                allocator,
+                started.invocation.summary,
+                .running,
+            ),
         };
+    }
+
+    fn matchesStart(
+        self: ToolEntry,
+        started: *const backend.ToolStarted,
+    ) bool {
+        const invocation_hash = hashToolInvocation(started);
+        return self.call_id.eql(started.call_id) and
+            std.mem.eql(
+                u8,
+                self.invocation_hash[0..],
+                invocation_hash[0..],
+            );
     }
 
     fn finish(
         self: *ToolEntry,
-        allocator: std.mem.Allocator,
         finished: *const backend.ToolFinished,
     ) !void {
-        try self.activity.finish(finished);
-        const compact = try tool_renderer.renderCompact(
-            allocator,
-            &self.activity,
-        );
-        allocator.free(self.compact);
-        self.compact = compact;
+        if (!self.call_id.eql(finished.call_id)) {
+            return error.MismatchedToolCall;
+        }
+        const completion: Completion = switch (finished.result) {
+            .succeeded => |text| .{
+                .succeeded = hashToolPayload(text),
+            },
+            .failed => |text| .{
+                .failed = hashToolPayload(text),
+            },
+        };
+        if (self.completion) |existing| {
+            if (!existing.eql(completion)) {
+                return error.ConflictingToolCompletion;
+            }
+            return;
+        }
+        self.completion = completion;
+        const marker = switch (completion) {
+            .succeeded => "✓",
+            .failed => "✗",
+        };
+        std.debug.assert(std.mem.startsWith(u8, self.compact, "◌"));
+        @memcpy(self.compact[0..marker.len], marker);
     }
 
     fn deinit(self: *ToolEntry, allocator: std.mem.Allocator) void {
         allocator.free(self.compact);
-        self.activity.deinit();
+        self.call_id.deinit(allocator);
         self.* = undefined;
     }
 };
+
+fn hashToolInvocation(
+    started: *const backend.ToolStarted,
+) [std.crypto.hash.sha2.Sha256.digest_length]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(@tagName(started.invocation.summary));
+    hasher.update(&.{0});
+    hasher.update(started.invocation.arguments_json);
+    return hasher.finalResult();
+}
+
+fn hashToolPayload(payload: []const u8) [std.crypto.hash.sha2.Sha256.digest_length]u8 {
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(payload, &digest, .{});
+    return digest;
+}
 
 const Entry = union(enum) {
     message: MessageEntry,
@@ -352,7 +430,7 @@ const Transcript = struct {
         switch (update.*) {
             .started => |*started| {
                 if (self.findTool(started.call_id)) |tool| {
-                    if (tool.activity.matchesStart(started)) return;
+                    if (tool.matchesStart(started)) return;
                     return error.ConflictingToolStart;
                 }
                 self.finishTurn();
@@ -372,7 +450,7 @@ const Transcript = struct {
             .finished => |*finished| {
                 const tool = self.findTool(finished.call_id) orelse
                     return error.UnknownToolCall;
-                try tool.finish(allocator, finished);
+                try tool.finish(finished);
             },
         }
     }
@@ -385,7 +463,7 @@ const Transcript = struct {
             switch (entry.*) {
                 .message => {},
                 .tool => |*tool| {
-                    if (tool.activity.call_id.eql(call_id)) return tool;
+                    if (tool.call_id.eql(call_id)) return tool;
                 },
             }
         }
@@ -1629,7 +1707,6 @@ const ChatUi = struct {
                     self.allocator,
                     update,
                 );
-                self.followTail();
             },
             .user_input_requested => |request| {
                 const replacement = try request.clone(self.allocator);
@@ -2181,13 +2258,13 @@ const ChatUi = struct {
             },
             .tool => {
                 const tool = &entry.tool;
-                const color = switch (tool.activity.lifecycle) {
-                    .running => reasoning_color,
-                    .finished => |result| switch (result) {
+                const color = if (tool.completion) |completion|
+                    switch (completion) {
                         .succeeded => accent,
                         .failed => vaxis.Color{ .index = 203 },
-                    },
-                };
+                    }
+                else
+                    reasoning_color;
                 var segments = [_]vaxis.Segment{.{
                     .text = tool.compact[line.start..line.end],
                     .style = .{ .fg = color, .dim = true },
@@ -2867,19 +2944,17 @@ test "tool completions update interleaved rows in reverse order" {
     try std.testing.expectEqual(@as(usize, 2), transcript.entries.items.len);
     try std.testing.expectEqualStrings(
         "call-1",
-        transcript.entries.items[0].tool.activity.call_id.bytes,
+        transcript.entries.items[0].tool.call_id.bytes,
     );
-    try std.testing.expectEqualStrings(
-        "first",
-        transcript.entries.items[0].tool.activity.lifecycle.finished.failed,
+    try std.testing.expect(
+        transcript.entries.items[0].tool.completion.? == .failed,
     );
     try std.testing.expectEqualStrings(
         "call-2",
-        transcript.entries.items[1].tool.activity.call_id.bytes,
+        transcript.entries.items[1].tool.call_id.bytes,
     );
-    try std.testing.expectEqualStrings(
-        "second",
-        transcript.entries.items[1].tool.activity.lifecycle.finished.succeeded,
+    try std.testing.expect(
+        transcript.entries.items[1].tool.completion.? == .succeeded,
     );
 }
 
@@ -3024,6 +3099,75 @@ test "compact tool rows wrap by grapheme width with one entry index" {
     }
 }
 
+test "tool entries retain bounded display state instead of full payloads" {
+    const command = try std.testing.allocator.alloc(u8, 16 * 1024);
+    defer std.testing.allocator.free(command);
+    @memset(command, 'a');
+    const arguments = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"command\":\"{s}\"}}",
+        .{command},
+    );
+    defer std.testing.allocator.free(arguments);
+    var started = try toolStarted(
+        "call-1",
+        arguments,
+        .{ .bash = .{ .command = command } },
+    );
+    defer started.deinit();
+    var transcript: Transcript = .{};
+    defer transcript.deinit(std.testing.allocator);
+
+    try transcript.applyToolActivity(
+        std.testing.allocator,
+        &.{ .started = started },
+    );
+
+    const tool = transcript.entries.items[0].tool;
+    try std.testing.expect(tool.compact.len < 256);
+    try std.testing.expectEqual(
+        @as(usize, std.crypto.hash.sha2.Sha256.digest_length),
+        tool.invocation_hash.len,
+    );
+}
+
+test "tool events preserve a scrolled transcript position" {
+    var ui: ChatUi = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .input = TextInput.init(std.testing.allocator),
+        .cwd = try std.testing.allocator.dupe(u8, "."),
+        .rows_from_tail = 5,
+    };
+    defer ui.deinit();
+    var started_event: backend.ConversationEvent = .{
+        .tool_activity = .{
+            .started = try toolStarted(
+                "call-1",
+                "{\"command\":\"true\"}",
+                .{ .bash = .{ .command = "true" } },
+            ),
+        },
+    };
+    defer started_event.deinit();
+
+    _ = try ui.applyConversationEvent(&started_event);
+    try std.testing.expectEqual(@as(usize, 5), ui.rows_from_tail);
+
+    var finished_event: backend.ConversationEvent = .{
+        .tool_activity = .{
+            .finished = try toolFinished(
+                "call-1",
+                .{ .succeeded = "ok" },
+            ),
+        },
+    };
+    defer finished_event.deinit();
+
+    _ = try ui.applyConversationEvent(&finished_event);
+    try std.testing.expectEqual(@as(usize, 5), ui.rows_from_tail);
+}
+
 test "tool activity draws its compact row to the terminal screen" {
     var ui: ChatUi = .{
         .allocator = std.testing.allocator,
@@ -3077,7 +3221,7 @@ test "tool activity draws its compact row to the terminal screen" {
     try std.testing.expect(std.mem.indexOf(
         u8,
         rendered.items,
-        "Read README.md first 1 lines",
+        "Read README.md first 1 line",
     ) != null);
 }
 

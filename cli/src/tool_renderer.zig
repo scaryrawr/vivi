@@ -4,40 +4,50 @@ const vaxis = @import("vaxis");
 
 const bash_preview_graphemes = 80;
 
+pub const ToolStatus = enum {
+    running,
+    succeeded,
+    failed,
+};
+
 pub fn renderCompact(
     allocator: std.mem.Allocator,
-    activity: *const backend.ToolActivity,
+    summary: backend.ToolSummary,
+    status: ToolStatus,
 ) ![]u8 {
-    const marker = switch (activity.lifecycle) {
+    const marker = switch (status) {
         .running => "◌",
-        .finished => |result| switch (result) {
-            .succeeded => "✓",
-            .failed => "✗",
-        },
+        .succeeded => "✓",
+        .failed => "✗",
     };
 
-    return switch (activity.invocation.summary) {
-        .read => |summary| renderRead(allocator, marker, summary),
-        .bash => |summary| renderBash(allocator, marker, summary),
-        .edit => |summary| std.fmt.allocPrint(
+    return switch (summary) {
+        .read => |read_summary| renderRead(allocator, marker, read_summary),
+        .bash => |bash_summary| renderBash(allocator, marker, bash_summary),
+        .edit => |edit_summary| std.fmt.allocPrint(
             allocator,
             "{s} Edit {s}, {d} replacement{s}",
             .{
                 marker,
-                summary.path,
-                summary.replacement_count,
-                if (summary.replacement_count == 1) "" else "s",
+                edit_summary.path,
+                edit_summary.replacement_count,
+                if (edit_summary.replacement_count == 1) "" else "s",
             },
         ),
-        .write => |summary| std.fmt.allocPrint(
+        .write => |write_summary| std.fmt.allocPrint(
             allocator,
-            "{s} Write {s}, {d} bytes",
-            .{ marker, summary.path, summary.byte_count },
+            "{s} Write {s}, {d} byte{s}",
+            .{
+                marker,
+                write_summary.path,
+                write_summary.byte_count,
+                if (write_summary.byte_count == 1) "" else "s",
+            },
         ),
-        .other => |summary| std.fmt.allocPrint(
+        .other => |other_summary| std.fmt.allocPrint(
             allocator,
             "{s} Tool {s}",
-            .{ marker, summary.name },
+            .{ marker, other_summary.name },
         ),
     };
 }
@@ -52,7 +62,7 @@ fn renderRead(
             return std.fmt.allocPrint(
                 allocator,
                 "{s} Read {s} lines {d}-{d}",
-                .{ marker, summary.path, offset, offset +| limit -| 1 },
+                .{ marker, summary.path, offset, offset +| (limit -| 1) },
             );
         }
         return std.fmt.allocPrint(
@@ -64,8 +74,8 @@ fn renderRead(
     if (summary.limit) |limit| {
         return std.fmt.allocPrint(
             allocator,
-            "{s} Read {s} first {d} lines",
-            .{ marker, summary.path, limit },
+            "{s} Read {s} first {d} line{s}",
+            .{ marker, summary.path, limit, if (limit == 1) "" else "s" },
         );
     }
     return std.fmt.allocPrint(
@@ -95,17 +105,15 @@ fn compactBashPreview(
 ) ![]u8 {
     var compact: std.ArrayList(u8) = .empty;
     defer compact.deinit(allocator);
-    var in_whitespace = true;
     for (command) |byte| {
-        if (std.ascii.isWhitespace(byte)) {
-            in_whitespace = true;
-            continue;
+        switch (byte) {
+            '\n' => try compact.appendSlice(allocator, "\\n"),
+            '\r' => try compact.appendSlice(allocator, "\\r"),
+            '\t' => try compact.appendSlice(allocator, "\\t"),
+            0x0b => try compact.appendSlice(allocator, "\\v"),
+            0x0c => try compact.appendSlice(allocator, "\\f"),
+            else => try compact.append(allocator, byte),
         }
-        if (in_whitespace and compact.items.len > 0) {
-            try compact.append(allocator, ' ');
-        }
-        try compact.append(allocator, byte);
-        in_whitespace = false;
     }
 
     var iterator = vaxis.unicode.graphemeIterator(compact.items);
@@ -120,23 +128,6 @@ fn compactBashPreview(
     }
     if (end == compact.items.len) return compact.toOwnedSlice(allocator);
     return std.fmt.allocPrint(allocator, "{s}…", .{compact.items[0..end]});
-}
-
-fn testActivity(
-    allocator: std.mem.Allocator,
-    summary: backend.ToolSummary,
-    lifecycle: backend.ToolLifecycle,
-) !backend.ToolActivity {
-    var started = try backend.ToolStarted.init(
-        allocator,
-        "call",
-        "{}",
-        summary,
-    );
-    defer started.deinit();
-    var activity = try backend.ToolActivity.init(allocator, &started);
-    activity.lifecycle = lifecycle;
-    return activity;
 }
 
 test "built-in summaries and lifecycle chrome are distinct" {
@@ -156,7 +147,7 @@ test "built-in summaries and lifecycle chrome are distinct" {
             .summary = .{ .bash = .{
                 .command = "zig\n  build\t test",
             } },
-            .expected = "◌ Run zig build test",
+            .expected = "◌ Run zig\\n  build\\t test",
         },
         .{
             .summary = .{ .edit = .{
@@ -168,9 +159,9 @@ test "built-in summaries and lifecycle chrome are distinct" {
         .{
             .summary = .{ .write = .{
                 .path = "notes.txt",
-                .byte_count = 5,
+                .byte_count = 1,
             } },
-            .expected = "◌ Write notes.txt, 5 bytes",
+            .expected = "◌ Write notes.txt, 1 byte",
         },
         .{
             .summary = .{ .other = .{ .name = "search" } },
@@ -179,16 +170,46 @@ test "built-in summaries and lifecycle chrome are distinct" {
     };
 
     for (cases) |case| {
-        var activity = try testActivity(
+        const rendered = try renderCompact(
             std.testing.allocator,
             case.summary,
             .running,
         );
-        defer activity.deinit();
-        const rendered = try renderCompact(std.testing.allocator, &activity);
         defer std.testing.allocator.free(rendered);
         try std.testing.expectEqualStrings(case.expected, rendered);
     }
+}
+
+test "read ranges saturate after computing their zero-based span" {
+    const expected = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "◌ Read large.txt lines {d}-{d}",
+        .{ std.math.maxInt(usize), std.math.maxInt(usize) },
+    );
+    defer std.testing.allocator.free(expected);
+    const rendered = try renderCompact(
+        std.testing.allocator,
+        .{ .read = .{
+            .path = "large.txt",
+            .offset = std.math.maxInt(usize),
+            .limit = 1,
+        } },
+        .running,
+    );
+    defer std.testing.allocator.free(rendered);
+    try std.testing.expectEqualStrings(expected, rendered);
+}
+
+test "bash preview preserves spaces and escapes control whitespace" {
+    const preview = try compactBashPreview(
+        std.testing.allocator,
+        "printf 'a  b'\nrm file\targ",
+    );
+    defer std.testing.allocator.free(preview);
+    try std.testing.expectEqualStrings(
+        "printf 'a  b'\\nrm file\\targ",
+        preview,
+    );
 }
 
 test "bash preview is grapheme bounded" {
@@ -206,37 +227,19 @@ test "bash preview is grapheme bounded" {
 }
 
 test "lifecycle chrome distinguishes success and failure" {
-    var success = try testActivity(
+    const success_text = try renderCompact(
         std.testing.allocator,
         .{ .other = .{ .name = "search" } },
-        .running,
+        .succeeded,
     );
-    defer success.deinit();
-    var success_update = try backend.ToolFinished.init(
-        std.testing.allocator,
-        "call",
-        .{ .succeeded = "ok" },
-    );
-    defer success_update.deinit();
-    try success.finish(&success_update);
-    const success_text = try renderCompact(std.testing.allocator, &success);
     defer std.testing.allocator.free(success_text);
     try std.testing.expectEqualStrings("✓ Tool search", success_text);
 
-    var failure = try testActivity(
+    const failure_text = try renderCompact(
         std.testing.allocator,
         .{ .other = .{ .name = "search" } },
-        .running,
+        .failed,
     );
-    defer failure.deinit();
-    var failure_update = try backend.ToolFinished.init(
-        std.testing.allocator,
-        "call",
-        .{ .failed = "no" },
-    );
-    defer failure_update.deinit();
-    try failure.finish(&failure_update);
-    const failure_text = try renderCompact(std.testing.allocator, &failure);
     defer std.testing.allocator.free(failure_text);
     try std.testing.expectEqualStrings("✗ Tool search", failure_text);
 }
