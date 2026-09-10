@@ -1,4 +1,5 @@
 const std = @import("std");
+const tool_activity = @import("tool_activity.zig");
 
 pub const Wake = struct {
     context: *anyopaque,
@@ -352,6 +353,7 @@ pub const Event = union(enum) {
     reasoning_complete: OwnedText,
     assistant_delta: OwnedText,
     assistant_complete: OwnedText,
+    tool_activity: tool_activity.ToolActivityUpdate,
     user_input_requested: UserInputRequest,
     command_completed: OwnedText,
     idle,
@@ -365,6 +367,7 @@ pub const Event = union(enum) {
             .assistant_complete,
             .command_completed,
             => |*text| text.deinit(),
+            .tool_activity => |*update| update.deinit(),
             .user_input_requested => |*request| request.deinit(),
             .command_catalog => |*catalog| catalog.deinit(),
             .model_catalog => |*catalog| catalog.deinit(),
@@ -697,6 +700,13 @@ pub const Worker = struct {
         });
     }
 
+    pub fn toolActivity(
+        self: *Worker,
+        update: tool_activity.ToolActivityUpdate,
+    ) !void {
+        try self.publish(.{ .tool_activity = update });
+    }
+
     pub fn idle(self: *Worker) !void {
         try self.core.mutex.lock(self.core.io);
         if (!self.core.stop_requested) self.core.state = .idle;
@@ -1001,6 +1011,7 @@ test "conversation transfers streamed events without SDK access" {
                 worker.closeRequested();
                 return;
             }
+
             var command = worker.waitCommand();
             defer command.deinit();
             switch (command) {
@@ -1075,6 +1086,80 @@ test "conversation transfers streamed events without SDK access" {
         }
     }
     try std.testing.expect(wake_counter.count.load(.monotonic) > 0);
+}
+
+test "conversation transfers owned tool lifecycle events without SDK access" {
+    const Script = struct {
+        fn run(worker: *Worker) void {
+            const started = tool_activity.ToolStarted.init(
+                worker.allocator(),
+                "call-1",
+                "{\"path\":\"file.txt\"}",
+                .{ .read = .{
+                    .path = "file.txt",
+                    .offset = null,
+                    .limit = null,
+                } },
+            ) catch return;
+            worker.toolActivity(.{ .started = started }) catch return;
+            const finished = tool_activity.ToolFinished.init(
+                worker.allocator(),
+                "call-1",
+                .{ .succeeded = "contents" },
+            ) catch return;
+            worker.toolActivity(.{ .finished = finished }) catch return;
+            var stop = worker.waitCommand();
+            stop.deinit();
+            worker.closeRequested();
+        }
+    };
+    const WakeCounter = struct {
+        fn notify(_: *anyopaque) void {}
+    };
+
+    var wake_context: u8 = 0;
+    var conversation = try openWithRunner(
+        std.testing.allocator,
+        std.testing.io,
+        .{ .context = &wake_context, .notify = WakeCounter.notify },
+        Script.run,
+    );
+    defer conversation.deinit();
+
+    var started_seen = false;
+    var finished_seen = false;
+    while (!finished_seen) {
+        if (try conversation.tryTakeEvent()) |event_value| {
+            var event = event_value;
+            defer event.deinit();
+            switch (event) {
+                .tool_activity => |update| switch (update) {
+                    .started => |started| {
+                        try std.testing.expectEqualStrings(
+                            "call-1",
+                            started.call_id.bytes,
+                        );
+                        try std.testing.expectEqualStrings(
+                            "{\"path\":\"file.txt\"}",
+                            started.invocation.arguments_json,
+                        );
+                        started_seen = true;
+                    },
+                    .finished => |finished| {
+                        try std.testing.expect(started_seen);
+                        try std.testing.expectEqualStrings(
+                            "contents",
+                            finished.result.succeeded,
+                        );
+                        finished_seen = true;
+                    },
+                },
+                else => {},
+            }
+        } else {
+            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+    }
 }
 
 test "conversation accepts steering and queued prompts while streaming" {
