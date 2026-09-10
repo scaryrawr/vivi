@@ -62,7 +62,10 @@ late-registering extensions can appear without restarting Vivi. Select
 and discovered OMLX models. Selecting the active model is a no-op. A successful switch keeps the
 visible Vivi transcript but starts a fresh server-side session, so prior turns
 are not part of the replacement model's context. Vivi currently executes
-`/model` with Vivi's model picker. Compatible SDK-contributed commands,
+`/model` with Vivi's model picker. Vivi records sessions it creates under
+`~/.vivi/sessions/`; select `/resume` to filter those sessions by workspace and
+continue one later. Copilot CLI remains the authoritative history store, and a
+failed resume leaves the current chat active. Compatible SDK-contributed commands,
 including session-mode commands such as `/autopilot`, execute through
 Copilot's command API.
 

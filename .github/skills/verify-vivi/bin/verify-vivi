@@ -14,9 +14,10 @@ Usage:
   verify-vivi chat-streaming-input <run-id>
   verify-vivi chat-ask-user <run-id>
   verify-vivi chat-model-menu <run-id>
+  verify-vivi chat-session-resume <run-id>
   verify-vivi chat-shutdown <run-id>
-  verify-vivi extract-frames <run-id> <chat-streaming|chat-streaming-input|chat-ask-user|chat-model-menu|chat-shutdown>
-  verify-vivi frame-check <run-id> <chat-streaming|chat-streaming-input|chat-ask-user|chat-model-menu|chat-shutdown>
+  verify-vivi extract-frames <run-id> <chat-streaming|chat-streaming-input|chat-ask-user|chat-model-menu|chat-session-resume|chat-shutdown>
+  verify-vivi frame-check <run-id> <chat-streaming|chat-streaming-input|chat-ask-user|chat-model-menu|chat-session-resume|chat-shutdown>
   verify-vivi cleanup <run-id>
 EOF
 }
@@ -117,9 +118,9 @@ cli_discovery() {
 
 validate_capture_name() {
     case "$1" in
-        chat-streaming|chat-streaming-input|chat-ask-user|chat-model-menu|chat-shutdown) ;;
+        chat-streaming|chat-streaming-input|chat-ask-user|chat-model-menu|chat-session-resume|chat-shutdown) ;;
         *)
-            printf 'capture must be chat-streaming, chat-streaming-input, chat-ask-user, chat-model-menu, or chat-shutdown\n' >&2
+            printf 'capture must be chat-streaming, chat-streaming-input, chat-ask-user, chat-model-menu, chat-session-resume, or chat-shutdown\n' >&2
             exit 1
             ;;
     esac
@@ -635,6 +636,156 @@ chat_model_menu() {
     test -s "$run_dir/chat-model-menu.contact-sheet.png"
 }
 
+write_session_resume_tape() {
+    run_dir=$1
+    cat >"$run_dir/chat-session-resume.tape" <<EOF
+Output "$run_dir/chat-session-resume.gif"
+Require copilot
+Set Shell "bash"
+Set Width 1200
+Set Height 720
+Set FontSize 22
+Set TypingSpeed 20ms
+
+Type "./zig-out/bin/vivi chat --model copilot/default"
+Enter
+Sleep 10s
+Type "Remember the token VIVI_RESUME_MEMORY for this session. Reply exactly SAVED."
+Enter
+Sleep 25s
+Ctrl+C
+Sleep 3s
+Ctrl+C
+Sleep 2s
+Type "./zig-out/bin/vivi chat --model copilot/default"
+Enter
+Sleep 10s
+Type "/resume"
+Sleep 10s
+Enter
+Sleep 5s
+Enter
+Sleep 8s
+Type "Reply with only the token I asked you to remember earlier."
+Enter
+Sleep 25s
+Ctrl+C
+Sleep 3s
+Ctrl+C
+Sleep 2s
+EOF
+}
+
+chat_session_resume() {
+    run_dir=$(prepare_run "$1")
+    build_vivi
+    write_session_resume_tape "$run_dir"
+    resume_home="$run_dir/home"
+    vhs_home="$run_dir/vhs-home"
+    mkdir -p "$resume_home"
+    mkdir -p "$vhs_home"
+    rm -rf "$resume_home/.vivi"
+    rm -rf "$vhs_home/.vivi"
+    if test -n "${HOME:-}" &&
+        test -d "$HOME/.copilot" &&
+        ! test -e "$resume_home/.copilot"
+    then
+        ln -s "$HOME/.copilot" "$resume_home/.copilot"
+    fi
+    if test -n "${HOME:-}" &&
+        test -d "$HOME/.copilot" &&
+        ! test -e "$vhs_home/.copilot"
+    then
+        ln -s "$HOME/.copilot" "$vhs_home/.copilot"
+    fi
+
+    (
+        cd "$repo_root" &&
+            HOME="$vhs_home" VIVI_KEEP_GIF=1 \
+                vhs "$run_dir/chat-session-resume.tape"
+    )
+    VIVI_KEEP_GIF=1 extract_frames "$1" chat-session-resume
+
+    (
+        sleep 10
+        printf 'Remember the token VIVI_RESUME_MEMORY for this session. Reply exactly SAVED.\r'
+        sleep 25
+        printf '\003'
+        sleep 3
+        printf '\003'
+        sleep 2
+    ) | HOME="$resume_home" \
+        script -q "$run_dir/chat-session-resume-first.terminal.log" sh -c \
+        "stty cols 100 rows 30; '$binary' chat --model copilot/default"
+
+    (
+        sleep 10
+        printf '/resume'
+        sleep 10
+        printf '\r'
+        sleep 5
+        printf '\r'
+        sleep 8
+        printf 'Reply with only the token I asked you to remember earlier.\r'
+        sleep 25
+        printf '\003'
+        sleep 3
+        printf '\003'
+        sleep 2
+    ) | HOME="$resume_home" \
+        script -q "$run_dir/chat-session-resume-second.terminal.log" sh -c \
+        "stty cols 100 rows 30; '$binary' chat --model copilot/default" &
+    pty_pid=$!
+    printf '%s\n' "$pty_pid" >"$run_dir/pty.pid"
+    trap 'kill "$pty_pid" 2>/dev/null || true; wait "$pty_pid" 2>/dev/null || true' EXIT INT TERM
+
+    if wait "$pty_pid"; then
+        status=0
+    else
+        status=$?
+    fi
+    rm -f "$run_dir/pty.pid"
+    trap - EXIT INT TERM
+    cat "$run_dir/chat-session-resume-first.terminal.log" \
+        "$run_dir/chat-session-resume-second.terminal.log" \
+        >"$run_dir/chat-session-resume.terminal.log"
+
+    perl -0pe \
+        's/\e\[[0-?]*[ -\/]*[@-~]//g; s/\e\][^\a]*(?:\a|\e\\)//g' \
+        "$run_dir/chat-session-resume.terminal.log" |
+        tr -d '\r\b' >"$run_dir/chat-session-resume.normalized.txt"
+    perl -0pe \
+        's/\e\[[0-?]*[ -\/]*[@-~]//g; s/\e\][^\a]*(?:\a|\e\\)//g' \
+        "$run_dir/chat-session-resume-second.terminal.log" |
+        tr -d '\r\b' >"$run_dir/chat-session-resume-second.normalized.txt"
+
+    {
+        printf 'exit=%s\n' "$status"
+        printf 'resume_status_seen='
+        if grep -q 'Resumed ' \
+            "$run_dir/chat-session-resume-second.normalized.txt"
+        then
+            printf 'yes\n'
+        else
+            printf 'no\n'
+        fi
+        printf 'history_seen='
+        if grep -Eq 'Vivi[[:space:]]*VIVI_RESUME_MEMORY' \
+            "$run_dir/chat-session-resume-second.normalized.txt"
+        then
+            printf 'yes\n'
+        else
+            printf 'no\n'
+        fi
+    } >"$run_dir/chat-session-resume.assertions.txt"
+
+    test "$status" -eq 0
+    grep -q 'Resumed ' "$run_dir/chat-session-resume-second.normalized.txt"
+    grep -Eq 'Vivi[[:space:]]*VIVI_RESUME_MEMORY' \
+        "$run_dir/chat-session-resume-second.normalized.txt"
+    test -s "$run_dir/chat-session-resume.contact-sheet.png"
+}
+
 write_shutdown_tape() {
     run_dir=$1
     cat >"$run_dir/chat-shutdown.tape" <<EOF
@@ -723,6 +874,13 @@ case "${1:-}" in
             exit 2
         }
         chat_model_menu "$2"
+        ;;
+    chat-session-resume)
+        test "$#" -eq 2 || {
+            usage >&2
+            exit 2
+        }
+        chat_session_resume "$2"
         ;;
     chat-shutdown)
         test "$#" -eq 2 || {

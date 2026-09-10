@@ -147,11 +147,38 @@ for one launch; selecting that already-active override through `/model`
 promotes it to the persisted default without replacing the SDK session.
 
 `backend/src/settings.zig` owns the versioned, SDK-free settings document and
-atomic replacement. Hosts resolve the user's home directory and pass the
+atomic replacement. Writers coordinate through a sidecar lock, and rollback
+uses a random identity captured by the exact write, so a failed model switch
+cannot overwrite a newer default saved by another process, be fooled by the
+same model value appearing again, or mistake a legacy writer's field-dropping
+rewrite for its own write. Hosts resolve the user's home directory and pass the
 settings path into conversation options; they do not parse the document or
 coordinate model-switch persistence. Copilot CLI continues to own its session
 storage. The SDK can create or join sessions by ID, but does not expose a
 custom session-storage backend.
+
+`backend/src/session_store.zig` owns Vivi's durable index of sessions it
+created. Processes coordinate through an advisory `.lock` file under
+`~/.vivi/sessions/`. While holding that lock, each read or write merges valid
+versioned JSON shards by SDK session ID, incrementally bounds the catalog,
+atomically writes the merged catalog to the current process's shard, and
+best-effort removes sibling shards after that commit. Malformed shards are
+skipped and then removed during compaction. An unsupported document version or
+an oversized shard aborts the operation before compaction so an older Vivi
+binary cannot delete a newer catalog it cannot safely inspect. On POSIX
+systems, the directory, lock, and shards use owner-only permissions; Windows
+creation inherits the user profile's access-controlled directory permissions.
+The store records only the session ID, working directory, model identity, and
+recency, refreshing recency after each completed response; Copilot CLI remains
+the sole transcript/history store.
+
+`/resume` is a first-class broker control operation rather than an SDK slash
+command. The terminal receives display-ready rows with request-local numeric
+keys, while `backend/src/root.zig` privately resolves the selected record and
+calls `Client.joinSession`. Joining, durable recency update, active-session
+commit, and previous-session cleanup form one backend transaction. Candidate
+tools and the system prompt are rebuilt for the recorded working directory;
+any failure before commit leaves the current session active.
 
 Cancellation is cooperative because the pinned SDK has no documented
 cross-thread operation that interrupts a blocked `Session.nextEvent`.

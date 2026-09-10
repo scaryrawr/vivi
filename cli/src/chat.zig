@@ -270,6 +270,7 @@ const UiPhase = enum {
     awaiting_input,
     running_command,
     switching,
+    resuming,
     stopping,
 
     fn label(self: UiPhase) []const u8 {
@@ -281,6 +282,7 @@ const UiPhase = enum {
             .awaiting_input => "Answer required",
             .running_command => "Running command...",
             .switching => "Switching model...",
+            .resuming => "Resuming session...",
             .stopping => "Stopping...",
         };
     }
@@ -508,9 +510,32 @@ const MenuDetail = union(enum) {
         output_tokens: u64,
         supports_vision: bool,
     },
+    session: struct {
+        model_id: []const u8,
+        last_used_unix_ms: i64,
+    },
+};
+
+const MenuIdentity = union(enum) {
+    text: []const u8,
+    number: u64,
+
+    fn eql(left: MenuIdentity, right: MenuIdentity) bool {
+        return switch (left) {
+            .text => |value| switch (right) {
+                .text => |other| std.mem.eql(u8, value, other),
+                .number => false,
+            },
+            .number => |value| switch (right) {
+                .text => false,
+                .number => |other| value == other,
+            },
+        };
+    }
 };
 
 const MenuEntry = struct {
+    identity: MenuIdentity,
     key: []const u8,
     primary: []const u8,
     detail: MenuDetail,
@@ -542,7 +567,10 @@ const MenuState = struct {
         entries: []const MenuEntry,
         query: []const u8,
     ) !void {
-        const previous_key = if (self.selected()) |entry| entry.key else null;
+        const previous_identity = if (self.selected()) |entry|
+            entry.identity
+        else
+            null;
         self.entries.clearRetainingCapacity();
         self.matches.clearRetainingCapacity();
         try self.entries.appendSlice(allocator, entries);
@@ -558,9 +586,9 @@ const MenuState = struct {
         stableRank(self.matches.items, ranks.items);
 
         self.selected_match = 0;
-        if (previous_key) |key| {
+        if (previous_identity) |identity| {
             for (self.matches.items, 0..) |entry_index, match_index| {
-                if (std.mem.eql(u8, self.entries.items[entry_index].key, key)) {
+                if (self.entries.items[entry_index].identity.eql(identity)) {
                     self.selected_match = match_index;
                     break;
                 }
@@ -617,6 +645,10 @@ fn matchRank(entry: MenuEntry, query: []const u8) ?u2 {
         switch (entry.detail) {
             .text => |text| asciiContainsIgnoreCase(text, query),
             .model => false,
+            .session => |session| asciiContainsIgnoreCase(
+                session.model_id,
+                query,
+            ),
         })
     {
         return 2;
@@ -654,6 +686,45 @@ fn wordStartsWithIgnoreCase(value: []const u8, prefix: []const u8) bool {
     return false;
 }
 
+fn uniqueWorkspaceLabel(
+    sessions: []const backend.SessionSummary,
+    session_index: usize,
+) []const u8 {
+    const path = sessions[session_index].working_directory;
+    var start = path.len - std.fs.path.basename(path).len;
+    while (true) {
+        const candidate = path[start..];
+        var collision = false;
+        for (sessions, 0..) |other, other_index| {
+            if (other_index == session_index) continue;
+            if (pathEndsWithComponent(other.working_directory, candidate)) {
+                collision = true;
+                break;
+            }
+        }
+        if (!collision or start == 0) return candidate;
+        start = previousPathComponentStart(path, start);
+    }
+}
+
+fn pathEndsWithComponent(path: []const u8, suffix: []const u8) bool {
+    if (!std.mem.endsWith(u8, path, suffix)) return false;
+    if (path.len == suffix.len) return true;
+    return isPathSeparator(path[path.len - suffix.len - 1]);
+}
+
+fn previousPathComponentStart(path: []const u8, current_start: usize) usize {
+    var end = current_start;
+    while (end > 0 and isPathSeparator(path[end - 1])) end -= 1;
+    var start = end;
+    while (start > 0 and !isPathSeparator(path[start - 1])) start -= 1;
+    return start;
+}
+
+fn isPathSeparator(byte: u8) bool {
+    return byte == '/' or byte == '\\';
+}
+
 fn stableRank(indices: []usize, ranks: []u2) void {
     var index: usize = 1;
     while (index < indices.len) : (index += 1) {
@@ -675,16 +746,20 @@ const MenuMode = enum {
     commands,
     loading_models,
     models,
+    loading_sessions,
+    sessions,
 };
 
 const ChatUi = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     input: TextInput,
     transcript: Transcript = .{},
     cwd: []u8,
     phase: UiPhase = .connecting,
     commands: ?backend.CommandCatalog = null,
     models: ?backend.ModelCatalog = null,
+    sessions: ?backend.SessionCatalog = null,
     pending_user_input: ?backend.UserInputRequest = null,
     saved_input: ?TextInput = null,
     selected_user_input_choice: usize = 0,
@@ -717,6 +792,7 @@ const ChatUi = struct {
 
         return .{
             .allocator = allocator,
+            .io = io,
             .input = TextInput.init(allocator),
             .cwd = cwd,
         };
@@ -727,6 +803,7 @@ const ChatUi = struct {
         if (self.saved_input) |*input| input.deinit();
         if (self.pending_user_input) |*request| request.deinit();
         if (self.models) |*catalog| catalog.deinit();
+        if (self.sessions) |*catalog| catalog.deinit();
         if (self.commands) |*catalog| catalog.deinit();
         self.allocator.free(self.cwd);
         self.transcript.deinit(self.allocator);
@@ -766,12 +843,14 @@ const ChatUi = struct {
                 return .keep_running;
             }
             if (self.menu_mode != .loading_models and
+                self.menu_mode != .loading_sessions and
                 key.matches(vaxis.Key.up, .{}))
             {
                 self.menu.move(.previous);
                 return .keep_running;
             }
             if (self.menu_mode != .loading_models and
+                self.menu_mode != .loading_sessions and
                 key.matches(vaxis.Key.down, .{}))
             {
                 self.menu.move(.next);
@@ -779,7 +858,8 @@ const ChatUi = struct {
             }
             if (key.matches(vaxis.Key.enter, .{})) {
                 if (self.phase != .ready or
-                    self.menu_mode == .loading_models)
+                    self.menu_mode == .loading_models or
+                    self.menu_mode == .loading_sessions)
                 {
                     return .keep_running;
                 }
@@ -806,7 +886,10 @@ const ChatUi = struct {
             }
             return .keep_running;
         }
-        if (self.phase != .ready and self.phase != .responding) {
+        if (self.phase != .ready and
+            self.phase != .responding and
+            self.phase != .loading_commands)
+        {
             return .keep_running;
         }
 
@@ -840,7 +923,7 @@ const ChatUi = struct {
         const previous_menu_mode = self.menu_mode;
         try self.input.update(.{ .key_press = key });
         self.input_revision +%= 1;
-        if (self.phase == .ready) {
+        if (self.phase == .ready or self.phase == .loading_commands) {
             try self.syncSlashMenu();
         } else {
             self.menu_mode = .closed;
@@ -1008,9 +1091,16 @@ const ChatUi = struct {
     }
 
     fn syncSlashMenu(self: *ChatUi) !void {
-        if (self.menu_mode == .loading_models) return;
+        if (self.menu_mode == .loading_models or
+            self.menu_mode == .loading_sessions)
+        {
+            return;
+        }
         if (self.menu_mode == .models) {
             return self.rebuildModelMenu();
+        }
+        if (self.menu_mode == .sessions) {
+            return self.rebuildSessionMenu();
         }
         const contents = try self.input.toOwnedContents(self.allocator);
         defer self.allocator.free(contents);
@@ -1035,6 +1125,7 @@ const ChatUi = struct {
         defer self.allocator.free(entries);
         for (catalog.commands, 0..) |command, index| {
             entries[index] = .{
+                .identity = .{ .text = command.name },
                 .key = command.name,
                 .primary = command.name,
                 .detail = .{ .text = command.description },
@@ -1052,6 +1143,7 @@ const ChatUi = struct {
         defer self.allocator.free(entries);
         for (catalog.models, 0..) |model, index| {
             entries[index] = .{
+                .identity = .{ .text = model.id },
                 .key = model.id,
                 .primary = model.display_name,
                 .detail = .{ .model = .{
@@ -1060,6 +1152,32 @@ const ChatUi = struct {
                     .supports_vision = model.supports_vision,
                 } },
                 .current = std.mem.eql(u8, catalog.selected_id, model.id),
+                .source_index = index,
+            };
+        }
+        try self.menu.rebuild(self.allocator, entries, query);
+    }
+
+    fn rebuildSessionMenu(self: *ChatUi) !void {
+        const catalog = self.sessions orelse return;
+        const query = try self.input.toOwnedContents(self.allocator);
+        defer self.allocator.free(query);
+        const entries = try self.allocator.alloc(
+            MenuEntry,
+            catalog.sessions.len,
+        );
+        defer self.allocator.free(entries);
+        for (catalog.sessions, 0..) |session, index| {
+            entries[index] = .{
+                .identity = .{ .number = session.key },
+                .key = session.working_directory,
+                .primary = uniqueWorkspaceLabel(catalog.sessions, index),
+                .detail = .{ .session = .{
+                    .model_id = session.model_id,
+                    .last_used_unix_ms = session.last_used_unix_ms,
+                } },
+                .current = session.current,
+                .enabled = !session.current,
                 .source_index = index,
             };
         }
@@ -1075,6 +1193,19 @@ const ChatUi = struct {
             .commands => {
                 const catalog = self.commands orelse return;
                 const command = catalog.commands[selected.source_index];
+                if (std.ascii.eqlIgnoreCase(command.name, "resume")) {
+                    self.input.clearRetainingCapacity();
+                    self.menu_mode = .loading_sessions;
+                    conversation.refreshSessions() catch |err| switch (err) {
+                        error.Busy => {
+                            self.menu_mode = .closed;
+                            return;
+                        },
+                        else => return err,
+                    };
+                    self.phase = .resuming;
+                    return;
+                }
                 if (!std.ascii.eqlIgnoreCase(command.name, "model")) {
                     const contents = try self.input.toOwnedContents(
                         self.allocator,
@@ -1116,7 +1247,18 @@ const ChatUi = struct {
                 self.menu_mode = .closed;
                 self.phase = .switching;
             },
-            .closed, .loading_models => {},
+            .sessions => {
+                const catalog = self.sessions orelse return;
+                const target = catalog.sessions[selected.source_index];
+                conversation.resumeSession(target.key) catch |err| switch (err) {
+                    error.Busy => return,
+                    else => return err,
+                };
+                self.input.clearRetainingCapacity();
+                self.menu_mode = .closed;
+                self.phase = .resuming;
+            },
+            .closed, .loading_models, .loading_sessions => {},
         }
     }
 
@@ -1217,6 +1359,84 @@ const ChatUi = struct {
                     ),
                 }
             },
+            .session_catalog => |catalog| {
+                if (self.phase == .stopping) {
+                    self.menu_mode = .closed;
+                    return .keep_running;
+                }
+                const replacement = try catalog.clone(self.allocator);
+                if (self.sessions) |*current| current.deinit();
+                self.sessions = replacement;
+                self.phase = .ready;
+                if (self.menu_mode == .loading_sessions) {
+                    self.menu_mode = .sessions;
+                    try self.rebuildSessionMenu();
+                    if (catalog.skipped_invalid_shards) {
+                        try self.transcript.append(
+                            self.allocator,
+                            .status,
+                            "Some saved sessions could not be listed.",
+                        );
+                    }
+                }
+            },
+            .session_catalog_failed => |failure| {
+                if (self.phase == .stopping) {
+                    self.menu_mode = .closed;
+                    return .keep_running;
+                }
+                self.phase = .ready;
+                self.menu_mode = .closed;
+                try self.transcript.append(
+                    self.allocator,
+                    .status,
+                    failure.bytes,
+                );
+            },
+            .session_tracking_failed => |failure| {
+                try self.transcript.append(
+                    self.allocator,
+                    .status,
+                    failure.bytes,
+                );
+            },
+            .session_resume => |result| {
+                if (self.phase == .resuming) self.phase = .ready;
+                self.menu_mode = .closed;
+                switch (result) {
+                    .resumed => |success| {
+                        const resumed_cwd = try self.allocator.dupe(
+                            u8,
+                            success.session.working_directory,
+                        );
+                        self.allocator.free(self.cwd);
+                        self.cwd = resumed_cwd;
+                        try self.updateSelectedModel(success.session.model_id);
+                        const message = try std.fmt.allocPrint(
+                            self.allocator,
+                            "Resumed {s}. Copilot history now comes from that session; the visible Vivi transcript remains.{s}",
+                            .{
+                                success.session.working_directory,
+                                if (success.cleanup_failed)
+                                    " The previous session could not be detached cleanly."
+                                else
+                                    "",
+                            },
+                        );
+                        defer self.allocator.free(message);
+                        try self.transcript.append(
+                            self.allocator,
+                            .status,
+                            message,
+                        );
+                    },
+                    .failed => |failure| try self.transcript.append(
+                        self.allocator,
+                        .status,
+                        failure.bytes,
+                    ),
+                }
+            },
             .assistant_started => {
                 self.phase = .responding;
                 self.transcript.beginQueuedTurn();
@@ -1294,8 +1514,11 @@ const ChatUi = struct {
         const desired_menu_rows: u16 = if (self.phase == .awaiting_input)
             self.userInputPanelRows(root)
         else switch (self.menu_mode) {
-            .commands, .models => @intCast(@min(self.menu.matches.items.len, 8)),
-            .closed, .loading_models => 0,
+            .commands, .models, .sessions => @intCast(@min(
+                @max(self.menu.matches.items.len, 1),
+                8,
+            )),
+            .closed, .loading_models, .loading_sessions => 0,
         };
         const layout = FrameLayout.compute(
             root.width,
@@ -1341,6 +1564,31 @@ const ChatUi = struct {
             .char = .{ .grapheme = " ", .width = 1 },
             .style = .{ .bg = menu_background },
         });
+        if (self.menu.matches.items.len == 0) {
+            const text = if (self.menu_mode == .sessions)
+                sessionMenuEmptyMessage(blk: {
+                    const catalog = self.sessions orelse break :blk false;
+                    for (catalog.sessions) |session| {
+                        if (!session.current) break :blk true;
+                    }
+                    break :blk false;
+                })
+            else
+                "No matches.";
+            var segments = [_]vaxis.Segment{.{
+                .text = text,
+                .style = .{
+                    .bg = menu_background,
+                    .dim = true,
+                },
+            }};
+            _ = window.print(&segments, .{
+                .row_offset = 0,
+                .col_offset = 2,
+                .wrap = .none,
+            });
+            return;
+        }
         const range = self.menu.visibleRange(window.height);
         for (range.first..range.last, 0..) |match_index, row| {
             const entry_index = self.menu.matches.items[match_index];
@@ -1382,6 +1630,13 @@ const ChatUi = struct {
                 style,
             );
         }
+    }
+
+    fn sessionMenuEmptyMessage(has_resumable_sessions: bool) []const u8 {
+        return if (has_resumable_sessions)
+            "No matching sessions."
+        else
+            "No resumable sessions yet.";
     }
 
     fn drawQuestionDivider(_: *ChatUi, window: vaxis.Window) void {
@@ -1569,6 +1824,68 @@ const ChatUi = struct {
                 _ = window.print(&segments, .{
                     .row_offset = row,
                     .col_offset = @intCast(@min(window.width / 2, 36)),
+                    .wrap = .none,
+                });
+            },
+            .session => |session| {
+                var age_buffer: [24]u8 = undefined;
+                const age_ms = @max(
+                    @as(i64, 0),
+                    std.Io.Timestamp.now(self.io, .real).toMilliseconds() -
+                        session.last_used_unix_ms,
+                );
+                const age = if (age_ms < 60 * 1000)
+                    "now"
+                else if (age_ms < 60 * 60 * 1000)
+                    std.fmt.bufPrint(
+                        &age_buffer,
+                        "{d}m ago",
+                        .{@divTrunc(age_ms, 60 * 1000)},
+                    ) catch "recently"
+                else if (age_ms < 24 * 60 * 60 * 1000)
+                    std.fmt.bufPrint(
+                        &age_buffer,
+                        "{d}h ago",
+                        .{@divTrunc(age_ms, 60 * 60 * 1000)},
+                    ) catch "earlier"
+                else
+                    std.fmt.bufPrint(
+                        &age_buffer,
+                        "{d}d ago",
+                        .{@divTrunc(age_ms, 24 * 60 * 60 * 1000)},
+                    ) catch "earlier";
+                const detail_col = @min(window.width / 2, 36);
+                const age_width = window.gwidth(age);
+                const separator = " · ";
+                const separator_width = window.gwidth(separator);
+                const model_width = window.width -| detail_col -|
+                    age_width -| separator_width;
+                if (model_width > 0) {
+                    const model_window = window.child(.{
+                        .x_off = @intCast(detail_col),
+                        .y_off = @intCast(row),
+                        .width = model_width,
+                        .height = 1,
+                    });
+                    var model_segments = [_]vaxis.Segment{.{
+                        .text = session.model_id,
+                        .style = .{ .bg = style.bg, .dim = true },
+                    }};
+                    _ = model_window.print(&model_segments, .{ .wrap = .none });
+                }
+                var trailing_segments = [_]vaxis.Segment{
+                    .{
+                        .text = separator,
+                        .style = .{ .bg = style.bg, .dim = true },
+                    },
+                    .{
+                        .text = age,
+                        .style = .{ .bg = style.bg, .dim = true },
+                    },
+                };
+                _ = window.print(&trailing_segments, .{
+                    .row_offset = row,
+                    .col_offset = detail_col + model_width,
                     .wrap = .none,
                 });
             },
@@ -1783,7 +2100,7 @@ const ChatUi = struct {
                         "↑/↓ select  ·  Enter accept  ·  Ctrl-C stop"
                 else
                     "Enter answer  ·  PgUp/PgDn scroll  ·  Ctrl-C stop",
-                .connecting, .loading_commands, .running_command, .switching => "PgUp/PgDn scroll  ·  Ctrl-C stop",
+                .connecting, .loading_commands, .running_command, .switching, .resuming => "PgUp/PgDn scroll  ·  Ctrl-C stop",
                 .stopping => "Ctrl-C again force exit",
             }
         else if (window.width >= 24)
@@ -1794,7 +2111,7 @@ const ChatUi = struct {
                     "↑/↓ select  ·  Enter accept"
                 else
                     "Enter answer  ·  Ctrl-C stop",
-                .connecting, .loading_commands, .running_command, .switching => "Ctrl-C stop",
+                .connecting, .loading_commands, .running_command, .switching, .resuming => "Ctrl-C stop",
                 .stopping => "Ctrl-C again force exit",
             }
         else switch (self.phase) {
@@ -1804,7 +2121,7 @@ const ChatUi = struct {
                 "Enter choice"
             else
                 "Enter answer",
-            .connecting, .loading_commands, .running_command, .switching => "Ctrl-C stop",
+            .connecting, .loading_commands, .running_command, .switching, .resuming => "Ctrl-C stop",
             .stopping => "Ctrl-C again",
         };
         const model_name = self.selectedModelDisplayName();
@@ -1947,6 +2264,7 @@ const App = struct {
         init_args: std.process.Init,
         model: ?[]const u8,
         settings_path: ?[]const u8,
+        sessions_directory: ?[]const u8,
     ) !void {
         self.allocator = init_args.gpa;
         self.io = init_args.io;
@@ -1978,6 +2296,7 @@ const App = struct {
             .{
                 .model = model,
                 .settings_path = settings_path,
+                .sessions_directory = sessions_directory,
                 .omlx = .{
                     .base_url = init_args.environ_map.get("OMLX_BASE_URL") orelse
                         backend.default_omlx_base_url,
@@ -2062,10 +2381,11 @@ pub fn run(
     init: std.process.Init,
     model: ?[]const u8,
     settings_path: ?[]const u8,
+    sessions_directory: ?[]const u8,
 ) !void {
     const app = try init.gpa.create(App);
     defer init.gpa.destroy(app);
-    try app.init(init, model, settings_path);
+    try app.init(init, model, settings_path, sessions_directory);
     defer app.deinit();
     try app.run();
 }
@@ -2445,18 +2765,21 @@ test "ask-user choice range keeps the selection visible" {
 test "menu ranks prefixes and preserves deterministic navigation" {
     const entries = [_]MenuEntry{
         .{
+            .identity = .{ .text = "model" },
             .key = "model",
             .primary = "Model",
             .detail = .{ .text = "Switch the active model" },
             .source_index = 0,
         },
         .{
+            .identity = .{ .text = "memory" },
             .key = "memory",
             .primary = "Memory",
             .detail = .{ .text = "Manage memories" },
             .source_index = 1,
         },
         .{
+            .identity = .{ .text = "show-model" },
             .key = "show-model",
             .primary = "Show Model",
             .detail = .{ .text = "Inspect model information" },
@@ -2480,6 +2803,7 @@ test "model menu detail owns no composer text" {
     defer menu.deinit(std.testing.allocator);
     var query = [_]u8{ 'q', 'w', 'e', 'n' };
     const entries = [_]MenuEntry{.{
+        .identity = .{ .text = "omlx/qwen" },
         .key = "omlx/qwen",
         .primary = "Qwen",
         .detail = .{ .model = .{
@@ -2497,6 +2821,7 @@ test "model menu detail owns no composer text" {
 
 test "model menu matches provider-qualified identifiers" {
     const entries = [_]MenuEntry{.{
+        .identity = .{ .text = "copilot/gpt-5.6-sol" },
         .key = "copilot/gpt-5.6-sol",
         .primary = "GPT-5.6 Sol",
         .detail = .{ .model = .{
@@ -2513,5 +2838,257 @@ test "model menu matches provider-qualified identifiers" {
     try std.testing.expectEqualStrings(
         "copilot/gpt-5.6-sol",
         menu.selected().?.key,
+    );
+}
+
+test "session menu preserves duplicate workspace selection by session key" {
+    const entries = [_]MenuEntry{
+        .{
+            .identity = .{ .number = 41 },
+            .key = "/work/project",
+            .primary = "project",
+            .detail = .{ .session = .{
+                .model_id = "copilot/first",
+                .last_used_unix_ms = 20,
+            } },
+            .source_index = 0,
+        },
+        .{
+            .identity = .{ .number = 42 },
+            .key = "/work/project",
+            .primary = "project",
+            .detail = .{ .session = .{
+                .model_id = "copilot/second",
+                .last_used_unix_ms = 10,
+            } },
+            .source_index = 1,
+        },
+    };
+    var menu: MenuState = .{};
+    defer menu.deinit(std.testing.allocator);
+
+    try menu.rebuild(std.testing.allocator, &entries, "");
+    menu.move(.next);
+    try std.testing.expectEqual(@as(usize, 1), menu.selected().?.source_index);
+    try menu.rebuild(std.testing.allocator, &entries, "project");
+    try std.testing.expectEqual(@as(usize, 1), menu.selected().?.source_index);
+}
+
+test "session menu labels colliding workspaces with unique path suffixes" {
+    var first_path = "/teams/a/project".*;
+    var second_path = "/teams/b/project".*;
+    var unique_path = "/other/unique".*;
+    var first_model = "copilot/first".*;
+    var second_model = "copilot/second".*;
+    var third_model = "copilot/third".*;
+    const sessions = [_]backend.SessionSummary{
+        .{
+            .allocator = undefined,
+            .key = 1,
+            .working_directory = &first_path,
+            .model_id = &first_model,
+            .last_used_unix_ms = 20,
+            .current = false,
+        },
+        .{
+            .allocator = undefined,
+            .key = 2,
+            .working_directory = &second_path,
+            .model_id = &second_model,
+            .last_used_unix_ms = 10,
+            .current = false,
+        },
+        .{
+            .allocator = undefined,
+            .key = 3,
+            .working_directory = &unique_path,
+            .model_id = &third_model,
+            .last_used_unix_ms = 5,
+            .current = false,
+        },
+    };
+
+    try std.testing.expectEqualStrings(
+        "a/project",
+        uniqueWorkspaceLabel(&sessions, 0),
+    );
+    try std.testing.expectEqualStrings(
+        "b/project",
+        uniqueWorkspaceLabel(&sessions, 1),
+    );
+    try std.testing.expectEqualStrings(
+        "unique",
+        uniqueWorkspaceLabel(&sessions, 2),
+    );
+}
+
+test "session catalog failure closes stale cached finder" {
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    var ui = try ChatUi.init(
+        std.testing.allocator,
+        std.testing.io,
+        &environment,
+    );
+    defer ui.deinit();
+    ui.phase = .resuming;
+    ui.menu_mode = .loading_sessions;
+    ui.sessions = .{
+        .allocator = std.testing.allocator,
+        .sessions = try std.testing.allocator.alloc(
+            backend.SessionSummary,
+            0,
+        ),
+        .skipped_invalid_shards = false,
+    };
+
+    var event: backend.ConversationEvent = .{
+        .session_catalog_failed = try backend.OwnedText.init(
+            std.testing.allocator,
+            "Unable to load saved sessions.",
+        ),
+    };
+    defer event.deinit();
+    try std.testing.expectEqual(
+        ConversationOutcome.keep_running,
+        try ui.applyConversationEvent(&event),
+    );
+    try std.testing.expectEqual(UiPhase.ready, ui.phase);
+    try std.testing.expectEqual(MenuMode.closed, ui.menu_mode);
+    try std.testing.expectEqualStrings(
+        "Unable to load saved sessions.",
+        ui.transcript.entries.items[0].text.items,
+    );
+}
+
+test "session tracking failure preserves conversation state" {
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    var ui = try ChatUi.init(
+        std.testing.allocator,
+        std.testing.io,
+        &environment,
+    );
+    defer ui.deinit();
+    ui.phase = .ready;
+
+    var event: backend.ConversationEvent = .{
+        .session_tracking_failed = try backend.OwnedText.init(
+            std.testing.allocator,
+            "Session tracking disabled: AccessDenied",
+        ),
+    };
+    defer event.deinit();
+    try std.testing.expectEqual(
+        ConversationOutcome.keep_running,
+        try ui.applyConversationEvent(&event),
+    );
+    try std.testing.expectEqual(UiPhase.ready, ui.phase);
+    try std.testing.expectEqualStrings(
+        "Session tracking disabled: AccessDenied",
+        ui.transcript.entries.items[0].text.items,
+    );
+}
+
+test "session catalog completion restores ready after finder dismissal" {
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    var ui = try ChatUi.init(
+        std.testing.allocator,
+        std.testing.io,
+        &environment,
+    );
+    defer ui.deinit();
+    ui.phase = .resuming;
+    ui.menu_mode = .closed;
+
+    var event: backend.ConversationEvent = .{
+        .session_catalog = .{
+            .allocator = std.testing.allocator,
+            .sessions = try std.testing.allocator.alloc(
+                backend.SessionSummary,
+                0,
+            ),
+            .skipped_invalid_shards = false,
+        },
+    };
+    defer event.deinit();
+    try std.testing.expectEqual(
+        ConversationOutcome.keep_running,
+        try ui.applyConversationEvent(&event),
+    );
+    try std.testing.expectEqual(UiPhase.ready, ui.phase);
+    try std.testing.expectEqual(MenuMode.closed, ui.menu_mode);
+}
+
+test "late session catalog preserves stopping phase" {
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    var ui = try ChatUi.init(
+        std.testing.allocator,
+        std.testing.io,
+        &environment,
+    );
+    defer ui.deinit();
+    ui.phase = .stopping;
+    ui.menu_mode = .loading_sessions;
+
+    var event: backend.ConversationEvent = .{
+        .session_catalog = .{
+            .allocator = std.testing.allocator,
+            .sessions = try std.testing.allocator.alloc(
+                backend.SessionSummary,
+                0,
+            ),
+            .skipped_invalid_shards = false,
+        },
+    };
+    defer event.deinit();
+    try std.testing.expectEqual(
+        ConversationOutcome.keep_running,
+        try ui.applyConversationEvent(&event),
+    );
+    try std.testing.expectEqual(UiPhase.stopping, ui.phase);
+    try std.testing.expectEqual(MenuMode.closed, ui.menu_mode);
+    try std.testing.expect(ui.sessions == null);
+}
+
+test "late session resume preserves stopping phase" {
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    var ui = try ChatUi.init(
+        std.testing.allocator,
+        std.testing.io,
+        &environment,
+    );
+    defer ui.deinit();
+    ui.phase = .stopping;
+    ui.menu_mode = .sessions;
+
+    var event: backend.ConversationEvent = .{
+        .session_resume = .{
+            .failed = try backend.OwnedText.init(
+                std.testing.allocator,
+                "resume failed",
+            ),
+        },
+    };
+    defer event.deinit();
+    try std.testing.expectEqual(
+        ConversationOutcome.keep_running,
+        try ui.applyConversationEvent(&event),
+    );
+    try std.testing.expectEqual(UiPhase.stopping, ui.phase);
+    try std.testing.expectEqual(MenuMode.closed, ui.menu_mode);
+}
+
+test "session finder distinguishes empty catalog from empty filter" {
+    try std.testing.expectEqualStrings(
+        "No resumable sessions yet.",
+        ChatUi.sessionMenuEmptyMessage(false),
+    );
+    try std.testing.expectEqualStrings(
+        "No matching sessions.",
+        ChatUi.sessionMenuEmptyMessage(true),
     );
 }
