@@ -97,14 +97,54 @@ const MessageEntry = struct {
     }
 };
 
+const ToolEntry = struct {
+    activity: backend.ToolActivity,
+    compact: []u8,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        started: *const backend.ToolStarted,
+    ) !ToolEntry {
+        const activity = try backend.ToolActivity.init(allocator, started);
+        errdefer {
+            var mutable = activity;
+            mutable.deinit();
+        }
+        return .{
+            .activity = activity,
+            .compact = try tool_renderer.renderCompact(allocator, &activity),
+        };
+    }
+
+    fn finish(
+        self: *ToolEntry,
+        allocator: std.mem.Allocator,
+        finished: *const backend.ToolFinished,
+    ) !void {
+        try self.activity.finish(finished);
+        const compact = try tool_renderer.renderCompact(
+            allocator,
+            &self.activity,
+        );
+        allocator.free(self.compact);
+        self.compact = compact;
+    }
+
+    fn deinit(self: *ToolEntry, allocator: std.mem.Allocator) void {
+        allocator.free(self.compact);
+        self.activity.deinit();
+        self.* = undefined;
+    }
+};
+
 const Entry = union(enum) {
     message: MessageEntry,
-    tool: backend.ToolActivity,
+    tool: ToolEntry,
 
     fn deinit(self: *Entry, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .message => |*message| message.deinit(allocator),
-            .tool => |*activity| activity.deinit(),
+            .tool => |*tool| tool.deinit(allocator),
         }
         self.* = undefined;
     }
@@ -311,28 +351,28 @@ const Transcript = struct {
     ) !void {
         switch (update.*) {
             .started => |*started| {
-                if (self.findTool(started.call_id)) |activity| {
-                    if (activity.matchesStart(started)) return;
+                if (self.findTool(started.call_id)) |tool| {
+                    if (tool.activity.matchesStart(started)) return;
                     return error.ConflictingToolStart;
                 }
                 self.finishTurn();
-                const activity = try backend.ToolActivity.init(
+                const tool = try ToolEntry.init(
                     allocator,
                     started,
                 );
                 errdefer {
-                    var mutable = activity;
-                    mutable.deinit();
+                    var mutable = tool;
+                    mutable.deinit(allocator);
                 }
                 try self.insertBeforeQueued(
                     allocator,
-                    .{ .tool = activity },
+                    .{ .tool = tool },
                 );
             },
             .finished => |*finished| {
-                const activity = self.findTool(finished.call_id) orelse
+                const tool = self.findTool(finished.call_id) orelse
                     return error.UnknownToolCall;
-                try activity.finish(finished);
+                try tool.finish(allocator, finished);
             },
         }
     }
@@ -340,12 +380,12 @@ const Transcript = struct {
     fn findTool(
         self: *Transcript,
         call_id: backend.ToolCallId,
-    ) ?*backend.ToolActivity {
+    ) ?*ToolEntry {
         for (self.entries.items) |*entry| {
             switch (entry.*) {
                 .message => {},
-                .tool => |*activity| {
-                    if (activity.call_id.eql(call_id)) return activity;
+                .tool => |*tool| {
+                    if (tool.activity.call_id.eql(call_id)) return tool;
                 },
             }
         }
@@ -497,16 +537,12 @@ const RenderLine = struct {
     entry_index: usize,
     start: usize = 0,
     end: usize = 0,
-    owned_text: ?[]const u8 = null,
 };
 
 const Projection = struct {
     lines: std.ArrayList(RenderLine) = .empty,
-    owned_text: std.ArrayList([]u8) = .empty,
 
     fn deinit(self: *Projection, allocator: std.mem.Allocator) void {
-        for (self.owned_text.items) |text| allocator.free(text);
-        self.owned_text.deinit(allocator);
         self.lines.deinit(allocator);
         self.* = undefined;
     }
@@ -540,7 +576,6 @@ const Projection = struct {
                             window,
                             .body,
                             2,
-                            null,
                         );
                     },
                     .status => try projection.appendWrapped(
@@ -550,25 +585,17 @@ const Projection = struct {
                         window,
                         .status,
                         2,
-                        null,
                     ),
                 },
-                .tool => |*activity| {
-                    const compact = try tool_renderer.renderCompact(
-                        allocator,
-                        activity,
-                    );
-                    errdefer allocator.free(compact);
+                .tool => |tool| {
                     try projection.appendWrapped(
                         allocator,
                         entry_index,
-                        compact,
+                        tool.compact,
                         window,
                         .tool,
                         2,
-                        compact,
                     );
-                    try projection.owned_text.append(allocator, compact);
                 },
             }
         }
@@ -583,7 +610,6 @@ const Projection = struct {
         window: vaxis.Window,
         kind: LineKind,
         indent: u16,
-        owned_text: ?[]const u8,
     ) !void {
         const available_width = @max(window.width -| indent, 1);
         var iterator = vaxis.unicode.graphemeIterator(text);
@@ -598,7 +624,6 @@ const Projection = struct {
                     .entry_index = entry_index,
                     .start = line_start,
                     .end = grapheme.start,
-                    .owned_text = owned_text,
                 });
                 line_start = grapheme.start + grapheme.len;
                 line_width = 0;
@@ -612,7 +637,6 @@ const Projection = struct {
                     .entry_index = entry_index,
                     .start = line_start,
                     .end = grapheme.start,
-                    .owned_text = owned_text,
                 });
                 line_start = grapheme.start;
                 line_width = 0;
@@ -625,7 +649,6 @@ const Projection = struct {
             .entry_index = entry_index,
             .start = line_start,
             .end = text.len,
-            .owned_text = owned_text,
         });
     }
 };
@@ -2157,17 +2180,16 @@ const ChatUi = struct {
                 });
             },
             .tool => {
-                const activity = &entry.tool;
-                const color = switch (activity.lifecycle) {
+                const tool = &entry.tool;
+                const color = switch (tool.activity.lifecycle) {
                     .running => reasoning_color,
                     .finished => |result| switch (result) {
                         .succeeded => accent,
                         .failed => vaxis.Color{ .index = 203 },
                     },
                 };
-                const text = line.owned_text.?;
                 var segments = [_]vaxis.Segment{.{
-                    .text = text[line.start..line.end],
+                    .text = tool.compact[line.start..line.end],
                     .style = .{ .fg = color, .dim = true },
                 }};
                 _ = window.print(&segments, .{
@@ -2845,19 +2867,19 @@ test "tool completions update interleaved rows in reverse order" {
     try std.testing.expectEqual(@as(usize, 2), transcript.entries.items.len);
     try std.testing.expectEqualStrings(
         "call-1",
-        transcript.entries.items[0].tool.call_id.bytes,
+        transcript.entries.items[0].tool.activity.call_id.bytes,
     );
     try std.testing.expectEqualStrings(
         "first",
-        transcript.entries.items[0].tool.lifecycle.finished.failed,
+        transcript.entries.items[0].tool.activity.lifecycle.finished.failed,
     );
     try std.testing.expectEqualStrings(
         "call-2",
-        transcript.entries.items[1].tool.call_id.bytes,
+        transcript.entries.items[1].tool.activity.call_id.bytes,
     );
     try std.testing.expectEqualStrings(
         "second",
-        transcript.entries.items[1].tool.lifecycle.finished.succeeded,
+        transcript.entries.items[1].tool.activity.lifecycle.finished.succeeded,
     );
 }
 
@@ -2997,7 +3019,7 @@ test "compact tool rows wrap by grapheme width with one entry index" {
         try std.testing.expectEqual(LineKind.tool, line.kind);
         try std.testing.expectEqual(@as(usize, 0), line.entry_index);
         try std.testing.expect(std.unicode.utf8ValidateSlice(
-            line.owned_text.?[line.start..line.end],
+            transcript.entries.items[0].tool.compact[line.start..line.end],
         ));
     }
 }
