@@ -53,4 +53,17 @@ implemented native binding together.
 
 ## Commit & Pull Request Guidelines
 
-No commit convention exists yet. Keep changes narrowly scoped and include the relevant command output in PR descriptions. Never commit generated archives, caches, Derived Data, credentials, or a Copilot CLI binary.
+No commit convention exists yet. Keep changes narrowly scoped and include the
+relevant command output in PR descriptions.
+
+Every PR that changes user-visible CLI, TUI, or native app behavior must include
+a reviewer-facing demo in its description. Use a short GIF or video when the
+behavior changes over time. Use before-and-after screenshots when a static
+comparison is clearer. Exercise the built application through the same surface
+the user sees. Unit tests, terminal transcripts, and written claims do not
+replace the visual demo. If the host cannot capture or upload media, state the
+specific blocker in the PR description and do not present the PR as visually
+verified.
+
+Never commit generated archives, caches, Derived Data, credentials, or a
+Copilot CLI binary.
