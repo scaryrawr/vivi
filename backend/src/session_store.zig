@@ -236,8 +236,13 @@ pub const Store = struct {
         var skipped_invalid = false;
         var iterator = directory.iterate();
         while (try iterator.next(self.io)) |entry| {
-            if (entry.kind != .file or
-                !std.mem.endsWith(u8, entry.name, ".json"))
+            if (!std.mem.endsWith(u8, entry.name, ".json") or
+                !try isRegularFile(
+                    directory,
+                    self.io,
+                    entry.name,
+                    entry.kind,
+                ))
             {
                 continue;
             }
@@ -388,9 +393,14 @@ pub const Store = struct {
         const own_filename = std.fs.path.basename(self.shard_path);
         var iterator = directory.iterate();
         while (try iterator.next(self.io)) |entry| {
-            if (entry.kind != .file or
-                !std.mem.endsWith(u8, entry.name, ".json") or
-                std.mem.eql(u8, entry.name, own_filename))
+            if (!std.mem.endsWith(u8, entry.name, ".json") or
+                std.mem.eql(u8, entry.name, own_filename) or
+                !try isRegularFile(
+                    directory,
+                    self.io,
+                    entry.name,
+                    entry.kind,
+                ))
             {
                 continue;
             }
@@ -445,6 +455,23 @@ pub const Store = struct {
         try atomic_file.replace(self.io);
     }
 };
+
+fn isRegularFile(
+    directory: std.Io.Dir,
+    io: std.Io,
+    name: []const u8,
+    kind: std.Io.File.Kind,
+) !bool {
+    const resolved_kind = if (kind == .unknown)
+        (try directory.statFile(
+            io,
+            name,
+            .{ .follow_symlinks = false },
+        )).kind
+    else
+        kind;
+    return resolved_kind == .file;
+}
 
 fn validateText(value: []const u8, maximum: usize) !void {
     if (value.len == 0 or value.len > maximum or
@@ -577,6 +604,29 @@ test "session store merges shards and keeps newest record" {
         }
     }
     try std.testing.expectEqual(@as(usize, 1), shard_count);
+}
+
+test "session store resolves unknown directory entry kinds" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = "shard.json",
+        .data = "",
+    });
+    try temporary.dir.createDir(std.testing.io, "directory.json", .default_dir);
+
+    try std.testing.expect(try isRegularFile(
+        temporary.dir,
+        std.testing.io,
+        "shard.json",
+        .unknown,
+    ));
+    try std.testing.expect(!try isRegularFile(
+        temporary.dir,
+        std.testing.io,
+        "directory.json",
+        .unknown,
+    ));
 }
 
 test "session store skips corrupt sibling shards" {

@@ -1463,15 +1463,9 @@ fn runSdkConversation(
                 resume_index = null;
                 resume_index = if (store) |*value|
                     value.list() catch |err| {
-                        worker.completeSessionResume(.{
-                            .failed = conversation.OwnedText.init(
-                                worker.allocator(),
-                                @errorName(err),
-                            ) catch {
-                                worker.closeFailure(.stream, @errorName(err));
-                                return;
-                            },
-                        }) catch {
+                        worker.completeSessionRefreshFailure(
+                            @errorName(err),
+                        ) catch {
                             worker.closeFailure(.stream, @errorName(err));
                             return;
                         };

@@ -686,6 +686,45 @@ fn wordStartsWithIgnoreCase(value: []const u8, prefix: []const u8) bool {
     return false;
 }
 
+fn uniqueWorkspaceLabel(
+    sessions: []const backend.SessionSummary,
+    session_index: usize,
+) []const u8 {
+    const path = sessions[session_index].working_directory;
+    var start = path.len - std.fs.path.basename(path).len;
+    while (true) {
+        const candidate = path[start..];
+        var collision = false;
+        for (sessions, 0..) |other, other_index| {
+            if (other_index == session_index) continue;
+            if (pathEndsWithComponent(other.working_directory, candidate)) {
+                collision = true;
+                break;
+            }
+        }
+        if (!collision or start == 0) return candidate;
+        start = previousPathComponentStart(path, start);
+    }
+}
+
+fn pathEndsWithComponent(path: []const u8, suffix: []const u8) bool {
+    if (!std.mem.endsWith(u8, path, suffix)) return false;
+    if (path.len == suffix.len) return true;
+    return isPathSeparator(path[path.len - suffix.len - 1]);
+}
+
+fn previousPathComponentStart(path: []const u8, current_start: usize) usize {
+    var end = current_start;
+    while (end > 0 and isPathSeparator(path[end - 1])) end -= 1;
+    var start = end;
+    while (start > 0 and !isPathSeparator(path[start - 1])) start -= 1;
+    return start;
+}
+
+fn isPathSeparator(byte: u8) bool {
+    return byte == '/' or byte == '\\';
+}
+
 fn stableRank(indices: []usize, ranks: []u2) void {
     var index: usize = 1;
     while (index < indices.len) : (index += 1) {
@@ -1132,7 +1171,7 @@ const ChatUi = struct {
             entries[index] = .{
                 .identity = .{ .number = session.key },
                 .key = session.working_directory,
-                .primary = std.fs.path.basename(session.working_directory),
+                .primary = uniqueWorkspaceLabel(catalog.sessions, index),
                 .detail = .{ .session = .{
                     .model_id = session.model_id,
                     .last_used_unix_ms = session.last_used_unix_ms,
@@ -1340,6 +1379,26 @@ const ChatUi = struct {
                         );
                     }
                 }
+            },
+            .session_catalog_failed => |failure| {
+                if (self.phase == .stopping) {
+                    self.menu_mode = .closed;
+                    return .keep_running;
+                }
+                self.phase = .ready;
+                if (self.sessions != null and
+                    self.menu_mode == .loading_sessions)
+                {
+                    self.menu_mode = .sessions;
+                    try self.rebuildSessionMenu();
+                } else {
+                    self.menu_mode = .closed;
+                }
+                try self.transcript.append(
+                    self.allocator,
+                    .status,
+                    failure.bytes,
+                );
             },
             .session_resume => |result| {
                 if (self.phase == .resuming) self.phase = .ready;
@@ -2813,6 +2872,85 @@ test "session menu preserves duplicate workspace selection by session key" {
     try std.testing.expectEqual(@as(usize, 1), menu.selected().?.source_index);
     try menu.rebuild(std.testing.allocator, &entries, "project");
     try std.testing.expectEqual(@as(usize, 1), menu.selected().?.source_index);
+}
+
+test "session menu labels colliding workspaces with unique path suffixes" {
+    var first_path = "/teams/a/project".*;
+    var second_path = "/teams/b/project".*;
+    var unique_path = "/other/unique".*;
+    var first_model = "copilot/first".*;
+    var second_model = "copilot/second".*;
+    var third_model = "copilot/third".*;
+    const sessions = [_]backend.SessionSummary{
+        .{
+            .allocator = undefined,
+            .key = 1,
+            .working_directory = &first_path,
+            .model_id = &first_model,
+            .last_used_unix_ms = 20,
+            .current = false,
+        },
+        .{
+            .allocator = undefined,
+            .key = 2,
+            .working_directory = &second_path,
+            .model_id = &second_model,
+            .last_used_unix_ms = 10,
+            .current = false,
+        },
+        .{
+            .allocator = undefined,
+            .key = 3,
+            .working_directory = &unique_path,
+            .model_id = &third_model,
+            .last_used_unix_ms = 5,
+            .current = false,
+        },
+    };
+
+    try std.testing.expectEqualStrings(
+        "a/project",
+        uniqueWorkspaceLabel(&sessions, 0),
+    );
+    try std.testing.expectEqualStrings(
+        "b/project",
+        uniqueWorkspaceLabel(&sessions, 1),
+    );
+    try std.testing.expectEqualStrings(
+        "unique",
+        uniqueWorkspaceLabel(&sessions, 2),
+    );
+}
+
+test "session catalog failure restores ready state" {
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    var ui = try ChatUi.init(
+        std.testing.allocator,
+        std.testing.io,
+        &environment,
+    );
+    defer ui.deinit();
+    ui.phase = .resuming;
+    ui.menu_mode = .loading_sessions;
+
+    var event: backend.ConversationEvent = .{
+        .session_catalog_failed = try backend.OwnedText.init(
+            std.testing.allocator,
+            "Unable to load saved sessions.",
+        ),
+    };
+    defer event.deinit();
+    try std.testing.expectEqual(
+        ConversationOutcome.keep_running,
+        try ui.applyConversationEvent(&event),
+    );
+    try std.testing.expectEqual(UiPhase.ready, ui.phase);
+    try std.testing.expectEqual(MenuMode.closed, ui.menu_mode);
+    try std.testing.expectEqualStrings(
+        "Unable to load saved sessions.",
+        ui.transcript.entries.items[0].text.items,
+    );
 }
 
 test "session catalog completion restores ready after finder dismissal" {
