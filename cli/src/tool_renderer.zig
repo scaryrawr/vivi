@@ -2,7 +2,7 @@ const std = @import("std");
 const backend = @import("vivi_backend");
 const vaxis = @import("vaxis");
 
-const bash_preview_graphemes = 80;
+const summary_text_graphemes = 80;
 
 pub const ToolStatus = enum {
     running,
@@ -24,31 +24,9 @@ pub fn renderCompact(
     return switch (summary) {
         .read => |read_summary| renderRead(allocator, marker, read_summary),
         .bash => |bash_summary| renderBash(allocator, marker, bash_summary),
-        .edit => |edit_summary| std.fmt.allocPrint(
-            allocator,
-            "{s} Edit {s}, {d} replacement{s}",
-            .{
-                marker,
-                edit_summary.path,
-                edit_summary.replacement_count,
-                if (edit_summary.replacement_count == 1) "" else "s",
-            },
-        ),
-        .write => |write_summary| std.fmt.allocPrint(
-            allocator,
-            "{s} Write {s}, {d} byte{s}",
-            .{
-                marker,
-                write_summary.path,
-                write_summary.byte_count,
-                if (write_summary.byte_count == 1) "" else "s",
-            },
-        ),
-        .other => |other_summary| std.fmt.allocPrint(
-            allocator,
-            "{s} Tool {s}",
-            .{ marker, other_summary.name },
-        ),
+        .edit => |edit_summary| renderEdit(allocator, marker, edit_summary),
+        .write => |write_summary| renderWrite(allocator, marker, write_summary),
+        .other => |other_summary| renderOther(allocator, marker, other_summary),
     };
 }
 
@@ -57,31 +35,33 @@ fn renderRead(
     marker: []const u8,
     summary: backend.ReadToolSummary,
 ) ![]u8 {
+    const path = try compactDisplayText(allocator, summary.path);
+    defer allocator.free(path);
     if (summary.offset) |offset| {
         if (summary.limit) |limit| {
             return std.fmt.allocPrint(
                 allocator,
                 "{s} Read {s} lines {d}-{d}",
-                .{ marker, summary.path, offset, offset +| (limit -| 1) },
+                .{ marker, path, offset, offset +| (limit -| 1) },
             );
         }
         return std.fmt.allocPrint(
             allocator,
             "{s} Read {s} from line {d}",
-            .{ marker, summary.path, offset },
+            .{ marker, path, offset },
         );
     }
     if (summary.limit) |limit| {
         return std.fmt.allocPrint(
             allocator,
             "{s} Read {s} first {d} line{s}",
-            .{ marker, summary.path, limit, if (limit == 1) "" else "s" },
+            .{ marker, path, limit, if (limit == 1) "" else "s" },
         );
     }
     return std.fmt.allocPrint(
         allocator,
         "{s} Read {s}",
-        .{ marker, summary.path },
+        .{ marker, path },
     );
 }
 
@@ -90,7 +70,7 @@ fn renderBash(
     marker: []const u8,
     summary: backend.BashToolSummary,
 ) ![]u8 {
-    const preview = try compactBashPreview(allocator, summary.command);
+    const preview = try compactDisplayText(allocator, summary.command);
     defer allocator.free(preview);
     return std.fmt.allocPrint(
         allocator,
@@ -99,20 +79,79 @@ fn renderBash(
     );
 }
 
-fn compactBashPreview(
+fn renderEdit(
     allocator: std.mem.Allocator,
-    command: []const u8,
+    marker: []const u8,
+    summary: backend.EditToolSummary,
+) ![]u8 {
+    const path = try compactDisplayText(allocator, summary.path);
+    defer allocator.free(path);
+    return std.fmt.allocPrint(
+        allocator,
+        "{s} Edit {s}, {d} replacement{s}",
+        .{
+            marker,
+            path,
+            summary.replacement_count,
+            if (summary.replacement_count == 1) "" else "s",
+        },
+    );
+}
+
+fn renderWrite(
+    allocator: std.mem.Allocator,
+    marker: []const u8,
+    summary: backend.WriteToolSummary,
+) ![]u8 {
+    const path = try compactDisplayText(allocator, summary.path);
+    defer allocator.free(path);
+    return std.fmt.allocPrint(
+        allocator,
+        "{s} Write {s}, {d} byte{s}",
+        .{
+            marker,
+            path,
+            summary.byte_count,
+            if (summary.byte_count == 1) "" else "s",
+        },
+    );
+}
+
+fn renderOther(
+    allocator: std.mem.Allocator,
+    marker: []const u8,
+    summary: backend.OtherToolSummary,
+) ![]u8 {
+    const name = try compactDisplayText(allocator, summary.name);
+    defer allocator.free(name);
+    return std.fmt.allocPrint(
+        allocator,
+        "{s} Tool {s}",
+        .{ marker, name },
+    );
+}
+
+fn compactDisplayText(
+    allocator: std.mem.Allocator,
+    text: []const u8,
 ) ![]u8 {
     var compact: std.ArrayList(u8) = .empty;
     defer compact.deinit(allocator);
-    for (command) |byte| {
+    const hex = "0123456789abcdef";
+    for (text) |byte| {
         switch (byte) {
             '\n' => try compact.appendSlice(allocator, "\\n"),
             '\r' => try compact.appendSlice(allocator, "\\r"),
             '\t' => try compact.appendSlice(allocator, "\\t"),
             0x0b => try compact.appendSlice(allocator, "\\v"),
             0x0c => try compact.appendSlice(allocator, "\\f"),
-            else => try compact.append(allocator, byte),
+            else => if (byte < 0x20 or byte == 0x7f) {
+                try compact.appendSlice(allocator, "\\x");
+                try compact.append(allocator, hex[byte >> 4]);
+                try compact.append(allocator, hex[byte & 0x0f]);
+            } else {
+                try compact.append(allocator, byte);
+            },
         }
     }
 
@@ -120,7 +159,7 @@ fn compactBashPreview(
     var count: usize = 0;
     var end = compact.items.len;
     while (iterator.next()) |grapheme| {
-        if (count == bash_preview_graphemes) {
+        if (count == summary_text_graphemes) {
             end = grapheme.start;
             break;
         }
@@ -201,7 +240,7 @@ test "read ranges saturate after computing their zero-based span" {
 }
 
 test "bash preview preserves spaces and escapes control whitespace" {
-    const preview = try compactBashPreview(
+    const preview = try compactDisplayText(
         std.testing.allocator,
         "printf 'a  b'\nrm file\targ",
     );
@@ -216,7 +255,7 @@ test "bash preview is grapheme bounded" {
     var command: std.ArrayList(u8) = .empty;
     defer command.deinit(std.testing.allocator);
     for (0..81) |_| try command.appendSlice(std.testing.allocator, "e\u{301}");
-    const preview = try compactBashPreview(std.testing.allocator, command.items);
+    const preview = try compactDisplayText(std.testing.allocator, command.items);
     defer std.testing.allocator.free(preview);
 
     try std.testing.expect(std.mem.endsWith(u8, preview, "…"));
@@ -224,6 +263,32 @@ test "bash preview is grapheme bounded" {
     var count: usize = 0;
     while (iterator.next()) |_| count += 1;
     try std.testing.expectEqual(@as(usize, 81), count);
+}
+
+test "all dynamic summary text is escaped and grapheme bounded" {
+    var path: std.ArrayList(u8) = .empty;
+    defer path.deinit(std.testing.allocator);
+    try path.appendSlice(std.testing.allocator, "line\n");
+    for (0..81) |_| try path.appendSlice(std.testing.allocator, "é");
+
+    const rendered = try renderCompact(
+        std.testing.allocator,
+        .{ .read = .{
+            .path = path.items,
+            .offset = null,
+            .limit = null,
+        } },
+        .running,
+    );
+    defer std.testing.allocator.free(rendered);
+
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        rendered,
+        "◌ Read line\\n",
+    ));
+    try std.testing.expect(std.mem.endsWith(u8, rendered, "…"));
+    try std.testing.expect(std.mem.indexOfScalar(u8, rendered, '\n') == null);
 }
 
 test "lifecycle chrome distinguishes success and failure" {

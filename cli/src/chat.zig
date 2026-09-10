@@ -204,6 +204,14 @@ fn hashToolInvocation(
 ) [std.crypto.hash.sha2.Sha256.digest_length]u8 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update(@tagName(started.invocation.summary));
+    switch (started.invocation.summary) {
+        .other => |summary| {
+            const name_len: u64 = @intCast(summary.name.len);
+            hasher.update(std.mem.asBytes(&name_len));
+            hasher.update(summary.name);
+        },
+        else => {},
+    }
     hasher.update(&.{0});
     hasher.update(started.invocation.arguments_json);
     return hasher.finalResult();
@@ -3031,6 +3039,35 @@ test "equal tool updates are idempotent and conflicts fail" {
         transcript.applyToolActivity(
             std.testing.allocator,
             &.{ .finished = unknown },
+        ),
+    );
+}
+
+test "fallback tool names are part of duplicate start identity" {
+    var transcript: Transcript = .{};
+    defer transcript.deinit(std.testing.allocator);
+    var search = try toolStarted(
+        "call-1",
+        "{}",
+        .{ .other = .{ .name = "search" } },
+    );
+    defer search.deinit();
+    var fetch = try toolStarted(
+        "call-1",
+        "{}",
+        .{ .other = .{ .name = "fetch" } },
+    );
+    defer fetch.deinit();
+
+    try transcript.applyToolActivity(
+        std.testing.allocator,
+        &.{ .started = search },
+    );
+    try std.testing.expectError(
+        error.ConflictingToolStart,
+        transcript.applyToolActivity(
+            std.testing.allocator,
+            &.{ .started = fetch },
         ),
     );
 }
