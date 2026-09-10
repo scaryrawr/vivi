@@ -3,6 +3,8 @@ const backend = @import("vivi_backend");
 const vaxis = @import("vaxis");
 
 const summary_text_graphemes = 80;
+const summary_text_bytes = 240;
+const ellipsis = "…";
 
 pub const ToolStatus = enum {
     running,
@@ -158,15 +160,22 @@ fn compactDisplayText(
     var iterator = vaxis.unicode.graphemeIterator(compact.items);
     var count: usize = 0;
     var end = compact.items.len;
+    const content_byte_limit = summary_text_bytes - ellipsis.len;
     while (iterator.next()) |grapheme| {
-        if (count == summary_text_graphemes) {
+        if (count == summary_text_graphemes or
+            grapheme.start + grapheme.len > content_byte_limit)
+        {
             end = grapheme.start;
             break;
         }
         count += 1;
     }
     if (end == compact.items.len) return compact.toOwnedSlice(allocator);
-    return std.fmt.allocPrint(allocator, "{s}…", .{compact.items[0..end]});
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}{s}",
+        .{ compact.items[0..end], ellipsis },
+    );
 }
 
 test "built-in summaries and lifecycle chrome are distinct" {
@@ -263,6 +272,25 @@ test "bash preview is grapheme bounded" {
     var count: usize = 0;
     while (iterator.next()) |_| count += 1;
     try std.testing.expectEqual(@as(usize, 81), count);
+}
+
+test "display text is byte bounded at a grapheme boundary" {
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(std.testing.allocator);
+    try text.append(std.testing.allocator, 'e');
+    for (0..256) |_| {
+        try text.appendSlice(std.testing.allocator, "\u{301}");
+    }
+
+    const compact = try compactDisplayText(
+        std.testing.allocator,
+        text.items,
+    );
+    defer std.testing.allocator.free(compact);
+
+    try std.testing.expectEqualStrings(ellipsis, compact);
+    try std.testing.expect(compact.len <= summary_text_bytes);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(compact));
 }
 
 test "all dynamic summary text is escaped and grapheme bounded" {
