@@ -1487,9 +1487,7 @@ fn runSdkConversation(
                 };
             },
             .refresh_sessions => {
-                if (resume_index) |*index| index.deinit();
-                resume_index = null;
-                resume_index = if (store) |*value|
+                var new_index: session_store.Index = if (store) |*value|
                     value.list() catch |err| {
                         worker.completeSessionRefreshFailure(
                             @errorName(err),
@@ -1512,21 +1510,25 @@ fn runSdkConversation(
                     };
                 const catalog = buildSessionCatalog(
                     worker.allocator(),
-                    &resume_index.?,
+                    &new_index,
                     session.id,
                 ) catch |err| {
+                    new_index.deinit();
                     worker.closeFailure(.stream, @errorName(err));
                     return;
                 };
                 worker.completeSessionRefresh(catalog) catch {
                     var mutable = catalog;
                     mutable.deinit();
+                    new_index.deinit();
                     worker.closeFailure(
                         .stream,
                         "Unable to deliver the session catalog.",
                     );
                     return;
                 };
+                if (resume_index) |*index| index.deinit();
+                resume_index = new_index;
             },
             .resume_session => |key| {
                 const index = if (resume_index) |*value| value else {
