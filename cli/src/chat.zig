@@ -1386,14 +1386,7 @@ const ChatUi = struct {
                     return .keep_running;
                 }
                 self.phase = .ready;
-                if (self.sessions != null and
-                    self.menu_mode == .loading_sessions)
-                {
-                    self.menu_mode = .sessions;
-                    try self.rebuildSessionMenu();
-                } else {
-                    self.menu_mode = .closed;
-                }
+                self.menu_mode = .closed;
                 try self.transcript.append(
                     self.allocator,
                     .status,
@@ -2929,7 +2922,7 @@ test "session menu labels colliding workspaces with unique path suffixes" {
     );
 }
 
-test "session catalog failure restores ready state" {
+test "session catalog failure closes stale cached finder" {
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
     var ui = try ChatUi.init(
@@ -2961,7 +2954,7 @@ test "session catalog failure restores ready state" {
         try ui.applyConversationEvent(&event),
     );
     try std.testing.expectEqual(UiPhase.ready, ui.phase);
-    try std.testing.expectEqual(MenuMode.sessions, ui.menu_mode);
+    try std.testing.expectEqual(MenuMode.closed, ui.menu_mode);
     try std.testing.expectEqualStrings(
         "Unable to load saved sessions.",
         ui.transcript.entries.items[0].text.items,

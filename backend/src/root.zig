@@ -1699,31 +1699,29 @@ fn runSdkConversation(
                     worker.closeFailure(.stream, @errorName(err));
                     return;
                 };
-                if (session_tracking_enabled) {
-                    if (store) |*value| value.touch(
-                        target,
-                        now,
-                    ) catch |err| {
-                        summary.deinit();
-                        worker.allocator().free(candidate_working_directory);
-                        candidate.disconnect() catch {};
-                        candidate_tools.deinit();
-                        target_plan.deinit(worker.allocator());
-                        worker.completeSessionResume(.{
-                            .failed = conversation.OwnedText.init(
-                                worker.allocator(),
-                                @errorName(err),
-                            ) catch {
-                                worker.closeFailure(.stream, @errorName(err));
-                                return;
-                            },
-                        }) catch {
+                if (store) |*value| value.touch(
+                    target,
+                    now,
+                ) catch |err| {
+                    summary.deinit();
+                    worker.allocator().free(candidate_working_directory);
+                    candidate.disconnect() catch {};
+                    candidate_tools.deinit();
+                    target_plan.deinit(worker.allocator());
+                    worker.completeSessionResume(.{
+                        .failed = conversation.OwnedText.init(
+                            worker.allocator(),
+                            @errorName(err),
+                        ) catch {
                             worker.closeFailure(.stream, @errorName(err));
                             return;
-                        };
-                        continue;
+                        },
+                    }) catch {
+                        worker.closeFailure(.stream, @errorName(err));
+                        return;
                     };
-                }
+                    continue;
+                };
 
                 const previous_session = session;
                 var previous_tools = tool_service;
