@@ -345,6 +345,7 @@ pub const Event = union(enum) {
     model_switch: ModelSwitchResult,
     session_catalog: SessionCatalog,
     session_catalog_failed: OwnedText,
+    session_tracking_failed: OwnedText,
     session_resume: SessionResumeResult,
     assistant_started,
     reasoning_delta: OwnedText,
@@ -371,6 +372,7 @@ pub const Event = union(enum) {
             .model_switch => |*result| result.deinit(),
             .session_catalog => |*catalog| catalog.deinit(),
             .session_catalog_failed => |*text| text.deinit(),
+            .session_tracking_failed => |*text| text.deinit(),
             .session_resume => |*result| result.deinit(),
             .closed => |*closed| closed.deinit(),
             .ready, .assistant_started, .idle => {},
@@ -664,6 +666,18 @@ pub const Worker = struct {
     ) !void {
         try self.completeControl(.{
             .session_catalog_failed = try OwnedText.init(
+                self.core.allocator,
+                message,
+            ),
+        });
+    }
+
+    pub fn sessionTrackingFailed(
+        self: *Worker,
+        message: []const u8,
+    ) !void {
+        try self.publish(.{
+            .session_tracking_failed = try OwnedText.init(
                 self.core.allocator,
                 message,
             ),

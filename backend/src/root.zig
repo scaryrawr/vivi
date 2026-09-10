@@ -1063,6 +1063,33 @@ fn unixMilliseconds(io: std.Io) i64 {
     return std.Io.Timestamp.now(io, .real).toMilliseconds();
 }
 
+fn recordSessionRecency(
+    worker: *conversation.Worker,
+    store: ?*session_store.Store,
+    tracking_enabled: *bool,
+    session_id: []const u8,
+    working_directory: []const u8,
+    model_id: []const u8,
+) void {
+    if (!tracking_enabled.*) return;
+    const value = store orelse return;
+    value.recordCreated(
+        session_id,
+        working_directory,
+        model_id,
+        unixMilliseconds(worker.io()),
+    ) catch |err| {
+        tracking_enabled.* = false;
+        var buffer: [256]u8 = undefined;
+        const message = std.fmt.bufPrint(
+            &buffer,
+            "Session tracking disabled: {s}",
+            .{@errorName(err)},
+        ) catch "Session tracking disabled.";
+        worker.sessionTrackingFailed(message) catch {};
+    };
+}
+
 const StreamResult = enum {
     idle,
     stopped,
@@ -1367,6 +1394,7 @@ fn runSdkConversation(
             return;
         };
     }
+    var session_tracking_enabled = store != null;
 
     if (!(worker.ready() catch {
         worker.closeFailure(.startup, "Unable to publish conversation readiness.");
@@ -1686,26 +1714,31 @@ fn runSdkConversation(
                     worker.closeFailure(.stream, @errorName(err));
                     return;
                 };
-                if (store) |*value| value.touch(target, now) catch |err| {
-                    summary.deinit();
-                    worker.allocator().free(candidate_working_directory);
-                    candidate.disconnect() catch {};
-                    candidate_tools.deinit();
-                    target_plan.deinit(worker.allocator());
-                    worker.completeSessionResume(.{
-                        .failed = conversation.OwnedText.init(
-                            worker.allocator(),
-                            @errorName(err),
-                        ) catch {
+                if (session_tracking_enabled) {
+                    if (store) |*value| value.touch(
+                        target,
+                        now,
+                    ) catch |err| {
+                        summary.deinit();
+                        worker.allocator().free(candidate_working_directory);
+                        candidate.disconnect() catch {};
+                        candidate_tools.deinit();
+                        target_plan.deinit(worker.allocator());
+                        worker.completeSessionResume(.{
+                            .failed = conversation.OwnedText.init(
+                                worker.allocator(),
+                                @errorName(err),
+                            ) catch {
+                                worker.closeFailure(.stream, @errorName(err));
+                                return;
+                            },
+                        }) catch {
                             worker.closeFailure(.stream, @errorName(err));
                             return;
-                        },
-                    }) catch {
-                        worker.closeFailure(.stream, @errorName(err));
-                        return;
+                        };
+                        continue;
                     };
-                    continue;
-                };
+                }
 
                 const previous_session = session;
                 var previous_tools = tool_service;
@@ -1805,20 +1838,14 @@ fn runSdkConversation(
                                 },
                                 .failed => return,
                             }
-                            if (store) |*value| {
-                                value.recordCreated(
-                                    session.id,
-                                    active_working_directory,
-                                    active_plan.id(),
-                                    unixMilliseconds(worker.io()),
-                                ) catch |err| {
-                                    worker.closeFailure(
-                                        .stream,
-                                        @errorName(err),
-                                    );
-                                    return;
-                                };
-                            }
+                            recordSessionRecency(
+                                worker,
+                                if (store) |*value| value else null,
+                                &session_tracking_enabled,
+                                session.id,
+                                active_working_directory,
+                                active_plan.id(),
+                            );
                             break :command_execution;
                         },
                         .select_subcommand => |selection| {
@@ -2117,59 +2144,61 @@ fn runSdkConversation(
                     };
                     break :blk value;
                 } else null;
-                if (store) |*value| {
-                    value.recordCreated(
-                        candidate.id,
-                        active_working_directory,
-                        target_plan.id(),
-                        unixMilliseconds(worker.io()),
-                    ) catch |err| {
-                        if (settings_update) |*update| {
-                            _ = settings.rollbackDefaultModel(
-                                worker.allocator(),
-                                worker.io(),
-                                context.settings_path.?,
-                                update,
-                            ) catch |rollback_err| {
+                if (session_tracking_enabled) {
+                    if (store) |*value| {
+                        value.recordCreated(
+                            candidate.id,
+                            active_working_directory,
+                            target_plan.id(),
+                            unixMilliseconds(worker.io()),
+                        ) catch |err| {
+                            if (settings_update) |*update| {
+                                _ = settings.rollbackDefaultModel(
+                                    worker.allocator(),
+                                    worker.io(),
+                                    context.settings_path.?,
+                                    update,
+                                ) catch |rollback_err| {
+                                    update.deinit();
+                                    settings_update = null;
+                                    candidate.disconnect() catch {};
+                                    target_plan.deinit(worker.allocator());
+                                    var mutable = info;
+                                    mutable.deinit();
+                                    if (persisted_model) |model| {
+                                        worker.allocator().free(model);
+                                    }
+                                    worker.closeFailure(
+                                        .stream,
+                                        @errorName(rollback_err),
+                                    );
+                                    return;
+                                };
                                 update.deinit();
                                 settings_update = null;
-                                candidate.disconnect() catch {};
-                                target_plan.deinit(worker.allocator());
-                                var mutable = info;
-                                mutable.deinit();
-                                if (persisted_model) |model| {
-                                    worker.allocator().free(model);
-                                }
-                                worker.closeFailure(
-                                    .stream,
-                                    @errorName(rollback_err),
-                                );
-                                return;
-                            };
-                            update.deinit();
-                            settings_update = null;
-                        }
-                        candidate.disconnect() catch {};
-                        target_plan.deinit(worker.allocator());
-                        var mutable = info;
-                        mutable.deinit();
-                        if (persisted_model) |model| {
-                            worker.allocator().free(model);
-                        }
-                        worker.completeModelSwitch(.{
-                            .failed = conversation.OwnedText.init(
-                                worker.allocator(),
-                                @errorName(err),
-                            ) catch {
+                            }
+                            candidate.disconnect() catch {};
+                            target_plan.deinit(worker.allocator());
+                            var mutable = info;
+                            mutable.deinit();
+                            if (persisted_model) |model| {
+                                worker.allocator().free(model);
+                            }
+                            worker.completeModelSwitch(.{
+                                .failed = conversation.OwnedText.init(
+                                    worker.allocator(),
+                                    @errorName(err),
+                                ) catch {
+                                    worker.closeFailure(.stream, @errorName(err));
+                                    return;
+                                },
+                            }) catch {
                                 worker.closeFailure(.stream, @errorName(err));
                                 return;
-                            },
-                        }) catch {
-                            worker.closeFailure(.stream, @errorName(err));
-                            return;
+                            };
+                            continue;
                         };
-                        continue;
-                    };
+                    }
                 }
                 if (settings_update) |*update| {
                     update.deinit();
@@ -2248,17 +2277,14 @@ fn runSdkConversation(
                     },
                     .failed => return,
                 }
-                if (store) |*value| {
-                    value.recordCreated(
-                        session.id,
-                        active_working_directory,
-                        active_plan.id(),
-                        unixMilliseconds(worker.io()),
-                    ) catch |err| {
-                        worker.closeFailure(.stream, @errorName(err));
-                        return;
-                    };
-                }
+                recordSessionRecency(
+                    worker,
+                    if (store) |*value| value else null,
+                    &session_tracking_enabled,
+                    session.id,
+                    active_working_directory,
+                    active_plan.id(),
+                );
             },
         }
     }

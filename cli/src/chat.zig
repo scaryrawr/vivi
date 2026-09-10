@@ -1393,6 +1393,13 @@ const ChatUi = struct {
                     failure.bytes,
                 );
             },
+            .session_tracking_failed => |failure| {
+                try self.transcript.append(
+                    self.allocator,
+                    .status,
+                    failure.bytes,
+                );
+            },
             .session_resume => |result| {
                 if (self.phase == .resuming) self.phase = .ready;
                 self.menu_mode = .closed;
@@ -2950,6 +2957,35 @@ test "session catalog failure restores ready state" {
     try std.testing.expectEqual(MenuMode.closed, ui.menu_mode);
     try std.testing.expectEqualStrings(
         "Unable to load saved sessions.",
+        ui.transcript.entries.items[0].text.items,
+    );
+}
+
+test "session tracking failure preserves conversation state" {
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    var ui = try ChatUi.init(
+        std.testing.allocator,
+        std.testing.io,
+        &environment,
+    );
+    defer ui.deinit();
+    ui.phase = .ready;
+
+    var event: backend.ConversationEvent = .{
+        .session_tracking_failed = try backend.OwnedText.init(
+            std.testing.allocator,
+            "Session tracking disabled: AccessDenied",
+        ),
+    };
+    defer event.deinit();
+    try std.testing.expectEqual(
+        ConversationOutcome.keep_running,
+        try ui.applyConversationEvent(&event),
+    );
+    try std.testing.expectEqual(UiPhase.ready, ui.phase);
+    try std.testing.expectEqualStrings(
+        "Session tracking disabled: AccessDenied",
         ui.transcript.entries.items[0].text.items,
     );
 }
