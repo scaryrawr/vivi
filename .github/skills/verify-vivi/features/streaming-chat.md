@@ -12,6 +12,8 @@ the session returns to the ready state.
 - `response-stream` shows the responding state and Vivi output.
 - `reasoning-stream` shows model reasoning as a dim, italic `Thinking` entry
   before the corresponding Vivi response.
+- `tool-activity` shows compact running, successful, or failed rows for
+  `read`, `bash`, `edit`, and `write` calls.
 - `response-steer` keeps the composer active and sends Enter submissions into
   the current turn.
 - `response-queue` sends Ctrl+Enter submissions as FIFO follow-up turns.
@@ -63,7 +65,8 @@ Preconditions:
   sends a Ctrl+Enter queued follow-up.
 - **Observe streaming input.** Confirm the composer remains editable while the
   context reads `Responding...`, the footer shows `Enter steer` and
-  `Ctrl+Enter queue`, and both submitted messages appear in the transcript.
+  `Ctrl+Enter queue`, both submitted messages appear in the transcript, and a
+  compact `Run sleep 6` tool row appears without replacing the Vivi response.
   The normalized transcript must contain `VIVI_STEER_OK`,
   `VIVI_QUEUE_FIRST`, and `VIVI_QUEUE_OK`.
 - **Record streaming-input review.** Complete

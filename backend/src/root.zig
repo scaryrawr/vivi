@@ -5,6 +5,7 @@ const conversation = @import("conversation.zig");
 const models = @import("models.zig");
 const session_store = @import("session_store.zig");
 const settings = @import("settings.zig");
+const tool_activity = @import("tool_activity.zig");
 const tools = @import("tools.zig");
 
 pub const version = build_options.version;
@@ -19,6 +20,18 @@ pub const ModelCatalog = conversation.ModelCatalog;
 pub const ModelInfo = conversation.ModelInfo;
 pub const SessionCatalog = conversation.SessionCatalog;
 pub const SessionSummary = conversation.SessionSummary;
+pub const ToolActivity = tool_activity.ToolActivity;
+pub const ToolActivityUpdate = tool_activity.ToolActivityUpdate;
+pub const ToolStarted = tool_activity.ToolStarted;
+pub const ToolFinished = tool_activity.ToolFinished;
+pub const ToolCallId = tool_activity.ToolCallId;
+pub const ToolLifecycle = tool_activity.ToolLifecycle;
+pub const ToolSummary = tool_activity.ToolSummary;
+pub const ReadToolSummary = tool_activity.ReadSummary;
+pub const BashToolSummary = tool_activity.BashSummary;
+pub const EditToolSummary = tool_activity.EditSummary;
+pub const WriteToolSummary = tool_activity.WriteSummary;
+pub const OtherToolSummary = tool_activity.OtherSummary;
 pub const OmlxCatalog = models.Catalog;
 pub const OmlxModel = models.Model;
 pub const OmlxOptions = models.OmlxOptions;
@@ -1194,7 +1207,7 @@ fn streamSessionResponse(
                 return .failed;
             },
             .external_tool_requested => |request| {
-                var result = tool_service.executeJson(
+                var prepared = tool_service.prepare(
                     request.tool_name,
                     request.arguments_json,
                 ) catch |err| {
@@ -1210,7 +1223,38 @@ fn streamSessionResponse(
                     };
                     continue;
                 };
+                defer prepared.deinit();
+                const started = prepared.started(
+                    worker.allocator(),
+                    request.tool_call_id,
+                ) catch |err| {
+                    worker.closeFailure(.stream, @errorName(err));
+                    return .failed;
+                };
+                worker.toolActivity(.{ .started = started }) catch |err| {
+                    worker.closeFailure(.stream, @errorName(err));
+                    return .failed;
+                };
+                var result = tool_service.execute(&prepared) catch |err| {
+                    worker.closeFailure(.stream, @errorName(err));
+                    return .failed;
+                };
                 defer result.deinit(worker.allocator());
+                const finished = tool_activity.ToolFinished.init(
+                    worker.allocator(),
+                    request.tool_call_id,
+                    switch (result) {
+                        .text => |text| .{ .succeeded = text },
+                        .failure => |message| .{ .failed = message },
+                    },
+                ) catch |err| {
+                    worker.closeFailure(.stream, @errorName(err));
+                    return .failed;
+                };
+                worker.toolActivity(.{ .finished = finished }) catch |err| {
+                    worker.closeFailure(.stream, @errorName(err));
+                    return .failed;
+                };
                 switch (result) {
                     .text => |text| session.respondToTool(
                         request.request_id,
