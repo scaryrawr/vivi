@@ -59,6 +59,8 @@ user-visible behavior. It then uses exactly four H2 sections in this order:
 - [Streaming chat](./streaming-chat.md) covers composer input, submission,
   streamed Copilot output, steering, queued follow-ups, and return to the
   ready state.
+- [Markdown rendering](./markdown-rendering.md) covers headings, inline
+  emphasis and code, and readable table layout in assistant responses.
 - [Ask-user prompt](./ask-user.md) covers interactive questions, numbered
   choices, answer entry, and resumed streaming.
 - [Chat shutdown](./chat-shutdown.md) covers cooperative Ctrl-C shutdown and

@@ -13,6 +13,7 @@ pub const abi_version: u32 = 1;
 pub const Conversation = conversation.Conversation;
 pub const ConversationEvent = conversation.Event;
 pub const ConversationWake = conversation.Wake;
+pub const OwnedText = conversation.OwnedText;
 pub const PromptDelivery = conversation.PromptDelivery;
 pub const CommandCatalog = conversation.CommandCatalog;
 pub const UserInputRequest = conversation.UserInputRequest;
