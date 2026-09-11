@@ -79,7 +79,8 @@ pub const Language = enum {
             ,
             .bash =>
             \\[(string) (raw_string) (heredoc_body) (heredoc_start)] @string
-            \\[(command_name) (function_definition name: (word))] @function
+            \\(command_name) @function
+            \\(function_definition name: (word) @function)
             \\(variable_name) @property
             \\["case" "do" "done" "elif" "else" "esac" "export" "fi" "for"
             \\ "function" "if" "in" "select" "then" "unset" "until" "while"] @keyword
@@ -233,4 +234,24 @@ test "highlighting is bounded for large sources" {
     for (highlighted) |span| {
         try std.testing.expect(span.end <= max_source_bytes);
     }
+}
+
+test "Bash function styling is limited to the function name" {
+    const source = "greet() { if true; then printf hi; fi; }";
+    const highlighted = try spans(std.testing.allocator, .bash, source);
+    defer std.testing.allocator.free(highlighted);
+
+    var saw_function_name = false;
+    var saw_body_keyword = false;
+    for (highlighted) |span| {
+        const text = source[span.start..span.end];
+        saw_function_name = saw_function_name or
+            (span.token == .function and std.mem.eql(u8, text, "greet"));
+        saw_body_keyword = saw_body_keyword or
+            (span.token == .keyword and std.mem.eql(u8, text, "if"));
+        if (span.token == .function) {
+            try std.testing.expect(std.mem.indexOfScalar(u8, text, '{') == null);
+        }
+    }
+    try std.testing.expect(saw_function_name and saw_body_keyword);
 }
