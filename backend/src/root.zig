@@ -1200,7 +1200,27 @@ fn streamSessionResponse(
                 worker.closeFailure(.stream, failure.message);
                 return .failed;
             },
-            .permission_requested => {},
+            .permission_requested => |request| switch (request.automatic_handling) {
+                .handled => {},
+                .not_configured => {
+                    worker.closeFailure(
+                        .stream,
+                        "Copilot requested permission without an automatic handler.",
+                    );
+                    return .failed;
+                },
+                .no_result => {
+                    worker.closeFailure(
+                        .stream,
+                        "Copilot requires manual permission approval, which vivi does not support yet.",
+                    );
+                    return .failed;
+                },
+                .handler_failed, .delivery_failed => |err| {
+                    worker.closeFailure(.stream, @errorName(err));
+                    return .failed;
+                },
+            },
             .external_tool_requested => |request| {
                 var prepared = tool_service.prepare(
                     request.tool_name,
