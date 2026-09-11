@@ -360,6 +360,11 @@ const Builder = struct {
     fn beginListItem(self: *Builder, detail: ?*anyopaque) !void {
         self.finishLine();
         if (self.failure != null) return self.failure.?;
+        if (self.pending_list_prefix != null) {
+            _ = try self.ensureLine();
+            self.finishLine();
+            if (self.failure != null) return self.failure.?;
+        }
         var prefix: []u8 = undefined;
         const list = &self.lists.items[self.lists.items.len - 1];
         const item: *const c.MD_BLOCK_LI_DETAIL = @ptrCast(@alignCast(detail.?));
@@ -1561,6 +1566,26 @@ test "empty list items do not leak their prefixes" {
     try std.testing.expect(std.mem.endsWith(u8, rendered.items, "\nparagraph"));
     try std.testing.expect(
         std.mem.indexOf(u8, rendered.items, "• paragraph") == null,
+    );
+}
+
+test "empty parent list items retain nested list prefixes" {
+    var screen: vaxis.Screen = undefined;
+    const window = testWindow(&screen, 80);
+    var layout = try Layout.init(
+        std.testing.allocator,
+        "-\n  - child\n\nparagraph",
+        window,
+        78,
+    );
+    defer layout.deinit();
+    var rendered: std.ArrayList(u8) = .empty;
+    defer rendered.deinit(std.testing.allocator);
+    try appendLayoutText(std.testing.allocator, &rendered, &layout);
+
+    try std.testing.expectEqualStrings(
+        "•\n  • child\n\nparagraph",
+        rendered.items,
     );
 }
 
