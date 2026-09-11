@@ -1,4 +1,5 @@
 const std = @import("std");
+const highlight = @import("highlight.zig");
 const vaxis = @import("vaxis");
 const c = @cImport({
     @cInclude("md4c.h");
@@ -12,6 +13,7 @@ pub const Style = struct {
     code: bool = false,
     heading: bool = false,
     link: bool = false,
+    syntax: ?highlight.Token = null,
 };
 
 pub const Segment = struct {
@@ -119,7 +121,20 @@ pub fn combineStyle(base: vaxis.Style, markdown: Style) vaxis.Style {
     result.strikethrough = result.strikethrough or markdown.strikethrough;
     if (markdown.heading or markdown.link) result.ul_style = .single;
     if (markdown.code) result.bg = .{ .index = 236 };
+    if (markdown.syntax) |syntax| result.fg = syntaxColor(syntax);
     return result;
+}
+
+fn syntaxColor(token: highlight.Token) vaxis.Color {
+    return switch (token) {
+        .comment => .{ .rgb = .{ 148, 163, 184 } },
+        .string => .{ .rgb = .{ 134, 239, 172 } },
+        .number, .constant => .{ .rgb = .{ 253, 186, 116 } },
+        .keyword => .{ .rgb = .{ 196, 181, 253 } },
+        .function => .{ .rgb = .{ 125, 211, 252 } },
+        .property => .{ .rgb = .{ 253, 224, 71 } },
+        .operator => .{ .rgb = .{ 244, 114, 182 } },
+    };
 }
 
 const ListState = struct {
@@ -186,6 +201,7 @@ const Builder = struct {
     strikethrough_depth: u16 = 0,
     heading_level: u8 = 0,
     code_block: bool = false,
+    code_language: ?highlight.Language = null,
     link_stack: std.ArrayList(?[]u8) = .empty,
     table: ?Table = null,
     current_row: ?Table.Row = null,
@@ -279,20 +295,57 @@ const Builder = struct {
         for (text, 0..) |byte, index| {
             if (byte != '\n') continue;
             const line = try self.ensureLine();
-            try line.append(
-                self.allocator,
-                text[start..index],
-                self.style,
-                self.activeUri(),
-            );
+            try self.appendCodeLine(line, text[start..index]);
             self.finishLine();
             start = index + 1;
         }
         if (start < text.len) {
             const line = try self.ensureLine();
+            try self.appendCodeLine(line, text[start..]);
+        }
+    }
+
+    fn appendCodeLine(self: *Builder, line: *Line, text: []const u8) !void {
+        const language = self.code_language orelse {
             try line.append(
                 self.allocator,
-                text[start..],
+                text,
+                self.style,
+                self.activeUri(),
+            );
+            return;
+        };
+        const highlighted = try highlight.spans(
+            self.allocator,
+            language,
+            text,
+        );
+        defer self.allocator.free(highlighted);
+
+        var offset: usize = 0;
+        for (highlighted) |span| {
+            if (offset < span.start) {
+                try line.append(
+                    self.allocator,
+                    text[offset..span.start],
+                    self.style,
+                    self.activeUri(),
+                );
+            }
+            var style = self.style;
+            style.syntax = span.token;
+            try line.append(
+                self.allocator,
+                text[span.start..span.end],
+                style,
+                self.activeUri(),
+            );
+            offset = span.end;
+        }
+        if (offset < text.len) {
+            try line.append(
+                self.allocator,
+                text[offset..],
                 self.style,
                 self.activeUri(),
             );
@@ -1084,6 +1137,15 @@ fn enterBlock(
             builder.finishLine();
             builder.code_block = true;
             builder.style.code = true;
+            const info: *const c.MD_BLOCK_CODE_DETAIL =
+                @ptrCast(@alignCast(detail.?));
+            const language_name = decodeAttribute(
+                builder.allocator,
+                info.lang,
+            ) catch |err| return builder.fail(err);
+            defer builder.allocator.free(language_name);
+            builder.code_language =
+                highlight.Language.fromMarkdownName(language_name);
         },
         c.MD_BLOCK_HR => {
             builder.appendText("────────────────") catch |err|
@@ -1134,6 +1196,7 @@ fn leaveBlock(
         c.MD_BLOCK_CODE => {
             builder.finishLine();
             builder.code_block = false;
+            builder.code_language = null;
             builder.style.code = false;
             builder.appendBlank() catch |err| return builder.fail(err);
         },
@@ -1492,6 +1555,31 @@ test "fenced code retains line breaks while escaping controls" {
         std.mem.indexOf(u8, rendered.items, "  first␛\n  second") != null,
     );
     try std.testing.expect(std.mem.indexOf(u8, rendered.items, "␊") == null);
+}
+
+test "fenced code applies tree-sitter syntax styles" {
+    var screen: vaxis.Screen = undefined;
+    const window = testWindow(&screen, 100);
+    var layout = try Layout.init(
+        std.testing.allocator,
+        "```zig\nconst answer = 42; // ready\n```",
+        window,
+        98,
+    );
+    defer layout.deinit();
+
+    var saw_keyword = false;
+    var saw_number = false;
+    var saw_comment = false;
+    for (layout.lines.items) |line| {
+        for (line.segments.items) |segment| {
+            const token = segment.style.syntax orelse continue;
+            saw_keyword = saw_keyword or token == .keyword;
+            saw_number = saw_number or token == .number;
+            saw_comment = saw_comment or token == .comment;
+        }
+    }
+    try std.testing.expect(saw_keyword and saw_number and saw_comment);
 }
 
 test "incomplete streaming prefixes remain visible" {

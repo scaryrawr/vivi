@@ -12,6 +12,22 @@
             .url = "git+https://github.com/rockorager/libvaxis.git#44dbbb7802801d11b22ce6eabe22f56550dc26c6",
             .hash = "vaxis-0.6.0-BWNV_HvTCwC_rv3qyvPMcOZfBIGcB417fJ6xqcYxpAIy",
         },
+        .tree_sitter = .{
+            .url = "git+https://github.com/tree-sitter/zig-tree-sitter#b562510b5563dcf3b7fcac4a5fe9d60834c84667",
+            .hash = "tree_sitter-0.26.0-8heIf-vDAQDh0HhAAUVwVZFmLrwSKMZl5gRaVFqtas0W",
+        },
+        .tree_sitter_bash = .{
+            .url = "https://github.com/tree-sitter/tree-sitter-bash/archive/a06c2e4415e9bc0346c6b86d401879ffb44058f7.tar.gz",
+            .hash = "N-V-__8AANjenwCy_cXlIbU8nqBzGxMlEHVokLZJYrmIXtoz",
+        },
+        .tree_sitter_json = .{
+            .url = "https://github.com/tree-sitter/tree-sitter-json/archive/001c28d7a29832b06b0e831ec77845553c89b56d.tar.gz",
+            .hash = "N-V-__8AAHNaAgD6kjK3HX6lAf89chPqS5zIm0tLpvBQLOtX",
+        },
+        .tree_sitter_zig = .{
+            .url = "git+https://github.com/kohdice/tree-sitter-zig#6c2f4f90cab7c72ec27d9dd19361649cc59f41c2",
+            .hash = "tree_sitter_zig-1.1.2-sr5WUIF7XACkCsywV3Fe8eWmyLCLEOzkQoIUEa37IVE-",
+        },
     },
     .paths = .{
         "README.md",

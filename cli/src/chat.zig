@@ -1,5 +1,6 @@
 const std = @import("std");
 const backend = @import("vivi_backend");
+const highlight = @import("highlight.zig");
 const markdown = @import("markdown.zig");
 const tool_renderer = @import("tool_renderer.zig");
 const vaxis = @import("vaxis");
@@ -14,6 +15,13 @@ const composer_background = vaxis.Color{ .index = 236 };
 const menu_background = vaxis.Color{ .index = 234 };
 const tool_detail_background = vaxis.Color{ .index = 234 };
 const menu_selected_background = vaxis.Color{ .index = 238 };
+const syntax_comment = vaxis.Color{ .rgb = .{ 148, 163, 184 } };
+const syntax_string = vaxis.Color{ .rgb = .{ 134, 239, 172 } };
+const syntax_number = vaxis.Color{ .rgb = .{ 253, 186, 116 } };
+const syntax_keyword = vaxis.Color{ .rgb = .{ 196, 181, 253 } };
+const syntax_function = vaxis.Color{ .rgb = .{ 125, 211, 252 } };
+const syntax_property = vaxis.Color{ .rgb = .{ 253, 224, 71 } };
+const syntax_operator = vaxis.Color{ .rgb = .{ 244, 114, 182 } };
 
 const AppEvent = union(enum) {
     key_press: vaxis.Key,
@@ -114,6 +122,9 @@ const ToolEntry = struct {
     input_display: []u8,
     output: ?[]u8 = null,
     output_display: ?[]u8 = null,
+    input_highlights: []highlight.Span,
+    output_highlights: ?[]highlight.Span = null,
+    output_language: ?highlight.Language,
     expanded: bool = false,
 
     const Completion = union(enum) {
@@ -155,10 +166,24 @@ const ToolEntry = struct {
         errdefer allocator.free(input);
         const input_display = try tool_renderer.renderArguments(allocator, input);
         errdefer allocator.free(input_display);
+        const input_language: ?highlight.Language = switch (started.invocation.summary) {
+            .bash => .bash,
+            else => null,
+        };
+        const input_highlights = if (input_language) |language|
+            try highlight.spans(allocator, language, input_display)
+        else
+            try allocator.alloc(highlight.Span, 0);
+        errdefer allocator.free(input_highlights);
         return .{
             .call_id = call_id,
             .input = input,
             .input_display = input_display,
+            .input_highlights = input_highlights,
+            .output_language = switch (started.invocation.summary) {
+                .read => |summary| highlight.Language.fromPath(summary.path),
+                else => null,
+            },
             .invocation_hash = hashToolInvocation(started),
             .compact = try tool_renderer.renderCompact(
                 allocator,
@@ -209,8 +234,14 @@ const ToolEntry = struct {
         const output = try allocator.dupe(u8, text);
         errdefer allocator.free(output);
         const output_display = try tool_renderer.renderLiteral(allocator, output);
+        errdefer allocator.free(output_display);
+        const output_highlights = if (self.output_language) |language|
+            try highlight.spans(allocator, language, output_display)
+        else
+            try allocator.alloc(highlight.Span, 0);
         self.output = output;
         self.output_display = output_display;
+        self.output_highlights = output_highlights;
         self.completion = completion;
         const marker = switch (completion) {
             .succeeded => "✓",
@@ -224,8 +255,10 @@ const ToolEntry = struct {
         allocator.free(self.compact);
         allocator.free(self.input);
         allocator.free(self.input_display);
+        allocator.free(self.input_highlights);
         if (self.output) |output| allocator.free(output);
         if (self.output_display) |output| allocator.free(output);
+        if (self.output_highlights) |spans| allocator.free(spans);
         self.call_id.deinit(allocator);
         self.* = undefined;
     }
@@ -253,6 +286,76 @@ fn hashToolPayload(payload: []const u8) [std.crypto.hash.sha2.Sha256.digest_leng
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(payload, &digest, .{});
     return digest;
+}
+
+fn syntaxStyle(base: vaxis.Style, token: highlight.Token) vaxis.Style {
+    var style = base;
+    style.fg = switch (token) {
+        .comment => syntax_comment,
+        .string => syntax_string,
+        .number, .constant => syntax_number,
+        .keyword => syntax_keyword,
+        .function => syntax_function,
+        .property => syntax_property,
+        .operator => syntax_operator,
+    };
+    return style;
+}
+
+fn drawHighlightedRange(
+    window: vaxis.Window,
+    row: u16,
+    column: u16,
+    text: []const u8,
+    start: usize,
+    end: usize,
+    highlights: []const highlight.Span,
+    base_style: vaxis.Style,
+) void {
+    var offset = start;
+    var current_column = column;
+    for (highlights) |span| {
+        if (span.end <= start) continue;
+        if (span.start >= end) break;
+        const span_start = @max(span.start, start);
+        const span_end = @min(span.end, end);
+        if (offset < span_start) {
+            const plain = text[offset..span_start];
+            var segments = [_]vaxis.Segment{.{
+                .text = plain,
+                .style = base_style,
+            }};
+            _ = window.print(&segments, .{
+                .row_offset = row,
+                .col_offset = current_column,
+                .wrap = .none,
+            });
+            current_column +|= window.gwidth(plain);
+        }
+        const colored = text[span_start..span_end];
+        var segments = [_]vaxis.Segment{.{
+            .text = colored,
+            .style = syntaxStyle(base_style, span.token),
+        }};
+        _ = window.print(&segments, .{
+            .row_offset = row,
+            .col_offset = current_column,
+            .wrap = .none,
+        });
+        current_column +|= window.gwidth(colored);
+        offset = span_end;
+    }
+    if (offset < end) {
+        var segments = [_]vaxis.Segment{.{
+            .text = text[offset..end],
+            .style = base_style,
+        }};
+        _ = window.print(&segments, .{
+            .row_offset = row,
+            .col_offset = current_column,
+            .wrap = .none,
+        });
+    }
 }
 
 const Entry = union(enum) {
@@ -2602,11 +2705,28 @@ const ChatUi = struct {
                     .text = text,
                     .style = .{ .bold = label, .fg = reasoning_color, .bg = tool_detail_background },
                 }};
-                _ = window.print(&segments, .{
-                    .row_offset = row,
-                    .col_offset = @min(window.width -| 1, 4),
-                    .wrap = .none,
-                });
+                if (label) {
+                    _ = window.print(&segments, .{
+                        .row_offset = row,
+                        .col_offset = @min(window.width -| 1, 4),
+                        .wrap = .none,
+                    });
+                } else {
+                    const highlights = if (line.kind == .tool_input)
+                        tool.input_highlights
+                    else
+                        tool.output_highlights orelse &.{};
+                    drawHighlightedRange(
+                        window,
+                        row,
+                        @min(window.width -| 1, 4),
+                        if (line.kind == .tool_input) tool.input_display else output,
+                        line.start,
+                        line.end,
+                        highlights,
+                        .{ .fg = reasoning_color, .bg = tool_detail_background },
+                    );
+                }
             },
         }
     }
@@ -3072,6 +3192,38 @@ fn toolFinished(
             .{ .failed = value },
         ),
     };
+}
+
+test "tool details highlight shell input and supported read output" {
+    var bash_started = try toolStarted(
+        "bash-highlight",
+        "{\"command\":\"printf '%s\\\\n' ready\"}",
+        .{ .bash = .{ .command = "printf '%s\\n' ready" } },
+    );
+    defer bash_started.deinit();
+    var bash_entry = try ToolEntry.init(std.testing.allocator, &bash_started);
+    defer bash_entry.deinit(std.testing.allocator);
+    try std.testing.expect(bash_entry.input_highlights.len > 0);
+
+    var read_started = try toolStarted(
+        "read-highlight",
+        "{\"path\":\"sample.zig\"}",
+        .{ .read = .{
+            .path = "sample.zig",
+            .offset = null,
+            .limit = null,
+        } },
+    );
+    defer read_started.deinit();
+    var read_entry = try ToolEntry.init(std.testing.allocator, &read_started);
+    defer read_entry.deinit(std.testing.allocator);
+    var finished = try toolFinished(
+        "read-highlight",
+        .{ .succeeded = "const answer = 42;" },
+    );
+    defer finished.deinit();
+    try read_entry.finish(std.testing.allocator, &finished);
+    try std.testing.expect(read_entry.output_highlights.?.len > 0);
 }
 
 test "transcript replaces streamed draft with completed response" {
@@ -3767,7 +3919,7 @@ test "tool disclosure hit mapping follows wrapping scrolling resizing and comple
             for (0..window.width) |col| {
                 try std.testing.expectEqual(tool_detail_background, screen.readCell(@intCast(col), 0).?.style.bg);
             }
-            if (line.start != line.end or line.kind == .tool_input_label or line.kind == .tool_output_label)
+            if (line.kind == .tool_input_label or line.kind == .tool_output_label)
                 try std.testing.expectEqual(reasoning_color, screen.readCell(4, 0).?.style.fg);
         }
     }
