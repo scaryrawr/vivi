@@ -19,5 +19,6 @@
         "build.zig.zon",
         "backend",
         "cli",
+        "third_party",
     },
 }

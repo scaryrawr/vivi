@@ -1,5 +1,7 @@
 const std = @import("std");
 const backend = @import("vivi_backend");
+const markdown = @import("markdown.zig");
+const tool_renderer = @import("tool_renderer.zig");
 const vaxis = @import("vaxis");
 
 const TextInput = vaxis.widgets.TextInput;
@@ -14,6 +16,7 @@ const menu_selected_background = vaxis.Color{ .index = 238 };
 
 const AppEvent = union(enum) {
     key_press: vaxis.Key,
+    mouse: vaxis.Mouse,
     winsize: vaxis.Winsize,
     conversation_wake,
 };
@@ -75,7 +78,7 @@ fn visibleSelectionRange(
     };
 }
 
-const Entry = struct {
+const MessageEntry = struct {
     role: Role,
     text: std.ArrayList(u8) = .empty,
 
@@ -83,16 +86,169 @@ const Entry = struct {
         allocator: std.mem.Allocator,
         role: Role,
         text: []const u8,
-    ) !Entry {
-        var entry: Entry = .{ .role = role };
+    ) !MessageEntry {
+        var entry: MessageEntry = .{ .role = role };
         errdefer entry.text.deinit(allocator);
         try entry.text.appendSlice(allocator, text);
         return entry;
     }
 
-    fn deinit(self: *Entry, allocator: std.mem.Allocator) void {
+    fn deinit(self: *MessageEntry, allocator: std.mem.Allocator) void {
         self.text.deinit(allocator);
         self.* = undefined;
+    }
+};
+
+const ToolEntry = struct {
+    call_id: backend.ToolCallId,
+    invocation_hash: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+    completion: ?Completion = null,
+    compact: []u8,
+
+    const Completion = union(enum) {
+        succeeded: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+        failed: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+
+        fn eql(self: Completion, other: Completion) bool {
+            return switch (self) {
+                .succeeded => |hash| switch (other) {
+                    .succeeded => |candidate| std.mem.eql(
+                        u8,
+                        hash[0..],
+                        candidate[0..],
+                    ),
+                    .failed => false,
+                },
+                .failed => |hash| switch (other) {
+                    .succeeded => false,
+                    .failed => |candidate| std.mem.eql(
+                        u8,
+                        hash[0..],
+                        candidate[0..],
+                    ),
+                },
+            };
+        }
+    };
+
+    fn init(
+        allocator: std.mem.Allocator,
+        started: *const backend.ToolStarted,
+    ) !ToolEntry {
+        const call_id = try started.call_id.clone(allocator);
+        errdefer {
+            var mutable = call_id;
+            mutable.deinit(allocator);
+        }
+        return .{
+            .call_id = call_id,
+            .invocation_hash = hashToolInvocation(started),
+            .compact = try tool_renderer.renderCompact(
+                allocator,
+                started.invocation.summary,
+                .running,
+            ),
+        };
+    }
+
+    fn matchesStart(
+        self: ToolEntry,
+        started: *const backend.ToolStarted,
+    ) bool {
+        const invocation_hash = hashToolInvocation(started);
+        return self.call_id.eql(started.call_id) and
+            std.mem.eql(
+                u8,
+                self.invocation_hash[0..],
+                invocation_hash[0..],
+            );
+    }
+
+    fn finish(
+        self: *ToolEntry,
+        finished: *const backend.ToolFinished,
+    ) !void {
+        if (!self.call_id.eql(finished.call_id)) {
+            return error.MismatchedToolCall;
+        }
+        const completion: Completion = switch (finished.result) {
+            .succeeded => |text| .{
+                .succeeded = hashToolPayload(text),
+            },
+            .failed => |text| .{
+                .failed = hashToolPayload(text),
+            },
+        };
+        if (self.completion) |existing| {
+            if (!existing.eql(completion)) {
+                return error.ConflictingToolCompletion;
+            }
+            return;
+        }
+        self.completion = completion;
+        const marker = switch (completion) {
+            .succeeded => "✓",
+            .failed => "✗",
+        };
+        std.debug.assert(std.mem.startsWith(u8, self.compact, "◌"));
+        @memcpy(self.compact[0..marker.len], marker);
+    }
+
+    fn deinit(self: *ToolEntry, allocator: std.mem.Allocator) void {
+        allocator.free(self.compact);
+        self.call_id.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+fn hashToolInvocation(
+    started: *const backend.ToolStarted,
+) [std.crypto.hash.sha2.Sha256.digest_length]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(@tagName(started.invocation.summary));
+    switch (started.invocation.summary) {
+        .other => |summary| {
+            const name_len: u64 = @intCast(summary.name.len);
+            hasher.update(std.mem.asBytes(&name_len));
+            hasher.update(summary.name);
+        },
+        else => {},
+    }
+    hasher.update(&.{0});
+    hasher.update(started.invocation.arguments_json);
+    return hasher.finalResult();
+}
+
+fn hashToolPayload(payload: []const u8) [std.crypto.hash.sha2.Sha256.digest_length]u8 {
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(payload, &digest, .{});
+    return digest;
+}
+
+const Entry = union(enum) {
+    message: MessageEntry,
+    tool: ToolEntry,
+
+    fn deinit(self: *Entry, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .message => |*message| message.deinit(allocator),
+            .tool => |*tool| tool.deinit(allocator),
+        }
+        self.* = undefined;
+    }
+
+    fn messageValue(self: *Entry) ?*MessageEntry {
+        return switch (self.*) {
+            .message => |*message| message,
+            .tool => null,
+        };
+    }
+
+    fn constMessage(self: *const Entry) ?*const MessageEntry {
+        return switch (self.*) {
+            .message => |*message| message,
+            .tool => null,
+        };
     }
 };
 
@@ -114,12 +270,12 @@ const Transcript = struct {
         role: Role,
         text: []const u8,
     ) !void {
-        const entry = try Entry.init(allocator, role, text);
+        const message = try MessageEntry.init(allocator, role, text);
         errdefer {
-            var mutable = entry;
+            var mutable = message;
             mutable.deinit(allocator);
         }
-        try self.entries.append(allocator, entry);
+        try self.entries.append(allocator, .{ .message = message });
     }
 
     fn appendBeforeQueued(
@@ -128,15 +284,16 @@ const Transcript = struct {
         role: Role,
         text: []const u8,
     ) !void {
-        const entry = try Entry.init(allocator, role, text);
+        const message = try MessageEntry.init(allocator, role, text);
         errdefer {
-            var mutable = entry;
+            var mutable = message;
             mutable.deinit(allocator);
         }
         const index = for (self.entries.items, 0..) |existing, queued_index| {
-            if (existing.role == .queued) break queued_index;
+            const existing_message = existing.constMessage() orelse continue;
+            if (existing_message.role == .queued) break queued_index;
         } else self.entries.items.len;
-        try self.entries.insert(allocator, index, entry);
+        try self.entries.insert(allocator, index, .{ .message = message });
     }
 
     fn appendDelta(
@@ -148,7 +305,10 @@ const Transcript = struct {
         self.finishReasoning();
         const index = self.active_assistant orelse
             try self.startEntry(allocator, .assistant);
-        try self.entries.items[index].text.appendSlice(allocator, text);
+        try self.entries.items[index].messageValue().?.text.appendSlice(
+            allocator,
+            text,
+        );
     }
 
     fn appendReasoningDelta(
@@ -160,7 +320,10 @@ const Transcript = struct {
         self.finishAssistant();
         const index = self.active_reasoning orelse
             try self.startEntry(allocator, .reasoning);
-        try self.entries.items[index].text.appendSlice(allocator, text);
+        try self.entries.items[index].messageValue().?.text.appendSlice(
+            allocator,
+            text,
+        );
     }
 
     fn startEntry(
@@ -168,15 +331,16 @@ const Transcript = struct {
         allocator: std.mem.Allocator,
         role: Role,
     ) !usize {
-        const entry = try Entry.init(allocator, role, "");
+        const message = try MessageEntry.init(allocator, role, "");
         errdefer {
-            var mutable = entry;
+            var mutable = message;
             mutable.deinit(allocator);
         }
         const index = for (self.entries.items, 0..) |existing, queued_index| {
-            if (existing.role == .queued) break queued_index;
+            const existing_message = existing.constMessage() orelse continue;
+            if (existing_message.role == .queued) break queued_index;
         } else self.entries.items.len;
-        try self.entries.insert(allocator, index, entry);
+        try self.entries.insert(allocator, index, .{ .message = message });
         switch (role) {
             .reasoning => {
                 self.active_reasoning = index;
@@ -197,8 +361,9 @@ const Transcript = struct {
         self.finishReasoning();
         const index = self.active_assistant orelse
             try self.startEntry(allocator, .assistant);
-        self.entries.items[index].text.clearRetainingCapacity();
-        try self.entries.items[index].text.appendSlice(allocator, text);
+        const message = self.entries.items[index].messageValue().?;
+        message.text.clearRetainingCapacity();
+        try message.text.appendSlice(allocator, text);
     }
 
     fn completeReasoning(
@@ -212,8 +377,9 @@ const Transcript = struct {
                 self.finishAssistant();
                 break :create try self.startEntry(allocator, .reasoning);
             };
-        self.entries.items[index].text.clearRetainingCapacity();
-        try self.entries.items[index].text.appendSlice(allocator, text);
+        const message = self.entries.items[index].messageValue().?;
+        message.text.clearRetainingCapacity();
+        try message.text.appendSlice(allocator, text);
     }
 
     fn finishAssistant(self: *Transcript) void {
@@ -241,17 +407,22 @@ const Transcript = struct {
 
     fn promoteNextQueuedPrompt(self: *Transcript) void {
         const selected_index = for (self.entries.items, 0..) |entry, index| {
-            if (entry.role == .queued) break index;
+            const message = entry.constMessage() orelse continue;
+            if (message.role == .queued) break index;
         } else return;
 
         var selected = self.entries.orderedRemove(selected_index);
-        selected.role = .user;
+        selected.message.role = .user;
         self.entries.appendAssumeCapacity(selected);
 
         var index: usize = 0;
         var remaining = self.entries.items.len;
         while (index < remaining) {
-            if (self.entries.items[index].role != .queued) {
+            const message = self.entries.items[index].messageValue() orelse {
+                index += 1;
+                continue;
+            };
+            if (message.role != .queued) {
                 index += 1;
                 continue;
             }
@@ -259,6 +430,70 @@ const Transcript = struct {
             self.entries.appendAssumeCapacity(queued);
             remaining -= 1;
         }
+    }
+
+    fn applyToolActivity(
+        self: *Transcript,
+        allocator: std.mem.Allocator,
+        update: *const backend.ToolActivityUpdate,
+    ) !void {
+        switch (update.*) {
+            .started => |*started| {
+                if (self.findTool(started.call_id)) |tool| {
+                    if (tool.matchesStart(started)) return;
+                    return error.ConflictingToolStart;
+                }
+                self.finishTurn();
+                const tool = try ToolEntry.init(
+                    allocator,
+                    started,
+                );
+                errdefer {
+                    var mutable = tool;
+                    mutable.deinit(allocator);
+                }
+                try self.insertBeforeQueued(
+                    allocator,
+                    .{ .tool = tool },
+                );
+            },
+            .finished => |*finished| {
+                const tool = self.findTool(finished.call_id) orelse
+                    return error.UnknownToolCall;
+                try tool.finish(finished);
+            },
+        }
+    }
+
+    fn findTool(
+        self: *Transcript,
+        call_id: backend.ToolCallId,
+    ) ?*ToolEntry {
+        for (self.entries.items) |*entry| {
+            switch (entry.*) {
+                .message => {},
+                .tool => |*tool| {
+                    if (tool.call_id.eql(call_id)) return tool;
+                },
+            }
+        }
+        return null;
+    }
+
+    fn insertBeforeQueued(
+        self: *Transcript,
+        allocator: std.mem.Allocator,
+        entry: Entry,
+    ) !void {
+        const index = for (self.entries.items, 0..) |existing, queued_index| {
+            const message = existing.constMessage() orelse continue;
+            if (message.role == .queued) break queued_index;
+        } else self.entries.items.len;
+        try self.entries.insert(allocator, index, entry);
+    }
+
+    fn messageAt(self: *const Transcript, index: usize) *const MessageEntry {
+        return self.entries.items[index].constMessage().?;
     }
 };
 
@@ -301,6 +536,16 @@ const Region = struct {
             .width = self.width,
             .height = self.height,
         });
+    }
+
+    fn contains(self: Region, col: i16, row: i16) bool {
+        if (col < 0 or row < 0) return false;
+        const x: usize = @intCast(col);
+        const y: usize = @intCast(row);
+        return x >= self.x and
+            x < @as(usize, self.x) + self.width and
+            y >= self.y and
+            y < @as(usize, self.y) + self.height;
     }
 };
 
@@ -381,7 +626,9 @@ const LineKind = enum {
     blank,
     role,
     body,
+    markdown,
     status,
+    tool,
 };
 
 const RenderLine = struct {
@@ -393,8 +640,11 @@ const RenderLine = struct {
 
 const Projection = struct {
     lines: std.ArrayList(RenderLine) = .empty,
+    markdown_lines: std.ArrayList(markdown.Line) = .empty,
 
     fn deinit(self: *Projection, allocator: std.mem.Allocator) void {
+        for (self.markdown_lines.items) |*line| line.deinit(allocator);
+        self.markdown_lines.deinit(allocator);
         self.lines.deinit(allocator);
         self.* = undefined;
     }
@@ -414,29 +664,69 @@ const Projection = struct {
                     .entry_index = entry_index,
                 });
             }
-            switch (entry.role) {
-                .user, .queued, .reasoning, .assistant, .question => {
-                    try projection.lines.append(allocator, .{
-                        .kind = .role,
-                        .entry_index = entry_index,
-                    });
+            switch (entry) {
+                .message => |message| switch (message.role) {
+                    .reasoning, .assistant => {
+                        try projection.lines.append(allocator, .{
+                            .kind = .role,
+                            .entry_index = entry_index,
+                        });
+                        var layout = try markdown.Layout.init(
+                            allocator,
+                            message.text.items,
+                            window,
+                            @max(window.width -| 2, 1),
+                        );
+                        defer layout.deinit();
+                        for (layout.lines.items) |*line| {
+                            const markdown_index =
+                                projection.markdown_lines.items.len;
+                            try projection.markdown_lines.append(
+                                allocator,
+                                line.*,
+                            );
+                            line.* = .{};
+                            try projection.lines.append(allocator, .{
+                                .kind = .markdown,
+                                .entry_index = entry_index,
+                                .start = markdown_index,
+                            });
+                        }
+                        layout.lines.clearRetainingCapacity();
+                    },
+                    .user, .queued, .question => {
+                        try projection.lines.append(allocator, .{
+                            .kind = .role,
+                            .entry_index = entry_index,
+                        });
+                        try projection.appendWrapped(
+                            allocator,
+                            entry_index,
+                            message.text.items,
+                            window,
+                            .body,
+                            2,
+                        );
+                    },
+                    .status => try projection.appendWrapped(
+                        allocator,
+                        entry_index,
+                        message.text.items,
+                        window,
+                        .status,
+                        2,
+                    ),
+                },
+                .tool => |tool| {
                     try projection.appendWrapped(
                         allocator,
                         entry_index,
-                        entry.text.items,
+                        tool.compact,
                         window,
-                        .body,
+                        .tool,
                         2,
                     );
                 },
-                .status => try projection.appendWrapped(
-                    allocator,
-                    entry_index,
-                    entry.text.items,
-                    window,
-                    .status,
-                    2,
-                ),
             }
         }
         return projection;
@@ -502,6 +792,8 @@ const KeyOutcome = enum {
     keep_running,
     force_exit,
 };
+
+const mouse_wheel_rows: usize = 3;
 
 const MenuDetail = union(enum) {
     text: []const u8,
@@ -772,6 +1064,7 @@ const ChatUi = struct {
     rows_from_tail: usize = 0,
     last_total_rows: usize = 0,
     last_viewport_rows: usize = 0,
+    last_transcript_region: Region = .{},
 
     fn init(
         allocator: std.mem.Allocator,
@@ -936,6 +1229,17 @@ const ChatUi = struct {
             self.phase = .loading_commands;
         }
         return .keep_running;
+    }
+
+    fn handleMouse(self: *ChatUi, mouse: vaxis.Mouse) bool {
+        if (!self.last_transcript_region.contains(mouse.col, mouse.row))
+            return false;
+
+        return switch (mouse.button) {
+            .wheel_up => self.scrollUp(mouse_wheel_rows),
+            .wheel_down => self.scrollDown(mouse_wheel_rows),
+            else => false,
+        };
     }
 
     fn submitUserInput(
@@ -1464,6 +1768,12 @@ const ChatUi = struct {
                 );
                 if (text.bytes.len > 0) self.transcript.finishTurn();
             },
+            .tool_activity => |*update| {
+                try self.transcript.applyToolActivity(
+                    self.allocator,
+                    update,
+                );
+            },
             .user_input_requested => |request| {
                 const replacement = try request.clone(self.allocator);
                 if (self.pending_user_input) |*current| current.deinit();
@@ -1510,7 +1820,10 @@ const ChatUi = struct {
         }
     }
 
-    fn draw(self: *ChatUi, root: vaxis.Window) !void {
+    fn draw(self: *ChatUi, root: vaxis.Window) !?Projection {
+        var projection: ?Projection = null;
+        errdefer if (projection) |*value| value.deinit(self.allocator);
+
         const desired_menu_rows: u16 = if (self.phase == .awaiting_input)
             self.userInputPanelRows(root)
         else switch (self.menu_mode) {
@@ -1525,6 +1838,7 @@ const ChatUi = struct {
             root.height,
             desired_menu_rows,
         );
+        self.last_transcript_region = layout.transcript;
         if (layout.transcript.height > 0) {
             const transcript_window = layout.transcript.child(root);
             if (self.transcript.entries.items.len == 0) {
@@ -1532,13 +1846,12 @@ const ChatUi = struct {
                 self.last_total_rows = 0;
                 self.last_viewport_rows = transcript_window.height;
             } else {
-                var projection = try Projection.build(
+                projection = try Projection.build(
                     self.allocator,
                     &self.transcript,
                     transcript_window,
                 );
-                defer projection.deinit(self.allocator);
-                self.drawTranscript(transcript_window, &projection);
+                self.drawTranscript(transcript_window, &projection.?);
             }
         }
         if (layout.context) |region| {
@@ -1557,6 +1870,7 @@ const ChatUi = struct {
             self.drawComposer(layout.composer.child(root));
         }
         if (layout.footer) |region| self.drawFooter(region.child(root));
+        return projection;
     }
 
     fn drawMenu(self: *ChatUi, window: vaxis.Window) void {
@@ -1931,7 +2245,12 @@ const ChatUi = struct {
         const last_row = @min(first_row + viewport_rows, total_rows);
 
         for (projection.lines.items[first_row..last_row], 0..) |line, row| {
-            self.drawTranscriptLine(window, @intCast(row), line);
+            self.drawTranscriptLine(
+                window,
+                @intCast(row),
+                projection,
+                line,
+            );
         }
         self.last_total_rows = total_rows;
         self.last_viewport_rows = viewport_rows;
@@ -1941,13 +2260,15 @@ const ChatUi = struct {
         self: *ChatUi,
         window: vaxis.Window,
         row: u16,
+        projection: *const Projection,
         line: RenderLine,
     ) void {
         const entry = self.transcript.entries.items[line.entry_index];
         switch (line.kind) {
             .blank => {},
             .role => {
-                const role_text = switch (entry.role) {
+                const message = entry.constMessage().?;
+                const role_text = switch (message.role) {
                     .user => "You",
                     .queued => "Queued",
                     .reasoning => "Thinking",
@@ -1955,7 +2276,7 @@ const ChatUi = struct {
                     .question => "Question",
                     .status => unreachable,
                 };
-                const role_color = switch (entry.role) {
+                const role_color = switch (message.role) {
                     .user => user_color,
                     .queued => accent,
                     .reasoning => reasoning_color,
@@ -1965,7 +2286,7 @@ const ChatUi = struct {
                 };
                 var segments = [_]vaxis.Segment{.{
                     .text = role_text,
-                    .style = if (entry.role == .reasoning)
+                    .style = if (message.role == .reasoning)
                         .{ .fg = role_color, .dim = true, .italic = true }
                     else
                         .{ .fg = role_color, .bold = true },
@@ -1976,9 +2297,10 @@ const ChatUi = struct {
                 });
             },
             .body => {
+                const message = entry.constMessage().?;
                 var segments = [_]vaxis.Segment{.{
-                    .text = entry.text.items[line.start..line.end],
-                    .style = if (entry.role == .reasoning)
+                    .text = message.text.items[line.start..line.end],
+                    .style = if (message.role == .reasoning)
                         .{
                             .fg = reasoning_color,
                             .dim = true,
@@ -1993,19 +2315,72 @@ const ChatUi = struct {
                     .wrap = .none,
                 });
             },
+            .markdown => {
+                const message = entry.constMessage().?;
+                const base_style: vaxis.Style =
+                    if (message.role == .reasoning)
+                        .{
+                            .fg = reasoning_color,
+                            .dim = true,
+                            .italic = true,
+                        }
+                    else
+                        .{};
+                const markdown_line = projection.markdown_lines.items[line.start];
+                var column: u16 = if (window.width >= 4) 2 else 0;
+                for (markdown_line.segments.items) |segment| {
+                    var segments = [_]vaxis.Segment{.{
+                        .text = segment.text,
+                        .style = markdown.combineStyle(
+                            base_style,
+                            segment.style,
+                        ),
+                        .link = if (segment.uri) |uri|
+                            .{ .uri = uri }
+                        else
+                            .{},
+                    }};
+                    _ = window.print(&segments, .{
+                        .row_offset = row,
+                        .col_offset = column,
+                        .wrap = .none,
+                    });
+                    column +|= window.gwidth(segment.text);
+                }
+            },
             .status => {
+                const message = entry.constMessage().?;
                 var segments = [_]vaxis.Segment{
                     .{
                         .text = "• ",
                         .style = .{ .fg = accent, .dim = true },
                     },
                     .{
-                        .text = entry.text.items[line.start..line.end],
+                        .text = message.text.items[line.start..line.end],
                         .style = .{ .dim = true },
                     },
                 };
                 _ = window.print(&segments, .{
                     .row_offset = row,
+                    .wrap = .none,
+                });
+            },
+            .tool => {
+                const tool = &entry.tool;
+                const color = if (tool.completion) |completion|
+                    switch (completion) {
+                        .succeeded => accent,
+                        .failed => vaxis.Color{ .index = 203 },
+                    }
+                else
+                    reasoning_color;
+                var segments = [_]vaxis.Segment{.{
+                    .text = tool.compact[line.start..line.end],
+                    .style = .{ .fg = color, .dim = true },
+                }};
+                _ = window.print(&segments, .{
+                    .row_offset = row,
+                    .col_offset = if (window.width >= 4) 2 else 0,
                     .wrap = .none,
                 });
             },
@@ -2091,16 +2466,16 @@ const ChatUi = struct {
         if (window.width == 0) return;
         const hints = if (window.width >= 48)
             switch (self.phase) {
-                .ready => "Enter send  ·  PgUp/PgDn scroll  ·  Ctrl-C quit",
-                .responding => "Enter steer  ·  Ctrl+Enter queue  ·  PgUp/PgDn scroll  ·  Ctrl-C stop",
+                .ready => "Enter send  ·  Wheel/PgUp/PgDn scroll  ·  Ctrl-C quit",
+                .responding => "Enter steer  ·  Ctrl+Enter queue  ·  Wheel/PgUp/PgDn scroll  ·  Ctrl-C stop",
                 .awaiting_input => if (self.hasInputChoices())
                     if (self.hasFreeformChoice())
                         "↑/↓ select  ·  Enter accept  ·  type for other  ·  Ctrl-C stop"
                     else
                         "↑/↓ select  ·  Enter accept  ·  Ctrl-C stop"
                 else
-                    "Enter answer  ·  PgUp/PgDn scroll  ·  Ctrl-C stop",
-                .connecting, .loading_commands, .running_command, .switching, .resuming => "PgUp/PgDn scroll  ·  Ctrl-C stop",
+                    "Enter answer  ·  Wheel/PgUp/PgDn scroll  ·  Ctrl-C stop",
+                .connecting, .loading_commands, .running_command, .switching, .resuming => "Wheel/PgUp/PgDn scroll  ·  Ctrl-C stop",
                 .stopping => "Ctrl-C again force exit",
             }
         else if (window.width >= 24)
@@ -2230,17 +2605,29 @@ const ChatUi = struct {
 
     fn pageUp(self: *ChatUi) void {
         const page_rows = @max(self.last_viewport_rows -| 1, 1);
-        const max_scroll = self.last_total_rows -|
-            @min(self.last_total_rows, self.last_viewport_rows);
-        self.rows_from_tail = @min(
-            self.rows_from_tail + page_rows,
-            max_scroll,
-        );
+        _ = self.scrollUp(page_rows);
     }
 
     fn pageDown(self: *ChatUi) void {
         const page_rows = @max(self.last_viewport_rows -| 1, 1);
-        self.rows_from_tail -|= page_rows;
+        _ = self.scrollDown(page_rows);
+    }
+
+    fn scrollUp(self: *ChatUi, rows: usize) bool {
+        const previous = self.rows_from_tail;
+        const max_scroll = self.last_total_rows -|
+            @min(self.last_total_rows, self.last_viewport_rows);
+        self.rows_from_tail = @min(
+            self.rows_from_tail + rows,
+            max_scroll,
+        );
+        return self.rows_from_tail != previous;
+    }
+
+    fn scrollDown(self: *ChatUi, rows: usize) bool {
+        const previous = self.rows_from_tail;
+        self.rows_from_tail -|= rows;
+        return self.rows_from_tail != previous;
     }
 
     fn followTail(self: *ChatUi) void {
@@ -2325,6 +2712,7 @@ const App = struct {
         try self.loop.start();
         try self.vx.enterAltScreen(self.tty.writer());
         try self.vx.queryTerminal(self.tty.writer(), .fromSeconds(1));
+        try self.vx.setMouseMode(self.tty.writer(), true);
         const use_signal_resize = !self.vx.state.in_band_resize;
         if (use_signal_resize) try self.loop.installResizeHandler();
         defer if (use_signal_resize) self.loop.uninstallResizeHandler();
@@ -2332,11 +2720,13 @@ const App = struct {
 
         while (!self.closed) {
             const event = try self.loop.nextEvent();
+            var redraw = true;
             switch (event) {
                 .key_press => |key| switch (try self.ui.handleKey(key, &self.conversation)) {
                     .keep_running => {},
                     .force_exit => self.hardExit(),
                 },
+                .mouse => |mouse| redraw = self.ui.handleMouse(mouse),
                 .winsize => |winsize| {
                     try self.vx.resize(
                         self.allocator,
@@ -2346,25 +2736,30 @@ const App = struct {
                 },
                 .conversation_wake => {},
             }
-            try self.drainConversation();
-            if (!self.closed) try self.render();
+            const conversation_changed = try self.drainConversation();
+            if (!self.closed and (redraw or conversation_changed))
+                try self.render();
         }
     }
 
-    fn drainConversation(self: *App) !void {
+    fn drainConversation(self: *App) !bool {
+        var changed = false;
         while (try self.conversation.tryTakeEvent()) |event_value| {
+            changed = true;
             var event = event_value;
             defer event.deinit();
             if (try self.ui.applyConversationEvent(&event) == .close) {
                 self.closed = true;
             }
         }
+        return changed;
     }
 
     fn render(self: *App) !void {
         const root = self.vx.window();
         root.clear();
-        try self.ui.draw(root);
+        var projection = try self.ui.draw(root);
+        defer if (projection) |*value| value.deinit(self.allocator);
         try self.vx.render(self.tty.writer());
         try self.tty.writer().flush();
     }
@@ -2390,6 +2785,40 @@ pub fn run(
     try app.run();
 }
 
+fn toolStarted(
+    call_id: []const u8,
+    arguments_json: []const u8,
+    summary: backend.ToolSummary,
+) !backend.ToolStarted {
+    return backend.ToolStarted.init(
+        std.testing.allocator,
+        call_id,
+        arguments_json,
+        summary,
+    );
+}
+
+fn toolFinished(
+    call_id: []const u8,
+    result: union(enum) {
+        succeeded: []const u8,
+        failed: []const u8,
+    },
+) !backend.ToolFinished {
+    return switch (result) {
+        .succeeded => |value| backend.ToolFinished.init(
+            std.testing.allocator,
+            call_id,
+            .{ .succeeded = value },
+        ),
+        .failed => |value| backend.ToolFinished.init(
+            std.testing.allocator,
+            call_id,
+            .{ .failed = value },
+        ),
+    };
+}
+
 test "transcript replaces streamed draft with completed response" {
     var transcript: Transcript = .{};
     defer transcript.deinit(std.testing.allocator);
@@ -2401,7 +2830,7 @@ test "transcript replaces streamed draft with completed response" {
     try std.testing.expectEqual(1, transcript.entries.items.len);
     try std.testing.expectEqualStrings(
         "hello",
-        transcript.entries.items[0].text.items,
+        transcript.messageAt(0).text.items,
     );
 }
 
@@ -2418,7 +2847,7 @@ test "empty assistant completion does not create or clear a draft" {
     try std.testing.expectEqual(1, transcript.entries.items.len);
     try std.testing.expectEqualStrings(
         "hello",
-        transcript.entries.items[0].text.items,
+        transcript.messageAt(0).text.items,
     );
 }
 
@@ -2435,15 +2864,15 @@ test "assistant message boundary preserves queued turn order" {
     try std.testing.expectEqual(3, transcript.entries.items.len);
     try std.testing.expectEqualStrings(
         "first",
-        transcript.entries.items[0].text.items,
+        transcript.messageAt(0).text.items,
     );
     try std.testing.expectEqualStrings(
         "queued",
-        transcript.entries.items[1].text.items,
+        transcript.messageAt(1).text.items,
     );
     try std.testing.expectEqualStrings(
         "second",
-        transcript.entries.items[2].text.items,
+        transcript.messageAt(2).text.items,
     );
 }
 
@@ -2455,11 +2884,11 @@ test "queued prompts are promoted in FIFO order" {
     try transcript.append(std.testing.allocator, .queued, "second");
 
     transcript.promoteNextQueuedPrompt();
-    try std.testing.expectEqual(Role.user, transcript.entries.items[0].role);
-    try std.testing.expectEqual(Role.queued, transcript.entries.items[1].role);
+    try std.testing.expectEqual(Role.user, transcript.messageAt(0).role);
+    try std.testing.expectEqual(Role.queued, transcript.messageAt(1).role);
 
     transcript.promoteNextQueuedPrompt();
-    try std.testing.expectEqual(Role.user, transcript.entries.items[1].role);
+    try std.testing.expectEqual(Role.user, transcript.messageAt(1).role);
 }
 
 test "queued prompt moves behind the response it waited for" {
@@ -2474,12 +2903,12 @@ test "queued prompt moves behind the response it waited for" {
     try std.testing.expectEqual(3, transcript.entries.items.len);
     try std.testing.expectEqualStrings(
         "first response",
-        transcript.entries.items[1].text.items,
+        transcript.messageAt(1).text.items,
     );
-    try std.testing.expectEqual(Role.user, transcript.entries.items[2].role);
+    try std.testing.expectEqual(Role.user, transcript.messageAt(2).role);
     try std.testing.expectEqualStrings(
         "queued prompt",
-        transcript.entries.items[2].text.items,
+        transcript.messageAt(2).text.items,
     );
 }
 
@@ -2492,12 +2921,12 @@ test "response arriving after queue submission is inserted before the queue" {
     try transcript.appendDelta(std.testing.allocator, "first response");
 
     try std.testing.expectEqual(3, transcript.entries.items.len);
-    try std.testing.expectEqual(Role.assistant, transcript.entries.items[1].role);
+    try std.testing.expectEqual(Role.assistant, transcript.messageAt(1).role);
     try std.testing.expectEqualStrings(
         "first response",
-        transcript.entries.items[1].text.items,
+        transcript.messageAt(1).text.items,
     );
-    try std.testing.expectEqual(Role.queued, transcript.entries.items[2].role);
+    try std.testing.expectEqual(Role.queued, transcript.messageAt(2).role);
 }
 
 test "reasoning and response stay ordered before a queued prompt" {
@@ -2514,25 +2943,25 @@ test "reasoning and response stay ordered before a queued prompt" {
     try transcript.appendDelta(std.testing.allocator, "queued response");
 
     try std.testing.expectEqual(5, transcript.entries.items.len);
-    try std.testing.expectEqual(Role.reasoning, transcript.entries.items[1].role);
+    try std.testing.expectEqual(Role.reasoning, transcript.messageAt(1).role);
     try std.testing.expectEqualStrings(
         "thought through",
-        transcript.entries.items[1].text.items,
+        transcript.messageAt(1).text.items,
     );
-    try std.testing.expectEqual(Role.assistant, transcript.entries.items[2].role);
+    try std.testing.expectEqual(Role.assistant, transcript.messageAt(2).role);
     try std.testing.expectEqualStrings(
         "first response",
-        transcript.entries.items[2].text.items,
+        transcript.messageAt(2).text.items,
     );
-    try std.testing.expectEqual(Role.user, transcript.entries.items[3].role);
+    try std.testing.expectEqual(Role.user, transcript.messageAt(3).role);
     try std.testing.expectEqualStrings(
         "queued prompt",
-        transcript.entries.items[3].text.items,
+        transcript.messageAt(3).text.items,
     );
-    try std.testing.expectEqual(Role.assistant, transcript.entries.items[4].role);
+    try std.testing.expectEqual(Role.assistant, transcript.messageAt(4).role);
     try std.testing.expectEqualStrings(
         "queued response",
-        transcript.entries.items[4].text.items,
+        transcript.messageAt(4).text.items,
     );
 }
 
@@ -2559,14 +2988,14 @@ test "ask-user exchange separates resumed output from active reasoning" {
     try transcript.appendDelta(std.testing.allocator, "after answer");
 
     try std.testing.expectEqual(@as(usize, 5), transcript.entries.items.len);
-    try std.testing.expectEqual(Role.reasoning, transcript.entries.items[0].role);
-    try std.testing.expectEqual(Role.question, transcript.entries.items[1].role);
-    try std.testing.expectEqual(Role.user, transcript.entries.items[2].role);
-    try std.testing.expectEqual(Role.assistant, transcript.entries.items[3].role);
-    try std.testing.expectEqual(Role.queued, transcript.entries.items[4].role);
+    try std.testing.expectEqual(Role.reasoning, transcript.messageAt(0).role);
+    try std.testing.expectEqual(Role.question, transcript.messageAt(1).role);
+    try std.testing.expectEqual(Role.user, transcript.messageAt(2).role);
+    try std.testing.expectEqual(Role.assistant, transcript.messageAt(3).role);
+    try std.testing.expectEqual(Role.queued, transcript.messageAt(4).role);
     try std.testing.expectEqualStrings(
         "after answer",
-        transcript.entries.items[3].text.items,
+        transcript.messageAt(3).text.items,
     );
 }
 
@@ -2581,15 +3010,15 @@ test "late reasoning completion updates its entry before the response" {
     try transcript.appendDelta(std.testing.allocator, "!");
 
     try std.testing.expectEqual(2, transcript.entries.items.len);
-    try std.testing.expectEqual(Role.reasoning, transcript.entries.items[0].role);
+    try std.testing.expectEqual(Role.reasoning, transcript.messageAt(0).role);
     try std.testing.expectEqualStrings(
         "complete thought",
-        transcript.entries.items[0].text.items,
+        transcript.messageAt(0).text.items,
     );
-    try std.testing.expectEqual(Role.assistant, transcript.entries.items[1].role);
+    try std.testing.expectEqual(Role.assistant, transcript.messageAt(1).role);
     try std.testing.expectEqualStrings(
         "answer!",
-        transcript.entries.items[1].text.items,
+        transcript.messageAt(1).text.items,
     );
 }
 
@@ -2603,6 +3032,508 @@ test "blank reasoning and assistant deltas do not create entries" {
     try transcript.completeAssistant(std.testing.allocator, "");
 
     try std.testing.expectEqual(0, transcript.entries.items.len);
+}
+
+test "tool completions update interleaved rows in reverse order" {
+    var transcript: Transcript = .{};
+    defer transcript.deinit(std.testing.allocator);
+    var first = try toolStarted(
+        "call-1",
+        "{\"path\":\"one\"}",
+        .{ .read = .{ .path = "one", .offset = null, .limit = null } },
+    );
+    defer first.deinit();
+    var second = try toolStarted(
+        "call-2",
+        "{\"command\":\"two\"}",
+        .{ .bash = .{ .command = "two" } },
+    );
+    defer second.deinit();
+    try transcript.applyToolActivity(
+        std.testing.allocator,
+        &.{ .started = first },
+    );
+    try transcript.applyToolActivity(
+        std.testing.allocator,
+        &.{ .started = second },
+    );
+
+    var second_finished = try toolFinished(
+        "call-2",
+        .{ .succeeded = "second" },
+    );
+    defer second_finished.deinit();
+    var first_finished = try toolFinished(
+        "call-1",
+        .{ .failed = "first" },
+    );
+    defer first_finished.deinit();
+    try transcript.applyToolActivity(
+        std.testing.allocator,
+        &.{ .finished = second_finished },
+    );
+    try transcript.applyToolActivity(
+        std.testing.allocator,
+        &.{ .finished = first_finished },
+    );
+
+    try std.testing.expectEqual(@as(usize, 2), transcript.entries.items.len);
+    try std.testing.expectEqualStrings(
+        "call-1",
+        transcript.entries.items[0].tool.call_id.bytes,
+    );
+    try std.testing.expect(
+        transcript.entries.items[0].tool.completion.? == .failed,
+    );
+    try std.testing.expectEqualStrings(
+        "call-2",
+        transcript.entries.items[1].tool.call_id.bytes,
+    );
+    try std.testing.expect(
+        transcript.entries.items[1].tool.completion.? == .succeeded,
+    );
+}
+
+test "equal tool updates are idempotent and conflicts fail" {
+    var transcript: Transcript = .{};
+    defer transcript.deinit(std.testing.allocator);
+    var started = try toolStarted(
+        "call-1",
+        "{\"path\":\"one\"}",
+        .{ .read = .{ .path = "one", .offset = null, .limit = null } },
+    );
+    defer started.deinit();
+    var duplicate = try toolStarted(
+        "call-1",
+        "{\"path\":\"one\"}",
+        .{ .read = .{ .path = "one", .offset = null, .limit = null } },
+    );
+    defer duplicate.deinit();
+    var conflict = try toolStarted(
+        "call-1",
+        "{\"path\":\"two\"}",
+        .{ .read = .{ .path = "two", .offset = null, .limit = null } },
+    );
+    defer conflict.deinit();
+
+    try transcript.applyToolActivity(
+        std.testing.allocator,
+        &.{ .started = started },
+    );
+    try transcript.applyToolActivity(
+        std.testing.allocator,
+        &.{ .started = duplicate },
+    );
+    try std.testing.expectEqual(@as(usize, 1), transcript.entries.items.len);
+    try std.testing.expectError(
+        error.ConflictingToolStart,
+        transcript.applyToolActivity(
+            std.testing.allocator,
+            &.{ .started = conflict },
+        ),
+    );
+
+    var finished = try toolFinished("call-1", .{ .succeeded = "ok" });
+    defer finished.deinit();
+    var finished_duplicate = try toolFinished(
+        "call-1",
+        .{ .succeeded = "ok" },
+    );
+    defer finished_duplicate.deinit();
+    var finished_conflict = try toolFinished(
+        "call-1",
+        .{ .failed = "no" },
+    );
+    defer finished_conflict.deinit();
+    var unknown = try toolFinished("missing", .{ .succeeded = "ok" });
+    defer unknown.deinit();
+    try transcript.applyToolActivity(
+        std.testing.allocator,
+        &.{ .finished = finished },
+    );
+    try transcript.applyToolActivity(
+        std.testing.allocator,
+        &.{ .finished = finished_duplicate },
+    );
+    try std.testing.expectError(
+        error.ConflictingToolCompletion,
+        transcript.applyToolActivity(
+            std.testing.allocator,
+            &.{ .finished = finished_conflict },
+        ),
+    );
+    try std.testing.expectError(
+        error.UnknownToolCall,
+        transcript.applyToolActivity(
+            std.testing.allocator,
+            &.{ .finished = unknown },
+        ),
+    );
+}
+
+test "fallback tool names are part of duplicate start identity" {
+    var transcript: Transcript = .{};
+    defer transcript.deinit(std.testing.allocator);
+    var search = try toolStarted(
+        "call-1",
+        "{}",
+        .{ .other = .{ .name = "search" } },
+    );
+    defer search.deinit();
+    var fetch = try toolStarted(
+        "call-1",
+        "{}",
+        .{ .other = .{ .name = "fetch" } },
+    );
+    defer fetch.deinit();
+
+    try transcript.applyToolActivity(
+        std.testing.allocator,
+        &.{ .started = search },
+    );
+    try std.testing.expectError(
+        error.ConflictingToolStart,
+        transcript.applyToolActivity(
+            std.testing.allocator,
+            &.{ .started = fetch },
+        ),
+    );
+}
+
+test "tool row preserves queued ordering and splits assistant output" {
+    var transcript: Transcript = .{};
+    defer transcript.deinit(std.testing.allocator);
+    try transcript.append(std.testing.allocator, .queued, "later");
+    try transcript.appendDelta(std.testing.allocator, "before");
+    var started = try toolStarted(
+        "call-1",
+        "{\"command\":\"true\"}",
+        .{ .bash = .{ .command = "true" } },
+    );
+    defer started.deinit();
+    try transcript.applyToolActivity(
+        std.testing.allocator,
+        &.{ .started = started },
+    );
+    try transcript.appendDelta(std.testing.allocator, "after");
+
+    try std.testing.expectEqual(@as(usize, 4), transcript.entries.items.len);
+    try std.testing.expectEqualStrings("before", transcript.messageAt(0).text.items);
+    try std.testing.expect(transcript.entries.items[1] == .tool);
+    try std.testing.expectEqualStrings("after", transcript.messageAt(2).text.items);
+    try std.testing.expectEqual(Role.queued, transcript.messageAt(3).role);
+}
+
+test "compact tool rows wrap by grapheme width with one entry index" {
+    var transcript: Transcript = .{};
+    defer transcript.deinit(std.testing.allocator);
+    var started = try toolStarted(
+        "call-1",
+        "{\"command\":\"printf αβγδεζηθ\"}",
+        .{ .bash = .{ .command = "printf αβγδεζηθ" } },
+    );
+    defer started.deinit();
+    try transcript.applyToolActivity(
+        std.testing.allocator,
+        &.{ .started = started },
+    );
+    var screen: vaxis.Screen = .{ .width_method = .unicode };
+    const window: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 10,
+        .height = 20,
+        .screen = &screen,
+    };
+    var projection = try Projection.build(
+        std.testing.allocator,
+        &transcript,
+        window,
+    );
+    defer projection.deinit(std.testing.allocator);
+
+    try std.testing.expect(projection.lines.items.len > 1);
+    for (projection.lines.items) |line| {
+        try std.testing.expectEqual(LineKind.tool, line.kind);
+        try std.testing.expectEqual(@as(usize, 0), line.entry_index);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(
+            transcript.entries.items[0].tool.compact[line.start..line.end],
+        ));
+    }
+}
+
+test "tool entries retain bounded display state instead of full payloads" {
+    const command = try std.testing.allocator.alloc(u8, 16 * 1024);
+    defer std.testing.allocator.free(command);
+    @memset(command, 'a');
+    const arguments = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"command\":\"{s}\"}}",
+        .{command},
+    );
+    defer std.testing.allocator.free(arguments);
+    var started = try toolStarted(
+        "call-1",
+        arguments,
+        .{ .bash = .{ .command = command } },
+    );
+    defer started.deinit();
+    var transcript: Transcript = .{};
+    defer transcript.deinit(std.testing.allocator);
+
+    try transcript.applyToolActivity(
+        std.testing.allocator,
+        &.{ .started = started },
+    );
+
+    const tool = transcript.entries.items[0].tool;
+    try std.testing.expect(tool.compact.len < 256);
+    try std.testing.expectEqual(
+        @as(usize, std.crypto.hash.sha2.Sha256.digest_length),
+        tool.invocation_hash.len,
+    );
+}
+
+test "tool events preserve a scrolled transcript position" {
+    var ui: ChatUi = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .input = TextInput.init(std.testing.allocator),
+        .cwd = try std.testing.allocator.dupe(u8, "."),
+        .rows_from_tail = 5,
+    };
+    defer ui.deinit();
+    var started_event: backend.ConversationEvent = .{
+        .tool_activity = .{
+            .started = try toolStarted(
+                "call-1",
+                "{\"command\":\"true\"}",
+                .{ .bash = .{ .command = "true" } },
+            ),
+        },
+    };
+    defer started_event.deinit();
+
+    _ = try ui.applyConversationEvent(&started_event);
+    try std.testing.expectEqual(@as(usize, 5), ui.rows_from_tail);
+
+    var finished_event: backend.ConversationEvent = .{
+        .tool_activity = .{
+            .finished = try toolFinished(
+                "call-1",
+                .{ .succeeded = "ok" },
+            ),
+        },
+    };
+    defer finished_event.deinit();
+
+    _ = try ui.applyConversationEvent(&finished_event);
+    try std.testing.expectEqual(@as(usize, 5), ui.rows_from_tail);
+}
+
+test "mouse wheel scrolls the transcript within its bounds" {
+    var ui: ChatUi = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .input = TextInput.init(std.testing.allocator),
+        .cwd = try std.testing.allocator.dupe(u8, "."),
+        .last_total_rows = 20,
+        .last_viewport_rows = 8,
+        .last_transcript_region = .{
+            .x = 2,
+            .width = 96,
+            .height = 8,
+        },
+    };
+    defer ui.deinit();
+
+    try std.testing.expect(ui.handleMouse(.{
+        .col = 2,
+        .row = 4,
+        .button = .wheel_up,
+        .mods = .{},
+        .type = .press,
+    }));
+    try std.testing.expectEqual(mouse_wheel_rows, ui.rows_from_tail);
+
+    try std.testing.expect(ui.handleMouse(.{
+        .col = 2,
+        .row = 4,
+        .button = .wheel_down,
+        .mods = .{},
+        .type = .press,
+    }));
+    try std.testing.expectEqual(@as(usize, 0), ui.rows_from_tail);
+
+    for (0..10) |_| {
+        _ = ui.handleMouse(.{
+            .col = 2,
+            .row = 4,
+            .button = .wheel_up,
+            .mods = .{},
+            .type = .press,
+        });
+    }
+    try std.testing.expectEqual(@as(usize, 12), ui.rows_from_tail);
+}
+
+test "mouse wheel outside the transcript does not scroll" {
+    var ui: ChatUi = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .input = TextInput.init(std.testing.allocator),
+        .cwd = try std.testing.allocator.dupe(u8, "."),
+        .last_total_rows = 20,
+        .last_viewport_rows = 8,
+        .last_transcript_region = .{
+            .x = 2,
+            .width = 96,
+            .height = 8,
+        },
+    };
+    defer ui.deinit();
+
+    try std.testing.expect(!ui.handleMouse(.{
+        .col = 2,
+        .row = 8,
+        .button = .wheel_up,
+        .mods = .{},
+        .type = .press,
+    }));
+    try std.testing.expect(!ui.handleMouse(.{
+        .col = 1,
+        .row = 4,
+        .button = .wheel_up,
+        .mods = .{},
+        .type = .press,
+    }));
+    try std.testing.expect(!ui.handleMouse(.{
+        .col = 2,
+        .row = 4,
+        .button = .none,
+        .mods = .{},
+        .type = .motion,
+    }));
+    try std.testing.expectEqual(@as(usize, 0), ui.rows_from_tail);
+}
+
+test "tool activity draws its compact row to the terminal screen" {
+    var ui: ChatUi = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .input = TextInput.init(std.testing.allocator),
+        .cwd = try std.testing.allocator.dupe(u8, "."),
+    };
+    defer ui.deinit();
+    var started = try toolStarted(
+        "call-1",
+        "{\"path\":\"README.md\",\"limit\":1}",
+        .{ .read = .{ .path = "README.md", .offset = null, .limit = 1 } },
+    );
+    defer started.deinit();
+    try ui.transcript.applyToolActivity(
+        std.testing.allocator,
+        &.{ .started = started },
+    );
+    try ui.transcript.appendDelta(std.testing.allocator, "READ_DONE");
+
+    var screen = try vaxis.Screen.init(std.testing.allocator, .{
+        .rows = 12,
+        .cols = 50,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(std.testing.allocator);
+    const window: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = screen.width,
+        .height = screen.height,
+        .screen = &screen,
+    };
+    var projection = try ui.draw(window);
+    defer if (projection) |*value| value.deinit(std.testing.allocator);
+
+    var rendered: std.ArrayList(u8) = .empty;
+    defer rendered.deinit(std.testing.allocator);
+    for (0..screen.height) |row| {
+        for (0..screen.width) |column| {
+            const cell = screen.readCell(
+                @intCast(column),
+                @intCast(row),
+            ).?;
+            try rendered.appendSlice(std.testing.allocator, cell.char.grapheme);
+        }
+
+        try rendered.append(std.testing.allocator, '\n');
+    }
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        rendered.items,
+        "Read README.md first 1 line",
+    ) != null);
+}
+
+test "Markdown draw storage remains valid while screen cells are consumed" {
+    var ui: ChatUi = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .input = TextInput.init(std.testing.allocator),
+        .cwd = try std.testing.allocator.dupe(u8, "."),
+    };
+    defer ui.deinit();
+    try ui.transcript.append(
+        std.testing.allocator,
+        .assistant,
+        "# Render Test\n\n**Styled** `code`\n\n" ++
+            "| Feature | Status |\n| --- | --- |\n| Tables | Readable |",
+    );
+
+    var screen = try vaxis.Screen.init(std.testing.allocator, .{
+        .rows = 16,
+        .cols = 60,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(std.testing.allocator);
+    const window: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = screen.width,
+        .height = screen.height,
+        .screen = &screen,
+    };
+    var projection = try ui.draw(window);
+    defer if (projection) |*value| value.deinit(std.testing.allocator);
+
+    var rendered: std.ArrayList(u8) = .empty;
+    defer rendered.deinit(std.testing.allocator);
+    for (0..screen.height) |row| {
+        for (0..screen.width) |column| {
+            const cell = screen.readCell(
+                @intCast(column),
+                @intCast(row),
+            ).?;
+            try rendered.appendSlice(std.testing.allocator, cell.char.grapheme);
+        }
+        try rendered.append(std.testing.allocator, '\n');
+    }
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        rendered.items,
+        "Render Test",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        rendered.items,
+        "Tables",
+    ) != null);
 }
 
 test "frame layout keeps chrome in bounds" {
@@ -2649,6 +3580,7 @@ test "frame layout keeps chrome in bounds" {
 test "ask-user input preserves the existing composer draft" {
     var ui: ChatUi = .{
         .allocator = std.testing.allocator,
+        .io = std.testing.io,
         .input = TextInput.init(std.testing.allocator),
         .cwd = try std.testing.allocator.dupe(u8, "."),
     };
@@ -2692,6 +3624,7 @@ test "slash command parsing preserves argument suffixes" {
 test "arrow selection replaces typed ask-user input" {
     var ui: ChatUi = .{
         .allocator = std.testing.allocator,
+        .io = std.testing.io,
         .input = TextInput.init(std.testing.allocator),
         .cwd = try std.testing.allocator.dupe(u8, "."),
         .pending_user_input = try backend.UserInputRequest.init(
@@ -2716,6 +3649,7 @@ test "arrow selection replaces typed ask-user input" {
 test "ask-user panel reserves rows for wrapped questions" {
     var ui: ChatUi = .{
         .allocator = std.testing.allocator,
+        .io = std.testing.io,
         .input = TextInput.init(std.testing.allocator),
         .cwd = try std.testing.allocator.dupe(u8, "."),
         .pending_user_input = try backend.UserInputRequest.init(
@@ -2957,7 +3891,7 @@ test "session catalog failure closes stale cached finder" {
     try std.testing.expectEqual(MenuMode.closed, ui.menu_mode);
     try std.testing.expectEqualStrings(
         "Unable to load saved sessions.",
-        ui.transcript.entries.items[0].text.items,
+        ui.transcript.messageAt(0).text.items,
     );
 }
 
@@ -2986,7 +3920,7 @@ test "session tracking failure preserves conversation state" {
     try std.testing.expectEqual(UiPhase.ready, ui.phase);
     try std.testing.expectEqualStrings(
         "Session tracking disabled: AccessDenied",
-        ui.transcript.entries.items[0].text.items,
+        ui.transcript.messageAt(0).text.items,
     );
 }
 

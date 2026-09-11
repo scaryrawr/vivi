@@ -1,4 +1,5 @@
 const std = @import("std");
+const tool_activity = @import("tool_activity.zig");
 
 pub const Descriptor = struct {
     name: []const u8,
@@ -75,6 +76,72 @@ const WriteArguments = struct {
     content: []const u8,
 };
 
+pub const PreparedCall = struct {
+    allocator: std.mem.Allocator,
+    arguments_json: []u8,
+    operation: Operation,
+
+    const Operation = union(enum) {
+        read: std.json.Parsed(ReadArguments),
+        bash: std.json.Parsed(BashArguments),
+        edit: std.json.Parsed(EditArguments),
+        write: std.json.Parsed(WriteArguments),
+        rejected: struct {
+            tool_name: []u8,
+            message: []u8,
+        },
+    };
+
+    pub fn started(
+        self: *const PreparedCall,
+        allocator: std.mem.Allocator,
+        call_id: []const u8,
+    ) !tool_activity.ToolStarted {
+        const summary: tool_activity.ToolSummary = switch (self.operation) {
+            .read => |parsed| .{ .read = .{
+                .path = parsed.value.path,
+                .offset = parsed.value.offset,
+                .limit = parsed.value.limit,
+            } },
+            .bash => |parsed| .{ .bash = .{
+                .command = parsed.value.command,
+            } },
+            .edit => |parsed| .{ .edit = .{
+                .path = parsed.value.path,
+                .replacement_count = parsed.value.edits.len,
+            } },
+            .write => |parsed| .{ .write = .{
+                .path = parsed.value.path,
+                .byte_count = parsed.value.content.len,
+            } },
+            .rejected => |rejected_call| .{ .other = .{
+                .name = rejected_call.tool_name,
+            } },
+        };
+        return tool_activity.ToolStarted.init(
+            allocator,
+            call_id,
+            self.arguments_json,
+            summary,
+        );
+    }
+
+    pub fn deinit(self: *PreparedCall) void {
+        self.allocator.free(self.arguments_json);
+        switch (self.operation) {
+            .read => |*parsed| parsed.deinit(),
+            .bash => |*parsed| parsed.deinit(),
+            .edit => |*parsed| parsed.deinit(),
+            .write => |*parsed| parsed.deinit(),
+            .rejected => |rejected_call| {
+                self.allocator.free(rejected_call.tool_name);
+                self.allocator.free(rejected_call.message);
+            },
+        }
+        self.* = undefined;
+    }
+};
+
 const Replacement = struct {
     start: usize,
     end: usize,
@@ -103,52 +170,168 @@ pub const Service = struct {
         self.* = undefined;
     }
 
-    pub fn executeJson(
+    pub fn prepare(
         self: *Service,
         name: []const u8,
         arguments_json: []const u8,
-    ) !Result {
+    ) !PreparedCall {
+        const owned_arguments = try self.allocator.dupe(u8, arguments_json);
+        errdefer self.allocator.free(owned_arguments);
         if (std.mem.eql(u8, name, "read")) {
-            return self.parseAndRun(ReadArguments, arguments_json, runRead);
+            var parsed = self.parse(ReadArguments, arguments_json) catch |err|
+                return self.rejectedParse(owned_arguments, name, err);
+            validateReadArguments(parsed.value) catch |err| {
+                parsed.deinit();
+                return self.rejectedExecution(owned_arguments, name, err);
+            };
+            return .{
+                .allocator = self.allocator,
+                .arguments_json = owned_arguments,
+                .operation = .{ .read = parsed },
+            };
         }
         if (std.mem.eql(u8, name, "bash")) {
-            return self.parseAndRun(BashArguments, arguments_json, runBash);
+            var parsed = self.parse(BashArguments, arguments_json) catch |err|
+                return self.rejectedParse(owned_arguments, name, err);
+            validateBashArguments(parsed.value) catch |err| {
+                parsed.deinit();
+                return self.rejectedExecution(owned_arguments, name, err);
+            };
+            return .{
+                .allocator = self.allocator,
+                .arguments_json = owned_arguments,
+                .operation = .{ .bash = parsed },
+            };
         }
         if (std.mem.eql(u8, name, "edit")) {
-            return self.parseAndRun(EditArguments, arguments_json, runEdit);
+            var parsed = self.parse(EditArguments, arguments_json) catch |err|
+                return self.rejectedParse(owned_arguments, name, err);
+            validateEditArguments(parsed.value) catch |err| {
+                parsed.deinit();
+                return self.rejectedExecution(owned_arguments, name, err);
+            };
+            return .{
+                .allocator = self.allocator,
+                .arguments_json = owned_arguments,
+                .operation = .{ .edit = parsed },
+            };
         }
         if (std.mem.eql(u8, name, "write")) {
-            return self.parseAndRun(WriteArguments, arguments_json, runWrite);
+            var parsed = self.parse(WriteArguments, arguments_json) catch |err|
+                return self.rejectedParse(owned_arguments, name, err);
+            validateWriteArguments(parsed.value) catch |err| {
+                parsed.deinit();
+                return self.rejectedExecution(owned_arguments, name, err);
+            };
+            return .{
+                .allocator = self.allocator,
+                .arguments_json = owned_arguments,
+                .operation = .{ .write = parsed },
+            };
         }
-        return self.failure("Vivi does not provide tool \"{s}\".", .{name});
+        const tool_name = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(tool_name);
+        return .{
+            .allocator = self.allocator,
+            .arguments_json = owned_arguments,
+            .operation = .{ .rejected = .{
+                .tool_name = tool_name,
+                .message = try std.fmt.allocPrint(
+                    self.allocator,
+                    "Vivi does not provide tool \"{s}\".",
+                    .{name},
+                ),
+            } },
+        };
     }
 
-    fn parseAndRun(
+    pub fn execute(
+        self: *Service,
+        prepared: *const PreparedCall,
+    ) !Result {
+        return switch (prepared.operation) {
+            .read => |parsed| self.runRead(parsed.value) catch |err|
+                self.toolFailure("read", err),
+            .bash => |parsed| self.runBash(parsed.value) catch |err|
+                self.toolFailure("bash", err),
+            .edit => |parsed| self.runEdit(parsed.value) catch |err|
+                self.toolFailure("edit", err),
+            .write => |parsed| self.runWrite(parsed.value) catch |err|
+                self.toolFailure("write", err),
+            .rejected => |rejected_call| .{
+                .failure = try self.allocator.dupe(u8, rejected_call.message),
+            },
+        };
+    }
+
+    fn parse(
         self: *Service,
         comptime Arguments: type,
         arguments_json: []const u8,
-        comptime run: fn (*Service, Arguments) anyerror!Result,
-    ) !Result {
-        const parsed = std.json.parseFromSlice(
+    ) !std.json.Parsed(Arguments) {
+        return std.json.parseFromSlice(
             Arguments,
             self.allocator,
             arguments_json,
             .{ .allocate = .alloc_always },
-        ) catch |err| {
-            return self.failure(
-                "Invalid {s} arguments: {s}.",
-                .{ toolName(Arguments), @errorName(err) },
-            );
+        );
+    }
+
+    fn rejectedParse(
+        self: *Service,
+        arguments_json: []u8,
+        name: []const u8,
+        err: anyerror,
+    ) !PreparedCall {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        const tool_name = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(tool_name);
+        return .{
+            .allocator = self.allocator,
+            .arguments_json = arguments_json,
+            .operation = .{ .rejected = .{
+                .tool_name = tool_name,
+                .message = try std.fmt.allocPrint(
+                    self.allocator,
+                    "Invalid {s} arguments: {s}.",
+                    .{ name, @errorName(err) },
+                ),
+            } },
         };
-        defer parsed.deinit();
-        return run(self, parsed.value) catch |err|
-            self.failure("{s} failed: {s}.", .{ toolName(Arguments), @errorName(err) });
+    }
+
+    fn rejectedExecution(
+        self: *Service,
+        arguments_json: []u8,
+        name: []const u8,
+        err: anyerror,
+    ) !PreparedCall {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        const tool_name = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(tool_name);
+        return .{
+            .allocator = self.allocator,
+            .arguments_json = arguments_json,
+            .operation = .{ .rejected = .{
+                .tool_name = tool_name,
+                .message = try std.fmt.allocPrint(
+                    self.allocator,
+                    "{s} failed: {s}.",
+                    .{ name, @errorName(err) },
+                ),
+            } },
+        };
+    }
+
+    fn toolFailure(
+        self: *Service,
+        name: []const u8,
+        err: anyerror,
+    ) !Result {
+        return self.failure("{s} failed: {s}.", .{ name, @errorName(err) });
     }
 
     fn resolvePath(self: *Service, input: []const u8) ![]u8 {
-        if (input.len == 0 or std.mem.indexOfScalar(u8, input, 0) != null) {
-            return error.InvalidPath;
-        }
         if (std.fs.path.isAbsolute(input)) {
             return std.fs.path.resolve(self.allocator, &.{input});
         }
@@ -170,8 +353,6 @@ pub const Service = struct {
 
         const offset = arguments.offset orelse 1;
         const limit = arguments.limit orelse std.math.maxInt(usize);
-        if (offset == 0 or limit == 0) return error.InvalidLineRange;
-
         var lines: std.ArrayList([]const u8) = .empty;
         defer lines.deinit(self.allocator);
         var iterator = std.mem.splitScalar(u8, content, '\n');
@@ -196,14 +377,7 @@ pub const Service = struct {
     }
 
     fn runBash(self: *Service, arguments: BashArguments) !Result {
-        if (arguments.command.len == 0) return error.EmptyCommand;
         const timeout_seconds = arguments.timeout orelse 120;
-        if (!std.math.isFinite(timeout_seconds) or
-            timeout_seconds <= 0 or
-            timeout_seconds > 600)
-        {
-            return error.InvalidTimeout;
-        }
 
         const script = try std.fmt.allocPrint(
             self.allocator,
@@ -262,7 +436,6 @@ pub const Service = struct {
     }
 
     fn runEdit(self: *Service, arguments: EditArguments) !Result {
-        if (arguments.edits.len == 0) return error.EmptyEdits;
         const path = try self.resolvePath(arguments.path);
         defer self.allocator.free(path);
 
@@ -285,7 +458,6 @@ pub const Service = struct {
         var replacements: std.ArrayList(Replacement) = .empty;
         defer replacements.deinit(self.allocator);
         for (arguments.edits) |edit_value| {
-            if (edit_value.oldText.len == 0) return error.EmptyOldText;
             const old_text = try normalizeLines(self.allocator, edit_value.oldText);
             defer self.allocator.free(old_text);
             const new_text = try normalizeLines(self.allocator, edit_value.newText);
@@ -361,17 +533,42 @@ pub const Service = struct {
     }
 };
 
-fn toolName(comptime Arguments: type) []const u8 {
-    return if (Arguments == ReadArguments)
-        "read"
-    else if (Arguments == BashArguments)
-        "bash"
-    else if (Arguments == EditArguments)
-        "edit"
-    else if (Arguments == WriteArguments)
-        "write"
-    else
-        @compileError("unknown tool arguments type");
+fn validatePath(path: []const u8) !void {
+    if (path.len == 0 or std.mem.indexOfScalar(u8, path, 0) != null) {
+        return error.InvalidPath;
+    }
+}
+
+fn validateReadArguments(arguments: ReadArguments) !void {
+    try validatePath(arguments.path);
+    if ((arguments.offset orelse 1) == 0 or
+        (arguments.limit orelse 1) == 0)
+    {
+        return error.InvalidLineRange;
+    }
+}
+
+fn validateBashArguments(arguments: BashArguments) !void {
+    if (arguments.command.len == 0) return error.EmptyCommand;
+    const timeout_seconds = arguments.timeout orelse 120;
+    if (!std.math.isFinite(timeout_seconds) or
+        timeout_seconds <= 0 or
+        timeout_seconds > 600)
+    {
+        return error.InvalidTimeout;
+    }
+}
+
+fn validateEditArguments(arguments: EditArguments) !void {
+    try validatePath(arguments.path);
+    if (arguments.edits.len == 0) return error.EmptyEdits;
+    for (arguments.edits) |edit_value| {
+        if (edit_value.oldText.len == 0) return error.EmptyOldText;
+    }
+}
+
+fn validateWriteArguments(arguments: WriteArguments) !void {
+    try validatePath(arguments.path);
 }
 
 fn writeFile(io: std.Io, path: []const u8, content: []const u8) !void {
@@ -432,9 +629,11 @@ test "read selects one-indexed lines without truncation" {
     );
     defer service.deinit();
 
-    var result = try service.executeJson("read",
+    var prepared = try service.prepare("read",
         \\{"path":"sample.txt","offset":2,"limit":2}
     );
+    defer prepared.deinit();
+    var result = try service.execute(&prepared);
     defer result.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("two\nthree", result.text);
 }
@@ -456,9 +655,11 @@ test "edit plans replacements against original content" {
     );
     defer service.deinit();
 
-    var result = try service.executeJson("edit",
+    var prepared = try service.prepare("edit",
         \\{"path":"sample.txt","edits":[{"oldText":"one","newText":"two"},{"oldText":"two","newText":"three\nfour"}]}
     );
+    defer prepared.deinit();
+    var result = try service.execute(&prepared);
     defer result.deinit(std.testing.allocator);
     try std.testing.expect(result == .text);
 
@@ -487,9 +688,11 @@ test "write creates parents and overwrites exact bytes" {
     );
     defer service.deinit();
 
-    var result = try service.executeJson("write",
+    var prepared = try service.prepare("write",
         \\{"path":"nested/sample.txt","content":"hello\n"}
     );
+    defer prepared.deinit();
+    var result = try service.execute(&prepared);
     defer result.deinit(std.testing.allocator);
     try std.testing.expect(result == .text);
 
@@ -515,16 +718,140 @@ test "bash returns complete output and status" {
     );
     defer service.deinit();
 
-    var success = try service.executeJson("bash",
+    var prepared_success = try service.prepare("bash",
         \\{"command":"printf out; printf err >&2"}
     );
+    defer prepared_success.deinit();
+    var success = try service.execute(&prepared_success);
     defer success.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("outerr", success.text);
 
-    var failure = try service.executeJson("bash",
+    var prepared_failure = try service.prepare("bash",
         \\{"command":"printf nope; exit 7"}
     );
+    defer prepared_failure.deinit();
+    var failure = try service.execute(&prepared_failure);
     defer failure.deinit(std.testing.allocator);
     try std.testing.expect(failure == .failure);
     try std.testing.expect(std.mem.indexOf(u8, failure.failure, "code 7") != null);
+}
+
+test "prepare derives built-in summaries from executable arguments" {
+    var service = try Service.init(
+        std.testing.allocator,
+        std.testing.io,
+        ".",
+    );
+    defer service.deinit();
+
+    const cases = [_]struct {
+        name: []const u8,
+        arguments: []const u8,
+    }{
+        .{
+            .name = "read",
+            .arguments = "{\"path\":\"a.txt\",\"offset\":2,\"limit\":3}",
+        },
+        .{
+            .name = "bash",
+            .arguments = "{\"command\":\"printf hi\"}",
+        },
+        .{
+            .name = "edit",
+            .arguments = "{\"path\":\"a.txt\",\"edits\":[{\"oldText\":\"a\",\"newText\":\"b\"},{\"oldText\":\"c\",\"newText\":\"d\"}]}",
+        },
+        .{
+            .name = "write",
+            .arguments = "{\"path\":\"a.txt\",\"content\":\"hello\"}",
+        },
+    };
+
+    for (cases, 0..) |case, index| {
+        var prepared = try service.prepare(case.name, case.arguments);
+        defer prepared.deinit();
+        var started = try prepared.started(
+            std.testing.allocator,
+            "call",
+        );
+        defer started.deinit();
+        try std.testing.expectEqualStrings(
+            case.arguments,
+            started.invocation.arguments_json,
+        );
+        switch (index) {
+            0 => {
+                const summary = started.invocation.summary.read;
+                try std.testing.expectEqualStrings("a.txt", summary.path);
+                try std.testing.expectEqual(@as(?usize, 2), summary.offset);
+                try std.testing.expectEqual(@as(?usize, 3), summary.limit);
+            },
+            1 => try std.testing.expectEqualStrings(
+                "printf hi",
+                started.invocation.summary.bash.command,
+            ),
+            2 => {
+                const summary = started.invocation.summary.edit;
+                try std.testing.expectEqualStrings("a.txt", summary.path);
+                try std.testing.expectEqual(
+                    @as(usize, 2),
+                    summary.replacement_count,
+                );
+            },
+            3 => {
+                const summary = started.invocation.summary.write;
+                try std.testing.expectEqualStrings("a.txt", summary.path);
+                try std.testing.expectEqual(@as(usize, 5), summary.byte_count);
+            },
+            else => unreachable,
+        }
+    }
+}
+
+test "prepare keeps malformed and unknown tools visible and failing" {
+    var service = try Service.init(
+        std.testing.allocator,
+        std.testing.io,
+        ".",
+    );
+    defer service.deinit();
+
+    const cases = [_]struct {
+        name: []const u8,
+        arguments: []const u8,
+        failure_prefix: []const u8,
+    }{
+        .{
+            .name = "read",
+            .arguments = "{\"path\":",
+            .failure_prefix = "Invalid read arguments:",
+        },
+        .{
+            .name = "bash",
+            .arguments = "{\"command\":\"\"}",
+            .failure_prefix = "bash failed: EmptyCommand.",
+        },
+        .{
+            .name = "search",
+            .arguments = "{}",
+            .failure_prefix = "Vivi does not provide tool \"search\".",
+        },
+    };
+    for (cases) |case| {
+        var prepared = try service.prepare(case.name, case.arguments);
+        defer prepared.deinit();
+        var started = try prepared.started(std.testing.allocator, "call");
+        defer started.deinit();
+        try std.testing.expectEqualStrings(
+            case.name,
+            started.invocation.summary.other.name,
+        );
+        var result = try service.execute(&prepared);
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expect(result == .failure);
+        try std.testing.expect(std.mem.startsWith(
+            u8,
+            result.failure,
+            case.failure_prefix,
+        ));
+    }
 }
