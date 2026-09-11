@@ -45,7 +45,13 @@ whole; Copilot owns any large-result handling.
 In the terminal transcript, tool calls start collapsed. Click a tool row
 (marked `▸`) to expand its complete actual input and output; click it again
 to collapse (`▾`). Expanded running calls show their output when they finish,
-including failures. Details wrap with the terminal width and scroll with the
+including failures. For keyboard access, press F6 from the composer to focus
+the first visible tool (or the first tool if none is visible), use Up/Down to
+move between tools, and Enter or Space to expand/collapse. A `>` marker and
+highlighted summary identify focus; navigation scrolls the tool into view.
+Escape or F6 returns to the unchanged composer. Menus and pending questions
+retain their own keys; Page Up/Down and mouse scrolling still work.
+Details wrap with the terminal width and scroll with the
 transcript, on a subtly contrasting background. Input arguments use readable
 labels with decoded strings and line breaks, including all additional fields;
 nested objects and arrays use indentation and indexed items. Invalid JSON is
