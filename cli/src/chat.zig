@@ -254,8 +254,15 @@ const ToolEntry = struct {
     ) !void {
         if (self.output_highlights != null) return;
         const output = self.output_display orelse return;
-        self.output_highlights = if (self.output_language) |language|
-            try highlight.spans(allocator, language, output)
+        const succeeded = if (self.completion) |completion| switch (completion) {
+            .succeeded => true,
+            .failed => false,
+        } else false;
+        self.output_highlights = if (succeeded)
+            if (self.output_language) |language|
+                try highlight.spans(allocator, language, output)
+            else
+                try allocator.alloc(highlight.Span, 0)
         else
             try allocator.alloc(highlight.Span, 0);
     }
@@ -3328,6 +3335,33 @@ test "tool details highlight shell input and supported read output" {
     try std.testing.expect(read_entry.output_highlights == null);
     try read_entry.ensureOutputHighlights(std.testing.allocator);
     try std.testing.expect(read_entry.output_highlights.?.len > 0);
+
+    var failed_started = try toolStarted(
+        "read-highlight-failed",
+        "{\"path\":\"missing.zig\"}",
+        .{ .read = .{
+            .path = "missing.zig",
+            .offset = null,
+            .limit = null,
+        } },
+    );
+    defer failed_started.deinit();
+    var failed_entry = try ToolEntry.init(
+        std.testing.allocator,
+        &failed_started,
+    );
+    defer failed_entry.deinit(std.testing.allocator);
+    var failed = try toolFinished(
+        "read-highlight-failed",
+        .{ .failed = "read failed: FileNotFound" },
+    );
+    defer failed.deinit();
+    try failed_entry.finish(std.testing.allocator, &failed);
+    try failed_entry.ensureOutputHighlights(std.testing.allocator);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        failed_entry.output_highlights.?.len,
+    );
 }
 
 test "expanded tool rows draw syntax colors across wrapping" {
