@@ -116,19 +116,22 @@ pub const Span = struct {
     token: Token,
 };
 
+pub const max_source_bytes = 256 * 1024;
+
 pub fn spans(
     allocator: std.mem.Allocator,
     language: Language,
     source: []const u8,
 ) ![]Span {
-    if (source.len == 0 or source.len > std.math.maxInt(u32)) {
+    const bounded_source = source[0..@min(source.len, max_source_bytes)];
+    if (bounded_source.len == 0) {
         return allocator.alloc(Span, 0);
     }
 
     const parser = ts.Parser.create();
     defer parser.destroy();
     try parser.setLanguage(language.treeSitterLanguage());
-    const tree = parser.parseString(source, null) orelse
+    const tree = parser.parseString(bounded_source, null) orelse
         return allocator.alloc(Span, 0);
     defer tree.destroy();
 
@@ -140,7 +143,7 @@ pub fn spans(
     );
     defer query.destroy();
 
-    const tokens = try allocator.alloc(?Token, source.len);
+    const tokens = try allocator.alloc(?Token, bounded_source.len);
     defer allocator.free(tokens);
     @memset(tokens, null);
 
@@ -152,7 +155,10 @@ pub fn spans(
         const name = query.captureNameForId(capture.index) orelse continue;
         const token = std.meta.stringToEnum(Token, name) orelse continue;
         const start: usize = @intCast(capture.node.startByte());
-        const end: usize = @min(@as(usize, @intCast(capture.node.endByte())), source.len);
+        const end: usize = @min(
+            @as(usize, @intCast(capture.node.endByte())),
+            bounded_source.len,
+        );
         if (start >= end) continue;
         @memset(tokens[start..end], token);
     }
@@ -206,4 +212,15 @@ test "tree-sitter produces semantic spans" {
     );
     defer std.testing.allocator.free(json);
     try std.testing.expect(json.len > 0);
+}
+
+test "highlighting is bounded for large sources" {
+    const source = try std.testing.allocator.alloc(u8, max_source_bytes + 1024);
+    defer std.testing.allocator.free(source);
+    @memset(source, '1');
+    const highlighted = try spans(std.testing.allocator, .json, source);
+    defer std.testing.allocator.free(highlighted);
+    for (highlighted) |span| {
+        try std.testing.expect(span.end <= max_source_bytes);
+    }
 }

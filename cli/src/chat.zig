@@ -166,14 +166,14 @@ const ToolEntry = struct {
         errdefer allocator.free(input);
         const input_display = try tool_renderer.renderArguments(allocator, input);
         errdefer allocator.free(input_display);
-        const input_language: ?highlight.Language = switch (started.invocation.summary) {
-            .bash => .bash,
-            else => null,
+        const input_highlights = switch (started.invocation.summary) {
+            .bash => |summary| try highlightBashInput(
+                allocator,
+                input_display,
+                summary.command,
+            ),
+            else => try allocator.alloc(highlight.Span, 0),
         };
-        const input_highlights = if (input_language) |language|
-            try highlight.spans(allocator, language, input_display)
-        else
-            try allocator.alloc(highlight.Span, 0);
         errdefer allocator.free(input_highlights);
         return .{
             .call_id = call_id,
@@ -235,13 +235,8 @@ const ToolEntry = struct {
         errdefer allocator.free(output);
         const output_display = try tool_renderer.renderLiteral(allocator, output);
         errdefer allocator.free(output_display);
-        const output_highlights = if (self.output_language) |language|
-            try highlight.spans(allocator, language, output_display)
-        else
-            try allocator.alloc(highlight.Span, 0);
         self.output = output;
         self.output_display = output_display;
-        self.output_highlights = output_highlights;
         self.completion = completion;
         const marker = switch (completion) {
             .succeeded => "✓",
@@ -249,6 +244,18 @@ const ToolEntry = struct {
         };
         std.debug.assert(std.mem.startsWith(u8, self.compact, "◌"));
         @memcpy(self.compact[0..marker.len], marker);
+    }
+
+    fn ensureOutputHighlights(
+        self: *ToolEntry,
+        allocator: std.mem.Allocator,
+    ) !void {
+        if (self.output_highlights != null) return;
+        const output = self.output_display orelse return;
+        self.output_highlights = if (self.output_language) |language|
+            try highlight.spans(allocator, language, output)
+        else
+            try allocator.alloc(highlight.Span, 0);
     }
 
     fn deinit(self: *ToolEntry, allocator: std.mem.Allocator) void {
@@ -263,6 +270,63 @@ const ToolEntry = struct {
         self.* = undefined;
     }
 };
+
+fn highlightBashInput(
+    allocator: std.mem.Allocator,
+    display: []const u8,
+    command: []const u8,
+) ![]highlight.Span {
+    const prefix = "Command: ";
+    if (!std.mem.startsWith(u8, display, prefix)) {
+        return allocator.alloc(highlight.Span, 0);
+    }
+    const command_spans = try highlight.spans(allocator, .bash, command);
+    defer allocator.free(command_spans);
+    const result = try allocator.alloc(highlight.Span, command_spans.len);
+    for (command_spans, result) |span, *mapped| {
+        mapped.* = .{
+            .start = prefix.len + commandDisplayOffset(command, span.start),
+            .end = prefix.len + commandDisplayOffset(command, span.end),
+            .token = span.token,
+        };
+    }
+    return result;
+}
+
+fn commandDisplayOffset(command: []const u8, end: usize) usize {
+    var source_offset: usize = 0;
+    var display_offset: usize = 0;
+    while (source_offset < @min(end, command.len)) {
+        const byte = command[source_offset];
+        if (byte == '\n') {
+            source_offset += 1;
+            display_offset += 3;
+            continue;
+        }
+        const length = std.unicode.utf8ByteSequenceLength(byte) catch 0;
+        const codepoint = if (length > 0 and
+            source_offset + length <= command.len)
+            std.unicode.utf8Decode(
+                command[source_offset..][0..length],
+            ) catch null
+        else
+            null;
+        if (codepoint) |value| {
+            if (value >= 0x20 and value != 0x7f and
+                !(value >= 0x80 and value <= 0x9f) and
+                !(value >= 0x202a and value <= 0x202e) and
+                !(value >= 0x2066 and value <= 0x2069))
+            {
+                source_offset += length;
+                display_offset += length;
+                continue;
+            }
+        }
+        source_offset += 1;
+        display_offset += 4;
+    }
+    return display_offset;
+}
 
 fn hashToolInvocation(
     started: *const backend.ToolStarted,
@@ -788,21 +852,21 @@ const Projection = struct {
 
     fn build(
         allocator: std.mem.Allocator,
-        transcript: *const Transcript,
+        transcript: *Transcript,
         window: vaxis.Window,
     ) !Projection {
         var projection: Projection = .{};
         errdefer projection.deinit(allocator);
 
-        for (transcript.entries.items, 0..) |entry, entry_index| {
+        for (transcript.entries.items, 0..) |*entry, entry_index| {
             if (projection.lines.items.len > 0) {
                 try projection.lines.append(allocator, .{
                     .kind = .blank,
                     .entry_index = entry_index,
                 });
             }
-            switch (entry) {
-                .message => |message| switch (message.role) {
+            switch (entry.*) {
+                .message => |*message| switch (message.role) {
                     .reasoning, .assistant => {
                         try projection.lines.append(allocator, .{
                             .kind = .role,
@@ -854,7 +918,7 @@ const Projection = struct {
                         2,
                     ),
                 },
-                .tool => |tool| {
+                .tool => |*tool| {
                     try projection.appendWrapped(
                         allocator,
                         entry_index,
@@ -864,6 +928,7 @@ const Projection = struct {
                         4,
                     );
                     if (tool.expanded) {
+                        try tool.ensureOutputHighlights(allocator);
                         try projection.lines.append(allocator, .{
                             .kind = .tool_input_label,
                             .entry_index = entry_index,
@@ -3204,6 +3269,11 @@ test "tool details highlight shell input and supported read output" {
     var bash_entry = try ToolEntry.init(std.testing.allocator, &bash_started);
     defer bash_entry.deinit(std.testing.allocator);
     try std.testing.expect(bash_entry.input_highlights.len > 0);
+    const command_name = bash_entry.input_highlights[0];
+    try std.testing.expectEqualStrings(
+        "printf",
+        bash_entry.input_display[command_name.start..command_name.end],
+    );
 
     var read_started = try toolStarted(
         "read-highlight",
@@ -3223,6 +3293,8 @@ test "tool details highlight shell input and supported read output" {
     );
     defer finished.deinit();
     try read_entry.finish(std.testing.allocator, &finished);
+    try std.testing.expect(read_entry.output_highlights == null);
+    try read_entry.ensureOutputHighlights(std.testing.allocator);
     try std.testing.expect(read_entry.output_highlights.?.len > 0);
 }
 

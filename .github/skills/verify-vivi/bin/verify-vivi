@@ -327,7 +327,7 @@ Set TypingSpeed 10ms
 Type "./zig-out/bin/vivi chat --model copilot/gpt-5.4"
 Enter
 Sleep 3s
-Type "Convert these lowercase labels to uppercase in the response: render test, feature, status, styling, working, tables, readable. Use the converted first label as a Markdown heading, then one sentence with bold text and inline code, then a fenced zig code block containing exactly const VIVI_HIGHLIGHT = 42;, then a two-column table using the other converted labels. Do not use tools or add any other text."
+Type "Convert these lowercase labels to uppercase in the response: render test, feature, status, styling, working, tables, readable, vivi_highlight. Use the converted first label as a Markdown heading, then one sentence with bold text and inline code, then a fenced zig code block containing const followed by the converted final label followed by = 42;, then a two-column table using the other converted labels. Do not use tools or add any other text."
 Enter
 Sleep 20s
 Ctrl+C
@@ -348,7 +348,7 @@ chat_markdown() {
     (
         sleep 3
         printf '%s\r' \
-            'Convert these lowercase labels to uppercase in the response: render test, feature, status, styling, working, tables, readable. Use the converted first label as a Markdown heading, then one sentence with bold text and inline code, then a fenced zig code block containing exactly const VIVI_HIGHLIGHT = 42;, then a two-column table using the other converted labels. Do not use tools or add any other text.'
+            'Convert these lowercase labels to uppercase in the response: render test, feature, status, styling, working, tables, readable, vivi_highlight. Use the converted first label as a Markdown heading, then one sentence with bold text and inline code, then a fenced zig code block containing const followed by the converted final label followed by = 42;, then a two-column table using the other converted labels. Do not use tools or add any other text.'
         sleep 20
         printf '\003'
         sleep 3

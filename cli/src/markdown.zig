@@ -202,6 +202,7 @@ const Builder = struct {
     heading_level: u8 = 0,
     code_block: bool = false,
     code_language: ?highlight.Language = null,
+    code_source: std.ArrayList(u8) = .empty,
     link_stack: std.ArrayList(?[]u8) = .empty,
     table: ?Table = null,
     current_row: ?Table.Row = null,
@@ -214,6 +215,7 @@ const Builder = struct {
         self.lines.deinit(self.allocator);
         self.lists.deinit(self.allocator);
         self.list_item_indents.deinit(self.allocator);
+        self.code_source.deinit(self.allocator);
         if (self.pending_list_prefix) |prefix| self.allocator.free(prefix);
         for (self.link_stack.items) |uri| {
             if (uri) |value| self.allocator.free(value);
@@ -290,44 +292,69 @@ const Builder = struct {
             );
             return;
         }
-
-        var start: usize = 0;
-        for (text, 0..) |byte, index| {
-            if (byte != '\n') continue;
-            const line = try self.ensureLine();
-            try self.appendCodeLine(line, text[start..index]);
-            self.finishLine();
-            start = index + 1;
-        }
-        if (start < text.len) {
-            const line = try self.ensureLine();
-            try self.appendCodeLine(line, text[start..]);
-        }
+        try self.code_source.appendSlice(self.allocator, text);
     }
 
-    fn appendCodeLine(self: *Builder, line: *Line, text: []const u8) !void {
-        const language = self.code_language orelse {
+    fn flushCodeBlock(self: *Builder) !void {
+        const source = self.code_source.items;
+        const highlighted = if (self.code_language) |language|
+            try highlight.spans(self.allocator, language, source)
+        else
+            try self.allocator.alloc(highlight.Span, 0);
+        defer self.allocator.free(highlighted);
+
+        var line_start: usize = 0;
+        while (line_start < source.len) {
+            const newline = std.mem.indexOfScalarPos(
+                u8,
+                source,
+                line_start,
+                '\n',
+            );
+            const line_end = newline orelse source.len;
+            const line = try self.ensureLine();
+            try self.appendCodeRange(
+                line,
+                source,
+                highlighted,
+                line_start,
+                line_end,
+            );
+            if (newline == null) break;
+            self.finishLine();
+            line_start = line_end + 1;
+        }
+        self.code_source.clearRetainingCapacity();
+    }
+
+    fn appendCodeRange(
+        self: *Builder,
+        line: *Line,
+        source: []const u8,
+        highlighted: []const highlight.Span,
+        start: usize,
+        end: usize,
+    ) !void {
+        if (highlighted.len == 0) {
             try line.append(
                 self.allocator,
-                text,
+                source[start..end],
                 self.style,
                 self.activeUri(),
             );
             return;
-        };
-        const highlighted = try highlight.spans(
-            self.allocator,
-            language,
-            text,
-        );
-        defer self.allocator.free(highlighted);
+        }
 
-        var offset: usize = 0;
+        var offset = start;
         for (highlighted) |span| {
-            if (offset < span.start) {
+            if (span.end <= start) continue;
+            if (span.start >= end) break;
+            const span_start = @max(span.start, start);
+            const span_end = @min(span.end, end);
+            if (offset < span_start) {
                 try line.append(
                     self.allocator,
-                    text[offset..span.start],
+                    source[offset..span_start],
                     self.style,
                     self.activeUri(),
                 );
@@ -336,16 +363,16 @@ const Builder = struct {
             style.syntax = span.token;
             try line.append(
                 self.allocator,
-                text[span.start..span.end],
+                source[span_start..span_end],
                 style,
                 self.activeUri(),
             );
-            offset = span.end;
+            offset = span_end;
         }
-        if (offset < text.len) {
+        if (offset < end) {
             try line.append(
                 self.allocator,
-                text[offset..],
+                source[offset..end],
                 self.style,
                 self.activeUri(),
             );
@@ -1137,6 +1164,7 @@ fn enterBlock(
             builder.finishLine();
             builder.code_block = true;
             builder.style.code = true;
+            builder.code_source.clearRetainingCapacity();
             const info: *const c.MD_BLOCK_CODE_DETAIL =
                 @ptrCast(@alignCast(detail.?));
             const language_name = decodeAttribute(
@@ -1194,6 +1222,7 @@ fn leaveBlock(
             builder.appendBlank() catch |err| return builder.fail(err);
         },
         c.MD_BLOCK_CODE => {
+            builder.flushCodeBlock() catch |err| return builder.fail(err);
             builder.finishLine();
             builder.code_block = false;
             builder.code_language = null;
@@ -1580,6 +1609,28 @@ test "fenced code applies tree-sitter syntax styles" {
         }
     }
     try std.testing.expect(saw_keyword and saw_number and saw_comment);
+}
+
+test "fenced code parses multiline syntax as one document" {
+    var screen: vaxis.Screen = undefined;
+    const window = testWindow(&screen, 100);
+    var layout = try Layout.init(
+        std.testing.allocator,
+        "```bash\ncat <<EOF\nhello from heredoc\nEOF\n```",
+        window,
+        98,
+    );
+    defer layout.deinit();
+
+    var heredoc_is_string = false;
+    for (layout.lines.items) |line| {
+        for (line.segments.items) |segment| {
+            if (std.mem.eql(u8, segment.text, "hello from heredoc")) {
+                heredoc_is_string = segment.style.syntax == .string;
+            }
+        }
+    }
+    try std.testing.expect(heredoc_is_string);
 }
 
 test "incomplete streaming prefixes remain visible" {
