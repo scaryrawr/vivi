@@ -3330,6 +3330,118 @@ test "tool details highlight shell input and supported read output" {
     try std.testing.expect(read_entry.output_highlights.?.len > 0);
 }
 
+test "expanded tool rows draw syntax colors across wrapping" {
+    var ui: ChatUi = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .input = TextInput.init(std.testing.allocator),
+        .cwd = try std.testing.allocator.dupe(u8, "."),
+    };
+    defer ui.deinit();
+
+    var bash_started = try toolStarted(
+        "bash-render",
+        "{\"command\":\"printf 'abcdefghijklmnop'\"}",
+        .{ .bash = .{ .command = "printf 'abcdefghijklmnop'" } },
+    );
+    try ui.transcript.applyToolActivity(
+        std.testing.allocator,
+        &.{ .started = bash_started },
+    );
+    bash_started.deinit();
+    var bash_finished = try toolFinished(
+        "bash-render",
+        .{ .succeeded = "done" },
+    );
+    try ui.transcript.applyToolActivity(
+        std.testing.allocator,
+        &.{ .finished = bash_finished },
+    );
+    bash_finished.deinit();
+    ui.transcript.entries.items[0].tool.expanded = true;
+
+    var read_started = try toolStarted(
+        "read-render",
+        "{\"path\":\"sample.zig\"}",
+        .{ .read = .{
+            .path = "sample.zig",
+            .offset = null,
+            .limit = null,
+        } },
+    );
+    try ui.transcript.applyToolActivity(
+        std.testing.allocator,
+        &.{ .started = read_started },
+    );
+    read_started.deinit();
+    var read_finished = try toolFinished(
+        "read-render",
+        .{ .succeeded = "const answer = 42;" },
+    );
+    try ui.transcript.applyToolActivity(
+        std.testing.allocator,
+        &.{ .finished = read_finished },
+    );
+    read_finished.deinit();
+    ui.transcript.entries.items[1].tool.expanded = true;
+
+    var screen = try vaxis.Screen.init(std.testing.allocator, .{
+        .rows = 1,
+        .cols = 12,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(std.testing.allocator);
+    const window: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = screen.width,
+        .height = screen.height,
+        .screen = &screen,
+    };
+    var projection = try Projection.build(
+        std.testing.allocator,
+        &ui.transcript,
+        window,
+    );
+    defer projection.deinit(std.testing.allocator);
+
+    const bash_string = for (ui.transcript.entries.items[0].tool.input_highlights) |span| {
+        if (span.token == .string) break span;
+    } else unreachable;
+    var saw_wrapped_string = false;
+    var saw_read_styles = false;
+    for (projection.lines.items) |line| {
+        if (line.entry_index == 0 and line.kind == .tool_input and
+            line.start > bash_string.start and line.start < bash_string.end)
+        {
+            ui.drawTranscriptLine(window, 0, &projection, line);
+            try std.testing.expectEqual(
+                syntax_string,
+                screen.readCell(4, 0).?.style.fg,
+            );
+            saw_wrapped_string = true;
+        }
+        if (line.entry_index == 1 and line.kind == .tool_output and
+            line.start == 0)
+        {
+            ui.drawTranscriptLine(window, 0, &projection, line);
+            try std.testing.expectEqual(
+                syntax_keyword,
+                screen.readCell(4, 0).?.style.fg,
+            );
+            try std.testing.expectEqual(
+                reasoning_color,
+                screen.readCell(9, 0).?.style.fg,
+            );
+            saw_read_styles = true;
+        }
+    }
+    try std.testing.expect(saw_wrapped_string and saw_read_styles);
+}
+
 test "transcript replaces streamed draft with completed response" {
     var transcript: Transcript = .{};
     defer transcript.deinit(std.testing.allocator);
