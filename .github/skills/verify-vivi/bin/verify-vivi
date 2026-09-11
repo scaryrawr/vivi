@@ -13,12 +13,13 @@ Usage:
   verify-vivi chat-streaming <run-id>
   verify-vivi chat-streaming-input <run-id>
   verify-vivi chat-markdown <run-id>
+  verify-vivi chat-markdown-read <run-id>
   verify-vivi chat-ask-user <run-id>
   verify-vivi chat-model-menu <run-id>
   verify-vivi chat-session-resume <run-id>
   verify-vivi chat-shutdown <run-id>
-  verify-vivi extract-frames <run-id> <chat-streaming|chat-streaming-input|chat-markdown|chat-ask-user|chat-model-menu|chat-session-resume|chat-shutdown>
-  verify-vivi frame-check <run-id> <chat-streaming|chat-streaming-input|chat-markdown|chat-ask-user|chat-model-menu|chat-session-resume|chat-shutdown>
+  verify-vivi extract-frames <run-id> <chat-streaming|chat-streaming-input|chat-markdown|chat-markdown-read|chat-ask-user|chat-model-menu|chat-session-resume|chat-shutdown>
+  verify-vivi frame-check <run-id> <chat-streaming|chat-streaming-input|chat-markdown|chat-markdown-read|chat-ask-user|chat-model-menu|chat-session-resume|chat-shutdown>
   verify-vivi cleanup <run-id>
 EOF
 }
@@ -119,9 +120,9 @@ cli_discovery() {
 
 validate_capture_name() {
     case "$1" in
-        chat-streaming|chat-streaming-input|chat-markdown|chat-ask-user|chat-model-menu|chat-session-resume|chat-shutdown) ;;
+        chat-streaming|chat-streaming-input|chat-markdown|chat-markdown-read|chat-ask-user|chat-model-menu|chat-session-resume|chat-shutdown) ;;
         *)
-            printf 'capture must be chat-streaming, chat-streaming-input, chat-markdown, chat-ask-user, chat-model-menu, chat-session-resume, or chat-shutdown\n' >&2
+            printf 'capture must be chat-streaming, chat-streaming-input, chat-markdown, chat-markdown-read, chat-ask-user, chat-model-menu, chat-session-resume, or chat-shutdown\n' >&2
             exit 1
             ;;
     esac
@@ -416,6 +417,101 @@ chat_markdown() {
     test "$table_cells_seen" = yes
     test -s "$run_dir/chat-markdown.frames.txt"
     test -s "$run_dir/chat-markdown.contact-sheet.png"
+}
+
+write_markdown_read_tape() {
+    run_dir=$1
+    cat >"$run_dir/chat-markdown-read.tape" <<EOF
+Output "$run_dir/chat-markdown-read.gif"
+Require copilot
+Set Shell "bash"
+Set Width 1200
+Set Height 720
+Set FontSize 18
+Set TypingSpeed 5ms
+
+Type "./zig-out/bin/vivi chat --model copilot/gpt-5.4"
+Enter
+Sleep 3s
+Type "Use the read tool exactly once to read README.md, then return the uppercase spelling of vivi_read_done and nothing else."
+Enter
+Sleep 20s
+Type "\x1b[17~"
+Sleep 1s
+Enter
+Sleep 5s
+Ctrl+C
+Sleep 3s
+Ctrl+C
+Sleep 1s
+EOF
+}
+
+chat_markdown_read() {
+    run_dir=$(prepare_run "$1")
+    build_vivi
+    write_markdown_read_tape "$run_dir"
+
+    (cd "$repo_root" && VIVI_KEEP_GIF=1 vhs "$run_dir/chat-markdown-read.tape")
+    VIVI_KEEP_GIF=1 extract_frames "$1" chat-markdown-read
+
+    (
+        sleep 3
+        printf '%s\r' \
+            'Use the read tool exactly once to read README.md, then return the uppercase spelling of vivi_read_done and nothing else.'
+        sleep 20
+        printf '\033[17~'
+        sleep 1
+        printf '\r'
+        sleep 5
+        printf '\003'
+        sleep 3
+        printf '\003'
+    ) | script -q "$run_dir/chat-markdown-read.terminal.log" sh -c \
+        "stty cols 100 rows 30; '$binary' chat --model copilot/gpt-5.4" &
+    pty_pid=$!
+    printf '%s\n' "$pty_pid" >"$run_dir/pty.pid"
+    trap 'kill "$pty_pid" 2>/dev/null || true; wait "$pty_pid" 2>/dev/null || true' EXIT INT TERM
+
+    if wait "$pty_pid"; then
+        status=0
+    else
+        status=$?
+    fi
+    rm -f "$run_dir/pty.pid"
+    trap - EXIT INT TERM
+
+    perl -0pe \
+        's/\e\[[0-?]*[ -\/]*[@-~]//g; s/\e\][^\a]*(?:\a|\e\\)//g' \
+        "$run_dir/chat-markdown-read.terminal.log" |
+        tr -d '\r\b' >"$run_dir/chat-markdown-read.normalized.txt"
+
+    {
+        printf 'exit=%s\n' "$status"
+        printf 'read_tool_seen='
+        grep -a -q 'Read README.md' "$run_dir/chat-markdown-read.terminal.log" &&
+            printf 'yes\n' || printf 'no\n'
+        printf 'heading_seen='
+        grep -a -q 'Requirements' "$run_dir/chat-markdown-read.terminal.log" &&
+            printf 'yes\n' || printf 'no\n'
+        printf 'code_seen='
+        grep -a -q 'zig build' "$run_dir/chat-markdown-read.terminal.log" &&
+            printf 'yes\n' || printf 'no\n'
+        printf 'response_seen='
+        grep -q 'VIVI_READ_DONE' "$run_dir/chat-markdown-read.normalized.txt" &&
+            printf 'yes\n' || printf 'no\n'
+        printf 'frames_extracted='
+        test -s "$run_dir/chat-markdown-read.frames.txt" &&
+            printf 'yes\n' || printf 'no\n'
+    } >"$run_dir/chat-markdown-read.assertions.txt"
+
+    test "$status" -eq 0
+    grep -a -q 'Read README.md' "$run_dir/chat-markdown-read.terminal.log"
+    grep -a -q 'Requirements' "$run_dir/chat-markdown-read.terminal.log"
+    grep -a -q 'zig build' "$run_dir/chat-markdown-read.terminal.log"
+    grep -q 'VIVI_READ_DONE' "$run_dir/chat-markdown-read.normalized.txt"
+    test -s "$run_dir/chat-markdown-read.frames.txt"
+    test -s "$run_dir/chat-markdown-read.contact-sheet.png"
 }
 
 write_streaming_input_tape() {
@@ -973,6 +1069,13 @@ case "${1:-}" in
             exit 2
         }
         chat_markdown "$2"
+        ;;
+    chat-markdown-read)
+        test "$#" -eq 2 || {
+            usage >&2
+            exit 2
+        }
+        chat_markdown_read "$2"
         ;;
     chat-ask-user)
         test "$#" -eq 2 || {

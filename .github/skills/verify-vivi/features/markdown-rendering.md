@@ -12,6 +12,8 @@ without changing the raw conversation text.
 - Prose wraps at word boundaries, with grapheme fallback for oversized words.
 - Wide GFM tables render as grids; narrow tables render as labeled fields.
 - Incomplete streamed Markdown remains visible until its structure is complete.
+- Successful `read` tool output for Markdown files uses the same rich renderer
+  when the tool row is expanded; failed reads remain literal error output.
 
 ## How to get to it (user POV)
 
@@ -23,6 +25,9 @@ without changing the raw conversation text.
 
 - Run `.github/skills/verify-vivi/bin/verify-vivi doctor`.
 - Run `.github/skills/verify-vivi/bin/verify-vivi chat-markdown <run-id>`.
+- Run
+  `.github/skills/verify-vivi/bin/verify-vivi chat-markdown-read <run-id>` to
+  read `README.md`, focus the completed tool with F6, and expand it.
 - Open `chat-markdown.contact-sheet.png` and inspect individual frames under
   `chat-markdown.frames/`.
 - Confirm `Render Test` appears as a heading, bold and inline-code styles are
@@ -31,6 +36,11 @@ without changing the raw conversation text.
 - Complete `chat-markdown.visual-review.md`, set `status: pass`, record the
   inspected frame numbers, and run
   `.github/skills/verify-vivi/bin/verify-vivi frame-check <run-id> chat-markdown`.
+- For the read-tool drive, confirm the expanded output shows rendered
+  `Requirements` and `Build the CLI and backend` headings, list bullets, and
+  indented code rather than raw Markdown markers. Complete
+  `chat-markdown-read.visual-review.md`, then run
+  `.github/skills/verify-vivi/bin/verify-vivi frame-check <run-id> chat-markdown-read`.
 
 ## Gotchas
 
