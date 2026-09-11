@@ -1,4 +1,5 @@
 const std = @import("std");
+const highlight = @import("highlight.zig");
 const vaxis = @import("vaxis");
 const c = @cImport({
     @cInclude("md4c.h");
@@ -12,6 +13,7 @@ pub const Style = struct {
     code: bool = false,
     heading: bool = false,
     link: bool = false,
+    syntax: ?highlight.Token = null,
 };
 
 pub const Segment = struct {
@@ -71,6 +73,16 @@ pub const Layout = struct {
         window: vaxis.Window,
         width: u16,
     ) !Layout {
+        return initCached(allocator, source, window, width, null);
+    }
+
+    pub fn initCached(
+        allocator: std.mem.Allocator,
+        source: []const u8,
+        window: vaxis.Window,
+        width: u16,
+        highlight_cache: ?*HighlightCache,
+    ) !Layout {
         if (source.len > std.math.maxInt(c.MD_SIZE)) {
             return error.MarkdownInputTooLarge;
         }
@@ -78,6 +90,7 @@ pub const Layout = struct {
             .allocator = allocator,
             .window = window,
             .width = @max(width, 1),
+            .highlight_cache = highlight_cache,
         };
         defer builder.deinit();
 
@@ -98,6 +111,9 @@ pub const Layout = struct {
         if (builder.failure) |failure| return failure;
         if (result != 0) return error.MarkdownParseFailed;
         try builder.finishDocument();
+        if (highlight_cache) |cache| {
+            cache.truncate(allocator, builder.code_block_index);
+        }
 
         var layout = Layout{ .allocator = allocator };
         errdefer layout.deinit();
@@ -112,6 +128,75 @@ pub const Layout = struct {
     }
 };
 
+pub const HighlightCache = struct {
+    blocks: std.ArrayList(Block) = .empty,
+
+    const digest_length = std.crypto.hash.sha2.Sha256.digest_length;
+
+    const Block = struct {
+        language: highlight.Language,
+        digest: [digest_length]u8,
+        spans: []highlight.Span,
+    };
+
+    pub fn deinit(self: *HighlightCache, allocator: std.mem.Allocator) void {
+        for (self.blocks.items) |block| allocator.free(block.spans);
+        self.blocks.deinit(allocator);
+        self.* = undefined;
+    }
+
+    fn spansFor(
+        self: *HighlightCache,
+        allocator: std.mem.Allocator,
+        index: usize,
+        language: highlight.Language,
+        source: []const u8,
+    ) ![]const highlight.Span {
+        var digest: [digest_length]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(
+            source[0..@min(source.len, highlight.max_source_bytes)],
+            &digest,
+            .{},
+        );
+        if (index < self.blocks.items.len) {
+            const block = &self.blocks.items[index];
+            if (block.language == language and
+                std.mem.eql(u8, &block.digest, &digest))
+            {
+                return block.spans;
+            }
+            const spans = try highlight.spans(allocator, language, source);
+            allocator.free(block.spans);
+            block.* = .{
+                .language = language,
+                .digest = digest,
+                .spans = spans,
+            };
+            return block.spans;
+        }
+        std.debug.assert(index == self.blocks.items.len);
+        const spans = try highlight.spans(allocator, language, source);
+        errdefer allocator.free(spans);
+        try self.blocks.append(allocator, .{
+            .language = language,
+            .digest = digest,
+            .spans = spans,
+        });
+        return spans;
+    }
+
+    fn truncate(
+        self: *HighlightCache,
+        allocator: std.mem.Allocator,
+        count: usize,
+    ) void {
+        while (self.blocks.items.len > count) {
+            const block = self.blocks.pop().?;
+            allocator.free(block.spans);
+        }
+    }
+};
+
 pub fn combineStyle(base: vaxis.Style, markdown: Style) vaxis.Style {
     var result = base;
     result.bold = result.bold or markdown.bold or markdown.heading;
@@ -119,7 +204,20 @@ pub fn combineStyle(base: vaxis.Style, markdown: Style) vaxis.Style {
     result.strikethrough = result.strikethrough or markdown.strikethrough;
     if (markdown.heading or markdown.link) result.ul_style = .single;
     if (markdown.code) result.bg = .{ .index = 236 };
+    if (markdown.syntax) |syntax| result.fg = syntaxColor(syntax);
     return result;
+}
+
+fn syntaxColor(token: highlight.Token) vaxis.Color {
+    return switch (token) {
+        .comment => .{ .rgb = .{ 148, 163, 184 } },
+        .string => .{ .rgb = .{ 134, 239, 172 } },
+        .number, .constant => .{ .rgb = .{ 253, 186, 116 } },
+        .keyword => .{ .rgb = .{ 196, 181, 253 } },
+        .function => .{ .rgb = .{ 125, 211, 252 } },
+        .property => .{ .rgb = .{ 253, 224, 71 } },
+        .operator => .{ .rgb = .{ 244, 114, 182 } },
+    };
 }
 
 const ListState = struct {
@@ -186,6 +284,11 @@ const Builder = struct {
     strikethrough_depth: u16 = 0,
     heading_level: u8 = 0,
     code_block: bool = false,
+    code_language: ?highlight.Language = null,
+    code_source: std.ArrayList(u8) = .empty,
+    highlight_cache: ?*HighlightCache = null,
+    code_block_index: usize = 0,
+    current_code_block_index: usize = 0,
     link_stack: std.ArrayList(?[]u8) = .empty,
     table: ?Table = null,
     current_row: ?Table.Row = null,
@@ -198,6 +301,7 @@ const Builder = struct {
         self.lines.deinit(self.allocator);
         self.lists.deinit(self.allocator);
         self.list_item_indents.deinit(self.allocator);
+        self.code_source.deinit(self.allocator);
         if (self.pending_list_prefix) |prefix| self.allocator.free(prefix);
         for (self.link_stack.items) |uri| {
             if (uri) |value| self.allocator.free(value);
@@ -274,25 +378,103 @@ const Builder = struct {
             );
             return;
         }
+        try self.code_source.appendSlice(self.allocator, text);
+    }
 
-        var start: usize = 0;
-        for (text, 0..) |byte, index| {
-            if (byte != '\n') continue;
+    fn flushCodeBlock(self: *Builder) !void {
+        const source = self.code_source.items;
+        var owned_highlights: ?[]highlight.Span = null;
+        defer if (owned_highlights) |spans| self.allocator.free(spans);
+        const highlighted: []const highlight.Span =
+            if (self.code_language) |language|
+                if (self.highlight_cache) |cache|
+                    try cache.spansFor(
+                        self.allocator,
+                        self.current_code_block_index,
+                        language,
+                        source,
+                    )
+                else blk: {
+                    owned_highlights = try highlight.spans(
+                        self.allocator,
+                        language,
+                        source,
+                    );
+                    break :blk owned_highlights.?;
+                }
+            else
+                &.{};
+
+        var line_start: usize = 0;
+        while (line_start < source.len) {
+            const newline = std.mem.indexOfScalarPos(
+                u8,
+                source,
+                line_start,
+                '\n',
+            );
+            const line_end = newline orelse source.len;
             const line = try self.ensureLine();
+            try self.appendCodeRange(
+                line,
+                source,
+                highlighted,
+                line_start,
+                line_end,
+            );
+            if (newline == null) break;
+            self.finishLine();
+            line_start = line_end + 1;
+        }
+        self.code_source.clearRetainingCapacity();
+    }
+
+    fn appendCodeRange(
+        self: *Builder,
+        line: *Line,
+        source: []const u8,
+        highlighted: []const highlight.Span,
+        start: usize,
+        end: usize,
+    ) !void {
+        if (highlighted.len == 0) {
             try line.append(
                 self.allocator,
-                text[start..index],
+                source[start..end],
                 self.style,
                 self.activeUri(),
             );
-            self.finishLine();
-            start = index + 1;
+            return;
         }
-        if (start < text.len) {
-            const line = try self.ensureLine();
+
+        var offset = start;
+        for (highlighted) |span| {
+            if (span.end <= start) continue;
+            if (span.start >= end) break;
+            const span_start = @max(span.start, start);
+            const span_end = @min(span.end, end);
+            if (offset < span_start) {
+                try line.append(
+                    self.allocator,
+                    source[offset..span_start],
+                    self.style,
+                    self.activeUri(),
+                );
+            }
+            var style = self.style;
+            style.syntax = span.token;
             try line.append(
                 self.allocator,
-                text[start..],
+                source[span_start..span_end],
+                style,
+                self.activeUri(),
+            );
+            offset = span_end;
+        }
+        if (offset < end) {
+            try line.append(
+                self.allocator,
+                source[offset..end],
                 self.style,
                 self.activeUri(),
             );
@@ -1084,6 +1266,20 @@ fn enterBlock(
             builder.finishLine();
             builder.code_block = true;
             builder.style.code = true;
+            builder.code_source.clearRetainingCapacity();
+            const info: *const c.MD_BLOCK_CODE_DETAIL =
+                @ptrCast(@alignCast(detail.?));
+            const language_name = decodeAttribute(
+                builder.allocator,
+                info.lang,
+            ) catch |err| return builder.fail(err);
+            defer builder.allocator.free(language_name);
+            builder.code_language =
+                highlight.Language.fromMarkdownName(language_name);
+            if (builder.code_language != null) {
+                builder.current_code_block_index = builder.code_block_index;
+                builder.code_block_index += 1;
+            }
         },
         c.MD_BLOCK_HR => {
             builder.appendText("────────────────") catch |err|
@@ -1132,8 +1328,10 @@ fn leaveBlock(
             builder.appendBlank() catch |err| return builder.fail(err);
         },
         c.MD_BLOCK_CODE => {
+            builder.flushCodeBlock() catch |err| return builder.fail(err);
             builder.finishLine();
             builder.code_block = false;
+            builder.code_language = null;
             builder.style.code = false;
             builder.appendBlank() catch |err| return builder.fail(err);
         },
@@ -1492,6 +1690,100 @@ test "fenced code retains line breaks while escaping controls" {
         std.mem.indexOf(u8, rendered.items, "  first␛\n  second") != null,
     );
     try std.testing.expect(std.mem.indexOf(u8, rendered.items, "␊") == null);
+}
+
+test "fenced code applies tree-sitter syntax styles" {
+    var screen: vaxis.Screen = undefined;
+    const window = testWindow(&screen, 100);
+    var layout = try Layout.init(
+        std.testing.allocator,
+        "```zig\nconst answer = 42; // ready\n```",
+        window,
+        98,
+    );
+    defer layout.deinit();
+
+    var saw_keyword = false;
+    var saw_number = false;
+    var saw_comment = false;
+    for (layout.lines.items) |line| {
+        for (line.segments.items) |segment| {
+            const token = segment.style.syntax orelse continue;
+            saw_keyword = saw_keyword or token == .keyword;
+            saw_number = saw_number or token == .number;
+            saw_comment = saw_comment or token == .comment;
+        }
+    }
+    try std.testing.expect(saw_keyword and saw_number and saw_comment);
+}
+
+test "fenced code parses multiline syntax as one document" {
+    var screen: vaxis.Screen = undefined;
+    const window = testWindow(&screen, 100);
+    var layout = try Layout.init(
+        std.testing.allocator,
+        "```bash\ncat <<EOF\nhello from heredoc\nEOF\n```",
+        window,
+        98,
+    );
+    defer layout.deinit();
+
+    var heredoc_is_string = false;
+    for (layout.lines.items) |line| {
+        for (line.segments.items) |segment| {
+            if (std.mem.eql(u8, segment.text, "hello from heredoc")) {
+                heredoc_is_string = segment.style.syntax == .string;
+            }
+        }
+    }
+    try std.testing.expect(heredoc_is_string);
+}
+
+test "completed fenced code reuses cached syntax spans" {
+    var screen: vaxis.Screen = undefined;
+    const window = testWindow(&screen, 100);
+    var cache: HighlightCache = .{};
+    defer cache.deinit(std.testing.allocator);
+    const source = "```zig\nconst answer = 42;\n```";
+
+    var first = try Layout.initCached(
+        std.testing.allocator,
+        source,
+        window,
+        98,
+        &cache,
+    );
+    defer first.deinit();
+    const first_spans = cache.blocks.items[0].spans;
+
+    var second = try Layout.initCached(
+        std.testing.allocator,
+        source,
+        window,
+        40,
+        &cache,
+    );
+    defer second.deinit();
+    try std.testing.expectEqual(
+        @intFromPtr(first_spans.ptr),
+        @intFromPtr(cache.blocks.items[0].spans.ptr),
+    );
+}
+
+test "unsupported fences do not offset cached supported blocks" {
+    var screen: vaxis.Screen = undefined;
+    const window = testWindow(&screen, 100);
+    var cache: HighlightCache = .{};
+    defer cache.deinit(std.testing.allocator);
+    var layout = try Layout.initCached(
+        std.testing.allocator,
+        "```unknown\nplain\n```\n\n```zig\nconst answer = 42;\n```",
+        window,
+        98,
+        &cache,
+    );
+    defer layout.deinit();
+    try std.testing.expectEqual(@as(usize, 1), cache.blocks.items.len);
 }
 
 test "incomplete streaming prefixes remain visible" {

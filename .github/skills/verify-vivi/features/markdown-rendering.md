@@ -7,6 +7,7 @@ without changing the raw conversation text.
 
 - Headings render without source markers and remain visually distinct.
 - Bold, italic, strikethrough, inline code, and safe links use terminal styles.
+- Fenced Zig, shell, and JSON snippets use tree-sitter syntax colors.
 - Lists, task items, blockquotes, and fenced code retain readable structure.
 - Prose wraps at word boundaries, with grapheme fallback for oversized words.
 - Wide GFM tables render as grids; narrow tables render as labeled fields.
@@ -25,8 +26,8 @@ without changing the raw conversation text.
 - Open `chat-markdown.contact-sheet.png` and inspect individual frames under
   `chat-markdown.frames/`.
 - Confirm `Render Test` appears as a heading, bold and inline-code styles are
-  visibly distinct, and the Feature/Status table uses aligned borders rather
-  than raw Markdown pipes.
+  visibly distinct, the Zig code block uses multiple syntax colors, and the
+  Feature/Status table uses aligned borders rather than raw Markdown pipes.
 - Complete `chat-markdown.visual-review.md`, set `status: pass`, record the
   inspected frame numbers, and run
   `.github/skills/verify-vivi/bin/verify-vivi frame-check <run-id> chat-markdown`.

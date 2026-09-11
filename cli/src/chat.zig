@@ -1,5 +1,6 @@
 const std = @import("std");
 const backend = @import("vivi_backend");
+const highlight = @import("highlight.zig");
 const markdown = @import("markdown.zig");
 const tool_renderer = @import("tool_renderer.zig");
 const vaxis = @import("vaxis");
@@ -14,6 +15,13 @@ const composer_background = vaxis.Color{ .index = 236 };
 const menu_background = vaxis.Color{ .index = 234 };
 const tool_detail_background = vaxis.Color{ .index = 234 };
 const menu_selected_background = vaxis.Color{ .index = 238 };
+const syntax_comment = vaxis.Color{ .rgb = .{ 148, 163, 184 } };
+const syntax_string = vaxis.Color{ .rgb = .{ 134, 239, 172 } };
+const syntax_number = vaxis.Color{ .rgb = .{ 253, 186, 116 } };
+const syntax_keyword = vaxis.Color{ .rgb = .{ 196, 181, 253 } };
+const syntax_function = vaxis.Color{ .rgb = .{ 125, 211, 252 } };
+const syntax_property = vaxis.Color{ .rgb = .{ 253, 224, 71 } };
+const syntax_operator = vaxis.Color{ .rgb = .{ 244, 114, 182 } };
 
 const AppEvent = union(enum) {
     key_press: vaxis.Key,
@@ -87,6 +95,7 @@ fn visibleSelectionRange(
 const MessageEntry = struct {
     role: Role,
     text: std.ArrayList(u8) = .empty,
+    highlight_cache: markdown.HighlightCache = .{},
 
     fn init(
         allocator: std.mem.Allocator,
@@ -100,6 +109,7 @@ const MessageEntry = struct {
     }
 
     fn deinit(self: *MessageEntry, allocator: std.mem.Allocator) void {
+        self.highlight_cache.deinit(allocator);
         self.text.deinit(allocator);
         self.* = undefined;
     }
@@ -114,6 +124,9 @@ const ToolEntry = struct {
     input_display: []u8,
     output: ?[]u8 = null,
     output_display: ?[]u8 = null,
+    input_highlights: []highlight.Span,
+    output_highlights: ?[]highlight.Span = null,
+    output_language: ?highlight.Language,
     expanded: bool = false,
 
     const Completion = union(enum) {
@@ -155,10 +168,24 @@ const ToolEntry = struct {
         errdefer allocator.free(input);
         const input_display = try tool_renderer.renderArguments(allocator, input);
         errdefer allocator.free(input_display);
+        const input_highlights = switch (started.invocation.summary) {
+            .bash => |summary| try highlightBashInput(
+                allocator,
+                input_display,
+                summary.command,
+            ),
+            else => try allocator.alloc(highlight.Span, 0),
+        };
+        errdefer allocator.free(input_highlights);
         return .{
             .call_id = call_id,
             .input = input,
             .input_display = input_display,
+            .input_highlights = input_highlights,
+            .output_language = switch (started.invocation.summary) {
+                .read => |summary| highlight.Language.fromPath(summary.path),
+                else => null,
+            },
             .invocation_hash = hashToolInvocation(started),
             .compact = try tool_renderer.renderCompact(
                 allocator,
@@ -209,6 +236,7 @@ const ToolEntry = struct {
         const output = try allocator.dupe(u8, text);
         errdefer allocator.free(output);
         const output_display = try tool_renderer.renderLiteral(allocator, output);
+        errdefer allocator.free(output_display);
         self.output = output;
         self.output_display = output_display;
         self.completion = completion;
@@ -220,16 +248,106 @@ const ToolEntry = struct {
         @memcpy(self.compact[0..marker.len], marker);
     }
 
+    fn ensureOutputHighlights(
+        self: *ToolEntry,
+        allocator: std.mem.Allocator,
+    ) !void {
+        if (self.output_highlights != null) return;
+        const output = self.output_display orelse return;
+        const succeeded = if (self.completion) |completion| switch (completion) {
+            .succeeded => true,
+            .failed => false,
+        } else false;
+        self.output_highlights = if (succeeded)
+            if (self.output_language) |language|
+                try highlight.spans(allocator, language, output)
+            else
+                try allocator.alloc(highlight.Span, 0)
+        else
+            try allocator.alloc(highlight.Span, 0);
+    }
+
     fn deinit(self: *ToolEntry, allocator: std.mem.Allocator) void {
         allocator.free(self.compact);
         allocator.free(self.input);
         allocator.free(self.input_display);
+        allocator.free(self.input_highlights);
         if (self.output) |output| allocator.free(output);
         if (self.output_display) |output| allocator.free(output);
+        if (self.output_highlights) |spans| allocator.free(spans);
         self.call_id.deinit(allocator);
         self.* = undefined;
     }
 };
+
+fn highlightBashInput(
+    allocator: std.mem.Allocator,
+    display: []const u8,
+    command: []const u8,
+) ![]highlight.Span {
+    const prefix = "Command: ";
+    const label_start = topLevelLabelStart(display, prefix) orelse {
+        return allocator.alloc(highlight.Span, 0);
+    };
+    const command_start = label_start + prefix.len;
+    const command_spans = try highlight.spans(allocator, .bash, command);
+    defer allocator.free(command_spans);
+    const result = try allocator.alloc(highlight.Span, command_spans.len);
+    for (command_spans, result) |span, *mapped| {
+        mapped.* = .{
+            .start = command_start + commandDisplayOffset(command, span.start),
+            .end = command_start + commandDisplayOffset(command, span.end),
+            .token = span.token,
+        };
+    }
+    return result;
+}
+
+fn topLevelLabelStart(display: []const u8, label: []const u8) ?usize {
+    if (std.mem.startsWith(u8, display, label)) return 0;
+    var offset: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, display, offset, '\n')) |newline| {
+        const start = newline + 1;
+        if (std.mem.startsWith(u8, display[start..], label)) return start;
+        offset = start;
+    }
+    return null;
+}
+
+fn commandDisplayOffset(command: []const u8, end: usize) usize {
+    var source_offset: usize = 0;
+    var display_offset: usize = 0;
+    while (source_offset < @min(end, command.len)) {
+        const byte = command[source_offset];
+        if (byte == '\n') {
+            source_offset += 1;
+            display_offset += 3;
+            continue;
+        }
+        const length = std.unicode.utf8ByteSequenceLength(byte) catch 0;
+        const codepoint = if (length > 0 and
+            source_offset + length <= command.len)
+            std.unicode.utf8Decode(
+                command[source_offset..][0..length],
+            ) catch null
+        else
+            null;
+        if (codepoint) |value| {
+            if (value >= 0x20 and value != 0x7f and
+                !(value >= 0x80 and value <= 0x9f) and
+                !(value >= 0x202a and value <= 0x202e) and
+                !(value >= 0x2066 and value <= 0x2069))
+            {
+                source_offset += length;
+                display_offset += length;
+                continue;
+            }
+        }
+        source_offset += 1;
+        display_offset += 4;
+    }
+    return display_offset;
+}
 
 fn hashToolInvocation(
     started: *const backend.ToolStarted,
@@ -253,6 +371,76 @@ fn hashToolPayload(payload: []const u8) [std.crypto.hash.sha2.Sha256.digest_leng
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(payload, &digest, .{});
     return digest;
+}
+
+fn syntaxStyle(base: vaxis.Style, token: highlight.Token) vaxis.Style {
+    var style = base;
+    style.fg = switch (token) {
+        .comment => syntax_comment,
+        .string => syntax_string,
+        .number, .constant => syntax_number,
+        .keyword => syntax_keyword,
+        .function => syntax_function,
+        .property => syntax_property,
+        .operator => syntax_operator,
+    };
+    return style;
+}
+
+fn drawHighlightedRange(
+    window: vaxis.Window,
+    row: u16,
+    column: u16,
+    text: []const u8,
+    start: usize,
+    end: usize,
+    highlights: []const highlight.Span,
+    base_style: vaxis.Style,
+) void {
+    var offset = start;
+    var current_column = column;
+    for (highlights) |span| {
+        if (span.end <= start) continue;
+        if (span.start >= end) break;
+        const span_start = @max(span.start, start);
+        const span_end = @min(span.end, end);
+        if (offset < span_start) {
+            const plain = text[offset..span_start];
+            var segments = [_]vaxis.Segment{.{
+                .text = plain,
+                .style = base_style,
+            }};
+            _ = window.print(&segments, .{
+                .row_offset = row,
+                .col_offset = current_column,
+                .wrap = .none,
+            });
+            current_column +|= window.gwidth(plain);
+        }
+        const colored = text[span_start..span_end];
+        var segments = [_]vaxis.Segment{.{
+            .text = colored,
+            .style = syntaxStyle(base_style, span.token),
+        }};
+        _ = window.print(&segments, .{
+            .row_offset = row,
+            .col_offset = current_column,
+            .wrap = .none,
+        });
+        current_column +|= window.gwidth(colored);
+        offset = span_end;
+    }
+    if (offset < end) {
+        var segments = [_]vaxis.Segment{.{
+            .text = text[offset..end],
+            .style = base_style,
+        }};
+        _ = window.print(&segments, .{
+            .row_offset = row,
+            .col_offset = current_column,
+            .wrap = .none,
+        });
+    }
 }
 
 const Entry = union(enum) {
@@ -685,31 +873,32 @@ const Projection = struct {
 
     fn build(
         allocator: std.mem.Allocator,
-        transcript: *const Transcript,
+        transcript: *Transcript,
         window: vaxis.Window,
     ) !Projection {
         var projection: Projection = .{};
         errdefer projection.deinit(allocator);
 
-        for (transcript.entries.items, 0..) |entry, entry_index| {
+        for (transcript.entries.items, 0..) |*entry, entry_index| {
             if (projection.lines.items.len > 0) {
                 try projection.lines.append(allocator, .{
                     .kind = .blank,
                     .entry_index = entry_index,
                 });
             }
-            switch (entry) {
-                .message => |message| switch (message.role) {
+            switch (entry.*) {
+                .message => |*message| switch (message.role) {
                     .reasoning, .assistant => {
                         try projection.lines.append(allocator, .{
                             .kind = .role,
                             .entry_index = entry_index,
                         });
-                        var layout = try markdown.Layout.init(
+                        var layout = try markdown.Layout.initCached(
                             allocator,
                             message.text.items,
                             window,
                             @max(window.width -| 2, 1),
+                            &message.highlight_cache,
                         );
                         defer layout.deinit();
                         for (layout.lines.items) |*line| {
@@ -751,7 +940,7 @@ const Projection = struct {
                         2,
                     ),
                 },
-                .tool => |tool| {
+                .tool => |*tool| {
                     try projection.appendWrapped(
                         allocator,
                         entry_index,
@@ -761,6 +950,7 @@ const Projection = struct {
                         4,
                     );
                     if (tool.expanded) {
+                        try tool.ensureOutputHighlights(allocator);
                         try projection.lines.append(allocator, .{
                             .kind = .tool_input_label,
                             .entry_index = entry_index,
@@ -2602,11 +2792,28 @@ const ChatUi = struct {
                     .text = text,
                     .style = .{ .bold = label, .fg = reasoning_color, .bg = tool_detail_background },
                 }};
-                _ = window.print(&segments, .{
-                    .row_offset = row,
-                    .col_offset = @min(window.width -| 1, 4),
-                    .wrap = .none,
-                });
+                if (label) {
+                    _ = window.print(&segments, .{
+                        .row_offset = row,
+                        .col_offset = @min(window.width -| 1, 4),
+                        .wrap = .none,
+                    });
+                } else {
+                    const highlights = if (line.kind == .tool_input)
+                        tool.input_highlights
+                    else
+                        tool.output_highlights orelse &.{};
+                    drawHighlightedRange(
+                        window,
+                        row,
+                        @min(window.width -| 1, 4),
+                        if (line.kind == .tool_input) tool.input_display else output,
+                        line.start,
+                        line.end,
+                        highlights,
+                        .{ .fg = reasoning_color, .bg = tool_detail_background },
+                    );
+                }
             },
         }
     }
@@ -3072,6 +3279,201 @@ fn toolFinished(
             .{ .failed = value },
         ),
     };
+}
+
+test "tool details highlight shell input and supported read output" {
+    var bash_started = try toolStarted(
+        "bash-highlight",
+        "{\"command\":\"printf '%s\\\\n' ready\"}",
+        .{ .bash = .{ .command = "printf '%s\\n' ready" } },
+    );
+    defer bash_started.deinit();
+    var bash_entry = try ToolEntry.init(std.testing.allocator, &bash_started);
+    defer bash_entry.deinit(std.testing.allocator);
+    try std.testing.expect(bash_entry.input_highlights.len > 0);
+    const command_name = bash_entry.input_highlights[0];
+    try std.testing.expectEqualStrings(
+        "printf",
+        bash_entry.input_display[command_name.start..command_name.end],
+    );
+
+    var reordered_started = try toolStarted(
+        "bash-highlight-reordered",
+        "{\"timeout\":30,\"command\":\"printf ready\"}",
+        .{ .bash = .{ .command = "printf ready" } },
+    );
+    defer reordered_started.deinit();
+    var reordered_entry = try ToolEntry.init(
+        std.testing.allocator,
+        &reordered_started,
+    );
+    defer reordered_entry.deinit(std.testing.allocator);
+    const reordered_command = reordered_entry.input_highlights[0];
+    try std.testing.expectEqualStrings(
+        "printf",
+        reordered_entry.input_display[reordered_command.start..reordered_command.end],
+    );
+
+    var read_started = try toolStarted(
+        "read-highlight",
+        "{\"path\":\"sample.zig\"}",
+        .{ .read = .{
+            .path = "sample.zig",
+            .offset = null,
+            .limit = null,
+        } },
+    );
+    defer read_started.deinit();
+    var read_entry = try ToolEntry.init(std.testing.allocator, &read_started);
+    defer read_entry.deinit(std.testing.allocator);
+    var finished = try toolFinished(
+        "read-highlight",
+        .{ .succeeded = "const answer = 42;" },
+    );
+    defer finished.deinit();
+    try read_entry.finish(std.testing.allocator, &finished);
+    try std.testing.expect(read_entry.output_highlights == null);
+    try read_entry.ensureOutputHighlights(std.testing.allocator);
+    try std.testing.expect(read_entry.output_highlights.?.len > 0);
+
+    var failed_started = try toolStarted(
+        "read-highlight-failed",
+        "{\"path\":\"missing.zig\"}",
+        .{ .read = .{
+            .path = "missing.zig",
+            .offset = null,
+            .limit = null,
+        } },
+    );
+    defer failed_started.deinit();
+    var failed_entry = try ToolEntry.init(
+        std.testing.allocator,
+        &failed_started,
+    );
+    defer failed_entry.deinit(std.testing.allocator);
+    var failed = try toolFinished(
+        "read-highlight-failed",
+        .{ .failed = "read failed: FileNotFound" },
+    );
+    defer failed.deinit();
+    try failed_entry.finish(std.testing.allocator, &failed);
+    try failed_entry.ensureOutputHighlights(std.testing.allocator);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        failed_entry.output_highlights.?.len,
+    );
+}
+
+test "expanded tool rows draw syntax colors across wrapping" {
+    var ui: ChatUi = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .input = TextInput.init(std.testing.allocator),
+        .cwd = try std.testing.allocator.dupe(u8, "."),
+    };
+    defer ui.deinit();
+
+    var bash_started = try toolStarted(
+        "bash-render",
+        "{\"command\":\"printf 'abcdefghijklmnop'\"}",
+        .{ .bash = .{ .command = "printf 'abcdefghijklmnop'" } },
+    );
+    try ui.transcript.applyToolActivity(
+        std.testing.allocator,
+        &.{ .started = bash_started },
+    );
+    bash_started.deinit();
+    var bash_finished = try toolFinished(
+        "bash-render",
+        .{ .succeeded = "done" },
+    );
+    try ui.transcript.applyToolActivity(
+        std.testing.allocator,
+        &.{ .finished = bash_finished },
+    );
+    bash_finished.deinit();
+    ui.transcript.entries.items[0].tool.expanded = true;
+
+    var read_started = try toolStarted(
+        "read-render",
+        "{\"path\":\"sample.zig\"}",
+        .{ .read = .{
+            .path = "sample.zig",
+            .offset = null,
+            .limit = null,
+        } },
+    );
+    try ui.transcript.applyToolActivity(
+        std.testing.allocator,
+        &.{ .started = read_started },
+    );
+    read_started.deinit();
+    var read_finished = try toolFinished(
+        "read-render",
+        .{ .succeeded = "const answer = 42;" },
+    );
+    try ui.transcript.applyToolActivity(
+        std.testing.allocator,
+        &.{ .finished = read_finished },
+    );
+    read_finished.deinit();
+    ui.transcript.entries.items[1].tool.expanded = true;
+
+    var screen = try vaxis.Screen.init(std.testing.allocator, .{
+        .rows = 1,
+        .cols = 12,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(std.testing.allocator);
+    const window: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = screen.width,
+        .height = screen.height,
+        .screen = &screen,
+    };
+    var projection = try Projection.build(
+        std.testing.allocator,
+        &ui.transcript,
+        window,
+    );
+    defer projection.deinit(std.testing.allocator);
+
+    const bash_string = for (ui.transcript.entries.items[0].tool.input_highlights) |span| {
+        if (span.token == .string) break span;
+    } else unreachable;
+    var saw_wrapped_string = false;
+    var saw_read_styles = false;
+    for (projection.lines.items) |line| {
+        if (line.entry_index == 0 and line.kind == .tool_input and
+            line.start > bash_string.start and line.start < bash_string.end)
+        {
+            ui.drawTranscriptLine(window, 0, &projection, line);
+            try std.testing.expectEqual(
+                syntax_string,
+                screen.readCell(4, 0).?.style.fg,
+            );
+            saw_wrapped_string = true;
+        }
+        if (line.entry_index == 1 and line.kind == .tool_output and
+            line.start == 0)
+        {
+            ui.drawTranscriptLine(window, 0, &projection, line);
+            try std.testing.expectEqual(
+                syntax_keyword,
+                screen.readCell(4, 0).?.style.fg,
+            );
+            try std.testing.expectEqual(
+                reasoning_color,
+                screen.readCell(9, 0).?.style.fg,
+            );
+            saw_read_styles = true;
+        }
+    }
+    try std.testing.expect(saw_wrapped_string and saw_read_styles);
 }
 
 test "transcript replaces streamed draft with completed response" {
@@ -3767,7 +4169,7 @@ test "tool disclosure hit mapping follows wrapping scrolling resizing and comple
             for (0..window.width) |col| {
                 try std.testing.expectEqual(tool_detail_background, screen.readCell(@intCast(col), 0).?.style.bg);
             }
-            if (line.start != line.end or line.kind == .tool_input_label or line.kind == .tool_output_label)
+            if (line.kind == .tool_input_label or line.kind == .tool_output_label)
                 try std.testing.expectEqual(reasoning_color, screen.readCell(4, 0).?.style.fg);
         }
     }
