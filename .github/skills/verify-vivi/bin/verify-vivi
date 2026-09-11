@@ -433,7 +433,7 @@ Set TypingSpeed 5ms
 Type "./zig-out/bin/vivi chat --model copilot/gpt-5.4"
 Enter
 Sleep 3s
-Type "Use the read tool exactly once to read README.md, then reply with exactly VIVI_READ_DONE."
+Type "Use the read tool exactly once to read README.md, then return the uppercase spelling of vivi_read_done and nothing else."
 Enter
 Sleep 20s
 Type "\x1b[17~"
@@ -458,7 +458,7 @@ chat_markdown_read() {
     (
         sleep 3
         printf '%s\r' \
-            'Use the read tool exactly once to read README.md, then reply with exactly VIVI_READ_DONE.'
+            'Use the read tool exactly once to read README.md, then return the uppercase spelling of vivi_read_done and nothing else.'
         sleep 20
         printf '\033[17~'
         sleep 1
