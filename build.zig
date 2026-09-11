@@ -108,9 +108,19 @@ pub fn build(b: *std.Build) void {
     });
     const chat_tests = b.addTest(.{
         .root_module = chat_tests_module,
-        .filters = &.{"Markdown draw storage remains valid"},
+        .filters = &.{ "Markdown draw storage remains valid", "tool", "mouse" },
     });
     const run_chat_tests = b.addRunArtifact(chat_tests);
+
+    const tool_tests_module = b.createModule(.{
+        .root_source_file = b.path("cli/src/tool_renderer.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    tool_tests_module.addImport("vivi_backend", backend);
+    tool_tests_module.addImport("vaxis", vaxis.module("vaxis"));
+    const tool_tests = b.addTest(.{ .root_module = tool_tests_module });
+    const run_tool_tests = b.addRunArtifact(tool_tests);
 
     const markdown_tests_module = b.createModule(.{
         .root_source_file = b.path("cli/src/markdown.zig"),
@@ -155,6 +165,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_backend_tests.step);
     test_step.dependOn(&run_cli_tests.step);
     test_step.dependOn(&run_chat_tests.step);
+    test_step.dependOn(&run_tool_tests.step);
     test_step.dependOn(&run_markdown_tests.step);
     test_step.dependOn(&run_c_smoke.step);
 
