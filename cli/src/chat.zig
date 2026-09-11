@@ -127,6 +127,8 @@ const ToolEntry = struct {
     input_highlights: []highlight.Span,
     output_highlights: ?[]highlight.Span = null,
     output_language: ?highlight.Language,
+    output_markdown: bool,
+    output_markdown_cache: markdown.HighlightCache = .{},
     expanded: bool = false,
 
     const Completion = union(enum) {
@@ -185,6 +187,10 @@ const ToolEntry = struct {
             .output_language = switch (started.invocation.summary) {
                 .read => |summary| highlight.Language.fromPath(summary.path),
                 else => null,
+            },
+            .output_markdown = switch (started.invocation.summary) {
+                .read => |summary| isMarkdownPath(summary.path),
+                else => false,
             },
             .invocation_hash = hashToolInvocation(started),
             .compact = try tool_renderer.renderCompact(
@@ -268,6 +274,7 @@ const ToolEntry = struct {
     }
 
     fn deinit(self: *ToolEntry, allocator: std.mem.Allocator) void {
+        self.output_markdown_cache.deinit(allocator);
         allocator.free(self.compact);
         allocator.free(self.input);
         allocator.free(self.input_display);
@@ -279,6 +286,14 @@ const ToolEntry = struct {
         self.* = undefined;
     }
 };
+
+fn isMarkdownPath(path: []const u8) bool {
+    const extension = std.fs.path.extension(path);
+    return std.ascii.eqlIgnoreCase(extension, ".md") or
+        std.ascii.eqlIgnoreCase(extension, ".markdown") or
+        std.ascii.eqlIgnoreCase(extension, ".mdown") or
+        std.ascii.eqlIgnoreCase(extension, ".mkdn");
+}
 
 fn highlightBashInput(
     allocator: std.mem.Allocator,
@@ -851,6 +866,7 @@ const LineKind = enum {
     tool_input,
     tool_output_label,
     tool_output,
+    tool_output_markdown,
 };
 
 const RenderLine = struct {
@@ -893,29 +909,15 @@ const Projection = struct {
                             .kind = .role,
                             .entry_index = entry_index,
                         });
-                        var layout = try markdown.Layout.initCached(
+                        try projection.appendMarkdown(
                             allocator,
+                            entry_index,
                             message.text.items,
                             window,
                             @max(window.width -| 2, 1),
                             &message.highlight_cache,
+                            .markdown,
                         );
-                        defer layout.deinit();
-                        for (layout.lines.items) |*line| {
-                            const markdown_index =
-                                projection.markdown_lines.items.len;
-                            try projection.markdown_lines.append(
-                                allocator,
-                                line.*,
-                            );
-                            line.* = .{};
-                            try projection.lines.append(allocator, .{
-                                .kind = .markdown,
-                                .entry_index = entry_index,
-                                .start = markdown_index,
-                            });
-                        }
-                        layout.lines.clearRetainingCapacity();
                     },
                     .user, .queued, .question => {
                         try projection.lines.append(allocator, .{
@@ -960,12 +962,60 @@ const Projection = struct {
                             .kind = .tool_output_label,
                             .entry_index = entry_index,
                         });
-                        try projection.appendWrapped(allocator, entry_index, tool.output_display orelse "Running…", window, .tool_output, 4);
+                        const render_markdown = tool.output_markdown and
+                            if (tool.completion) |completion| switch (completion) {
+                                .succeeded => true,
+                                .failed => false,
+                            } else false;
+                        if (render_markdown) {
+                            try projection.appendMarkdown(
+                                allocator,
+                                entry_index,
+                                tool.output_display.?,
+                                window,
+                                @max(window.width -| 4, 1),
+                                &tool.output_markdown_cache,
+                                .tool_output_markdown,
+                            );
+                        } else {
+                            try projection.appendWrapped(allocator, entry_index, tool.output_display orelse "Running…", window, .tool_output, 4);
+                        }
                     }
                 },
             }
         }
         return projection;
+    }
+
+    fn appendMarkdown(
+        self: *Projection,
+        allocator: std.mem.Allocator,
+        entry_index: usize,
+        text: []const u8,
+        window: vaxis.Window,
+        width: u16,
+        cache: *markdown.HighlightCache,
+        kind: LineKind,
+    ) !void {
+        var layout = try markdown.Layout.initCached(
+            allocator,
+            text,
+            window,
+            width,
+            cache,
+        );
+        defer layout.deinit();
+        for (layout.lines.items) |*line| {
+            const markdown_index = self.markdown_lines.items.len;
+            try self.markdown_lines.append(allocator, line.*);
+            line.* = .{};
+            try self.lines.append(allocator, .{
+                .kind = kind,
+                .entry_index = entry_index,
+                .start = markdown_index,
+            });
+        }
+        layout.lines.clearRetainingCapacity();
     }
 
     fn appendWrapped(
@@ -2609,7 +2659,7 @@ const ChatUi = struct {
 
         for (projection.lines.items[first_row..last_row], 0..) |line, row| {
             try self.tool_hits.append(self.allocator, switch (line.kind) {
-                .tool, .tool_input_label, .tool_input, .tool_output_label, .tool_output => line.entry_index,
+                .tool, .tool_input_label, .tool_input, .tool_output_label, .tool_output, .tool_output_markdown => line.entry_index,
                 else => null,
             });
             self.drawTranscriptLine(
@@ -2700,6 +2750,36 @@ const ChatUi = struct {
                         .text = segment.text,
                         .style = markdown.combineStyle(
                             base_style,
+                            segment.style,
+                        ),
+                        .link = if (segment.uri) |uri|
+                            .{ .uri = uri }
+                        else
+                            .{},
+                    }};
+                    _ = window.print(&segments, .{
+                        .row_offset = row,
+                        .col_offset = column,
+                        .wrap = .none,
+                    });
+                    column +|= window.gwidth(segment.text);
+                }
+            },
+            .tool_output_markdown => {
+                window.child(.{ .y_off = row, .height = 1 }).fill(.{
+                    .char = .{ .grapheme = " ", .width = 1 },
+                    .style = .{ .bg = tool_detail_background },
+                });
+                const markdown_line = projection.markdown_lines.items[line.start];
+                var column: u16 = @min(window.width -| 1, 4);
+                for (markdown_line.segments.items) |segment| {
+                    var segments = [_]vaxis.Segment{.{
+                        .text = segment.text,
+                        .style = markdown.combineStyle(
+                            .{
+                                .fg = reasoning_color,
+                                .bg = tool_detail_background,
+                            },
                             segment.style,
                         ),
                         .link = if (segment.uri) |uri|
@@ -4465,6 +4545,143 @@ test "tool activity draws its compact row to the terminal screen" {
         rendered.items,
         "Read README.md first 1 line",
     ) != null);
+}
+
+test "successful Markdown reads use the transcript Markdown renderer" {
+    var transcript: Transcript = .{};
+    defer transcript.deinit(std.testing.allocator);
+    var started = try toolStarted(
+        "markdown-read",
+        "{\"path\":\"README.md\"}",
+        .{ .read = .{
+            .path = "README.md",
+            .offset = null,
+            .limit = null,
+        } },
+    );
+    defer started.deinit();
+    try transcript.applyToolActivity(
+        std.testing.allocator,
+        &.{ .started = started },
+    );
+    var finished = try toolFinished(
+        "markdown-read",
+        .{ .succeeded = "# Rendered Heading\n\n**bold text**\n\n" ++
+            "| Feature | Status |\n| --- | --- |\n| Markdown | Rich |" },
+    );
+    defer finished.deinit();
+    try transcript.applyToolActivity(
+        std.testing.allocator,
+        &.{ .finished = finished },
+    );
+    transcript.entries.items[0].tool.expanded = true;
+
+    var screen = try vaxis.Screen.init(std.testing.allocator, .{
+        .rows = 12,
+        .cols = 60,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(std.testing.allocator);
+    const window: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = screen.width,
+        .height = screen.height,
+        .screen = &screen,
+    };
+    var projection = try Projection.build(
+        std.testing.allocator,
+        &transcript,
+        window,
+    );
+    defer projection.deinit(std.testing.allocator);
+
+    var saw_heading = false;
+    var saw_bold = false;
+    var saw_table_border = false;
+    for (projection.lines.items) |line| {
+        if (line.kind != .tool_output_markdown) continue;
+        for (projection.markdown_lines.items[line.start].segments.items) |segment| {
+            saw_heading = saw_heading or
+                (segment.style.heading and std.mem.indexOf(u8, segment.text, "Rendered Heading") != null);
+            saw_bold = saw_bold or
+                (segment.style.bold and std.mem.indexOf(u8, segment.text, "bold text") != null);
+            saw_table_border = saw_table_border or
+                std.mem.indexOf(u8, segment.text, "┌") != null;
+        }
+    }
+    try std.testing.expect(saw_heading);
+    try std.testing.expect(saw_bold);
+    try std.testing.expect(saw_table_border);
+}
+
+test "Markdown read detection is extension based and case insensitive" {
+    try std.testing.expect(isMarkdownPath("README.md"));
+    try std.testing.expect(isMarkdownPath("docs/GUIDE.MARKDOWN"));
+    try std.testing.expect(!isMarkdownPath("src/main.zig"));
+    try std.testing.expect(!isMarkdownPath("notes.md.txt"));
+}
+
+test "failed Markdown reads remain literal tool output" {
+    var transcript: Transcript = .{};
+    defer transcript.deinit(std.testing.allocator);
+    var started = try toolStarted(
+        "markdown-failure",
+        "{\"path\":\"README.md\"}",
+        .{ .read = .{
+            .path = "README.md",
+            .offset = null,
+            .limit = null,
+        } },
+    );
+    defer started.deinit();
+    try transcript.applyToolActivity(
+        std.testing.allocator,
+        &.{ .started = started },
+    );
+    var finished = try toolFinished(
+        "markdown-failure",
+        .{ .failed = "# Not a heading" },
+    );
+    defer finished.deinit();
+    try transcript.applyToolActivity(
+        std.testing.allocator,
+        &.{ .finished = finished },
+    );
+    transcript.entries.items[0].tool.expanded = true;
+
+    var screen = try vaxis.Screen.init(std.testing.allocator, .{
+        .rows = 8,
+        .cols = 40,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(std.testing.allocator);
+    const window: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = screen.width,
+        .height = screen.height,
+        .screen = &screen,
+    };
+    var projection = try Projection.build(
+        std.testing.allocator,
+        &transcript,
+        window,
+    );
+    defer projection.deinit(std.testing.allocator);
+
+    var saw_literal = false;
+    for (projection.lines.items) |line| {
+        try std.testing.expect(line.kind != .tool_output_markdown);
+        saw_literal = saw_literal or line.kind == .tool_output;
+    }
+    try std.testing.expect(saw_literal);
 }
 
 test "Markdown draw storage remains valid while screen cells are consumed" {

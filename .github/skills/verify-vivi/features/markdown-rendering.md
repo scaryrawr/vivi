@@ -12,6 +12,8 @@ without changing the raw conversation text.
 - Prose wraps at word boundaries, with grapheme fallback for oversized words.
 - Wide GFM tables render as grids; narrow tables render as labeled fields.
 - Incomplete streamed Markdown remains visible until its structure is complete.
+- Successful `read` tool output for Markdown files uses the same rich renderer
+  when the tool row is expanded; failed reads remain literal error output.
 
 ## How to get to it (user POV)
 
