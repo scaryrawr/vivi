@@ -42,6 +42,9 @@ panel with arrow-key choice selection. Typed choice numbers, exact choice text,
 and free-form input when allowed remain supported. Tool output is returned
 whole; Copilot owns any large-result handling.
 
+Mouse-wheel bursts are processed in bounded batches with one redraw per batch,
+so rapid scrolling does not replay a separate frame for every queued tick.
+
 In the terminal transcript, tool calls start collapsed. Click a tool row
 (marked `▸`) to expand its complete actual input and output; click it again
 to collapse (`▾`). Expanded running calls show their output when they finish,

@@ -22,6 +22,11 @@ const AppEvent = union(enum) {
     conversation_wake,
 };
 
+fn isMouseWheel(mouse: vaxis.Mouse) bool {
+    return mouse.type == .press and
+        (mouse.button == .wheel_up or mouse.button == .wheel_down);
+}
+
 const Role = enum {
     user,
     queued,
@@ -2861,6 +2866,24 @@ const ChatUi = struct {
     }
 };
 
+fn handleMouseBatch(
+    ui: *ChatUi,
+    loop: *vaxis.Loop(AppEvent),
+    first: vaxis.Mouse,
+) !struct { redraw: bool, next: ?AppEvent = null } {
+    var redraw = ui.handleMouse(first);
+    if (!isMouseWheel(first)) return .{ .redraw = redraw };
+
+    // Bound each batch so continuous wheel input cannot starve rendering or backend events.
+    for (1..512) |_| {
+        const event = try loop.tryEvent() orelse break;
+        if (event != .mouse or !isMouseWheel(event.mouse))
+            return .{ .redraw = redraw, .next = event };
+        redraw = ui.handleMouse(event.mouse) or redraw;
+    }
+    return .{ .redraw = redraw };
+}
+
 const App = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -2944,15 +2967,21 @@ const App = struct {
         defer if (use_signal_resize) self.loop.uninstallResizeHandler();
         try self.render();
 
+        var pending: ?AppEvent = null;
         while (!self.closed) {
-            const event = try self.loop.nextEvent();
+            const event = pending orelse try self.loop.nextEvent();
+            pending = null;
             var redraw = true;
             switch (event) {
                 .key_press => |key| switch (try self.ui.handleKey(key, &self.conversation)) {
                     .keep_running => {},
                     .force_exit => self.hardExit(),
                 },
-                .mouse => |mouse| redraw = self.ui.handleMouse(mouse),
+                .mouse => |mouse| {
+                    const batch = try handleMouseBatch(&self.ui, &self.loop, mouse);
+                    redraw = batch.redraw;
+                    pending = batch.next;
+                },
                 .winsize => |winsize| {
                     try self.vx.resize(
                         self.allocator,
@@ -3857,6 +3886,84 @@ test "mouse wheel scrolls the transcript within its bounds" {
         });
     }
     try std.testing.expectEqual(@as(usize, 12), ui.rows_from_tail);
+}
+
+test "mouse wheel batch preserves bounds direction and following input" {
+    var ui: ChatUi = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .input = TextInput.init(std.testing.allocator),
+        .cwd = try std.testing.allocator.dupe(u8, "."),
+        .last_total_rows = 20,
+        .last_viewport_rows = 8,
+        .last_transcript_region = .{ .width = 96, .height = 8 },
+    };
+    defer ui.deinit();
+    var tty: vaxis.Tty = undefined;
+    var vx: vaxis.Vaxis = undefined;
+    var loop = vaxis.Loop(AppEvent).init(std.testing.io, &tty, &vx);
+    const up: vaxis.Mouse = .{
+        .col = 2,
+        .row = 4,
+        .button = .wheel_up,
+        .mods = .{},
+        .type = .press,
+    };
+    var down = up;
+    down.button = .wheel_down;
+    const barriers: []const AppEvent = &.{
+        .{ .key_press = .{ .codepoint = 'x' } },
+        .{ .key_press = .{ .codepoint = 'c', .mods = .{ .ctrl = true } } },
+        .{ .mouse = .{ .col = 2, .row = 4, .button = .left, .mods = .{}, .type = .press } },
+        .{ .winsize = .{ .cols = 80, .rows = 24, .x_pixel = 0, .y_pixel = 0 } },
+        .conversation_wake,
+    };
+    for (barriers) |barrier| {
+        ui.rows_from_tail = 0;
+        for (0..200) |_| try loop.postEvent(.{ .mouse = up });
+        try loop.postEvent(.{ .mouse = down });
+        var outside = up;
+        outside.row = 9;
+        try loop.postEvent(.{ .mouse = outside });
+        try loop.postEvent(barrier);
+        try loop.postEvent(.{ .mouse = down });
+
+        const batch = try handleMouseBatch(&ui, &loop, up);
+        try std.testing.expect(batch.redraw);
+        try std.testing.expectEqual(@as(usize, 12) - mouse_wheel_rows, ui.rows_from_tail);
+        try std.testing.expectEqualDeep(barrier, batch.next.?);
+        try std.testing.expectEqualDeep(AppEvent{ .mouse = down }, (try loop.tryEvent()).?);
+        try std.testing.expectEqual(null, try loop.tryEvent());
+    }
+}
+
+test "mouse wheel batch is bounded and does not drain after clicks" {
+    var ui: ChatUi = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .input = TextInput.init(std.testing.allocator),
+        .cwd = try std.testing.allocator.dupe(u8, "."),
+    };
+    defer ui.deinit();
+    var tty: vaxis.Tty = undefined;
+    var vx: vaxis.Vaxis = undefined;
+    var loop = vaxis.Loop(AppEvent).init(std.testing.io, &tty, &vx);
+    const up: vaxis.Mouse = .{
+        .col = 2,
+        .row = 4,
+        .button = .wheel_up,
+        .mods = .{},
+        .type = .press,
+    };
+    for (0..512) |_| try loop.postEvent(.{ .mouse = up });
+    const batch = try handleMouseBatch(&ui, &loop, up);
+    try std.testing.expect(!batch.redraw);
+    try std.testing.expectEqual(null, batch.next);
+    var click = up;
+    click.button = .left;
+    _ = try handleMouseBatch(&ui, &loop, click);
+    try std.testing.expectEqualDeep(AppEvent{ .mouse = up }, (try loop.tryEvent()).?);
+    try std.testing.expectEqual(null, try loop.tryEvent());
 }
 
 test "mouse wheel outside the transcript does not scroll" {
