@@ -773,12 +773,18 @@ fn wrapLine(
                 removeTrailingWhitespace(&output, allocator);
                 try destination.append(allocator, output);
                 output = .{ .code = source.code };
+                const first_grapheme_width = firstGraphemeWidth(window, word);
+                const continuation_indent = fitContinuationIndent(
+                    width,
+                    source.continuation_indent,
+                    first_grapheme_width,
+                );
                 try appendIndent(
                     allocator,
                     &output,
-                    source.continuation_indent,
+                    continuation_indent,
                 );
-                line_width = source.continuation_indent;
+                line_width = continuation_indent;
             }
             previous_was_whitespace = false;
             try appendGraphemeWrapped(
@@ -855,8 +861,13 @@ fn appendGraphemeWrapped(
             }
             try destination.append(allocator, output.*);
             output.* = .{ .code = output.code };
-            try appendIndent(allocator, output, continuation_indent);
-            line_width.* = continuation_indent;
+            const fitted_indent = fitContinuationIndent(
+                width,
+                continuation_indent,
+                grapheme_width,
+            );
+            try appendIndent(allocator, output, fitted_indent);
+            line_width.* = fitted_indent;
             run_start = grapheme.start;
         }
         line_width.* +|= grapheme_width;
@@ -869,6 +880,20 @@ fn appendGraphemeWrapped(
             uri,
         );
     }
+}
+
+fn firstGraphemeWidth(window: vaxis.Window, text: []const u8) u16 {
+    var iterator = vaxis.unicode.graphemeIterator(text);
+    const grapheme = iterator.next() orelse return 0;
+    return window.gwidth(grapheme.bytes(text));
+}
+
+fn fitContinuationIndent(
+    width: u16,
+    continuation_indent: u16,
+    next_grapheme_width: u16,
+) u16 {
+    return @min(continuation_indent, width -| next_grapheme_width);
 }
 
 fn appendIndent(
@@ -1590,6 +1615,31 @@ test "multiline list items retain hanging indentation" {
         "• first line\n  continued\n\n  second paragraph",
         rendered.items,
     );
+}
+
+test "continuation indentation fits narrow nested lists" {
+    var screen: vaxis.Screen = undefined;
+    const window = testWindow(&screen, 4);
+    var layout = try Layout.init(
+        std.testing.allocator,
+        "-\n  - child",
+        window,
+        4,
+    );
+    defer layout.deinit();
+
+    var rendered: std.ArrayList(u8) = .empty;
+    defer rendered.deinit(std.testing.allocator);
+    try appendLayoutText(std.testing.allocator, &rendered, &layout);
+    for (layout.lines.items) |line| {
+        try std.testing.expect(lineWidth(window, line) <= 4);
+    }
+    for ("child") |letter| {
+        try std.testing.expectEqual(
+            @as(usize, 1),
+            std.mem.count(u8, rendered.items, &.{letter}),
+        );
+    }
 }
 
 test "ordered task items advance numbering" {
