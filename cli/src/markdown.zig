@@ -1212,6 +1212,24 @@ fn leaveSpan(
     return 0;
 }
 
+fn appendTerminalText(builder: *Builder, text: []const u8) !void {
+    var start: usize = 0;
+    for (text, 0..) |byte, index| {
+        if (byte >= 0x20 and byte != 0x7f) continue;
+        if (start < index) try builder.appendText(text[start..index]);
+
+        const codepoint: u21 = if (byte == 0x7f)
+            0x2421
+        else
+            0x2400 + @as(u21, byte);
+        var buffer: [4]u8 = undefined;
+        const length = try std.unicode.utf8Encode(codepoint, &buffer);
+        try builder.appendText(buffer[0..length]);
+        start = index + 1;
+    }
+    if (start < text.len) try builder.appendText(text[start..]);
+}
+
 fn textCallback(
     text_type: c.MD_TEXTTYPE,
     text: [*c]const c.MD_CHAR,
@@ -1235,10 +1253,12 @@ fn textCallback(
                 bytes,
             ) catch |err| return builder.fail(err);
             defer builder.allocator.free(decoded);
-            builder.appendText(decoded) catch |err| return builder.fail(err);
+            appendTerminalText(builder, decoded) catch |err|
+                return builder.fail(err);
         },
         c.MD_TEXT_HTML => {},
-        else => builder.appendText(bytes) catch |err| return builder.fail(err),
+        else => appendTerminalText(builder, bytes) catch |err|
+            return builder.fail(err),
     }
     return 0;
 }
@@ -1402,6 +1422,26 @@ test "decoded controls are rejected from link destinations" {
             try std.testing.expect(segment.uri == null);
         }
     }
+}
+
+test "text controls render as visible control pictures" {
+    var screen: vaxis.Screen = undefined;
+    const window = testWindow(&screen, 100);
+    var layout = try Layout.init(
+        std.testing.allocator,
+        "entity: &#27; &NewLine; &Tab; &#127; raw: \x1b\x7f",
+        window,
+        98,
+    );
+    defer layout.deinit();
+
+    var rendered: std.ArrayList(u8) = .empty;
+    defer rendered.deinit(std.testing.allocator);
+    try appendLayoutText(std.testing.allocator, &rendered, &layout);
+    try std.testing.expectEqualStrings(
+        "entity: ␛ ␊ ␉ ␡ raw: ␛␡",
+        rendered.items,
+    );
 }
 
 test "incomplete streaming prefixes remain visible" {
