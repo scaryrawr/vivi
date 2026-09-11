@@ -2,6 +2,7 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const c = @cImport({
     @cInclude("md4c.h");
+    @cInclude("entity.h");
 });
 
 pub const Style = struct {
@@ -27,6 +28,7 @@ pub const Segment = struct {
 
 pub const Line = struct {
     segments: std.ArrayList(Segment) = .empty,
+    leading_width: u16 = 0,
     continuation_indent: u16 = 0,
     code: bool = false,
 
@@ -123,6 +125,7 @@ pub fn combineStyle(base: vaxis.Style, markdown: Style) vaxis.Style {
 const ListState = struct {
     ordered: bool,
     next: u32,
+    tight: bool,
 };
 
 const Table = struct {
@@ -130,8 +133,23 @@ const Table = struct {
     header_rows: usize,
     rows: std.ArrayList(Row) = .empty,
 
+    const Alignment = enum {
+        left,
+        center,
+        right,
+    };
+
+    const Cell = struct {
+        line: Line = .{},
+        alignment: Alignment = .left,
+
+        fn deinit(self: *Cell, allocator: std.mem.Allocator) void {
+            self.line.deinit(allocator);
+        }
+    };
+
     const Row = struct {
-        cells: std.ArrayList(Line) = .empty,
+        cells: std.ArrayList(Cell) = .empty,
 
         fn deinit(self: *Row, allocator: std.mem.Allocator) void {
             for (self.cells.items) |*cell| cell.deinit(allocator);
@@ -153,15 +171,20 @@ const Builder = struct {
     lines: std.ArrayList(Line) = .empty,
     current: ?Line = null,
     lists: std.ArrayList(ListState) = .empty,
+    list_item_indents: std.ArrayList(u16) = .empty,
     quote_depth: u16 = 0,
     pending_list_prefix: ?[]u8 = null,
     style: Style = .{},
+    italic_depth: u16 = 0,
+    bold_depth: u16 = 0,
+    code_depth: u16 = 0,
+    strikethrough_depth: u16 = 0,
     heading_level: u8 = 0,
     code_block: bool = false,
     link_stack: std.ArrayList(?[]u8) = .empty,
     table: ?Table = null,
     current_row: ?Table.Row = null,
-    current_cell: ?Line = null,
+    current_cell: ?Table.Cell = null,
     failure: ?anyerror = null,
 
     fn deinit(self: *Builder) void {
@@ -169,6 +192,7 @@ const Builder = struct {
         for (self.lines.items) |*line| line.deinit(self.allocator);
         self.lines.deinit(self.allocator);
         self.lists.deinit(self.allocator);
+        self.list_item_indents.deinit(self.allocator);
         if (self.pending_list_prefix) |prefix| self.allocator.free(prefix);
         for (self.link_stack.items) |uri| {
             if (uri) |value| self.allocator.free(value);
@@ -192,7 +216,7 @@ const Builder = struct {
     fn ensureLine(self: *Builder) !*Line {
         if (self.table != null) {
             if (self.current_cell == null) self.current_cell = .{};
-            return &self.current_cell.?;
+            return &self.current_cell.?.line;
         }
         if (self.current == null) {
             self.current = .{ .code = self.code_block };
@@ -212,7 +236,13 @@ const Builder = struct {
                 indent +|= self.window.gwidth(prefix);
                 self.allocator.free(prefix);
                 self.pending_list_prefix = null;
-            } else if (self.code_block) {
+            } else if (self.list_item_indents.items.len > 0) {
+                const item_indent =
+                    self.list_item_indents.items[self.list_item_indents.items.len - 1];
+                try appendIndent(self.allocator, line, item_indent);
+                indent +|= item_indent;
+            }
+            if (self.code_block) {
                 try line.append(
                     self.allocator,
                     "  ",
@@ -221,6 +251,7 @@ const Builder = struct {
                 );
                 indent +|= 2;
             }
+            line.leading_width = indent;
             line.continuation_indent = indent;
         }
         return &self.current.?;
@@ -359,6 +390,10 @@ const Builder = struct {
             self.allocator.free(prefix);
             prefix = nested;
         }
+        try self.list_item_indents.append(
+            self.allocator,
+            self.window.gwidth(prefix),
+        );
         self.pending_list_prefix = prefix;
     }
 
@@ -377,6 +412,18 @@ const Builder = struct {
         var row = &self.current_row.?;
         try row.cells.append(self.allocator, self.current_cell orelse .{});
         self.current_cell = null;
+    }
+
+    fn beginCell(self: *Builder, detail: ?*anyopaque) void {
+        const info: *const c.MD_BLOCK_TD_DETAIL =
+            @ptrCast(@alignCast(detail.?));
+        self.current_cell = .{
+            .alignment = switch (info.@"align") {
+                c.MD_ALIGN_CENTER => .center,
+                c.MD_ALIGN_RIGHT => .right,
+                else => .left,
+            },
+        };
     }
 
     fn finishRow(self: *Builder) !void {
@@ -398,7 +445,7 @@ const Builder = struct {
                 if (column >= widths.len) break;
                 widths[column] = @max(
                     widths[column],
-                    lineWidth(self.window, cell),
+                    lineWidth(self.window, cell.line),
                 );
             }
         }
@@ -425,7 +472,15 @@ const Builder = struct {
                 if (column > 0) try self.appendLiteral(" ", .{});
                 if (column < row.cells.items.len) {
                     const cell = row.cells.items[column];
-                    for (cell.segments.items) |segment| {
+                    const used = lineWidth(self.window, cell.line);
+                    const padding = widths[column] -| used;
+                    const left_padding: u16 = switch (cell.alignment) {
+                        .left => 0,
+                        .center => padding / 2,
+                        .right => padding,
+                    };
+                    try self.appendPadding(left_padding);
+                    for (cell.line.segments.items) |segment| {
                         var style = segment.style;
                         if (row_index < table.header_rows) style.bold = true;
                         const line = try self.ensureLine();
@@ -436,8 +491,7 @@ const Builder = struct {
                             segment.uri,
                         );
                     }
-                    const used = lineWidth(self.window, cell);
-                    try self.appendPadding(widths[column] -| used);
+                    try self.appendPadding(padding - left_padding);
                 } else {
                     try self.appendPadding(widths[column]);
                 }
@@ -484,7 +538,7 @@ const Builder = struct {
             for (table.rows.items) |row| {
                 for (row.cells.items) |cell| {
                     self.current = .{};
-                    for (cell.segments.items) |segment| {
+                    for (cell.line.segments.items) |segment| {
                         var style = segment.style;
                         style.bold = true;
                         const line = try self.ensureLine();
@@ -506,7 +560,7 @@ const Builder = struct {
             for (0..table.columns) |column| {
                 self.current = .{};
                 if (column < headers.cells.items.len) {
-                    for (headers.cells.items[column].segments.items) |segment| {
+                    for (headers.cells.items[column].line.segments.items) |segment| {
                         var style = segment.style;
                         style.bold = true;
                         const line = try self.ensureLine();
@@ -522,7 +576,7 @@ const Builder = struct {
                 }
                 try self.appendLiteral(": ", .{ .bold = true });
                 if (column < row.cells.items.len) {
-                    for (row.cells.items[column].segments.items) |segment| {
+                    for (row.cells.items[column].line.segments.items) |segment| {
                         const line = try self.ensureLine();
                         try line.append(
                             self.allocator,
@@ -573,10 +627,22 @@ fn wrapLine(
         var index: usize = 0;
         while (index < segment.text.len) {
             if (isWrapWhitespace(segment.text[index])) {
+                const whitespace_start = index;
                 while (index < segment.text.len and
                     isWrapWhitespace(segment.text[index]))
                 {
                     index += 1;
+                }
+                if (line_width < source.leading_width) {
+                    const whitespace = segment.text[whitespace_start..index];
+                    try output.append(
+                        allocator,
+                        whitespace,
+                        segment.style,
+                        segment.uri,
+                    );
+                    line_width +|= window.gwidth(whitespace);
+                    continue;
                 }
                 if (line_width > 0 and !previous_was_whitespace) {
                     try output.append(
@@ -743,6 +809,106 @@ fn safeUri(uri: []const u8) bool {
     return false;
 }
 
+fn normalizedCodepoint(codepoint: u32) u21 {
+    const replacement: u21 = 0xfffd;
+    if (codepoint == 0 or codepoint > 0x10ffff or
+        (codepoint >= 0xd800 and codepoint <= 0xdfff))
+    {
+        return replacement;
+    }
+    if (codepoint >= 0x80 and codepoint <= 0x9f) {
+        const replacements = [_]u21{
+            0x20ac, 0x0081, 0x201a, 0x0192, 0x201e, 0x2026, 0x2020, 0x2021,
+            0x02c6, 0x2030, 0x0160, 0x2039, 0x0152, 0x008d, 0x017d, 0x008f,
+            0x0090, 0x2018, 0x2019, 0x201c, 0x201d, 0x2022, 0x2013, 0x2014,
+            0x02dc, 0x2122, 0x0161, 0x203a, 0x0153, 0x009d, 0x017e, 0x0178,
+        };
+        return replacements[codepoint - 0x80];
+    }
+    return @intCast(codepoint);
+}
+
+fn appendCodepoint(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    codepoint: u32,
+) !void {
+    var buffer: [4]u8 = undefined;
+    const length = try std.unicode.utf8Encode(
+        normalizedCodepoint(codepoint),
+        &buffer,
+    );
+    try output.appendSlice(allocator, buffer[0..length]);
+}
+
+fn decodeEntity(
+    allocator: std.mem.Allocator,
+    entity: []const u8,
+) ![]u8 {
+    var decoded: std.ArrayList(u8) = .empty;
+    errdefer decoded.deinit(allocator);
+
+    if (entity.len > 3 and entity[0] == '&' and entity[1] == '#') {
+        const hexadecimal = entity[2] == 'x' or entity[2] == 'X';
+        const digits = entity[if (hexadecimal) 3 else 2 .. entity.len - 1];
+        const codepoint = std.fmt.parseInt(
+            u32,
+            digits,
+            if (hexadecimal) 16 else 10,
+        ) catch {
+            try decoded.appendSlice(allocator, entity);
+            return decoded.toOwnedSlice(allocator);
+        };
+        try appendCodepoint(allocator, &decoded, codepoint);
+        return decoded.toOwnedSlice(allocator);
+    }
+
+    const found = c.entity_lookup(entity.ptr, entity.len);
+    if (found != null) {
+        const entry = found[0];
+        try appendCodepoint(allocator, &decoded, entry.codepoints[0]);
+        if (entry.codepoints[1] != 0) {
+            try appendCodepoint(allocator, &decoded, entry.codepoints[1]);
+        }
+    } else {
+        try decoded.appendSlice(allocator, entity);
+    }
+    return decoded.toOwnedSlice(allocator);
+}
+
+fn decodeAttribute(
+    allocator: std.mem.Allocator,
+    attribute: c.MD_ATTRIBUTE,
+) ![]u8 {
+    if (attribute.size == 0 or attribute.text == null) {
+        return allocator.dupe(u8, "");
+    }
+
+    var decoded: std.ArrayList(u8) = .empty;
+    errdefer decoded.deinit(allocator);
+
+    var index: usize = 0;
+    while (attribute.substr_offsets[index] < attribute.size) : (index += 1) {
+        const start = attribute.substr_offsets[index];
+        const end = attribute.substr_offsets[index + 1];
+        const bytes = attribute.text[start..end];
+        switch (attribute.substr_types[index]) {
+            c.MD_TEXT_ENTITY => {
+                const entity = try decodeEntity(allocator, bytes);
+                defer allocator.free(entity);
+                try decoded.appendSlice(allocator, entity);
+            },
+            c.MD_TEXT_NULLCHAR => try appendCodepoint(
+                allocator,
+                &decoded,
+                0,
+            ),
+            else => try decoded.appendSlice(allocator, bytes),
+        }
+    }
+    return decoded.toOwnedSlice(allocator);
+}
+
 fn enterBlock(
     block_type: c.MD_BLOCKTYPE,
     detail: ?*anyopaque,
@@ -752,16 +918,28 @@ fn enterBlock(
     if (builder.failure != null) return 1;
     switch (block_type) {
         c.MD_BLOCK_QUOTE => builder.quote_depth +|= 1,
-        c.MD_BLOCK_UL => builder.lists.append(
-            builder.allocator,
-            .{ .ordered = false, .next = 1 },
-        ) catch |err| return builder.fail(err),
+        c.MD_BLOCK_UL => {
+            const info: *const c.MD_BLOCK_UL_DETAIL =
+                @ptrCast(@alignCast(detail.?));
+            builder.lists.append(
+                builder.allocator,
+                .{
+                    .ordered = false,
+                    .next = 1,
+                    .tight = info.is_tight != 0,
+                },
+            ) catch |err| return builder.fail(err);
+        },
         c.MD_BLOCK_OL => {
             const info: *const c.MD_BLOCK_OL_DETAIL =
                 @ptrCast(@alignCast(detail.?));
             builder.lists.append(
                 builder.allocator,
-                .{ .ordered = true, .next = info.start },
+                .{
+                    .ordered = true,
+                    .next = info.start,
+                    .tight = info.is_tight != 0,
+                },
             ) catch |err| return builder.fail(err);
         },
         c.MD_BLOCK_LI => builder.beginListItem(detail) catch |err|
@@ -786,7 +964,7 @@ fn enterBlock(
         c.MD_BLOCK_TABLE => builder.beginTable(detail) catch |err|
             return builder.fail(err),
         c.MD_BLOCK_TR => builder.current_row = .{},
-        c.MD_BLOCK_TH, c.MD_BLOCK_TD => builder.current_cell = .{},
+        c.MD_BLOCK_TH, c.MD_BLOCK_TD => builder.beginCell(detail),
         else => {},
     }
     return 0;
@@ -811,7 +989,10 @@ fn leaveBlock(
                 builder.appendBlank() catch |err| return builder.fail(err);
             }
         },
-        c.MD_BLOCK_LI => builder.finishLine(),
+        c.MD_BLOCK_LI => {
+            builder.finishLine();
+            _ = builder.list_item_indents.pop();
+        },
         c.MD_BLOCK_H => {
             builder.finishLine();
             builder.style.heading = false;
@@ -826,7 +1007,10 @@ fn leaveBlock(
         },
         c.MD_BLOCK_P => {
             builder.finishLine();
-            if (builder.lists.items.len == 0 and builder.table == null) {
+            if (builder.table == null and
+                (builder.lists.items.len == 0 or
+                    !builder.lists.items[builder.lists.items.len - 1].tight))
+            {
                 builder.appendBlank() catch |err| return builder.fail(err);
             }
         },
@@ -849,19 +1033,31 @@ fn enterSpan(
     const builder: *Builder = @ptrCast(@alignCast(userdata.?));
     if (builder.failure != null) return 1;
     switch (span_type) {
-        c.MD_SPAN_EM => builder.style.italic = true,
-        c.MD_SPAN_STRONG => builder.style.bold = true,
-        c.MD_SPAN_CODE => builder.style.code = true,
-        c.MD_SPAN_DEL => builder.style.strikethrough = true,
+        c.MD_SPAN_EM => {
+            builder.italic_depth +|= 1;
+            builder.style.italic = true;
+        },
+        c.MD_SPAN_STRONG => {
+            builder.bold_depth +|= 1;
+            builder.style.bold = true;
+        },
+        c.MD_SPAN_CODE => {
+            builder.code_depth +|= 1;
+            builder.style.code = true;
+        },
+        c.MD_SPAN_DEL => {
+            builder.strikethrough_depth +|= 1;
+            builder.style.strikethrough = true;
+        },
         c.MD_SPAN_A => {
             const info: *const c.MD_SPAN_A_DETAIL =
                 @ptrCast(@alignCast(detail.?));
-            const href = info.href.text[0..info.href.size];
-            const uri = if (safeUri(href))
-                builder.allocator.dupe(u8, href) catch |err|
-                    return builder.fail(err)
-            else
-                null;
+            const href = decodeAttribute(
+                builder.allocator,
+                info.href,
+            ) catch |err| return builder.fail(err);
+            const uri = if (safeUri(href)) href else null;
+            if (uri == null) builder.allocator.free(href);
             builder.link_stack.append(builder.allocator, uri) catch |err| {
                 if (uri) |value| builder.allocator.free(value);
                 return builder.fail(err);
@@ -881,10 +1077,22 @@ fn leaveSpan(
     const builder: *Builder = @ptrCast(@alignCast(userdata.?));
     if (builder.failure != null) return 1;
     switch (span_type) {
-        c.MD_SPAN_EM => builder.style.italic = false,
-        c.MD_SPAN_STRONG => builder.style.bold = false,
-        c.MD_SPAN_CODE => builder.style.code = builder.code_block,
-        c.MD_SPAN_DEL => builder.style.strikethrough = false,
+        c.MD_SPAN_EM => {
+            builder.italic_depth -|= 1;
+            builder.style.italic = builder.italic_depth > 0;
+        },
+        c.MD_SPAN_STRONG => {
+            builder.bold_depth -|= 1;
+            builder.style.bold = builder.bold_depth > 0;
+        },
+        c.MD_SPAN_CODE => {
+            builder.code_depth -|= 1;
+            builder.style.code = builder.code_block or builder.code_depth > 0;
+        },
+        c.MD_SPAN_DEL => {
+            builder.strikethrough_depth -|= 1;
+            builder.style.strikethrough = builder.strikethrough_depth > 0;
+        },
         c.MD_SPAN_A => {
             if (builder.link_stack.pop()) |uri| {
                 if (uri) |value| builder.allocator.free(value);
@@ -914,6 +1122,14 @@ fn textCallback(
             return builder.fail(err),
         c.MD_TEXT_NULLCHAR => builder.appendText("�") catch |err|
             return builder.fail(err),
+        c.MD_TEXT_ENTITY => {
+            const decoded = decodeEntity(
+                builder.allocator,
+                bytes,
+            ) catch |err| return builder.fail(err);
+            defer builder.allocator.free(decoded);
+            builder.appendText(decoded) catch |err| return builder.fail(err);
+        },
         c.MD_TEXT_HTML => {},
         else => builder.appendText(bytes) catch |err| return builder.fail(err),
     }
@@ -1000,6 +1216,64 @@ test "core Markdown styles and safe links are retained" {
     try std.testing.expect(saw_strike);
     try std.testing.expect(saw_safe_link);
     try std.testing.expect(!saw_unsafe_link);
+}
+
+test "nested spans retain their outer styles" {
+    var screen: vaxis.Screen = undefined;
+    const window = testWindow(&screen, 100);
+    var layout = try Layout.init(
+        std.testing.allocator,
+        "*outer _inner_ italic-tail* **outer __inner__ bold-tail**",
+        window,
+        98,
+    );
+    defer layout.deinit();
+
+    var italic_tail = false;
+    var bold_tail = false;
+    for (layout.lines.items) |line| {
+        for (line.segments.items) |segment| {
+            if (std.mem.indexOf(u8, segment.text, "italic-tail") != null) {
+                italic_tail = segment.style.italic;
+            }
+            if (std.mem.indexOf(u8, segment.text, "bold-tail") != null) {
+                bold_tail = segment.style.bold;
+            }
+        }
+    }
+    try std.testing.expect(italic_tail);
+    try std.testing.expect(bold_tail);
+}
+
+test "entities are decoded in text and link destinations" {
+    var screen: vaxis.Screen = undefined;
+    const window = testWindow(&screen, 100);
+    var layout = try Layout.init(
+        std.testing.allocator,
+        "Fish &amp; Chips &#169; &#x41; " ++
+            "[safe](https://example.test/?a=1&amp;b=2)",
+        window,
+        98,
+    );
+    defer layout.deinit();
+
+    var rendered: std.ArrayList(u8) = .empty;
+    defer rendered.deinit(std.testing.allocator);
+    try appendLayoutText(std.testing.allocator, &rendered, &layout);
+    try std.testing.expect(
+        std.mem.indexOf(u8, rendered.items, "Fish & Chips © A") != null,
+    );
+
+    var saw_decoded_link = false;
+    for (layout.lines.items) |line| {
+        for (line.segments.items) |segment| {
+            if (segment.uri) |uri| {
+                saw_decoded_link =
+                    std.mem.eql(u8, uri, "https://example.test/?a=1&b=2");
+            }
+        }
+    }
+    try std.testing.expect(saw_decoded_link);
 }
 
 test "incomplete streaming prefixes remain visible" {
@@ -1105,6 +1379,26 @@ test "lists blockquotes tasks and code have readable structure" {
     );
 }
 
+test "multiline list items retain hanging indentation" {
+    var screen: vaxis.Screen = undefined;
+    const window = testWindow(&screen, 80);
+    var layout = try Layout.init(
+        std.testing.allocator,
+        "- first line  \n  continued\n\n  second paragraph",
+        window,
+        78,
+    );
+    defer layout.deinit();
+    var rendered: std.ArrayList(u8) = .empty;
+    defer rendered.deinit(std.testing.allocator);
+    try appendLayoutText(std.testing.allocator, &rendered, &layout);
+
+    try std.testing.expectEqualStrings(
+        "• first line\n  continued\n\n  second paragraph",
+        rendered.items,
+    );
+}
+
 test "wide tables render as a grid" {
     var screen: vaxis.Screen = undefined;
     const window = testWindow(&screen, 80);
@@ -1127,6 +1421,31 @@ test "wide tables render as a grid" {
     for (layout.lines.items) |line| {
         try std.testing.expectEqual(expected_width, lineWidth(window, line));
     }
+}
+
+test "wide tables honor column alignment" {
+    var screen: vaxis.Screen = undefined;
+    const window = testWindow(&screen, 80);
+    var layout = try Layout.init(
+        std.testing.allocator,
+        "| Left | Center | Right |\n" ++
+            "| :--- | :----: | ---: |\n" ++
+            "| x | y | z |",
+        window,
+        78,
+    );
+    defer layout.deinit();
+    var rendered: std.ArrayList(u8) = .empty;
+    defer rendered.deinit(std.testing.allocator);
+    try appendLayoutText(std.testing.allocator, &rendered, &layout);
+
+    try std.testing.expect(
+        std.mem.indexOf(
+            u8,
+            rendered.items,
+            "│ x    │   y    │     z │",
+        ) != null,
+    );
 }
 
 test "narrow tables render as stacked header values" {

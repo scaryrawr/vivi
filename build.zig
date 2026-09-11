@@ -66,6 +66,10 @@ pub fn build(b: *std.Build) void {
         .file = b.path("third_party/md4c/md4c.c"),
         .flags = &.{"-std=c99"},
     });
+    cli_module.addCSourceFile(.{
+        .file = b.path("third_party/md4c/entity.c"),
+        .flags = &.{"-std=c99"},
+    });
 
     const cli = b.addExecutable(.{
         .name = "vivi",
@@ -98,6 +102,10 @@ pub fn build(b: *std.Build) void {
         .file = b.path("third_party/md4c/md4c.c"),
         .flags = &.{"-std=c99"},
     });
+    chat_tests_module.addCSourceFile(.{
+        .file = b.path("third_party/md4c/entity.c"),
+        .flags = &.{"-std=c99"},
+    });
     const chat_tests = b.addTest(.{
         .root_module = chat_tests_module,
         .filters = &.{"Markdown draw storage remains valid"},
@@ -114,6 +122,10 @@ pub fn build(b: *std.Build) void {
     markdown_tests_module.addIncludePath(b.path("third_party/md4c"));
     markdown_tests_module.addCSourceFile(.{
         .file = b.path("third_party/md4c/md4c.c"),
+        .flags = &.{"-std=c99"},
+    });
+    markdown_tests_module.addCSourceFile(.{
+        .file = b.path("third_party/md4c/entity.c"),
         .flags = &.{"-std=c99"},
     });
     const markdown_tests = b.addTest(.{

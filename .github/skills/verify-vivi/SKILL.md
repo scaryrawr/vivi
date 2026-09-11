@@ -175,8 +175,8 @@ chat-ask-user <run-id>
 chat-model-menu <run-id>
 chat-session-resume <run-id>
 chat-shutdown <run-id>
-extract-frames <run-id> <chat-streaming|chat-streaming-input|chat-ask-user|chat-model-menu|chat-session-resume|chat-shutdown>
-frame-check <run-id> <chat-streaming|chat-streaming-input|chat-ask-user|chat-model-menu|chat-session-resume|chat-shutdown>
+extract-frames <run-id> <chat-streaming|chat-streaming-input|chat-markdown|chat-ask-user|chat-model-menu|chat-session-resume|chat-shutdown>
+frame-check <run-id> <chat-streaming|chat-streaming-input|chat-markdown|chat-ask-user|chat-model-menu|chat-session-resume|chat-shutdown>
 cleanup <run-id>
 ```
 

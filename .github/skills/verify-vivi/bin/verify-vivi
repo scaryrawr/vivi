@@ -324,10 +324,10 @@ Set Height 720
 Set FontSize 22
 Set TypingSpeed 10ms
 
-Type "./zig-out/bin/vivi chat"
+Type "./zig-out/bin/vivi chat --model copilot/gpt-5.4"
 Enter
 Sleep 3s
-Type "Return a Markdown heading named Render Test, one sentence with bold text and inline code, then a two-column table with headers Feature and Status and rows Styling Working and Tables Readable. Do not use tools or add any other text."
+Type "Convert these lowercase labels to uppercase in the response: render test, feature, status, styling, working, tables, readable. Use RENDER TEST as a Markdown heading, then one sentence with bold text and inline code, then a two-column table using the other uppercase labels. Do not use tools or add any other text."
 Enter
 Sleep 20s
 Ctrl+C
@@ -345,9 +345,51 @@ chat_markdown() {
     (cd "$repo_root" && VIVI_KEEP_GIF=1 vhs "$run_dir/chat-markdown.tape")
     VIVI_KEEP_GIF=1 extract_frames "$1" chat-markdown
 
+    (
+        sleep 3
+        printf '%s\r' \
+            'Convert these lowercase labels to uppercase in the response: render test, feature, status, styling, working, tables, readable. Use RENDER TEST as a Markdown heading, then one sentence with bold text and inline code, then a two-column table using the other uppercase labels. Do not use tools or add any other text.'
+        sleep 20
+        printf '\003'
+        sleep 3
+        printf '\003'
+    ) | script -q "$run_dir/chat-markdown.terminal.log" sh -c \
+        "stty cols 100 rows 30; '$binary' chat --model copilot/gpt-5.4" &
+    pty_pid=$!
+    printf '%s\n' "$pty_pid" >"$run_dir/pty.pid"
+    trap 'kill "$pty_pid" 2>/dev/null || true; wait "$pty_pid" 2>/dev/null || true' EXIT INT TERM
+
+    if wait "$pty_pid"; then
+        status=0
+    else
+        status=$?
+    fi
+    rm -f "$run_dir/pty.pid"
+    trap - EXIT INT TERM
+
+    perl -0pe \
+        's/\e\[[0-?]*[ -\/]*[@-~]//g; s/\e\][^\a]*(?:\a|\e\\)//g' \
+        "$run_dir/chat-markdown.terminal.log" |
+        tr -d '\r\b' >"$run_dir/chat-markdown.normalized.txt"
+
+    table_cells_seen=yes
+    for marker in FEATURE STATUS STYLING WORKING TABLES READABLE; do
+        if ! grep -q "$marker" "$run_dir/chat-markdown.normalized.txt"; then
+            table_cells_seen=no
+        fi
+    done
+
     {
-        printf 'heading_expected=Render Test\n'
-        printf 'table_cells_expected=Feature,Status,Styling,Working,Tables,Readable\n'
+        printf 'exit=%s\n' "$status"
+        printf 'heading_expected=RENDER TEST\n'
+        printf 'heading_seen='
+        if grep -q 'RENDER TEST' "$run_dir/chat-markdown.normalized.txt"; then
+            printf 'yes\n'
+        else
+            printf 'no\n'
+        fi
+        printf 'table_cells_expected=FEATURE,STATUS,STYLING,WORKING,TABLES,READABLE\n'
+        printf 'table_cells_seen=%s\n' "$table_cells_seen"
         printf 'frames_extracted='
         if test -s "$run_dir/chat-markdown.frames.txt"; then
             printf 'yes\n'
@@ -362,6 +404,9 @@ chat_markdown() {
         fi
     } >"$run_dir/chat-markdown.assertions.txt"
 
+    test "$status" -eq 0
+    grep -q 'RENDER TEST' "$run_dir/chat-markdown.normalized.txt"
+    test "$table_cells_seen" = yes
     test -s "$run_dir/chat-markdown.frames.txt"
     test -s "$run_dir/chat-markdown.contact-sheet.png"
 }
