@@ -73,6 +73,16 @@ pub const Layout = struct {
         window: vaxis.Window,
         width: u16,
     ) !Layout {
+        return initCached(allocator, source, window, width, null);
+    }
+
+    pub fn initCached(
+        allocator: std.mem.Allocator,
+        source: []const u8,
+        window: vaxis.Window,
+        width: u16,
+        highlight_cache: ?*HighlightCache,
+    ) !Layout {
         if (source.len > std.math.maxInt(c.MD_SIZE)) {
             return error.MarkdownInputTooLarge;
         }
@@ -80,6 +90,7 @@ pub const Layout = struct {
             .allocator = allocator,
             .window = window,
             .width = @max(width, 1),
+            .highlight_cache = highlight_cache,
         };
         defer builder.deinit();
 
@@ -100,6 +111,9 @@ pub const Layout = struct {
         if (builder.failure) |failure| return failure;
         if (result != 0) return error.MarkdownParseFailed;
         try builder.finishDocument();
+        if (highlight_cache) |cache| {
+            cache.truncate(allocator, builder.code_block_index);
+        }
 
         var layout = Layout{ .allocator = allocator };
         errdefer layout.deinit();
@@ -111,6 +125,75 @@ pub const Layout = struct {
         for (self.lines.items) |*line| line.deinit(self.allocator);
         self.lines.deinit(self.allocator);
         self.* = undefined;
+    }
+};
+
+pub const HighlightCache = struct {
+    blocks: std.ArrayList(Block) = .empty,
+
+    const digest_length = std.crypto.hash.sha2.Sha256.digest_length;
+
+    const Block = struct {
+        language: highlight.Language,
+        digest: [digest_length]u8,
+        spans: []highlight.Span,
+    };
+
+    pub fn deinit(self: *HighlightCache, allocator: std.mem.Allocator) void {
+        for (self.blocks.items) |block| allocator.free(block.spans);
+        self.blocks.deinit(allocator);
+        self.* = undefined;
+    }
+
+    fn spansFor(
+        self: *HighlightCache,
+        allocator: std.mem.Allocator,
+        index: usize,
+        language: highlight.Language,
+        source: []const u8,
+    ) ![]const highlight.Span {
+        var digest: [digest_length]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(
+            source[0..@min(source.len, highlight.max_source_bytes)],
+            &digest,
+            .{},
+        );
+        if (index < self.blocks.items.len) {
+            const block = &self.blocks.items[index];
+            if (block.language == language and
+                std.mem.eql(u8, &block.digest, &digest))
+            {
+                return block.spans;
+            }
+            const spans = try highlight.spans(allocator, language, source);
+            allocator.free(block.spans);
+            block.* = .{
+                .language = language,
+                .digest = digest,
+                .spans = spans,
+            };
+            return block.spans;
+        }
+        std.debug.assert(index == self.blocks.items.len);
+        const spans = try highlight.spans(allocator, language, source);
+        errdefer allocator.free(spans);
+        try self.blocks.append(allocator, .{
+            .language = language,
+            .digest = digest,
+            .spans = spans,
+        });
+        return spans;
+    }
+
+    fn truncate(
+        self: *HighlightCache,
+        allocator: std.mem.Allocator,
+        count: usize,
+    ) void {
+        while (self.blocks.items.len > count) {
+            const block = self.blocks.pop().?;
+            allocator.free(block.spans);
+        }
     }
 };
 
@@ -203,6 +286,9 @@ const Builder = struct {
     code_block: bool = false,
     code_language: ?highlight.Language = null,
     code_source: std.ArrayList(u8) = .empty,
+    highlight_cache: ?*HighlightCache = null,
+    code_block_index: usize = 0,
+    current_code_block_index: usize = 0,
     link_stack: std.ArrayList(?[]u8) = .empty,
     table: ?Table = null,
     current_row: ?Table.Row = null,
@@ -297,11 +383,27 @@ const Builder = struct {
 
     fn flushCodeBlock(self: *Builder) !void {
         const source = self.code_source.items;
-        const highlighted = if (self.code_language) |language|
-            try highlight.spans(self.allocator, language, source)
-        else
-            try self.allocator.alloc(highlight.Span, 0);
-        defer self.allocator.free(highlighted);
+        var owned_highlights: ?[]highlight.Span = null;
+        defer if (owned_highlights) |spans| self.allocator.free(spans);
+        const highlighted: []const highlight.Span =
+            if (self.code_language) |language|
+                if (self.highlight_cache) |cache|
+                    try cache.spansFor(
+                        self.allocator,
+                        self.current_code_block_index,
+                        language,
+                        source,
+                    )
+                else blk: {
+                    owned_highlights = try highlight.spans(
+                        self.allocator,
+                        language,
+                        source,
+                    );
+                    break :blk owned_highlights.?;
+                }
+            else
+                &.{};
 
         var line_start: usize = 0;
         while (line_start < source.len) {
@@ -1174,6 +1276,10 @@ fn enterBlock(
             defer builder.allocator.free(language_name);
             builder.code_language =
                 highlight.Language.fromMarkdownName(language_name);
+            if (builder.code_language != null) {
+                builder.current_code_block_index = builder.code_block_index;
+                builder.code_block_index += 1;
+            }
         },
         c.MD_BLOCK_HR => {
             builder.appendText("────────────────") catch |err|
@@ -1631,6 +1737,53 @@ test "fenced code parses multiline syntax as one document" {
         }
     }
     try std.testing.expect(heredoc_is_string);
+}
+
+test "completed fenced code reuses cached syntax spans" {
+    var screen: vaxis.Screen = undefined;
+    const window = testWindow(&screen, 100);
+    var cache: HighlightCache = .{};
+    defer cache.deinit(std.testing.allocator);
+    const source = "```zig\nconst answer = 42;\n```";
+
+    var first = try Layout.initCached(
+        std.testing.allocator,
+        source,
+        window,
+        98,
+        &cache,
+    );
+    defer first.deinit();
+    const first_spans = cache.blocks.items[0].spans;
+
+    var second = try Layout.initCached(
+        std.testing.allocator,
+        source,
+        window,
+        40,
+        &cache,
+    );
+    defer second.deinit();
+    try std.testing.expectEqual(
+        @intFromPtr(first_spans.ptr),
+        @intFromPtr(cache.blocks.items[0].spans.ptr),
+    );
+}
+
+test "unsupported fences do not offset cached supported blocks" {
+    var screen: vaxis.Screen = undefined;
+    const window = testWindow(&screen, 100);
+    var cache: HighlightCache = .{};
+    defer cache.deinit(std.testing.allocator);
+    var layout = try Layout.initCached(
+        std.testing.allocator,
+        "```unknown\nplain\n```\n\n```zig\nconst answer = 42;\n```",
+        window,
+        98,
+        &cache,
+    );
+    defer layout.deinit();
+    try std.testing.expectEqual(@as(usize, 1), cache.blocks.items.len);
 }
 
 test "incomplete streaming prefixes remain visible" {

@@ -95,6 +95,7 @@ fn visibleSelectionRange(
 const MessageEntry = struct {
     role: Role,
     text: std.ArrayList(u8) = .empty,
+    highlight_cache: markdown.HighlightCache = .{},
 
     fn init(
         allocator: std.mem.Allocator,
@@ -108,6 +109,7 @@ const MessageEntry = struct {
     }
 
     fn deinit(self: *MessageEntry, allocator: std.mem.Allocator) void {
+        self.highlight_cache.deinit(allocator);
         self.text.deinit(allocator);
         self.* = undefined;
     }
@@ -277,20 +279,32 @@ fn highlightBashInput(
     command: []const u8,
 ) ![]highlight.Span {
     const prefix = "Command: ";
-    if (!std.mem.startsWith(u8, display, prefix)) {
+    const label_start = topLevelLabelStart(display, prefix) orelse {
         return allocator.alloc(highlight.Span, 0);
-    }
+    };
+    const command_start = label_start + prefix.len;
     const command_spans = try highlight.spans(allocator, .bash, command);
     defer allocator.free(command_spans);
     const result = try allocator.alloc(highlight.Span, command_spans.len);
     for (command_spans, result) |span, *mapped| {
         mapped.* = .{
-            .start = prefix.len + commandDisplayOffset(command, span.start),
-            .end = prefix.len + commandDisplayOffset(command, span.end),
+            .start = command_start + commandDisplayOffset(command, span.start),
+            .end = command_start + commandDisplayOffset(command, span.end),
             .token = span.token,
         };
     }
     return result;
+}
+
+fn topLevelLabelStart(display: []const u8, label: []const u8) ?usize {
+    if (std.mem.startsWith(u8, display, label)) return 0;
+    var offset: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, display, offset, '\n')) |newline| {
+        const start = newline + 1;
+        if (std.mem.startsWith(u8, display[start..], label)) return start;
+        offset = start;
+    }
+    return null;
 }
 
 fn commandDisplayOffset(command: []const u8, end: usize) usize {
@@ -872,11 +886,12 @@ const Projection = struct {
                             .kind = .role,
                             .entry_index = entry_index,
                         });
-                        var layout = try markdown.Layout.init(
+                        var layout = try markdown.Layout.initCached(
                             allocator,
                             message.text.items,
                             window,
                             @max(window.width -| 2, 1),
+                            &message.highlight_cache,
                         );
                         defer layout.deinit();
                         for (layout.lines.items) |*line| {
@@ -3273,6 +3288,23 @@ test "tool details highlight shell input and supported read output" {
     try std.testing.expectEqualStrings(
         "printf",
         bash_entry.input_display[command_name.start..command_name.end],
+    );
+
+    var reordered_started = try toolStarted(
+        "bash-highlight-reordered",
+        "{\"timeout\":30,\"command\":\"printf ready\"}",
+        .{ .bash = .{ .command = "printf ready" } },
+    );
+    defer reordered_started.deinit();
+    var reordered_entry = try ToolEntry.init(
+        std.testing.allocator,
+        &reordered_started,
+    );
+    defer reordered_entry.deinit(std.testing.allocator);
+    const reordered_command = reordered_entry.input_highlights[0];
+    try std.testing.expectEqualStrings(
+        "printf",
+        reordered_entry.input_display[reordered_command.start..reordered_command.end],
     );
 
     var read_started = try toolStarted(
