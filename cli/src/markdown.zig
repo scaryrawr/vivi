@@ -1216,6 +1216,11 @@ fn appendTerminalText(builder: *Builder, text: []const u8) !void {
     var start: usize = 0;
     for (text, 0..) |byte, index| {
         if (byte >= 0x20 and byte != 0x7f) continue;
+        if (byte == '\n' and builder.code_block) {
+            try builder.appendText(text[start .. index + 1]);
+            start = index + 1;
+            continue;
+        }
         if (start < index) try builder.appendText(text[start..index]);
 
         const codepoint: u21 = if (byte == 0x7f)
@@ -1442,6 +1447,26 @@ test "text controls render as visible control pictures" {
         "entity: ␛ ␊ ␉ ␡ raw: ␛␡",
         rendered.items,
     );
+}
+
+test "fenced code retains line breaks while escaping controls" {
+    var screen: vaxis.Screen = undefined;
+    const window = testWindow(&screen, 100);
+    var layout = try Layout.init(
+        std.testing.allocator,
+        "```\nfirst\x1b\nsecond\n```",
+        window,
+        98,
+    );
+    defer layout.deinit();
+
+    var rendered: std.ArrayList(u8) = .empty;
+    defer rendered.deinit(std.testing.allocator);
+    try appendLayoutText(std.testing.allocator, &rendered, &layout);
+    try std.testing.expect(
+        std.mem.indexOf(u8, rendered.items, "  first␛\n  second") != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, rendered.items, "␊") == null);
 }
 
 test "incomplete streaming prefixes remain visible" {

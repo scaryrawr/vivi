@@ -5,10 +5,10 @@ Vivi vendors md4c release 0.5.3 from
 
 The parser and its generated HTML entity lookup are included:
 
-- `src/md4c.c`
-- `src/md4c.h`
-- `src/entity.c`
-- `src/entity.h`
+- `md4c.c`
+- `md4c.h`
+- `entity.c`
+- `entity.h`
 - `LICENSE.md`
 
 The files are unmodified from that release. Their SHA-256 checksums are:

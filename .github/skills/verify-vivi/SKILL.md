@@ -171,6 +171,7 @@ doctor
 cli-discovery <run-id>
 chat-streaming <run-id>
 chat-streaming-input <run-id>
+chat-markdown <run-id>
 chat-ask-user <run-id>
 chat-model-menu <run-id>
 chat-session-resume <run-id>
