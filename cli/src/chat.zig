@@ -15,6 +15,7 @@ const menu_selected_background = vaxis.Color{ .index = 238 };
 
 const AppEvent = union(enum) {
     key_press: vaxis.Key,
+    mouse: vaxis.Mouse,
     winsize: vaxis.Winsize,
     conversation_wake,
 };
@@ -749,6 +750,8 @@ const KeyOutcome = enum {
     force_exit,
 };
 
+const mouse_wheel_rows: usize = 3;
+
 const MenuDetail = union(enum) {
     text: []const u8,
     model: struct {
@@ -1182,6 +1185,20 @@ const ChatUi = struct {
             self.phase = .loading_commands;
         }
         return .keep_running;
+    }
+
+    fn handleMouse(self: *ChatUi, mouse: vaxis.Mouse) void {
+        if (mouse.row < 0 or
+            @as(usize, @intCast(mouse.row)) >= self.last_viewport_rows)
+        {
+            return;
+        }
+
+        switch (mouse.button) {
+            .wheel_up => self.scrollUp(mouse_wheel_rows),
+            .wheel_down => self.scrollDown(mouse_wheel_rows),
+            else => {},
+        }
     }
 
     fn submitUserInput(
@@ -2365,16 +2382,16 @@ const ChatUi = struct {
         if (window.width == 0) return;
         const hints = if (window.width >= 48)
             switch (self.phase) {
-                .ready => "Enter send  ·  PgUp/PgDn scroll  ·  Ctrl-C quit",
-                .responding => "Enter steer  ·  Ctrl+Enter queue  ·  PgUp/PgDn scroll  ·  Ctrl-C stop",
+                .ready => "Enter send  ·  Wheel/PgUp/PgDn scroll  ·  Ctrl-C quit",
+                .responding => "Enter steer  ·  Ctrl+Enter queue  ·  Wheel/PgUp/PgDn scroll  ·  Ctrl-C stop",
                 .awaiting_input => if (self.hasInputChoices())
                     if (self.hasFreeformChoice())
                         "↑/↓ select  ·  Enter accept  ·  type for other  ·  Ctrl-C stop"
                     else
                         "↑/↓ select  ·  Enter accept  ·  Ctrl-C stop"
                 else
-                    "Enter answer  ·  PgUp/PgDn scroll  ·  Ctrl-C stop",
-                .connecting, .loading_commands, .running_command, .switching, .resuming => "PgUp/PgDn scroll  ·  Ctrl-C stop",
+                    "Enter answer  ·  Wheel/PgUp/PgDn scroll  ·  Ctrl-C stop",
+                .connecting, .loading_commands, .running_command, .switching, .resuming => "Wheel/PgUp/PgDn scroll  ·  Ctrl-C stop",
                 .stopping => "Ctrl-C again force exit",
             }
         else if (window.width >= 24)
@@ -2504,17 +2521,25 @@ const ChatUi = struct {
 
     fn pageUp(self: *ChatUi) void {
         const page_rows = @max(self.last_viewport_rows -| 1, 1);
-        const max_scroll = self.last_total_rows -|
-            @min(self.last_total_rows, self.last_viewport_rows);
-        self.rows_from_tail = @min(
-            self.rows_from_tail + page_rows,
-            max_scroll,
-        );
+        self.scrollUp(page_rows);
     }
 
     fn pageDown(self: *ChatUi) void {
         const page_rows = @max(self.last_viewport_rows -| 1, 1);
-        self.rows_from_tail -|= page_rows;
+        self.scrollDown(page_rows);
+    }
+
+    fn scrollUp(self: *ChatUi, rows: usize) void {
+        const max_scroll = self.last_total_rows -|
+            @min(self.last_total_rows, self.last_viewport_rows);
+        self.rows_from_tail = @min(
+            self.rows_from_tail + rows,
+            max_scroll,
+        );
+    }
+
+    fn scrollDown(self: *ChatUi, rows: usize) void {
+        self.rows_from_tail -|= rows;
     }
 
     fn followTail(self: *ChatUi) void {
@@ -2599,6 +2624,7 @@ const App = struct {
         try self.loop.start();
         try self.vx.enterAltScreen(self.tty.writer());
         try self.vx.queryTerminal(self.tty.writer(), .fromSeconds(1));
+        try self.vx.setMouseMode(self.tty.writer(), true);
         const use_signal_resize = !self.vx.state.in_band_resize;
         if (use_signal_resize) try self.loop.installResizeHandler();
         defer if (use_signal_resize) self.loop.uninstallResizeHandler();
@@ -2611,6 +2637,7 @@ const App = struct {
                     .keep_running => {},
                     .force_exit => self.hardExit(),
                 },
+                .mouse => |mouse| self.ui.handleMouse(mouse),
                 .winsize => |winsize| {
                     try self.vx.resize(
                         self.allocator,
@@ -3203,6 +3230,68 @@ test "tool events preserve a scrolled transcript position" {
 
     _ = try ui.applyConversationEvent(&finished_event);
     try std.testing.expectEqual(@as(usize, 5), ui.rows_from_tail);
+}
+
+test "mouse wheel scrolls the transcript within its bounds" {
+    var ui: ChatUi = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .input = TextInput.init(std.testing.allocator),
+        .cwd = try std.testing.allocator.dupe(u8, "."),
+        .last_total_rows = 20,
+        .last_viewport_rows = 8,
+    };
+    defer ui.deinit();
+
+    ui.handleMouse(.{
+        .col = 2,
+        .row = 4,
+        .button = .wheel_up,
+        .mods = .{},
+        .type = .press,
+    });
+    try std.testing.expectEqual(mouse_wheel_rows, ui.rows_from_tail);
+
+    ui.handleMouse(.{
+        .col = 2,
+        .row = 4,
+        .button = .wheel_down,
+        .mods = .{},
+        .type = .press,
+    });
+    try std.testing.expectEqual(@as(usize, 0), ui.rows_from_tail);
+
+    for (0..10) |_| {
+        ui.handleMouse(.{
+            .col = 2,
+            .row = 4,
+            .button = .wheel_up,
+            .mods = .{},
+            .type = .press,
+        });
+    }
+    try std.testing.expectEqual(@as(usize, 12), ui.rows_from_tail);
+}
+
+test "mouse wheel outside the transcript does not scroll" {
+    var ui: ChatUi = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .input = TextInput.init(std.testing.allocator),
+        .cwd = try std.testing.allocator.dupe(u8, "."),
+        .last_total_rows = 20,
+        .last_viewport_rows = 8,
+    };
+    defer ui.deinit();
+
+    ui.handleMouse(.{
+        .col = 2,
+        .row = 8,
+        .button = .wheel_up,
+        .mods = .{},
+        .type = .press,
+    });
+    try std.testing.expectEqual(@as(usize, 0), ui.rows_from_tail);
 }
 
 test "tool activity draws its compact row to the terminal screen" {
