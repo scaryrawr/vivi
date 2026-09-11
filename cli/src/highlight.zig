@@ -88,8 +88,8 @@ pub const Language = enum {
             \\["$" "&&" ">" ">>" "<" "|"] @operator
             ,
             .json =>
-            \\(pair key: (_) @property)
             \\(string) @string
+            \\(pair key: (_) @property)
             \\(number) @number
             \\[(null) (true) (false)] @constant
             \\(escape_sequence) @operator
@@ -205,13 +205,23 @@ test "tree-sitter produces semantic spans" {
     }
     try std.testing.expect(saw_keyword and saw_number and saw_comment);
 
+    const json_source = "{\"ready\": \"yes\", \"count\": 2}";
     const json = try spans(
         std.testing.allocator,
         .json,
-        "{\"ready\": true, \"count\": 2}",
+        json_source,
     );
     defer std.testing.allocator.free(json);
-    try std.testing.expect(json.len > 0);
+    var saw_property = false;
+    var saw_string_value = false;
+    for (json) |span| {
+        const text = json_source[span.start..span.end];
+        saw_property = saw_property or
+            (span.token == .property and std.mem.eql(u8, text, "\"ready\""));
+        saw_string_value = saw_string_value or
+            (span.token == .string and std.mem.eql(u8, text, "\"yes\""));
+    }
+    try std.testing.expect(saw_property and saw_string_value);
 }
 
 test "highlighting is bounded for large sources" {
