@@ -109,21 +109,40 @@ test "tool argument parsing and fallback release all allocations on failure" {
 }
 
 pub fn renderLiteral(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    return renderSafeText(allocator, text, false);
+}
+
+pub fn renderMarkdown(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    return renderSafeText(allocator, text, true);
+}
+
+fn renderSafeText(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    preserve_markdown_whitespace: bool,
+) ![]u8 {
     var result: std.ArrayList(u8) = .empty;
     defer result.deinit(allocator);
     var index: usize = 0;
     while (index < text.len) {
         const byte = text[index];
+        if (preserve_markdown_whitespace and byte == '\r') {
+            try result.append(allocator, '\n');
+            index += if (index + 1 < text.len and text[index + 1] == '\n') 2 else 1;
+            continue;
+        }
         const length = std.unicode.utf8ByteSequenceLength(byte) catch 0;
         const codepoint = if (length > 0 and index + length <= text.len)
             std.unicode.utf8Decode(text[index..][0..length]) catch null
         else
             null;
         if (codepoint) |value| {
-            if (value == '\n' or (value >= 0x20 and value != 0x7f and
-                !(value >= 0x80 and value <= 0x9f) and
-                !(value >= 0x202a and value <= 0x202e) and
-                !(value >= 0x2066 and value <= 0x2069)))
+            if (value == '\n' or
+                (preserve_markdown_whitespace and value == '\t') or
+                (value >= 0x20 and value != 0x7f and
+                    !(value >= 0x80 and value <= 0x9f) and
+                    !(value >= 0x202a and value <= 0x202e) and
+                    !(value >= 0x2066 and value <= 0x2069)))
             {
                 try result.appendSlice(allocator, text[index..][0..length]);
                 index += length;
@@ -136,6 +155,18 @@ pub fn renderLiteral(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
         index += 1;
     }
     return result.toOwnedSlice(allocator);
+}
+
+test "Markdown display preserves structural whitespace and escapes controls" {
+    const rendered = try renderMarkdown(
+        std.testing.allocator,
+        "# Heading\r\n\r\n\tcode\r- item\tcontinued\x1b[31m",
+    );
+    defer std.testing.allocator.free(rendered);
+    try std.testing.expectEqualStrings(
+        "# Heading\n\n\tcode\n- item\tcontinued\\x1b[31m",
+        rendered,
+    );
 }
 
 test "tool literal display preserves multiline markdown and escapes unsafe bytes" {

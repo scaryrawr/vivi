@@ -241,7 +241,14 @@ const ToolEntry = struct {
         };
         const output = try allocator.dupe(u8, text);
         errdefer allocator.free(output);
-        const output_display = try tool_renderer.renderLiteral(allocator, output);
+        const succeeded = switch (completion) {
+            .succeeded => true,
+            .failed => false,
+        };
+        const output_display = if (self.output_markdown and succeeded)
+            try tool_renderer.renderMarkdown(allocator, output)
+        else
+            try tool_renderer.renderLiteral(allocator, output);
         errdefer allocator.free(output_display);
         self.output = output;
         self.output_display = output_display;
@@ -4548,8 +4555,13 @@ test "tool activity draws its compact row to the terminal screen" {
 }
 
 test "successful Markdown reads use the transcript Markdown renderer" {
-    var transcript: Transcript = .{};
-    defer transcript.deinit(std.testing.allocator);
+    var ui: ChatUi = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .input = TextInput.init(std.testing.allocator),
+        .cwd = try std.testing.allocator.dupe(u8, "."),
+    };
+    defer ui.deinit();
     var started = try toolStarted(
         "markdown-read",
         "{\"path\":\"README.md\"}",
@@ -4560,25 +4572,25 @@ test "successful Markdown reads use the transcript Markdown renderer" {
         } },
     );
     defer started.deinit();
-    try transcript.applyToolActivity(
+    try ui.transcript.applyToolActivity(
         std.testing.allocator,
         &.{ .started = started },
     );
     var finished = try toolFinished(
         "markdown-read",
-        .{ .succeeded = "# Rendered Heading\n\n**bold text**\n\n" ++
-            "| Feature | Status |\n| --- | --- |\n| Markdown | Rich |" },
+        .{ .succeeded = "# Rendered Heading\r\n\r\n**bold text** and [docs](https://example.com)\r\n\r\n" ++
+            "| Feature | Status |\r\n| --- | --- |\r\n| Markdown | Rich |\r\n\r\n\tcode" },
     );
     defer finished.deinit();
-    try transcript.applyToolActivity(
+    try ui.transcript.applyToolActivity(
         std.testing.allocator,
         &.{ .finished = finished },
     );
-    transcript.entries.items[0].tool.expanded = true;
+    ui.transcript.entries.items[0].tool.expanded = true;
 
     var screen = try vaxis.Screen.init(std.testing.allocator, .{
-        .rows = 12,
-        .cols = 60,
+        .rows = 30,
+        .cols = 70,
         .x_pixel = 0,
         .y_pixel = 0,
     });
@@ -4592,30 +4604,53 @@ test "successful Markdown reads use the transcript Markdown renderer" {
         .height = screen.height,
         .screen = &screen,
     };
-    var projection = try Projection.build(
-        std.testing.allocator,
-        &transcript,
-        window,
-    );
+    var projection = (try ui.draw(window)).?;
     defer projection.deinit(std.testing.allocator);
 
     var saw_heading = false;
     var saw_bold = false;
     var saw_table_border = false;
-    for (projection.lines.items) |line| {
-        if (line.kind != .tool_output_markdown) continue;
-        for (projection.markdown_lines.items[line.start].segments.items) |segment| {
-            saw_heading = saw_heading or
-                (segment.style.heading and std.mem.indexOf(u8, segment.text, "Rendered Heading") != null);
-            saw_bold = saw_bold or
-                (segment.style.bold and std.mem.indexOf(u8, segment.text, "bold text") != null);
-            saw_table_border = saw_table_border or
-                std.mem.indexOf(u8, segment.text, "┌") != null;
+    var saw_link = false;
+    var markdown_hit_rows: usize = 0;
+    for (0..screen.height) |row| {
+        var text: std.ArrayList(u8) = .empty;
+        defer text.deinit(std.testing.allocator);
+        for (0..screen.width) |column| {
+            const cell = screen.readCell(
+                @intCast(column),
+                @intCast(row),
+            ).?;
+            try text.appendSlice(std.testing.allocator, cell.char.grapheme);
+            saw_link = saw_link or
+                std.mem.eql(u8, cell.link.uri, "https://example.com");
         }
+        if (row < ui.tool_hits.items.len and ui.tool_hits.items[row] == 0) {
+            markdown_hit_rows += 1;
+        }
+        if (std.mem.indexOf(u8, text.items, "Rendered Heading")) |heading| {
+            saw_heading = true;
+            try std.testing.expect(std.mem.indexOfScalar(u8, text.items, '#') == null);
+            const cell = screen.readCell(@intCast(heading), @intCast(row)).?;
+            try std.testing.expect(cell.style.bold);
+            try std.testing.expectEqual(tool_detail_background, cell.style.bg);
+        }
+        if (std.mem.indexOf(u8, text.items, "bold text")) |bold| {
+            saw_bold = true;
+            try std.testing.expect(screen.readCell(@intCast(bold), @intCast(row)).?.style.bold);
+        }
+        saw_table_border = saw_table_border or
+            std.mem.indexOf(u8, text.items, "┌") != null;
     }
     try std.testing.expect(saw_heading);
     try std.testing.expect(saw_bold);
     try std.testing.expect(saw_table_border);
+    try std.testing.expect(saw_link);
+    try std.testing.expect(markdown_hit_rows > 3);
+    try std.testing.expectEqualStrings(
+        "# Rendered Heading\n\n**bold text** and [docs](https://example.com)\n\n" ++
+            "| Feature | Status |\n| --- | --- |\n| Markdown | Rich |\n\n\tcode",
+        ui.transcript.entries.items[0].tool.output_display.?,
+    );
 }
 
 test "Markdown read detection is extension based and case insensitive" {
