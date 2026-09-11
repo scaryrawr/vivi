@@ -131,6 +131,9 @@ const ListState = struct {
 const Table = struct {
     columns: usize,
     header_rows: usize,
+    first_prefix: Line = .{},
+    continuation_prefix: Line = .{},
+    emitted_lines: usize = 0,
     rows: std.ArrayList(Row) = .empty,
 
     const Alignment = enum {
@@ -158,6 +161,8 @@ const Table = struct {
     };
 
     fn deinit(self: *Table, allocator: std.mem.Allocator) void {
+        self.first_prefix.deinit(allocator);
+        self.continuation_prefix.deinit(allocator);
         for (self.rows.items) |*row| row.deinit(allocator);
         self.rows.deinit(allocator);
         self.* = undefined;
@@ -358,7 +363,28 @@ const Builder = struct {
         var prefix: []u8 = undefined;
         const list = &self.lists.items[self.lists.items.len - 1];
         const item: *const c.MD_BLOCK_LI_DETAIL = @ptrCast(@alignCast(detail.?));
-        if (item.is_task != 0) {
+        if (list.ordered) {
+            if (item.is_task != 0) {
+                prefix = try std.fmt.allocPrint(
+                    self.allocator,
+                    "{d}. {s} ",
+                    .{
+                        list.next,
+                        if (item.task_mark == 'x' or item.task_mark == 'X')
+                            "☑"
+                        else
+                            "☐",
+                    },
+                );
+            } else {
+                prefix = try std.fmt.allocPrint(
+                    self.allocator,
+                    "{d}. ",
+                    .{list.next},
+                );
+            }
+            list.next += 1;
+        } else if (item.is_task != 0) {
             prefix = try std.fmt.allocPrint(
                 self.allocator,
                 "{s} ",
@@ -367,13 +393,6 @@ const Builder = struct {
                 else
                     "☐"},
             );
-        } else if (list.ordered) {
-            prefix = try std.fmt.allocPrint(
-                self.allocator,
-                "{d}. ",
-                .{list.next},
-            );
-            list.next += 1;
         } else {
             prefix = try self.allocator.dupe(u8, "• ");
         }
@@ -402,10 +421,54 @@ const Builder = struct {
         if (self.failure != null) return self.failure.?;
         const info: *const c.MD_BLOCK_TABLE_DETAIL =
             @ptrCast(@alignCast(detail.?));
-        self.table = .{
+        var table = Table{
             .columns = info.col_count,
             .header_rows = info.head_row_count,
         };
+        errdefer table.deinit(self.allocator);
+        var indent: u16 = 0;
+        for (0..self.quote_depth) |_| {
+            try table.first_prefix.append(
+                self.allocator,
+                "│ ",
+                .{ .italic = true },
+                null,
+            );
+            try table.continuation_prefix.append(
+                self.allocator,
+                "│ ",
+                .{ .italic = true },
+                null,
+            );
+            indent +|= 2;
+        }
+        if (self.pending_list_prefix) |prefix| {
+            try table.first_prefix.append(self.allocator, prefix, .{}, null);
+            const prefix_width = self.window.gwidth(prefix);
+            try appendIndent(
+                self.allocator,
+                &table.continuation_prefix,
+                prefix_width,
+            );
+            indent +|= prefix_width;
+            self.allocator.free(prefix);
+            self.pending_list_prefix = null;
+        } else if (self.list_item_indents.items.len > 0) {
+            const item_indent =
+                self.list_item_indents.items[self.list_item_indents.items.len - 1];
+            try appendIndent(self.allocator, &table.first_prefix, item_indent);
+            try appendIndent(
+                self.allocator,
+                &table.continuation_prefix,
+                item_indent,
+            );
+            indent +|= item_indent;
+        }
+        table.first_prefix.leading_width = indent;
+        table.first_prefix.continuation_indent = indent;
+        table.continuation_prefix.leading_width = indent;
+        table.continuation_prefix.continuation_indent = indent;
+        self.table = table;
     }
 
     fn finishCell(self: *Builder) !void {
@@ -451,6 +514,7 @@ const Builder = struct {
         }
         var grid_width: usize = 1;
         for (widths) |cell_width| grid_width += cell_width + 3;
+        grid_width += lineWidth(self.window, table.continuation_prefix);
         if (grid_width <= self.width) {
             try self.renderGridTable(&table, widths);
         } else {
@@ -461,12 +525,12 @@ const Builder = struct {
 
     fn renderGridTable(
         self: *Builder,
-        table: *const Table,
+        table: *Table,
         widths: []const u16,
     ) !void {
-        try self.appendTableBorder(widths, "┌", "┬", "┐", "─");
+        try self.appendTableBorder(table, widths, "┌", "┬", "┐", "─");
         for (table.rows.items, 0..) |row, row_index| {
-            self.current = .{ .code = true };
+            try self.beginTableLine(table, true);
             try self.appendLiteral("│ ", .{});
             for (0..table.columns) |column| {
                 if (column > 0) try self.appendLiteral(" ", .{});
@@ -499,21 +563,29 @@ const Builder = struct {
             }
             self.finishLine();
             if (row_index + 1 == table.header_rows) {
-                try self.appendTableBorder(widths, "├", "┼", "┤", "─");
+                try self.appendTableBorder(
+                    table,
+                    widths,
+                    "├",
+                    "┼",
+                    "┤",
+                    "─",
+                );
             }
         }
-        try self.appendTableBorder(widths, "└", "┴", "┘", "─");
+        try self.appendTableBorder(table, widths, "└", "┴", "┘", "─");
     }
 
     fn appendTableBorder(
         self: *Builder,
+        table: *Table,
         widths: []const u16,
         left: []const u8,
         middle: []const u8,
         right: []const u8,
         horizontal: []const u8,
     ) !void {
-        self.current = .{ .code = true };
+        try self.beginTableLine(table, true);
         try self.appendLiteral(left, .{ .bold = true });
         for (widths, 0..) |cell_width, column| {
             try self.appendLiteral("─", .{ .bold = true });
@@ -529,15 +601,39 @@ const Builder = struct {
         self.finishLine();
     }
 
+    fn beginTableLine(
+        self: *Builder,
+        table: *Table,
+        code: bool,
+    ) !void {
+        self.current = .{ .code = code };
+        const prefix = if (table.emitted_lines == 0)
+            table.first_prefix
+        else
+            table.continuation_prefix;
+        for (prefix.segments.items) |segment| {
+            const line = &self.current.?;
+            try line.append(
+                self.allocator,
+                segment.text,
+                segment.style,
+                segment.uri,
+            );
+        }
+        self.current.?.leading_width = prefix.leading_width;
+        self.current.?.continuation_indent = prefix.continuation_indent;
+        table.emitted_lines += 1;
+    }
+
     fn appendPadding(self: *Builder, count: u16) !void {
         for (0..count) |_| try self.appendLiteral(" ", .{});
     }
 
-    fn renderStackedTable(self: *Builder, table: *const Table) !void {
+    fn renderStackedTable(self: *Builder, table: *Table) !void {
         if (table.rows.items.len <= table.header_rows) {
             for (table.rows.items) |row| {
                 for (row.cells.items) |cell| {
-                    self.current = .{};
+                    try self.beginTableLine(table, false);
                     for (cell.line.segments.items) |segment| {
                         var style = segment.style;
                         style.bold = true;
@@ -558,7 +654,7 @@ const Builder = struct {
         const headers = table.rows.items[0];
         for (table.rows.items[table.header_rows..], 0..) |row, row_index| {
             for (0..table.columns) |column| {
-                self.current = .{};
+                try self.beginTableLine(table, false);
                 if (column < headers.cells.items.len) {
                     for (headers.cells.items[column].line.segments.items) |segment| {
                         var style = segment.style;
@@ -798,6 +894,9 @@ fn isWrapWhitespace(byte: u8) bool {
 }
 
 fn safeUri(uri: []const u8) bool {
+    for (uri) |byte| {
+        if (byte < 0x20 or byte == 0x7f) return false;
+    }
     const schemes = [_][]const u8{ "https://", "http://", "mailto:" };
     for (schemes) |scheme| {
         if (uri.len >= scheme.len and
@@ -990,6 +1089,9 @@ fn leaveBlock(
             }
         },
         c.MD_BLOCK_LI => {
+            if (builder.pending_list_prefix != null) {
+                _ = builder.ensureLine() catch |err| return builder.fail(err);
+            }
             builder.finishLine();
             _ = builder.list_item_indents.pop();
         },
@@ -1140,6 +1242,8 @@ test "safe link schemes" {
     try std.testing.expect(safeUri("https://example.com"));
     try std.testing.expect(safeUri("HTTP://example.com"));
     try std.testing.expect(safeUri("mailto:test@example.com"));
+    try std.testing.expect(!safeUri("https://example.com/\x07"));
+    try std.testing.expect(!safeUri("https://example.com/\x1b"));
     try std.testing.expect(!safeUri("javascript:alert(1)"));
     try std.testing.expect(!safeUri("file:///etc/passwd"));
 }
@@ -1276,6 +1380,25 @@ test "entities are decoded in text and link destinations" {
     try std.testing.expect(saw_decoded_link);
 }
 
+test "decoded controls are rejected from link destinations" {
+    var screen: vaxis.Screen = undefined;
+    const window = testWindow(&screen, 100);
+    var layout = try Layout.init(
+        std.testing.allocator,
+        "[bell](https://example.test/&#7;) " ++
+            "[escape](https://example.test/&#27;)",
+        window,
+        98,
+    );
+    defer layout.deinit();
+
+    for (layout.lines.items) |line| {
+        for (line.segments.items) |segment| {
+            try std.testing.expect(segment.uri == null);
+        }
+    }
+}
+
 test "incomplete streaming prefixes remain visible" {
     var screen: vaxis.Screen = undefined;
     const window = testWindow(&screen, 40);
@@ -1399,6 +1522,48 @@ test "multiline list items retain hanging indentation" {
     );
 }
 
+test "ordered task items advance numbering" {
+    var screen: vaxis.Screen = undefined;
+    const window = testWindow(&screen, 80);
+    var layout = try Layout.init(
+        std.testing.allocator,
+        "1. [x] done\n2. next",
+        window,
+        78,
+    );
+    defer layout.deinit();
+    var rendered: std.ArrayList(u8) = .empty;
+    defer rendered.deinit(std.testing.allocator);
+    try appendLayoutText(std.testing.allocator, &rendered, &layout);
+
+    try std.testing.expect(
+        std.mem.indexOf(u8, rendered.items, "1. ☑ done") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, rendered.items, "2. next") != null,
+    );
+}
+
+test "empty list items do not leak their prefixes" {
+    var screen: vaxis.Screen = undefined;
+    const window = testWindow(&screen, 80);
+    var layout = try Layout.init(
+        std.testing.allocator,
+        "-\n-\n\nparagraph",
+        window,
+        78,
+    );
+    defer layout.deinit();
+    var rendered: std.ArrayList(u8) = .empty;
+    defer rendered.deinit(std.testing.allocator);
+    try appendLayoutText(std.testing.allocator, &rendered, &layout);
+
+    try std.testing.expect(std.mem.endsWith(u8, rendered.items, "\nparagraph"));
+    try std.testing.expect(
+        std.mem.indexOf(u8, rendered.items, "• paragraph") == null,
+    );
+}
+
 test "wide tables render as a grid" {
     var screen: vaxis.Screen = undefined;
     const window = testWindow(&screen, 80);
@@ -1446,6 +1611,36 @@ test "wide tables honor column alignment" {
             "│ x    │   y    │     z │",
         ) != null,
     );
+}
+
+test "tables retain enclosing quote and list prefixes" {
+    var screen: vaxis.Screen = undefined;
+    const window = testWindow(&screen, 100);
+    var quoted = try Layout.init(
+        std.testing.allocator,
+        "> | A | B |\n> | --- | --- |\n> | x | y |",
+        window,
+        98,
+    );
+    defer quoted.deinit();
+    for (quoted.lines.items) |line| {
+        if (line.segments.items.len == 0) continue;
+        try std.testing.expectEqualStrings("│ ", line.segments.items[0].text);
+    }
+
+    var listed = try Layout.init(
+        std.testing.allocator,
+        "- | A | B |\n  | --- | --- |\n  | x | y |",
+        window,
+        98,
+    );
+    defer listed.deinit();
+    var rendered: std.ArrayList(u8) = .empty;
+    defer rendered.deinit(std.testing.allocator);
+    try appendLayoutText(std.testing.allocator, &rendered, &listed);
+    try std.testing.expect(std.mem.startsWith(u8, rendered.items, "• ┌"));
+    try std.testing.expect(std.mem.indexOf(u8, rendered.items, "\n  │") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered.items, "\n  └") != null);
 }
 
 test "narrow tables render as stacked header values" {
