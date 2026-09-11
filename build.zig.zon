@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .copilot_sdk = .{
-            .url = "git+https://github.com/scaryrawr/copilot-sdk-zig#863e0c3b092fc1da4d891d034ae8b700333a815b",
-            .hash = "copilot_sdk-0.1.0-PjGl0Q3sAgC2ZK-6JZXZBIDFH_qZVx6of1o4lFb86wWV",
+            .url = "git+https://github.com/scaryrawr/copilot-sdk-zig#0ff789b0e1401d9782c770af81e9bd3b271f9523",
+            .hash = "copilot_sdk-0.1.0-PjGl0W3rAgB5yc6m1b91kEjV1KR6aX__7BtFjmjCDSfJ",
         },
         .vaxis = .{
             .url = "git+https://github.com/rockorager/libvaxis.git#44dbbb7802801d11b22ce6eabe22f56550dc26c6",
