@@ -57,9 +57,15 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("cli/src/main.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
     cli_module.addImport("vivi_backend", backend);
     cli_module.addImport("vaxis", vaxis.module("vaxis"));
+    cli_module.addIncludePath(b.path("third_party/md4c"));
+    cli_module.addCSourceFile(.{
+        .file = b.path("third_party/md4c/md4c.c"),
+        .flags = &.{"-std=c99"},
+    });
 
     const cli = b.addExecutable(.{
         .name = "vivi",
@@ -78,6 +84,42 @@ pub fn build(b: *std.Build) void {
 
     const cli_tests = b.addTest(.{ .root_module = cli_module });
     const run_cli_tests = b.addRunArtifact(cli_tests);
+
+    const chat_tests_module = b.createModule(.{
+        .root_source_file = b.path("cli/src/chat.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    chat_tests_module.addImport("vivi_backend", backend);
+    chat_tests_module.addImport("vaxis", vaxis.module("vaxis"));
+    chat_tests_module.addIncludePath(b.path("third_party/md4c"));
+    chat_tests_module.addCSourceFile(.{
+        .file = b.path("third_party/md4c/md4c.c"),
+        .flags = &.{"-std=c99"},
+    });
+    const chat_tests = b.addTest(.{
+        .root_module = chat_tests_module,
+        .filters = &.{"Markdown draw storage remains valid"},
+    });
+    const run_chat_tests = b.addRunArtifact(chat_tests);
+
+    const markdown_tests_module = b.createModule(.{
+        .root_source_file = b.path("cli/src/markdown.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    markdown_tests_module.addImport("vaxis", vaxis.module("vaxis"));
+    markdown_tests_module.addIncludePath(b.path("third_party/md4c"));
+    markdown_tests_module.addCSourceFile(.{
+        .file = b.path("third_party/md4c/md4c.c"),
+        .flags = &.{"-std=c99"},
+    });
+    const markdown_tests = b.addTest(.{
+        .root_module = markdown_tests_module,
+    });
+    const run_markdown_tests = b.addRunArtifact(markdown_tests);
 
     const c_smoke_module = b.createModule(.{
         .target = target,
@@ -100,6 +142,8 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_backend_tests.step);
     test_step.dependOn(&run_cli_tests.step);
+    test_step.dependOn(&run_chat_tests.step);
+    test_step.dependOn(&run_markdown_tests.step);
     test_step.dependOn(&run_c_smoke.step);
 
     const install_c_api = b.step(

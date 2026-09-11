@@ -1,5 +1,6 @@
 const std = @import("std");
 const backend = @import("vivi_backend");
+const markdown = @import("markdown.zig");
 const tool_renderer = @import("tool_renderer.zig");
 const vaxis = @import("vaxis");
 
@@ -614,6 +615,7 @@ const LineKind = enum {
     blank,
     role,
     body,
+    markdown,
     status,
     tool,
 };
@@ -627,8 +629,11 @@ const RenderLine = struct {
 
 const Projection = struct {
     lines: std.ArrayList(RenderLine) = .empty,
+    markdown_lines: std.ArrayList(markdown.Line) = .empty,
 
     fn deinit(self: *Projection, allocator: std.mem.Allocator) void {
+        for (self.markdown_lines.items) |*line| line.deinit(allocator);
+        self.markdown_lines.deinit(allocator);
         self.lines.deinit(allocator);
         self.* = undefined;
     }
@@ -650,7 +655,35 @@ const Projection = struct {
             }
             switch (entry) {
                 .message => |message| switch (message.role) {
-                    .user, .queued, .reasoning, .assistant, .question => {
+                    .reasoning, .assistant => {
+                        try projection.lines.append(allocator, .{
+                            .kind = .role,
+                            .entry_index = entry_index,
+                        });
+                        var layout = try markdown.Layout.init(
+                            allocator,
+                            message.text.items,
+                            window,
+                            @max(window.width -| 2, 1),
+                        );
+                        defer layout.deinit();
+                        for (layout.lines.items) |*line| {
+                            const markdown_index =
+                                projection.markdown_lines.items.len;
+                            try projection.markdown_lines.append(
+                                allocator,
+                                line.*,
+                            );
+                            line.* = .{};
+                            try projection.lines.append(allocator, .{
+                                .kind = .markdown,
+                                .entry_index = entry_index,
+                                .start = markdown_index,
+                            });
+                        }
+                        layout.lines.clearRetainingCapacity();
+                    },
+                    .user, .queued, .question => {
                         try projection.lines.append(allocator, .{
                             .kind = .role,
                             .entry_index = entry_index,
@@ -1762,7 +1795,10 @@ const ChatUi = struct {
         }
     }
 
-    fn draw(self: *ChatUi, root: vaxis.Window) !void {
+    fn draw(self: *ChatUi, root: vaxis.Window) !?Projection {
+        var projection: ?Projection = null;
+        errdefer if (projection) |*value| value.deinit(self.allocator);
+
         const desired_menu_rows: u16 = if (self.phase == .awaiting_input)
             self.userInputPanelRows(root)
         else switch (self.menu_mode) {
@@ -1784,13 +1820,12 @@ const ChatUi = struct {
                 self.last_total_rows = 0;
                 self.last_viewport_rows = transcript_window.height;
             } else {
-                var projection = try Projection.build(
+                projection = try Projection.build(
                     self.allocator,
                     &self.transcript,
                     transcript_window,
                 );
-                defer projection.deinit(self.allocator);
-                self.drawTranscript(transcript_window, &projection);
+                self.drawTranscript(transcript_window, &projection.?);
             }
         }
         if (layout.context) |region| {
@@ -1809,6 +1844,7 @@ const ChatUi = struct {
             self.drawComposer(layout.composer.child(root));
         }
         if (layout.footer) |region| self.drawFooter(region.child(root));
+        return projection;
     }
 
     fn drawMenu(self: *ChatUi, window: vaxis.Window) void {
@@ -2183,7 +2219,12 @@ const ChatUi = struct {
         const last_row = @min(first_row + viewport_rows, total_rows);
 
         for (projection.lines.items[first_row..last_row], 0..) |line, row| {
-            self.drawTranscriptLine(window, @intCast(row), line);
+            self.drawTranscriptLine(
+                window,
+                @intCast(row),
+                projection,
+                line,
+            );
         }
         self.last_total_rows = total_rows;
         self.last_viewport_rows = viewport_rows;
@@ -2193,6 +2234,7 @@ const ChatUi = struct {
         self: *ChatUi,
         window: vaxis.Window,
         row: u16,
+        projection: *const Projection,
         line: RenderLine,
     ) void {
         const entry = self.transcript.entries.items[line.entry_index];
@@ -2246,6 +2288,39 @@ const ChatUi = struct {
                     .col_offset = if (window.width >= 4) 2 else 0,
                     .wrap = .none,
                 });
+            },
+            .markdown => {
+                const message = entry.constMessage().?;
+                const base_style: vaxis.Style =
+                    if (message.role == .reasoning)
+                        .{
+                            .fg = reasoning_color,
+                            .dim = true,
+                            .italic = true,
+                        }
+                    else
+                        .{};
+                const markdown_line = projection.markdown_lines.items[line.start];
+                var column: u16 = if (window.width >= 4) 2 else 0;
+                for (markdown_line.segments.items) |segment| {
+                    var segments = [_]vaxis.Segment{.{
+                        .text = segment.text,
+                        .style = markdown.combineStyle(
+                            base_style,
+                            segment.style,
+                        ),
+                        .link = if (segment.uri) |uri|
+                            .{ .uri = uri }
+                        else
+                            .{},
+                    }};
+                    _ = window.print(&segments, .{
+                        .row_offset = row,
+                        .col_offset = column,
+                        .wrap = .none,
+                    });
+                    column +|= window.gwidth(segment.text);
+                }
             },
             .status => {
                 const message = entry.constMessage().?;
@@ -2638,7 +2713,8 @@ const App = struct {
     fn render(self: *App) !void {
         const root = self.vx.window();
         root.clear();
-        try self.ui.draw(root);
+        var projection = try self.ui.draw(root);
+        defer if (projection) |*value| value.deinit(self.allocator);
         try self.vx.render(self.tty.writer());
         try self.tty.writer().flush();
     }
@@ -2684,11 +2760,18 @@ fn toolFinished(
         failed: []const u8,
     },
 ) !backend.ToolFinished {
-    return backend.ToolFinished.init(
-        std.testing.allocator,
-        call_id,
-        result,
-    );
+    return switch (result) {
+        .succeeded => |value| backend.ToolFinished.init(
+            std.testing.allocator,
+            call_id,
+            .{ .succeeded = value },
+        ),
+        .failed => |value| backend.ToolFinished.init(
+            std.testing.allocator,
+            call_id,
+            .{ .failed = value },
+        ),
+    };
 }
 
 test "transcript replaces streamed draft with completed response" {
@@ -3241,7 +3324,62 @@ test "tool activity draws its compact row to the terminal screen" {
         .height = screen.height,
         .screen = &screen,
     };
-    try ui.draw(window);
+    var projection = try ui.draw(window);
+    defer if (projection) |*value| value.deinit(std.testing.allocator);
+
+    var rendered: std.ArrayList(u8) = .empty;
+    defer rendered.deinit(std.testing.allocator);
+    for (0..screen.height) |row| {
+        for (0..screen.width) |column| {
+            const cell = screen.readCell(
+                @intCast(column),
+                @intCast(row),
+            ).?;
+            try rendered.appendSlice(std.testing.allocator, cell.char.grapheme);
+        }
+
+        try rendered.append(std.testing.allocator, '\n');
+    }
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        rendered.items,
+        "Read README.md first 1 line",
+    ) != null);
+}
+
+test "Markdown draw storage remains valid while screen cells are consumed" {
+    var ui: ChatUi = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .input = TextInput.init(std.testing.allocator),
+        .cwd = try std.testing.allocator.dupe(u8, "."),
+    };
+    defer ui.deinit();
+    try ui.transcript.append(
+        std.testing.allocator,
+        .assistant,
+        "# Render Test\n\n**Styled** `code`\n\n" ++
+            "| Feature | Status |\n| --- | --- |\n| Tables | Readable |",
+    );
+
+    var screen = try vaxis.Screen.init(std.testing.allocator, .{
+        .rows = 16,
+        .cols = 60,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(std.testing.allocator);
+    const window: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = screen.width,
+        .height = screen.height,
+        .screen = &screen,
+    };
+    var projection = try ui.draw(window);
+    defer if (projection) |*value| value.deinit(std.testing.allocator);
 
     var rendered: std.ArrayList(u8) = .empty;
     defer rendered.deinit(std.testing.allocator);
@@ -3258,7 +3396,12 @@ test "tool activity draws its compact row to the terminal screen" {
     try std.testing.expect(std.mem.indexOf(
         u8,
         rendered.items,
-        "Read README.md first 1 line",
+        "Render Test",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        rendered.items,
+        "Tables",
     ) != null);
 }
 
@@ -3306,6 +3449,7 @@ test "frame layout keeps chrome in bounds" {
 test "ask-user input preserves the existing composer draft" {
     var ui: ChatUi = .{
         .allocator = std.testing.allocator,
+        .io = std.testing.io,
         .input = TextInput.init(std.testing.allocator),
         .cwd = try std.testing.allocator.dupe(u8, "."),
     };
@@ -3349,6 +3493,7 @@ test "slash command parsing preserves argument suffixes" {
 test "arrow selection replaces typed ask-user input" {
     var ui: ChatUi = .{
         .allocator = std.testing.allocator,
+        .io = std.testing.io,
         .input = TextInput.init(std.testing.allocator),
         .cwd = try std.testing.allocator.dupe(u8, "."),
         .pending_user_input = try backend.UserInputRequest.init(
@@ -3373,6 +3518,7 @@ test "arrow selection replaces typed ask-user input" {
 test "ask-user panel reserves rows for wrapped questions" {
     var ui: ChatUi = .{
         .allocator = std.testing.allocator,
+        .io = std.testing.io,
         .input = TextInput.init(std.testing.allocator),
         .cwd = try std.testing.allocator.dupe(u8, "."),
         .pending_user_input = try backend.UserInputRequest.init(
