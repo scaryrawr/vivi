@@ -12,6 +12,7 @@ const assistant_color = vaxis.Color{ .rgb = .{ 196, 181, 253 } };
 const reasoning_color = vaxis.Color{ .rgb = .{ 148, 163, 184 } };
 const composer_background = vaxis.Color{ .index = 236 };
 const menu_background = vaxis.Color{ .index = 234 };
+const tool_detail_background = vaxis.Color{ .index = 234 };
 const menu_selected_background = vaxis.Color{ .index = 238 };
 
 const AppEvent = union(enum) {
@@ -104,6 +105,11 @@ const ToolEntry = struct {
     invocation_hash: [std.crypto.hash.sha2.Sha256.digest_length]u8,
     completion: ?Completion = null,
     compact: []u8,
+    input: []u8,
+    input_display: []u8,
+    output: ?[]u8 = null,
+    output_display: ?[]u8 = null,
+    expanded: bool = false,
 
     const Completion = union(enum) {
         succeeded: [std.crypto.hash.sha2.Sha256.digest_length]u8,
@@ -140,8 +146,14 @@ const ToolEntry = struct {
             var mutable = call_id;
             mutable.deinit(allocator);
         }
+        const input = try allocator.dupe(u8, started.invocation.arguments_json);
+        errdefer allocator.free(input);
+        const input_display = try tool_renderer.renderArguments(allocator, input);
+        errdefer allocator.free(input_display);
         return .{
             .call_id = call_id,
+            .input = input,
+            .input_display = input_display,
             .invocation_hash = hashToolInvocation(started),
             .compact = try tool_renderer.renderCompact(
                 allocator,
@@ -166,6 +178,7 @@ const ToolEntry = struct {
 
     fn finish(
         self: *ToolEntry,
+        allocator: std.mem.Allocator,
         finished: *const backend.ToolFinished,
     ) !void {
         if (!self.call_id.eql(finished.call_id)) {
@@ -185,6 +198,14 @@ const ToolEntry = struct {
             }
             return;
         }
+        const text = switch (finished.result) {
+            .succeeded, .failed => |text| text,
+        };
+        const output = try allocator.dupe(u8, text);
+        errdefer allocator.free(output);
+        const output_display = try tool_renderer.renderLiteral(allocator, output);
+        self.output = output;
+        self.output_display = output_display;
         self.completion = completion;
         const marker = switch (completion) {
             .succeeded => "✓",
@@ -196,6 +217,10 @@ const ToolEntry = struct {
 
     fn deinit(self: *ToolEntry, allocator: std.mem.Allocator) void {
         allocator.free(self.compact);
+        allocator.free(self.input);
+        allocator.free(self.input_display);
+        if (self.output) |output| allocator.free(output);
+        if (self.output_display) |output| allocator.free(output);
         self.call_id.deinit(allocator);
         self.* = undefined;
     }
@@ -460,7 +485,7 @@ const Transcript = struct {
             .finished => |*finished| {
                 const tool = self.findTool(finished.call_id) orelse
                     return error.UnknownToolCall;
-                try tool.finish(finished);
+                try tool.finish(allocator, finished);
             },
         }
     }
@@ -629,6 +654,10 @@ const LineKind = enum {
     markdown,
     status,
     tool,
+    tool_input_label,
+    tool_input,
+    tool_output_label,
+    tool_output,
 };
 
 const RenderLine = struct {
@@ -724,8 +753,20 @@ const Projection = struct {
                         tool.compact,
                         window,
                         .tool,
-                        2,
+                        4,
                     );
+                    if (tool.expanded) {
+                        try projection.lines.append(allocator, .{
+                            .kind = .tool_input_label,
+                            .entry_index = entry_index,
+                        });
+                        try projection.appendWrapped(allocator, entry_index, tool.input_display, window, .tool_input, 4);
+                        try projection.lines.append(allocator, .{
+                            .kind = .tool_output_label,
+                            .entry_index = entry_index,
+                        });
+                        try projection.appendWrapped(allocator, entry_index, tool.output_display orelse "Running…", window, .tool_output, 4);
+                    }
                 },
             }
         }
@@ -1065,6 +1106,8 @@ const ChatUi = struct {
     last_total_rows: usize = 0,
     last_viewport_rows: usize = 0,
     last_transcript_region: Region = .{},
+    tool_hits: std.ArrayList(?usize) = .empty,
+    tool_anchor: ?struct { entry_index: usize, row: usize } = null,
 
     fn init(
         allocator: std.mem.Allocator,
@@ -1092,6 +1135,7 @@ const ChatUi = struct {
     }
 
     fn deinit(self: *ChatUi) void {
+        self.tool_hits.deinit(self.allocator);
         self.menu.deinit(self.allocator);
         if (self.saved_input) |*input| input.deinit();
         if (self.pending_user_input) |*request| request.deinit();
@@ -1235,9 +1279,22 @@ const ChatUi = struct {
         if (!self.last_transcript_region.contains(mouse.col, mouse.row))
             return false;
 
+        if (mouse.type != .press) return false;
         return switch (mouse.button) {
             .wheel_up => self.scrollUp(mouse_wheel_rows),
             .wheel_down => self.scrollDown(mouse_wheel_rows),
+            .left => blk: {
+                var row: usize = @as(usize, @intCast(mouse.row)) - self.last_transcript_region.y;
+                if (row >= self.tool_hits.items.len) break :blk false;
+                const entry_index = self.tool_hits.items[row] orelse break :blk false;
+                if (entry_index >= self.transcript.entries.items.len) break :blk false;
+                const entry = &self.transcript.entries.items[entry_index];
+                if (entry.* != .tool) break :blk false;
+                while (row > 0 and self.tool_hits.items[row - 1] == entry_index) row -= 1;
+                entry.tool.expanded = !entry.tool.expanded;
+                self.tool_anchor = .{ .entry_index = entry_index, .row = row };
+                break :blk true;
+            },
             else => false,
         };
     }
@@ -1839,6 +1896,7 @@ const ChatUi = struct {
             desired_menu_rows,
         );
         self.last_transcript_region = layout.transcript;
+        self.tool_hits.clearRetainingCapacity();
         if (layout.transcript.height > 0) {
             const transcript_window = layout.transcript.child(root);
             if (self.transcript.entries.items.len == 0) {
@@ -1851,7 +1909,7 @@ const ChatUi = struct {
                     &self.transcript,
                     transcript_window,
                 );
-                self.drawTranscript(transcript_window, &projection.?);
+                try self.drawTranscript(transcript_window, &projection.?);
             }
         }
         if (layout.context) |region| {
@@ -2232,10 +2290,18 @@ const ChatUi = struct {
         self: *ChatUi,
         window: vaxis.Window,
         projection: *const Projection,
-    ) void {
+    ) !void {
         const total_rows = projection.lines.items.len;
         const viewport_rows: usize = window.height;
-        if (self.rows_from_tail > 0 and total_rows > self.last_total_rows) {
+        if (self.tool_anchor) |anchor| {
+            for (projection.lines.items, 0..) |line, index| {
+                if (line.entry_index == anchor.entry_index and line.kind == .tool) {
+                    self.rows_from_tail = (total_rows -| viewport_rows) -| (index -| anchor.row);
+                    break;
+                }
+            }
+            self.tool_anchor = null;
+        } else if (self.rows_from_tail > 0 and total_rows > self.last_total_rows) {
             self.rows_from_tail += total_rows - self.last_total_rows;
         }
         const max_scroll = total_rows -| @min(total_rows, viewport_rows);
@@ -2245,6 +2311,10 @@ const ChatUi = struct {
         const last_row = @min(first_row + viewport_rows, total_rows);
 
         for (projection.lines.items[first_row..last_row], 0..) |line, row| {
+            try self.tool_hits.append(self.allocator, switch (line.kind) {
+                .tool, .tool_input_label, .tool_input, .tool_output_label, .tool_output => line.entry_index,
+                else => null,
+            });
             self.drawTranscriptLine(
                 window,
                 @intCast(row),
@@ -2380,7 +2450,46 @@ const ChatUi = struct {
                 }};
                 _ = window.print(&segments, .{
                     .row_offset = row,
-                    .col_offset = if (window.width >= 4) 2 else 0,
+                    .col_offset = @min(window.width -| 1, 4),
+                    .wrap = .none,
+                });
+                if (line.start == 0) {
+                    var disclosure = [_]vaxis.Segment{.{
+                        .text = if (tool.expanded) "▾" else "▸",
+                        .style = .{ .fg = color },
+                    }};
+                    _ = window.print(&disclosure, .{
+                        .row_offset = row,
+                        .col_offset = if (window.width >= 4) 2 else 0,
+                        .wrap = .none,
+                    });
+                }
+            },
+            .tool_input_label, .tool_output_label, .tool_input, .tool_output => {
+                window.child(.{ .y_off = row, .height = 1 }).fill(.{
+                    .char = .{ .grapheme = " ", .width = 1 },
+                    .style = .{ .bg = tool_detail_background },
+                });
+                const tool = &entry.tool;
+                const label = line.kind == .tool_input_label or line.kind == .tool_output_label;
+                const output: []const u8 = tool.output_display orelse "Running…";
+                const text = switch (line.kind) {
+                    .tool_input_label => "Input",
+                    .tool_output_label => if (tool.completion) |completion| switch (completion) {
+                        .succeeded => "Output",
+                        .failed => "Output (failed)",
+                    } else "Output (running)",
+                    .tool_input => tool.input_display[line.start..line.end],
+                    .tool_output => output[line.start..line.end],
+                    else => unreachable,
+                };
+                var segments = [_]vaxis.Segment{.{
+                    .text = text,
+                    .style = .{ .bold = label, .fg = reasoning_color, .bg = tool_detail_background },
+                }};
+                _ = window.print(&segments, .{
+                    .row_offset = row,
+                    .col_offset = @min(window.width -| 1, 4),
                     .wrap = .none,
                 });
             },
@@ -3264,7 +3373,7 @@ test "compact tool rows wrap by grapheme width with one entry index" {
     }
 }
 
-test "tool entries retain bounded display state instead of full payloads" {
+test "tool entries retain full owned payloads with bounded compact summaries" {
     const command = try std.testing.allocator.alloc(u8, 16 * 1024);
     defer std.testing.allocator.free(command);
     @memset(command, 'a');
@@ -3290,10 +3399,144 @@ test "tool entries retain bounded display state instead of full payloads" {
 
     const tool = transcript.entries.items[0].tool;
     try std.testing.expect(tool.compact.len < 256);
+    try std.testing.expect(!tool.expanded);
+    try std.testing.expectEqualStrings(arguments, tool.input);
+    try std.testing.expect(std.mem.startsWith(u8, tool.input_display, "Command: "));
+    try std.testing.expectEqualStrings(command, tool.input_display["Command: ".len..]);
     try std.testing.expectEqual(
         @as(usize, std.crypto.hash.sha2.Sha256.digest_length),
         tool.invocation_hash.len,
     );
+    var finished = try backend.ToolFinished.init(
+        std.testing.allocator,
+        "call-1",
+        .{ .succeeded = command },
+    );
+    try transcript.applyToolActivity(std.testing.allocator, &.{ .finished = finished });
+    finished.deinit();
+    try std.testing.expectEqualStrings(command, transcript.entries.items[0].tool.output.?);
+    try std.testing.expectEqualStrings(command, transcript.entries.items[0].tool.output_display.?);
+}
+
+fn toolAllocationLifecycle(allocator: std.mem.Allocator) !void {
+    var started = try toolStarted("allocation", "{\"path\":\"file\"}", .{
+        .read = .{ .path = "file", .offset = null, .limit = null },
+    });
+    defer started.deinit();
+    var tool = try ToolEntry.init(allocator, &started);
+    defer tool.deinit(allocator);
+    var finished = try backend.ToolFinished.init(std.testing.allocator, "allocation", .{
+        .succeeded = "output\n\x1b[31m",
+    });
+    defer finished.deinit();
+    tool.expanded = true;
+    tool.finish(allocator, &finished) catch |err| {
+        try std.testing.expect(tool.completion == null);
+        try std.testing.expect(tool.output == null and tool.output_display == null);
+        try std.testing.expect(std.mem.startsWith(u8, tool.compact, "◌"));
+        return err;
+    };
+    try std.testing.expect(tool.expanded);
+}
+
+test "tool owned payload lifecycle is atomic under allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, toolAllocationLifecycle, .{});
+}
+
+test "tool disclosure hit mapping follows wrapping scrolling resizing and completion" {
+    var ui: ChatUi = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .input = TextInput.init(std.testing.allocator),
+        .cwd = try std.testing.allocator.dupe(u8, "."),
+    };
+    defer ui.deinit();
+    var started = try toolStarted(
+        "disclosure",
+        "{\"command\":\"printf 'actual input, not the summary'\\n\\n\"}",
+        .{ .bash = .{ .command = "a long summary that wraps across several terminal rows" } },
+    );
+    try ui.transcript.applyToolActivity(std.testing.allocator, &.{ .started = started });
+    started.deinit();
+    try ui.transcript.append(std.testing.allocator, .status, "after");
+    var screen = try vaxis.Screen.init(std.testing.allocator, .{
+        .rows = 18,
+        .cols = 32,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(std.testing.allocator);
+    var window: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = screen.width,
+        .height = screen.height,
+        .screen = &screen,
+    };
+    var projection = (try ui.draw(window)).?;
+    projection.deinit(std.testing.allocator);
+    const click: vaxis.Mouse = .{
+        .col = @intCast(ui.last_transcript_region.x + 2),
+        .row = 1,
+        .button = .left,
+        .mods = .{},
+        .type = .press,
+    };
+    try std.testing.expectEqual(@as(?usize, 0), ui.tool_hits.items[1]);
+    try std.testing.expect(ui.handleMouse(click));
+    try std.testing.expect(ui.transcript.entries.items[0].tool.expanded);
+    projection = (try ui.draw(window)).?;
+    try std.testing.expectEqual(@as(?usize, 0), ui.tool_hits.items[0]);
+    var saw_input = false;
+    var saw_output = false;
+    for (projection.lines.items) |line| {
+        saw_input = saw_input or line.kind == .tool_input;
+        saw_output = saw_output or line.kind == .tool_output;
+        if (line.kind == .tool_input or line.kind == .tool_output or
+            line.kind == .tool_input_label or line.kind == .tool_output_label)
+        {
+            ui.drawTranscriptLine(window, 0, &projection, line);
+            for (0..window.width) |col| {
+                try std.testing.expectEqual(tool_detail_background, screen.readCell(@intCast(col), 0).?.style.bg);
+            }
+            if (line.start != line.end or line.kind == .tool_input_label or line.kind == .tool_output_label)
+                try std.testing.expectEqual(reasoning_color, screen.readCell(4, 0).?.style.fg);
+        }
+    }
+    try std.testing.expect(saw_input and saw_output);
+    projection.deinit(std.testing.allocator);
+
+    var finished = try backend.ToolFinished.init(
+        std.testing.allocator,
+        "disclosure",
+        .{ .failed = "# literal failure\n\x1b[31mactual output" },
+    );
+    try ui.transcript.applyToolActivity(std.testing.allocator, &.{ .finished = finished });
+    try ui.transcript.applyToolActivity(std.testing.allocator, &.{ .finished = finished });
+    finished.deinit();
+    try std.testing.expect(ui.transcript.entries.items[0].tool.expanded);
+    try std.testing.expectEqualStrings("# literal failure\n\x1b[31mactual output", ui.transcript.entries.items[0].tool.output.?);
+    try std.testing.expectEqualStrings("# literal failure\n\\x1b[31mactual output", ui.transcript.entries.items[0].tool.output_display.?);
+    window.width = 20;
+    projection = (try ui.draw(window)).?;
+    projection.deinit(std.testing.allocator);
+    _ = ui.scrollDown(3);
+    projection = (try ui.draw(window)).?;
+    projection.deinit(std.testing.allocator);
+    var release = click;
+    release.type = .release;
+    try std.testing.expect(!ui.handleMouse(release));
+    try std.testing.expect(ui.handleMouse(click));
+    try std.testing.expect(!ui.transcript.entries.items[0].tool.expanded);
+    projection = (try ui.draw(window)).?;
+    defer projection.deinit(std.testing.allocator);
+    for (projection.lines.items) |line| {
+        try std.testing.expect(line.kind != .tool_input and line.kind != .tool_output);
+    }
+    try std.testing.expect(!std.meta.eql(tool_detail_background, screen.readCell(4, 0).?.style.bg));
+    try std.testing.expectEqual(@as(?usize, 0), ui.tool_hits.items[0]);
 }
 
 test "tool events preserve a scrolled transcript position" {

@@ -42,6 +42,16 @@ panel with arrow-key choice selection. Typed choice numbers, exact choice text,
 and free-form input when allowed remain supported. Tool output is returned
 whole; Copilot owns any large-result handling.
 
+In the terminal transcript, tool calls start collapsed. Click a tool row
+(marked `▸`) to expand its complete actual input and output; click it again
+to collapse (`▾`). Expanded running calls show their output when they finish,
+including failures. Details wrap with the terminal width and scroll with the
+transcript, on a subtly contrasting background. Input arguments use readable
+labels with decoded strings and line breaks, including all additional fields;
+nested objects and arrays use indentation and indexed items. Invalid JSON is
+explicitly labeled and shown as unparsed input. Output stays literal, not
+JSON-decoded or rendered as Markdown. Terminal control characters are escaped.
+
 `vivi models` lists the authenticated Copilot model catalog alongside OMLX
 models discovered from `http://localhost:8000/v1/models/status`. Each row
 reports its qualified ID, context window, maximum output tokens, and vision
