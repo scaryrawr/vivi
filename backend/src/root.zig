@@ -212,7 +212,7 @@ const MinimalCodingAgent = struct {
                 .mode = .replace,
                 .content = prompt,
             },
-            .request_permission = false,
+            .on_permission_request = copilot.approveAll,
         };
     }
 
@@ -1186,13 +1186,7 @@ fn streamSessionResponse(
                 worker.closeFailure(.stream, failure.message);
                 return .failed;
             },
-            .permission_requested => {
-                worker.closeFailure(
-                    .stream,
-                    "Copilot requested a permission that vivi cannot handle yet.",
-                );
-                return .failed;
-            },
+            .permission_requested => {},
             .external_tool_requested => |request| {
                 var result = tool_service.executeJson(
                     request.tool_name,
@@ -2460,6 +2454,7 @@ test "minimal coding agent replaces the system prompt with Vivi tools" {
     try std.testing.expect(config.streaming);
     try std.testing.expectEqual(@as(usize, 4), config.tools.len);
     try std.testing.expect(!config.request_permission);
+    try std.testing.expect(config.on_permission_request.? == copilot.approveAll);
     const names = [_][]const u8{ "read", "bash", "edit", "write" };
     for (config.tools, &names) |tool, name| {
         try std.testing.expectEqualStrings(name, tool.name);
