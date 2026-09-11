@@ -226,7 +226,7 @@ const MinimalCodingAgent = struct {
                 .mode = .replace,
                 .content = prompt,
             },
-            .request_permission = false,
+            .on_permission_request = copilot.approveAll,
         };
     }
 
@@ -1110,6 +1110,17 @@ const StreamResult = enum {
     failed,
 };
 
+fn automaticPermissionFailure(
+    handling: copilot.AutomaticPermissionHandling,
+) ?[]const u8 {
+    return switch (handling) {
+        .handled => null,
+        .not_configured => "Copilot requested permission without an automatic handler.",
+        .no_result => "Copilot requires manual permission approval, which vivi does not support yet.",
+        .handler_failed, .delivery_failed => |err| @errorName(err),
+    };
+}
+
 fn streamSessionResponse(
     worker: *conversation.Worker,
     client: *copilot.Client,
@@ -1200,12 +1211,11 @@ fn streamSessionResponse(
                 worker.closeFailure(.stream, failure.message);
                 return .failed;
             },
-            .permission_requested => {
-                worker.closeFailure(
-                    .stream,
-                    "Copilot requested a permission that vivi cannot handle yet.",
-                );
-                return .failed;
+            .permission_requested => |request| {
+                if (automaticPermissionFailure(request.automatic_handling)) |message| {
+                    worker.closeFailure(.stream, message);
+                    return .failed;
+                }
             },
             .external_tool_requested => |request| {
                 var prepared = tool_service.prepare(
@@ -2505,6 +2515,7 @@ test "minimal coding agent replaces the system prompt with Vivi tools" {
     try std.testing.expect(config.streaming);
     try std.testing.expectEqual(@as(usize, 4), config.tools.len);
     try std.testing.expect(!config.request_permission);
+    try std.testing.expect(config.on_permission_request.? == copilot.approveAll);
     const names = [_][]const u8{ "read", "bash", "edit", "write" };
     for (config.tools, &names) |tool, name| {
         try std.testing.expectEqualStrings(name, tool.name);
@@ -2525,6 +2536,30 @@ test "minimal coding agent replaces the system prompt with Vivi tools" {
     try std.testing.expectEqualStrings(
         "minimal system prompt",
         config.system_message.?.content,
+    );
+}
+
+test "automatic permission outcomes continue only after a handled decision" {
+    try std.testing.expect(automaticPermissionFailure(.handled) == null);
+    try std.testing.expectEqualStrings(
+        "Copilot requested permission without an automatic handler.",
+        automaticPermissionFailure(.not_configured).?,
+    );
+    try std.testing.expectEqualStrings(
+        "Copilot requires manual permission approval, which vivi does not support yet.",
+        automaticPermissionFailure(.no_result).?,
+    );
+    try std.testing.expectEqualStrings(
+        "ApproveAllWithManagedSettings",
+        automaticPermissionFailure(.{
+            .handler_failed = error.ApproveAllWithManagedSettings,
+        }).?,
+    );
+    try std.testing.expectEqualStrings(
+        "PermissionDecisionNotAccepted",
+        automaticPermissionFailure(.{
+            .delivery_failed = error.PermissionDecisionNotAccepted,
+        }).?,
     );
 }
 
