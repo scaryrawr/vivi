@@ -39,5 +39,7 @@ slash menu, and the response produced by invoking it.
 - Vivi passes only the workspace root as an instruction source and the three
   documented skill roots; it does not enable ambient workspace configuration
   discovery or workspace-configured MCP servers.
+- Copilot SDK empty sessions require `enableSkills = true`, and live PTY
+  verification requires absolute paths for explicit skill directories.
 - The recipe needs authenticated Copilot access because both assertions cross
   the production SDK boundary.
