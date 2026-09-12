@@ -43,10 +43,10 @@ authentication looks questionable:
 .github/skills/verify-vivi/bin/verify-vivi doctor
 ```
 
-It requires Zig, VHS, `script`, FFmpeg/FFprobe, and GitHub Copilot CLI; builds
-Vivi; checks the installed Vivi and Copilot versions; and sends a no-tools
-Copilot prompt that must return `VIVI_DOCTOR_OK`. A failure means the instance
-is not worth driving. Copilot CLI does not expose a standalone
+It requires Zig, VHS, `script`, Expect, FFmpeg/FFprobe, and GitHub Copilot CLI;
+builds Vivi; checks the installed Vivi and Copilot versions; and sends a
+no-tools Copilot prompt that must return `VIVI_DOCTOR_OK`. A failure means the
+instance is not worth driving. Copilot CLI does not expose a standalone
 authenticated-status command, so the minimal prompt is the authentication
 check.
 
@@ -58,6 +58,7 @@ Use the executable helper:
 .github/skills/verify-vivi/bin/verify-vivi cli-discovery <run-id>
 .github/skills/verify-vivi/bin/verify-vivi chat-streaming <run-id>
 .github/skills/verify-vivi/bin/verify-vivi chat-streaming-input <run-id>
+.github/skills/verify-vivi/bin/verify-vivi chat-async-bash <run-id>
 .github/skills/verify-vivi/bin/verify-vivi chat-markdown <run-id>
 .github/skills/verify-vivi/bin/verify-vivi chat-markdown-read <run-id>
 .github/skills/verify-vivi/bin/verify-vivi chat-ask-user <run-id>
@@ -180,8 +181,8 @@ chat-model-menu <run-id>
 chat-customization <run-id>
 chat-session-resume <run-id>
 chat-shutdown <run-id>
-extract-frames <run-id> <chat-streaming|chat-streaming-input|chat-markdown|chat-markdown-read|chat-ask-user|chat-model-menu|chat-customization|chat-session-resume|chat-shutdown>
-frame-check <run-id> <chat-streaming|chat-streaming-input|chat-markdown|chat-markdown-read|chat-ask-user|chat-model-menu|chat-customization|chat-session-resume|chat-shutdown>
+extract-frames <run-id> <chat-streaming|chat-streaming-input|chat-async-bash|chat-markdown|chat-markdown-read|chat-ask-user|chat-model-menu|chat-customization|chat-session-resume|chat-shutdown>
+frame-check <run-id> <chat-streaming|chat-streaming-input|chat-async-bash|chat-markdown|chat-markdown-read|chat-ask-user|chat-model-menu|chat-customization|chat-session-resume|chat-shutdown>
 cleanup <run-id>
 ```
 

@@ -209,11 +209,10 @@ const ToolEntry = struct {
         const input_display = try tool_renderer.renderArguments(allocator, input);
         errdefer allocator.free(input_display);
         const input_highlights = switch (started.invocation.summary) {
-            .bash => |summary| try highlightBashInput(
-                allocator,
-                input_display,
-                summary.command,
-            ),
+            .bash => |summary| if (bashSummaryCommand(summary)) |command|
+                try highlightBashInput(allocator, input_display, command)
+            else
+                try allocator.alloc(highlight.Span, 0),
             else => try allocator.alloc(highlight.Span, 0),
         };
         errdefer allocator.free(input_highlights);
@@ -236,6 +235,14 @@ const ToolEntry = struct {
                 started.invocation.summary,
                 .running,
             ),
+        };
+    }
+
+    fn bashSummaryCommand(summary: backend.BashToolSummary) ?[]const u8 {
+        return switch (summary) {
+            .run => |value| value.command,
+            .start => |value| value.command,
+            else => null,
         };
     }
 
@@ -3600,7 +3607,7 @@ test "tool details highlight shell input and supported read output" {
     var bash_started = try toolStarted(
         "bash-highlight",
         "{\"command\":\"printf '%s\\\\n' ready\"}",
-        .{ .bash = .{ .command = "printf '%s\\n' ready" } },
+        .{ .bash = .{ .run = .{ .command = "printf '%s\\n' ready" } } },
     );
     defer bash_started.deinit();
     var bash_entry = try ToolEntry.init(std.testing.allocator, &bash_started);
@@ -3615,7 +3622,7 @@ test "tool details highlight shell input and supported read output" {
     var reordered_started = try toolStarted(
         "bash-highlight-reordered",
         "{\"timeout\":30,\"command\":\"printf ready\"}",
-        .{ .bash = .{ .command = "printf ready" } },
+        .{ .bash = .{ .run = .{ .command = "printf ready" } } },
     );
     defer reordered_started.deinit();
     var reordered_entry = try ToolEntry.init(
@@ -3691,7 +3698,7 @@ test "expanded tool rows draw syntax colors across wrapping" {
     var bash_started = try toolStarted(
         "bash-render",
         "{\"command\":\"printf 'abcdefghijklmnop'\"}",
-        .{ .bash = .{ .command = "printf 'abcdefghijklmnop'" } },
+        .{ .bash = .{ .run = .{ .command = "printf 'abcdefghijklmnop'" } } },
     );
     try ui.transcript.applyToolActivity(
         std.testing.allocator,
@@ -4018,7 +4025,7 @@ test "tool completions update interleaved rows in reverse order" {
     var second = try toolStarted(
         "call-2",
         "{\"command\":\"two\"}",
-        .{ .bash = .{ .command = "two" } },
+        .{ .bash = .{ .run = .{ .command = "two" } } },
     );
     defer second.deinit();
     try transcript.applyToolActivity(
@@ -4180,7 +4187,7 @@ test "tool row preserves queued ordering and splits assistant output" {
     var started = try toolStarted(
         "call-1",
         "{\"command\":\"true\"}",
-        .{ .bash = .{ .command = "true" } },
+        .{ .bash = .{ .run = .{ .command = "true" } } },
     );
     defer started.deinit();
     try transcript.applyToolActivity(
@@ -4202,7 +4209,7 @@ test "compact tool rows wrap by grapheme width with one entry index" {
     var started = try toolStarted(
         "call-1",
         "{\"command\":\"printf αβγδεζηθ\"}",
-        .{ .bash = .{ .command = "printf αβγδεζηθ" } },
+        .{ .bash = .{ .run = .{ .command = "printf αβγδεζηθ" } } },
     );
     defer started.deinit();
     try transcript.applyToolActivity(
@@ -4249,7 +4256,7 @@ test "tool entries retain full owned payloads with bounded compact summaries" {
     var started = try toolStarted(
         "call-1",
         arguments,
-        .{ .bash = .{ .command = command } },
+        .{ .bash = .{ .run = .{ .command = command } } },
     );
     defer started.deinit();
     var transcript: Transcript = .{};
@@ -4320,7 +4327,7 @@ test "tool keyboard focus preserves composer and respects menus and pending ques
     _ = try ui.handleKey(f6, &conversation);
     try std.testing.expectEqual(null, ui.focused_tool);
     _ = try ui.handleKey(.{ .codepoint = 'x', .text = "x" }, &conversation);
-    var started = try toolStarted("keyboard", "{\"command\":\"pwd\"}", .{ .bash = .{ .command = "pwd" } });
+    var started = try toolStarted("keyboard", "{\"command\":\"pwd\"}", .{ .bash = .{ .run = .{ .command = "pwd" } } });
     defer started.deinit();
     try ui.transcript.applyToolActivity(std.testing.allocator, &.{ .started = started });
     _ = try ui.handleKey(f6, &conversation);
@@ -4360,9 +4367,9 @@ test "tool keyboard navigation reveals focused headers and retains focus through
         .phase = .responding,
     };
     defer ui.deinit();
-    var first = try toolStarted("first", "{\"command\":\"pwd\"}", .{ .bash = .{ .command = "pwd" } });
+    var first = try toolStarted("first", "{\"command\":\"pwd\"}", .{ .bash = .{ .run = .{ .command = "pwd" } } });
     defer first.deinit();
-    var second = try toolStarted("second", "{\"command\":\"ls\"}", .{ .bash = .{ .command = "ls" } });
+    var second = try toolStarted("second", "{\"command\":\"ls\"}", .{ .bash = .{ .run = .{ .command = "ls" } } });
     defer second.deinit();
     try ui.transcript.applyToolActivity(std.testing.allocator, &.{ .started = first });
     try ui.transcript.append(std.testing.allocator, .assistant, "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight");
@@ -4437,7 +4444,7 @@ test "tool disclosure hit mapping follows wrapping scrolling resizing and comple
     var started = try toolStarted(
         "disclosure",
         "{\"command\":\"printf 'actual input, not the summary'\\n\\n\"}",
-        .{ .bash = .{ .command = "a long summary that wraps across several terminal rows" } },
+        .{ .bash = .{ .run = .{ .command = "a long summary that wraps across several terminal rows" } } },
     );
     try ui.transcript.applyToolActivity(std.testing.allocator, &.{ .started = started });
     started.deinit();
@@ -4536,7 +4543,7 @@ test "tool events preserve a scrolled transcript position" {
             .started = try toolStarted(
                 "call-1",
                 "{\"command\":\"true\"}",
-                .{ .bash = .{ .command = "true" } },
+                .{ .bash = .{ .run = .{ .command = "true" } } },
             ),
         },
     };

@@ -12,8 +12,8 @@ the session returns to the ready state.
 - `response-stream` shows the responding state and Vivi output.
 - `reasoning-stream` shows model reasoning as a dim, italic `Thinking` entry
   before the corresponding Vivi response.
-- `tool-activity` shows compact running, successful, or failed rows for
-  `read`, `bash`, `edit`, and `write` calls.
+- `tool-activity` shows compact running, successful, or failed rows for file,
+  synchronous Bash, and async Bash lifecycle calls.
 - `transcript-scroll` uses the mouse wheel or Page Up/Page Down to read chat
   history after it grows beyond the visible transcript.
 - `response-steer` keeps the composer active and sends Enter submissions into

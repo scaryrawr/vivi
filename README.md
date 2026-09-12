@@ -38,20 +38,28 @@ to `zig build` or `./scripts/check-zig.sh`; both run the same tests and checks.
 
 `vivi chat` opens a full-screen Vivi chat with a scrolling transcript,
 workspace context, and a compact bottom composer. It streams responses as they
-arrive and restores the composer after each completed turn. Vivi enables
-Copilot's session-isolated built-in tools for planning and subagent
-coordination while keeping built-in MCP servers disabled. Vivi scopes workspace
-customization to instruction files and the supported project skill directories;
-it does not enable ambient workspace configuration discovery. Copilot loads the
-workspace's instruction files, including top-level `AGENTS.md`, and discovers
-project skills from `.github/skills/`, `.agents/skills/`, and
-`.claude/skills/`. Skills marked `user-invocable: true` appear in the `/` menu
-and run through Copilot's skill prompt when selected. The SDK supplies
-`ask_user`, while Vivi supplies `read`, `bash`, `edit`, and `write`; the
-terminal presents questions in a separate decision panel with arrow-key choice
-selection. Typed choice numbers, exact choice text, and free-form input when
-allowed remain supported. Tool output is returned whole; Copilot owns any
-large-result handling.
+arrive and restores the composer after each completed turn. Hosted Copilot
+sessions enable reviewed session-isolated built-ins for planning and subagent
+coordination. OMLX sessions omit the entire task and agent-orchestration
+built-in family because Vivi runs one local model at a time; only `ask_user`
+and `skill` remain alongside custom tools. Both keep built-in MCP servers
+disabled. Vivi scopes workspace customization to instruction files and the
+supported project skill directories; it does not enable ambient workspace
+configuration discovery. Copilot loads the workspace's instruction files,
+including top-level `AGENTS.md`, and discovers project skills from
+`.github/skills/`, `.agents/skills/`, and `.claude/skills/`. Skills marked
+`user-invocable: true` appear in the `/` menu and run through Copilot's skill
+prompt when selected. The SDK supplies `ask_user`, while Vivi supplies exactly
+four custom tools: `read`, `bash`, `edit`, and `write`. Bash action `run` is the
+default synchronous command path. Its `start`, `list`, `read`, `write`, and
+`stop` actions manage persistent PTY sessions through later finite tool calls.
+PTY output is retained in a bounded buffer, reads wait only for a
+caller-selected bounded interval, and the workspace service stops all of its
+shells during resume or shutdown. The terminal presents questions in a separate
+decision panel with arrow-key choice selection. Typed choice numbers, exact
+choice text, and free-form input when allowed remain supported.
+Synchronous tool output is returned whole; Copilot owns any large-result
+handling.
 
 Mouse-wheel bursts are processed in bounded batches with one redraw per batch,
 so rapid scrolling does not replay a separate frame for every queued tick.

@@ -1,0 +1,283 @@
+#define _WIN32_WINNT 0x0A00
+#include "native.h"
+
+#include <windows.h>
+
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+static HANDLE value_handle(const vivi_pty_endpoint_t *endpoint, int index) {
+    return (HANDLE)(uintptr_t)endpoint->values[index];
+}
+
+static wchar_t *utf8_to_wide(const char *text) {
+    int count = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, -1, NULL, 0);
+    if (count == 0) return NULL;
+    wchar_t *wide = (wchar_t *)HeapAlloc(
+        GetProcessHeap(),
+        0,
+        (SIZE_T)count * sizeof(wchar_t)
+    );
+    if (wide == NULL) return NULL;
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, -1, wide, count) == 0) {
+        HeapFree(GetProcessHeap(), 0, wide);
+        return NULL;
+    }
+    return wide;
+}
+
+static wchar_t *make_command_line(const wchar_t *command) {
+    const wchar_t prefix[] = L"bash.exe --noprofile --norc -i +m -c \"";
+    size_t prefix_len = (sizeof(prefix) / sizeof(prefix[0])) - 1;
+    size_t command_len = lstrlenW(command);
+    size_t capacity = prefix_len + command_len * 2 + 3;
+    wchar_t *line = (wchar_t *)HeapAlloc(
+        GetProcessHeap(),
+        HEAP_ZERO_MEMORY,
+        capacity * sizeof(wchar_t)
+    );
+    if (line == NULL) return NULL;
+    memcpy(line, prefix, prefix_len * sizeof(wchar_t));
+    size_t out = prefix_len;
+    size_t index = 0;
+    while (index < command_len) {
+        size_t slashes = 0;
+        while (index < command_len && command[index] == L'\\') {
+            ++slashes;
+            ++index;
+        }
+        if (index == command_len) {
+            for (size_t count = 0; count < slashes * 2; ++count) {
+                line[out++] = L'\\';
+            }
+            break;
+        }
+        if (command[index] == L'"') {
+            for (size_t count = 0; count < slashes * 2 + 1; ++count) {
+                line[out++] = L'\\';
+            }
+            line[out++] = L'"';
+            ++index;
+            continue;
+        }
+        for (size_t count = 0; count < slashes; ++count) line[out++] = L'\\';
+        line[out++] = command[index++];
+    }
+    line[out++] = L'"';
+    line[out] = L'\0';
+    return line;
+}
+
+int vivi_pty_spawn(
+    const char *cwd,
+    const char *command,
+    uint16_t rows,
+    uint16_t columns,
+    vivi_pty_endpoint_t *endpoint
+) {
+    HANDLE input_read = NULL;
+    HANDLE input_write = NULL;
+    HANDLE output_read = NULL;
+    HANDLE output_write = NULL;
+    HANDLE job = NULL;
+    HPCON pseudo_console = NULL;
+    PPROC_THREAD_ATTRIBUTE_LIST attributes = NULL;
+    wchar_t *wide_cwd = NULL;
+    wchar_t *wide_command = NULL;
+    wchar_t *command_line = NULL;
+    PROCESS_INFORMATION process;
+    STARTUPINFOEXW startup;
+    SIZE_T attribute_bytes = 0;
+    SECURITY_ATTRIBUTES security = { sizeof(security), NULL, FALSE };
+    memset(endpoint, 0, sizeof(*endpoint));
+    memset(&process, 0, sizeof(process));
+    memset(&startup, 0, sizeof(startup));
+    startup.StartupInfo.cb = sizeof(startup);
+
+    if (!CreatePipe(&input_read, &input_write, &security, 0)) goto failed;
+    if (!CreatePipe(&output_read, &output_write, &security, 0)) goto failed;
+    COORD size = { (SHORT)columns, (SHORT)rows };
+    if (FAILED(CreatePseudoConsole(size, input_read, output_write, 0, &pseudo_console))) {
+        goto failed;
+    }
+    CloseHandle(input_read);
+    input_read = NULL;
+    CloseHandle(output_write);
+    output_write = NULL;
+
+    InitializeProcThreadAttributeList(NULL, 1, 0, &attribute_bytes);
+    attributes = (PPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(
+        GetProcessHeap(),
+        0,
+        attribute_bytes
+    );
+    if (attributes == NULL) goto failed;
+    if (!InitializeProcThreadAttributeList(attributes, 1, 0, &attribute_bytes)) {
+        goto failed;
+    }
+    if (!UpdateProcThreadAttribute(
+        attributes,
+        0,
+        PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+        pseudo_console,
+        sizeof(pseudo_console),
+        NULL,
+        NULL
+    )) goto failed;
+    startup.lpAttributeList = attributes;
+
+    wide_cwd = utf8_to_wide(cwd);
+    wide_command = utf8_to_wide(command);
+    if (wide_cwd == NULL || wide_command == NULL) goto failed;
+    command_line = make_command_line(wide_command);
+    if (command_line == NULL) goto failed;
+
+    job = CreateJobObjectW(NULL, NULL);
+    if (job == NULL) goto failed;
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits;
+    memset(&limits, 0, sizeof(limits));
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (!SetInformationJobObject(
+        job,
+        JobObjectExtendedLimitInformation,
+        &limits,
+        sizeof(limits)
+    )) goto failed;
+
+    if (!CreateProcessW(
+        NULL,
+        command_line,
+        NULL,
+        NULL,
+        FALSE,
+        EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
+        NULL,
+        wide_cwd,
+        &startup.StartupInfo,
+        &process
+    )) goto failed;
+    if (!AssignProcessToJobObject(job, process.hProcess)) goto failed;
+    if (ResumeThread(process.hThread) == (DWORD)-1) goto failed;
+    CloseHandle(process.hThread);
+    process.hThread = NULL;
+
+    endpoint->values[0] = (intptr_t)(uintptr_t)output_read;
+    endpoint->values[1] = (intptr_t)(uintptr_t)input_write;
+    endpoint->values[2] = (intptr_t)(uintptr_t)process.hProcess;
+    endpoint->values[3] = (intptr_t)(uintptr_t)job;
+    endpoint->values[4] = (intptr_t)(uintptr_t)pseudo_console;
+
+    DeleteProcThreadAttributeList(attributes);
+    HeapFree(GetProcessHeap(), 0, attributes);
+    HeapFree(GetProcessHeap(), 0, wide_cwd);
+    HeapFree(GetProcessHeap(), 0, wide_command);
+    HeapFree(GetProcessHeap(), 0, command_line);
+    return 0;
+
+failed:
+    if (process.hProcess != NULL) TerminateProcess(process.hProcess, 125);
+    if (process.hThread != NULL) CloseHandle(process.hThread);
+    if (process.hProcess != NULL) CloseHandle(process.hProcess);
+    if (job != NULL) CloseHandle(job);
+    if (pseudo_console != NULL) ClosePseudoConsole(pseudo_console);
+    if (input_read != NULL) CloseHandle(input_read);
+    if (input_write != NULL) CloseHandle(input_write);
+    if (output_read != NULL) CloseHandle(output_read);
+    if (output_write != NULL) CloseHandle(output_write);
+    if (attributes != NULL) {
+        DeleteProcThreadAttributeList(attributes);
+        HeapFree(GetProcessHeap(), 0, attributes);
+    }
+    if (wide_cwd != NULL) HeapFree(GetProcessHeap(), 0, wide_cwd);
+    if (wide_command != NULL) HeapFree(GetProcessHeap(), 0, wide_command);
+    if (command_line != NULL) HeapFree(GetProcessHeap(), 0, command_line);
+    return -1;
+}
+
+intptr_t vivi_pty_read(
+    vivi_pty_endpoint_t *endpoint,
+    void *buffer,
+    size_t length
+) {
+    DWORD amount = 0;
+    if (!ReadFile(
+        value_handle(endpoint, 0),
+        buffer,
+        (DWORD)length,
+        &amount,
+        NULL
+    )) {
+        DWORD error = GetLastError();
+        if (error == ERROR_BROKEN_PIPE || error == ERROR_OPERATION_ABORTED) return 0;
+        return -1;
+    }
+    return (intptr_t)amount;
+}
+
+int vivi_pty_write_all(
+    vivi_pty_endpoint_t *endpoint,
+    const void *buffer,
+    size_t length
+) {
+    const unsigned char *cursor = (const unsigned char *)buffer;
+    while (length != 0) {
+        DWORD amount = 0;
+        DWORD chunk = length > UINT32_MAX ? UINT32_MAX : (DWORD)length;
+        if (!WriteFile(value_handle(endpoint, 1), cursor, chunk, &amount, NULL)) {
+            return -1;
+        }
+        if (amount == 0) return -1;
+        cursor += amount;
+        length -= amount;
+    }
+    return 0;
+}
+
+int vivi_pty_terminate(vivi_pty_endpoint_t *endpoint, uint32_t grace_ms) {
+    (void)grace_ms;
+    HANDLE process = value_handle(endpoint, 2);
+    if (process != NULL && WaitForSingleObject(process, 0) == WAIT_OBJECT_0) {
+        return 0;
+    }
+    HANDLE job = value_handle(endpoint, 3);
+    if (job != NULL && TerminateJobObject(job, 1)) return 0;
+    if (process != NULL && TerminateProcess(process, 1)) return 0;
+    return process != NULL && WaitForSingleObject(process, 0) == WAIT_OBJECT_0
+        ? 0
+        : -1;
+}
+
+int vivi_pty_wait(
+    vivi_pty_endpoint_t *endpoint,
+    int *kind,
+    uint32_t *value
+) {
+    HANDLE process = value_handle(endpoint, 2);
+    if (process == NULL || WaitForSingleObject(process, INFINITE) != WAIT_OBJECT_0) {
+        return -1;
+    }
+    DWORD code = 0;
+    if (!GetExitCodeProcess(process, &code)) return -1;
+    HANDLE job = value_handle(endpoint, 3);
+    if (job != NULL) (void)TerminateJobObject(job, code);
+    HPCON pseudo_console = (HPCON)(uintptr_t)endpoint->values[4];
+    if (pseudo_console != NULL) {
+        ClosePseudoConsole(pseudo_console);
+        endpoint->values[4] = 0;
+    }
+    *kind = VIVI_PTY_EXIT_CODE;
+    *value = code;
+    return 0;
+}
+
+void vivi_pty_close(vivi_pty_endpoint_t *endpoint) {
+    for (int index = 0; index < 4; ++index) {
+        HANDLE handle = value_handle(endpoint, index);
+        if (handle != NULL && handle != INVALID_HANDLE_VALUE) CloseHandle(handle);
+        endpoint->values[index] = 0;
+    }
+    HPCON pseudo_console = (HPCON)(uintptr_t)endpoint->values[4];
+    if (pseudo_console != NULL) ClosePseudoConsole(pseudo_console);
+    endpoint->values[4] = 0;
+}

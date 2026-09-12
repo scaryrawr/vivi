@@ -86,20 +86,25 @@ directly to preserve paste-boundary events omitted by the pinned library's
 Windows loop adapter. All other events still use libvaxis's generic forwarding;
 input failures are delivered to the app for normal terminal cleanup.
 
-The initial coding-agent policy is private to `backend/src/root.zig`. Copilot
-CLI starts with the SDK's curated session-isolated built-in tools enabled for
-planning and subagent coordination, while built-in MCP servers and ambient
-workspace configuration discovery remain disabled. Vivi explicitly supplies
-the workspace root for instructions and `.github/skills`, `.agents/skills`,
-and `.claude/skills` for skills. The SDK provides its typed `ask_user`
-callback; the session registers Vivi-owned `read`, `bash`, `edit`, and `write`
-tools and appends Vivi's concise workspace-aware prompt to Copilot's system
-message. Source-qualified tool filters keep host-affecting built-ins
-unavailable without suppressing Vivi tools.
+The initial coding-agent policy is private to `backend/src/root.zig`. Hosted
+Copilot sessions enable the SDK's curated session-isolated built-ins for
+planning and subagent coordination. OMLX sessions omit the entire task and
+agent-orchestration built-in family because Vivi owns one local model at a
+time, retaining only `ask_user` and `skill`. Built-in MCP servers and ambient
+workspace configuration discovery remain disabled for both. Vivi explicitly
+supplies the workspace root for instructions and `.github/skills`,
+`.agents/skills`, and `.claude/skills` for skills. The SDK provides its typed `ask_user` callback; the session registers exactly
+four Vivi-owned tools: `read`, `bash`, `edit`, and `write`. The `bash` tool
+dispatches synchronous `run` plus persistent PTY `start`, `list`, `read`,
+`write`, and `stop` actions. Vivi appends its concise workspace-aware prompt to
+Copilot's system message. Provider-specific
+session-level source-qualified allowlists admit custom and extension tools
+while limiting Copilot's built-ins to the applicable reviewed set.
 
 `backend/src/tools.zig` owns SDK-free tool behavior: JSON argument validation,
-workspace-relative path resolution, text/image reads, Bash execution, exact
-multi-edit planning, line-ending/BOM preservation, and file writes. It returns
+workspace-relative path resolution, text/image reads, synchronous Bash
+execution, async Bash tool adaptation, exact multi-edit planning,
+line-ending/BOM preservation, and file writes. It returns
 owned text, image bytes with a detected format and display summary, or an
 actionable failure. `backend/src/root.zig` owns the four SDK
 declarations and explicitly resolves `external_tool_requested` events so full
@@ -120,6 +125,26 @@ images and unsupported binary text reads.
 Reads inspect a fixed-size prefix on one open file handle before allocating
 contents. Recognized images use a bounded reader; ordinary text keeps its
 existing unlimited behavior.
+
+`backend/src/bash_sessions.zig` is the deep, SDK-free owner of async Bash
+sessions. One manager is initialized lazily inside each workspace-scoped
+`tools.Service`; successful resume therefore stops the old workspace's
+processes, failed resume leaves them intact, and model switches preserve them.
+The manager owns opaque IDs, separately allocated session state, bounded input
+and output rings, reader/writer/waiter threads, PTY endpoints, and idempotent
+stop. Reads consume up to 32 KiB after a bounded wait, output retention is
+256 KiB per shell, writes are accepted atomically into a 64 KiB queue, and at
+most eight shells are retained.
+
+`backend/src/pty/platform.zig` hides the private native PTY ABI. macOS and
+Linux use `openpty` plus a supervisor that owns the Bash process group and
+kills it when Vivi closes the control socket, including forced exit. The
+supervisor reports exit independently of PTY EOF; the reader normalizes Linux
+`EIO` and macOS zero-length reads, and natural exit is published only after
+both output EOF and process status arrive. Windows uses ConPTY and launches
+`bash.exe` suspended before assigning it to a kill-on-close Job Object. Only
+target-selected C sources are compiled. No PTY handle, PID, ConPTY type, or
+libvaxis dependency crosses into the tool or SDK layers.
 
 `backend/src/models.zig` owns the first local-model integration: OMLX discovery
 through `/v1/models/status`, response validation, stable `omlx/<model-id>`
@@ -239,9 +264,9 @@ unchanged until a native caller defines its callback and ownership contract.
 
 The minimal agent configuration stays private to the SDK-owning root module
 rather than becoming caller-supplied conversation options. This keeps tool
-availability and prompt policy consistent across every host. The process-level
-built-in exclusion is authoritative for Copilot-provided capabilities while
-leaving extension/custom tool sources eligible. The SDK declarations use the
+availability and prompt policy consistent across every host. The session-level
+allowlist is authoritative for model-visible capabilities, while the process
+flag prevents built-in MCP servers from starting. The SDK declarations use the
 same four descriptors that drive the SDK-free dispatcher, and permission
 requests remain fail-closed because Vivi has no approval UI yet.
 
@@ -262,8 +287,8 @@ requests remain fail-closed because Vivi has no approval UI yet.
   the backend worker and terminal thread.
 - We accept cooperative cancellation in exchange for never calling the
   single-threaded SDK concurrently.
-- We accept CLI launch flags alongside SDK session configuration because the
-  pinned Zig SDK does not expose Copilot's source-qualified tool allowlist.
+- We accept a CLI launch flag alongside SDK session configuration because
+  built-in MCP startup remains a process-level concern.
 - We accept unbounded in-memory tool results in exchange for leaving
   truncation and large-result transport to Copilot.
 - We accept synchronous tool execution on the SDK worker in exchange for one

@@ -29,8 +29,101 @@ pub const ReadSummary = struct {
     limit: ?usize,
 };
 
-pub const BashSummary = struct {
-    command: []const u8,
+pub const BashAction = enum {
+    run,
+    start,
+    list,
+    read,
+    write,
+    stop,
+};
+
+pub const BashSummary = union(BashAction) {
+    run: struct { command: []const u8 },
+    start: struct { command: []const u8 },
+    list: void,
+    read: struct { shell_id: []const u8 },
+    write: struct { shell_id: []const u8 },
+    stop: struct { shell_id: []const u8 },
+
+    pub fn clone(self: BashSummary, allocator: std.mem.Allocator) !BashSummary {
+        return switch (self) {
+            .run => |value| .{ .run = .{
+                .command = try allocator.dupe(u8, value.command),
+            } },
+            .start => |value| .{ .start = .{
+                .command = try allocator.dupe(u8, value.command),
+            } },
+            .list => .list,
+            .read => |value| .{ .read = .{
+                .shell_id = try allocator.dupe(u8, value.shell_id),
+            } },
+            .write => |value| .{ .write = .{
+                .shell_id = try allocator.dupe(u8, value.shell_id),
+            } },
+            .stop => |value| .{ .stop = .{
+                .shell_id = try allocator.dupe(u8, value.shell_id),
+            } },
+        };
+    }
+
+    pub fn eql(self: BashSummary, other: BashSummary) bool {
+        return switch (self) {
+            .run => |value| switch (other) {
+                .run => |candidate| std.mem.eql(
+                    u8,
+                    value.command,
+                    candidate.command,
+                ),
+                else => false,
+            },
+            .start => |value| switch (other) {
+                .start => |candidate| std.mem.eql(
+                    u8,
+                    value.command,
+                    candidate.command,
+                ),
+                else => false,
+            },
+            .list => std.meta.activeTag(other) == .list,
+            .read => |value| switch (other) {
+                .read => |candidate| std.mem.eql(
+                    u8,
+                    value.shell_id,
+                    candidate.shell_id,
+                ),
+                else => false,
+            },
+            .write => |value| switch (other) {
+                .write => |candidate| std.mem.eql(
+                    u8,
+                    value.shell_id,
+                    candidate.shell_id,
+                ),
+                else => false,
+            },
+            .stop => |value| switch (other) {
+                .stop => |candidate| std.mem.eql(
+                    u8,
+                    value.shell_id,
+                    candidate.shell_id,
+                ),
+                else => false,
+            },
+        };
+    }
+
+    pub fn deinit(self: *BashSummary, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .run => |value| allocator.free(value.command),
+            .start => |value| allocator.free(value.command),
+            .list => {},
+            .read => |value| allocator.free(value.shell_id),
+            .write => |value| allocator.free(value.shell_id),
+            .stop => |value| allocator.free(value.shell_id),
+        }
+        self.* = undefined;
+    }
 };
 
 pub const EditSummary = struct {
@@ -61,9 +154,7 @@ pub const ToolSummary = union(enum) {
                 .offset = summary.offset,
                 .limit = summary.limit,
             } },
-            .bash => |summary| .{ .bash = .{
-                .command = try allocator.dupe(u8, summary.command),
-            } },
+            .bash => |summary| .{ .bash = try summary.clone(allocator) },
             .edit => |summary| .{ .edit = .{
                 .path = try allocator.dupe(u8, summary.path),
                 .replacement_count = summary.replacement_count,
@@ -86,7 +177,7 @@ pub const ToolSummary = union(enum) {
                 else => false,
             },
             .bash => |value| switch (other) {
-                .bash => |candidate| std.mem.eql(u8, value.command, candidate.command),
+                .bash => |candidate| value.eql(candidate),
                 else => false,
             },
             .edit => |value| switch (other) {
@@ -109,7 +200,7 @@ pub const ToolSummary = union(enum) {
     pub fn deinit(self: *ToolSummary, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .read => |summary| allocator.free(summary.path),
-            .bash => |summary| allocator.free(summary.command),
+            .bash => |*summary| summary.deinit(allocator),
             .edit => |summary| allocator.free(summary.path),
             .write => |summary| allocator.free(summary.path),
             .other => |summary| allocator.free(summary.name),
@@ -372,6 +463,22 @@ test "image tool completion owns bytes and compares image content" {
     } });
     defer different.deinit();
     try std.testing.expect(!finished.eql(different));
+}
+
+test "Bash summaries own action-specific display values" {
+    var original = BashSummary{ .start = .{ .command = "python3 -q" } };
+    var cloned = try original.clone(std.testing.allocator);
+    defer cloned.deinit(std.testing.allocator);
+    try std.testing.expect(original.eql(cloned));
+    original = .{ .read = .{
+        .shell_id = "bash_0123456789abcdef0123456789abcdef",
+    } };
+    try std.testing.expect(!original.eql(cloned));
+    const listed_summary: BashSummary = .list;
+    var listed = try listed_summary.clone(std.testing.allocator);
+    defer listed.deinit(std.testing.allocator);
+    try std.testing.expect(original.eql(original));
+    try std.testing.expect(std.meta.activeTag(listed) == .list);
 }
 
 test "tool activity accepts equal duplicate finish and rejects conflict" {
