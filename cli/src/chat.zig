@@ -2955,7 +2955,7 @@ const ChatUi = struct {
                 "↑/↓ · Enter · Esc input"
         else if (window.width >= 48)
             switch (self.phase) {
-                .ready => "Enter send · F6 tools · Wheel/PgUp/PgDn scroll · Ctrl-C quit",
+                .ready => "Enter send · F6 tools · PgUp/PgDn scroll · Ctrl-C quit",
                 .responding => "Enter steer · F6 tools · Ctrl+Enter queue · PgUp/PgDn scroll · Ctrl-C stop",
                 .awaiting_input => if (self.hasInputChoices())
                     if (self.hasFreeformChoice())
@@ -2963,8 +2963,8 @@ const ChatUi = struct {
                     else
                         "↑/↓ select  ·  Enter accept  ·  Ctrl-C stop"
                 else
-                    "Enter answer  ·  Wheel/PgUp/PgDn scroll  ·  Ctrl-C stop",
-                .connecting, .loading_commands, .running_command, .switching, .resuming => "Wheel/PgUp/PgDn scroll  ·  Ctrl-C stop",
+                    "Enter answer  ·  PgUp/PgDn scroll  ·  Ctrl-C stop",
+                .connecting, .loading_commands, .running_command, .switching, .resuming => "PgUp/PgDn scroll  ·  Ctrl-C stop",
                 .stopping => "Ctrl-C again force exit",
             }
         else if (window.width >= 24)
