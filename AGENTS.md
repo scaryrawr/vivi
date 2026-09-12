@@ -51,6 +51,17 @@ Default tests must not require Copilot credentials or a running Copilot CLI.
 Any C ABI change must update the header, Zig adapter, smoke test, and every
 implemented native binding together.
 
+C API cross-builds do not compile the CLI. For platform-specific clipboard or
+terminal-input changes, also cross-build the executable:
+
+```sh
+zig build -Dtarget=x86_64-linux-gnu --prefix zig-out/cli-linux
+zig build -Dtarget=x86_64-windows-gnu --prefix zig-out/cli-windows
+```
+
+Use the Windows GNU target when cross-building from macOS without MSVC headers.
+These checks establish compilation, not live desktop behavior.
+
 ## Commit & Pull Request Guidelines
 
 No commit convention exists yet. Keep changes narrowly scoped and include the
