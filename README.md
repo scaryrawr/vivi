@@ -31,6 +31,11 @@ zig build test
 zig build install-c-api
 ```
 
+Compiler-backend diagnostics can run the same checks with LLVM explicitly
+selected: `./scripts/check-zig.sh -Dllvm=true`. Without this option, builds
+retain Zig's default backend selection. CI runs this comparison only after a
+compiler core dump; it does not replace or forgive the original failed check.
+
 `vivi chat` opens a full-screen Vivi chat with a scrolling transcript,
 workspace context, and a compact bottom composer. It streams responses as they
 arrive and restores the composer after each completed turn. Vivi enables

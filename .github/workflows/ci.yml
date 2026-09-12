@@ -53,6 +53,15 @@ jobs:
               "$(command -v zig)" "$core"
           done
 
+      - name: Compare compiler crash with LLVM
+        if: failure()
+        run: |
+          for core in "$RUNNER_TEMP"/vivi-zig-core.*; do
+            [ -f "$core" ] || continue
+            ./scripts/check-zig.sh -Dllvm=true
+            break
+          done
+
   c-api-cross:
     name: C API cross-builds
     runs-on: ubuntu-latest
