@@ -88,12 +88,14 @@ input failures are delivered to the app for normal terminal cleanup.
 
 The initial coding-agent policy is private to `backend/src/root.zig`. Copilot
 CLI starts with the SDK's curated session-isolated built-in tools enabled for
-planning and subagent coordination, while built-in MCP servers and custom
-instructions remain disabled. The SDK provides its typed `ask_user` callback;
-the session registers Vivi-owned `read`, `bash`, `edit`, and `write` tools and
-replaces Copilot's system message with Vivi's concise workspace-aware prompt.
-Source-qualified tool filters keep host-affecting built-ins unavailable
-without suppressing Vivi tools.
+planning and subagent coordination, while built-in MCP servers and ambient
+workspace configuration discovery remain disabled. Vivi explicitly supplies
+the workspace root for instructions and `.github/skills`, `.agents/skills`,
+and `.claude/skills` for skills. The SDK provides its typed `ask_user`
+callback; the session registers Vivi-owned `read`, `bash`, `edit`, and `write`
+tools and appends Vivi's concise workspace-aware prompt to Copilot's system
+message. Source-qualified tool filters keep host-affecting built-ins
+unavailable without suppressing Vivi tools.
 
 `backend/src/tools.zig` owns SDK-free tool behavior: JSON argument validation,
 workspace-relative path resolution, text/image reads, Bash execution, exact
