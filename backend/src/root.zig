@@ -225,7 +225,8 @@ const MinimalCodingAgent = struct {
                 .max_output_tokens = selected.max_output_tokens,
             } else null,
             .working_directory = working_directory,
-            .enable_config_discovery = true,
+            .enable_config_discovery = false,
+            .enable_skills = true,
             .skip_custom_instructions = false,
             .enable_on_demand_instruction_discovery = true,
             .streaming = true,
@@ -821,12 +822,18 @@ fn createSdkSession(
     plan: *const SessionPlan,
     api_key: ?[]const u8,
 ) !copilot.Session {
+    var directories = try WorkspaceCustomizationDirectories.init(
+        worker.allocator(),
+        working_directory,
+    );
+    defer directories.deinit();
     var config = sessionConfigForPlan(
         system_prompt,
         working_directory,
         plan,
         api_key,
     );
+    directories.apply(&config);
     config.on_user_input_request = handleSdkUserInput;
     config.user_input_context = worker;
     return client.createSession(config);
@@ -841,12 +848,18 @@ fn joinSdkSession(
     plan: *const SessionPlan,
     api_key: ?[]const u8,
 ) !copilot.Session {
+    var directories = try WorkspaceCustomizationDirectories.init(
+        worker.allocator(),
+        working_directory,
+    );
+    defer directories.deinit();
     var config = sessionConfigForPlan(
         system_prompt,
         working_directory,
         plan,
         api_key,
     );
+    directories.apply(&config);
     config.on_user_input_request = handleSdkUserInput;
     config.user_input_context = worker;
     return client.joinSession(session_id, config);
@@ -1171,6 +1184,53 @@ const StreamResult = enum {
     idle,
     stopped,
     failed,
+};
+
+const WorkspaceCustomizationDirectories = struct {
+    allocator: std.mem.Allocator,
+    skills: [3][]u8,
+    instructions: [1][]u8,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        working_directory: []const u8,
+    ) !WorkspaceCustomizationDirectories {
+        const instructions = try allocator.dupe(u8, working_directory);
+        errdefer allocator.free(instructions);
+        const github_skills = try std.fs.path.join(
+            allocator,
+            &.{ working_directory, ".github/skills" },
+        );
+        errdefer allocator.free(github_skills);
+        const agents_skills = try std.fs.path.join(
+            allocator,
+            &.{ working_directory, ".agents/skills" },
+        );
+        errdefer allocator.free(agents_skills);
+        const claude_skills = try std.fs.path.join(
+            allocator,
+            &.{ working_directory, ".claude/skills" },
+        );
+
+        return .{
+            .allocator = allocator,
+            .skills = .{ github_skills, agents_skills, claude_skills },
+            .instructions = .{instructions},
+        };
+    }
+
+    fn deinit(self: *WorkspaceCustomizationDirectories) void {
+        for (self.skills) |directory| self.allocator.free(directory);
+        for (self.instructions) |directory| self.allocator.free(directory);
+    }
+
+    fn apply(
+        self: *const WorkspaceCustomizationDirectories,
+        config: *copilot.SessionConfig,
+    ) void {
+        config.skill_directories = &self.skills;
+        config.instruction_directories = &self.instructions;
+    }
 };
 
 fn automaticPermissionFailure(
@@ -2658,7 +2718,10 @@ test "minimal coding agent appends Vivi tools to discovered instructions" {
         "/workspace",
         config.working_directory.?,
     );
-    try std.testing.expectEqual(true, config.enable_config_discovery.?);
+    try std.testing.expectEqual(false, config.enable_config_discovery.?);
+    try std.testing.expectEqual(true, config.enable_skills.?);
+    try std.testing.expect(config.skill_directories == null);
+    try std.testing.expect(config.instruction_directories == null);
     try std.testing.expectEqual(false, config.skip_custom_instructions.?);
     try std.testing.expectEqual(
         true,
@@ -2671,6 +2734,29 @@ test "minimal coding agent appends Vivi tools to discovered instructions" {
     try std.testing.expectEqualStrings(
         "minimal system prompt",
         config.system_message.?.content,
+    );
+}
+
+test "workspace customization uses explicit absolute directories" {
+    var directories = try WorkspaceCustomizationDirectories.init(
+        std.testing.allocator,
+        "/workspace",
+    );
+    defer directories.deinit();
+    var config = copilot.SessionConfig{};
+    directories.apply(&config);
+
+    const expected_skills = [_][]const u8{
+        "/workspace/.github/skills",
+        "/workspace/.agents/skills",
+        "/workspace/.claude/skills",
+    };
+    for (expected_skills, config.skill_directories.?) |expected, actual| {
+        try std.testing.expectEqualStrings(expected, actual);
+    }
+    try std.testing.expectEqualStrings(
+        "/workspace",
+        config.instruction_directories.?[0],
     );
 }
 

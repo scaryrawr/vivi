@@ -40,7 +40,9 @@ to `zig build` or `./scripts/check-zig.sh`; both run the same tests and checks.
 workspace context, and a compact bottom composer. It streams responses as they
 arrive and restores the composer after each completed turn. Vivi enables
 Copilot's session-isolated built-in tools for planning and subagent
-coordination while keeping built-in MCP servers disabled. Copilot loads the
+coordination while keeping built-in MCP servers disabled. Vivi scopes workspace
+customization to instruction files and the supported project skill directories;
+it does not enable ambient workspace configuration discovery. Copilot loads the
 workspace's instruction files, including top-level `AGENTS.md`, and discovers
 project skills from `.github/skills/`, `.agents/skills/`, and
 `.claude/skills/`. Skills marked `user-invocable: true` appear in the `/` menu

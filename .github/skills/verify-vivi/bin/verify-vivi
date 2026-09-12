@@ -879,11 +879,11 @@ EOF
     cat >"$workspace/.agents/skills/vivi-fixture/SKILL.md" <<'EOF'
 ---
 name: vivi-fixture
-description: Return the Vivi skill verification token.
+description: Fixture skill discovered by Vivi.
 user-invocable: true
 ---
 
-When invoked, reply with exactly VIVI_SKILL_OK.
+When invoked, return the uppercase spelling of vivi_skill_ok and nothing else.
 EOF
 }
 
@@ -944,7 +944,8 @@ chat_customization() {
         grep -q 'VIVI_INSTRUCTION_OK' "$run_dir/chat-customization.normalized.txt" &&
             printf 'yes\n' || printf 'no\n'
         printf 'skill_menu_seen='
-        grep -q 'vivi-fixture' "$run_dir/chat-customization.normalized.txt" &&
+        grep -q 'Fixture skill discovered by Vivi.' \
+            "$run_dir/chat-customization.normalized.txt" &&
             printf 'yes\n' || printf 'no\n'
         printf 'skill_response_seen='
         grep -q 'VIVI_SKILL_OK' "$run_dir/chat-customization.normalized.txt" &&
@@ -953,7 +954,8 @@ chat_customization() {
 
     test "$status" -eq 0
     grep -q 'VIVI_INSTRUCTION_OK' "$run_dir/chat-customization.normalized.txt"
-    grep -q 'vivi-fixture' "$run_dir/chat-customization.normalized.txt"
+    grep -q 'Fixture skill discovered by Vivi.' \
+        "$run_dir/chat-customization.normalized.txt"
     grep -q 'VIVI_SKILL_OK' "$run_dir/chat-customization.normalized.txt"
     test -s "$run_dir/chat-customization.contact-sheet.png"
 }

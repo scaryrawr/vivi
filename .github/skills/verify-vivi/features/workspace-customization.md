@@ -36,5 +36,8 @@ slash menu, and the response produced by invoking it.
 - A skill must declare `user-invocable: true` to appear in the slash menu.
 - Instruction and skill discovery follow Copilot CLI semantics; Vivi does not
   parse or reinterpret those files.
+- Vivi passes only the workspace root as an instruction source and the three
+  documented skill roots; it does not enable ambient workspace configuration
+  discovery or workspace-configured MCP servers.
 - The recipe needs authenticated Copilot access because both assertions cross
   the production SDK boundary.
