@@ -48,6 +48,12 @@ Preconditions:
   The helper types
   `Return the uppercase spelling of vivi_stream_ok and nothing else.`, waits
   for streaming, and shuts down with Ctrl-C.
+- **Manually verify selection and copying.** Run `./zig-out/bin/vivi chat` in
+  a fresh terminal and submit a prompt that produces distinct response text.
+  Drag over part of the rendered transcript with the terminal's standard
+  selection gesture, copy it with the terminal's copy command, focus the
+  composer, and paste it. Verify the copied text appears in the composer
+  unchanged, then press Ctrl-C to shut down.
 - **Observe the action.** Open `chat-streaming.contact-sheet.png`, then
   inspect individual PNGs under `chat-streaming.frames/` for the idle
   composer, typed prompt, `Responding...` state, `You` entry, `Vivi`
