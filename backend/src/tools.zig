@@ -345,15 +345,27 @@ pub const Service = struct {
         const path = try self.resolvePath(arguments.path);
         defer self.allocator.free(path);
 
-        const content = try std.Io.Dir.cwd().readFileAlloc(
-            self.io,
-            path,
+        const file = try std.Io.Dir.cwd().openFile(self.io, path, .{});
+        defer file.close(self.io);
+        var prefix_buffer: [12]u8 = undefined;
+        var reader = file.reader(self.io, &prefix_buffer);
+        const prefix = reader.interface.peek(prefix_buffer.len) catch |err| switch (err) {
+            error.EndOfStream => reader.interface.buffered(),
+            error.ReadFailed => return reader.err.?,
+        };
+        const format = image.detect(prefix);
+        if (format != null and (try file.stat(self.io)).size > image.max_bytes)
+            return error.ImageTooLarge;
+        const content = reader.interface.allocRemaining(
             self.allocator,
-            .unlimited,
-        );
+            if (format != null) .limited(image.max_bytes) else .unlimited,
+        ) catch |err| switch (err) {
+            error.ReadFailed => return reader.err.?,
+            error.StreamTooLong => return error.ImageTooLarge,
+            error.OutOfMemory => return err,
+        };
         defer self.allocator.free(content);
-        if (image.detect(content)) |format| {
-            if (content.len > image.max_bytes) return error.ImageTooLarge;
+        if (format) |image_format| {
             if (arguments.offset != null or arguments.limit != null) {
                 return self.failure(
                     "offset and limit select text lines and cannot be used with images.",
@@ -363,12 +375,12 @@ pub const Service = struct {
             const description = try std.fmt.allocPrint(
                 self.allocator,
                 "Image: {s} ({s}, {d} bytes)",
-                .{ arguments.path, format.mimeType(), content.len },
+                .{ arguments.path, image_format.mimeType(), content.len },
             );
             errdefer self.allocator.free(description);
             return .{ .image = .{
                 .bytes = try self.allocator.dupe(u8, content),
-                .format = format,
+                .format = image_format,
                 .description = description,
             } };
         }
@@ -710,6 +722,7 @@ test "read tool rejects image line ranges and unsupported binary data" {
         try std.testing.expect(result == .failure);
         try std.testing.expect(std.mem.indexOf(u8, result.failure, "cannot be used with images") != null);
     }
+
     try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "binary", .data = "abc\x00def" });
     var prepared = try service.prepare("read", "{\"path\":\"binary\"}");
     defer prepared.deinit();
@@ -718,6 +731,48 @@ test "read tool rejects image line ranges and unsupported binary data" {
     try std.testing.expectEqualStrings("read failed: UnsupportedBinaryFile.", result.failure);
 }
 
+test "read rejects oversized images before allocating their contents" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const file = try temporary.dir.createFile(std.testing.io, "large.png", .{});
+    {
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, "\x89PNG\r\n\x1a\n");
+        try file.setLength(std.testing.io, image.max_bytes + 1);
+    }
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try temporary.dir.realPath(std.testing.io, &path_buffer);
+    var memory: [32 * 1024]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&memory);
+    var service = try Service.init(fixed.allocator(), std.testing.io, path_buffer[0..path_len]);
+    defer service.deinit();
+    var prepared = try service.prepare("read", "{\"path\":\"large.png\"}");
+    defer prepared.deinit();
+    var result = try service.execute(&prepared);
+    defer result.deinit(fixed.allocator());
+    try std.testing.expectEqualStrings("read failed: ImageTooLarge.", result.failure);
+}
+
+test "read text remains unlimited beyond the image byte limit" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const file = try temporary.dir.createFile(std.testing.io, "large.txt", .{});
+    {
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, "first\n");
+        const block = [_]u8{'a'} ** 4096;
+        for (0..image.max_bytes / block.len + 1) |_| try file.writeStreamingAll(std.testing.io, &block);
+    }
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try temporary.dir.realPath(std.testing.io, &path_buffer);
+    var service = try Service.init(std.testing.allocator, std.testing.io, path_buffer[0..path_len]);
+    defer service.deinit();
+    var prepared = try service.prepare("read", "{\"path\":\"large.txt\",\"limit\":1}");
+    defer prepared.deinit();
+    var result = try service.execute(&prepared);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("first", result.text);
+}
 test "edit plans replacements against original content" {
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();

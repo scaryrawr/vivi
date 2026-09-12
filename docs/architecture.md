@@ -81,6 +81,10 @@ that worker stops. Saved ask-user drafts retain their visible image paths.
 Only `root.zig` maps the snapshots into `session.send` blob attachments through
 the SDK's RPC API; the pinned typed `MessageOptions` is currently text-only.
 No chat operation is exposed through the scaffold C ABI.
+On Windows, Vivi drives the libvaxis terminal parser and existing event queue
+directly to preserve paste-boundary events omitted by the pinned library's
+Windows loop adapter. All other events still use libvaxis's generic forwarding;
+input failures are delivered to the app for normal terminal cleanup.
 
 The initial coding-agent policy is private to `backend/src/root.zig`. Copilot
 CLI starts with the SDK's curated session-isolated built-in tools enabled for
@@ -108,6 +112,9 @@ bounded rows in the transcript projection, and crop placements to the visible
 viewport. Terminal graphics handles live until app shutdown; unsupported
 terminals or decoder formats show a notice instead. The SDK-free read service
 rejects text line ranges on images and unsupported binary text reads.
+Reads inspect a fixed-size prefix on one open file handle before allocating
+contents. Recognized images use a bounded reader; ordinary text keeps its
+existing unlimited behavior.
 
 `backend/src/models.zig` owns the first local-model integration: OMLX discovery
 through `/v1/models/status`, response validation, stable `omlx/<model-id>`

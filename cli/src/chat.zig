@@ -32,6 +32,7 @@ const AppEvent = union(enum) {
     winsize: vaxis.Winsize,
     paste_start,
     paste_end,
+    input_error: anyerror,
     conversation_wake,
 };
 
@@ -3375,7 +3376,11 @@ const App = struct {
     }
 
     fn run(self: *App) !void {
-        try self.loop.start();
+        if (@import("builtin").os.tag == .windows) {
+            self.loop.thread = try self.io.concurrent(runWindowsInput, .{&self.loop});
+        } else {
+            try self.loop.start();
+        }
         try self.vx.enterAltScreen(self.tty.writer());
         try self.vx.queryTerminal(self.tty.writer(), .fromSeconds(1));
         try self.vx.setMouseMode(self.tty.writer(), true);
@@ -3424,10 +3429,37 @@ const App = struct {
                     );
                 },
                 .conversation_wake => {},
+                .input_error => |err| return err,
             }
             const conversation_changed = try self.drainConversation();
             if (!self.closed and (redraw or conversation_changed))
                 try self.render();
+        }
+    }
+
+    fn runWindowsInput(loop: *vaxis.Loop(AppEvent)) void {
+        readWindowsInput(loop) catch |err| {
+            if (loop.should_quit) return;
+            loop.postEvent(.{ .input_error = err }) catch |post_error|
+                std.log.err("Unable to report terminal input failure {s}: {s}", .{ @errorName(err), @errorName(post_error) });
+        };
+    }
+
+    fn readWindowsInput(loop: *vaxis.Loop(AppEvent)) !void {
+        var parser: vaxis.Parser = .{};
+        var cache: vaxis.GraphemeCache = .{};
+        while (!loop.should_quit) {
+            const event = try loop.tty.nextEvent(&parser, null);
+            try forwardTerminalEvent(loop, &cache, event);
+        }
+    }
+
+    fn forwardTerminalEvent(loop: *vaxis.Loop(AppEvent), cache: *vaxis.GraphemeCache, event: vaxis.Event) !void {
+        // The pinned libvaxis Windows adapter drops these parser events.
+        switch (event) {
+            .paste_start => try loop.postEvent(.paste_start),
+            .paste_end => try loop.postEvent(.paste_end),
+            else => try vaxis.loop.handleEventGeneric(loop, loop.vaxis, cache, AppEvent, event, null),
         }
     }
 
@@ -5063,6 +5095,52 @@ test "image bracketed text paste never submits or executes shortcuts" {
     const text = try ui.input.toOwnedContents(std.testing.allocator);
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings("hello there  ", text);
+    try std.testing.expectEqual(UiPhase.ready, ui.phase);
+    try std.testing.expectEqual(@as(usize, 0), ui.transcript.entries.items.len);
+}
+
+test "image paste boundaries survive terminal parser and event forwarding" {
+    var tty: vaxis.Tty = undefined;
+    var vx: vaxis.Vaxis = undefined;
+    var loop = vaxis.Loop(AppEvent).init(std.testing.io, &tty, &vx);
+    var cache: vaxis.GraphemeCache = .{};
+    var parser: vaxis.Parser = .{};
+    var remaining: []const u8 = "\x1b[200~hello\rthere\x03\x1b[201~";
+    while (remaining.len > 0) {
+        const parsed = try parser.parse(remaining, null);
+        try std.testing.expect(parsed.n > 0);
+        remaining = remaining[parsed.n..];
+        if (parsed.event) |event| try App.forwardTerminalEvent(&loop, &cache, event);
+    }
+    var ui: ChatUi = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .input = TextInput.init(std.testing.allocator),
+        .cwd = try std.testing.allocator.dupe(u8, "."),
+        .phase = .ready,
+    };
+    defer ui.deinit();
+    var unused: backend.Conversation = undefined;
+    var boundaries: usize = 0;
+    while (try loop.tryEvent()) |event| switch (event) {
+        .paste_start => {
+            try std.testing.expect(!ui.bracketed_paste);
+            ui.bracketed_paste = true;
+            boundaries += 1;
+        },
+        .paste_end => {
+            try std.testing.expect(ui.bracketed_paste);
+            ui.bracketed_paste = false;
+            boundaries += 1;
+        },
+        .key_press => |key| try std.testing.expect((try ui.handleKey(key, &unused)) == .keep_running),
+        else => return error.UnexpectedEvent,
+    };
+    const text = try ui.input.toOwnedContents(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("hello there", text);
+    try std.testing.expectEqual(@as(usize, 2), boundaries);
+    try std.testing.expect(!ui.bracketed_paste);
     try std.testing.expectEqual(UiPhase.ready, ui.phase);
     try std.testing.expectEqual(@as(usize, 0), ui.transcript.entries.items.len);
 }
