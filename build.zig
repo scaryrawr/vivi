@@ -3,7 +3,9 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const use_llvm = b.option(bool, "llvm", "Override Zig's default LLVM backend selection");
+    const use_llvm = b.option(bool, "llvm", "Override compiler backend selection");
+    // Zig 0.16's default x86_64 backend crashes compiling the image decoder.
+    const cli_use_llvm = use_llvm orelse true;
     const backend_linkage = b.option(
         std.builtin.LinkMode,
         "backend-linkage",
@@ -95,7 +97,7 @@ pub fn build(b: *std.Build) void {
     const cli = b.addExecutable(.{
         .name = "vivi",
         .root_module = cli_module,
-        .use_llvm = use_llvm,
+        .use_llvm = cli_use_llvm,
     });
     const install_cli = b.addInstallArtifact(cli, .{});
     b.getInstallStep().dependOn(&install_cli.step);
@@ -108,7 +110,7 @@ pub fn build(b: *std.Build) void {
     const backend_tests = b.addTest(.{ .root_module = backend, .use_llvm = use_llvm });
     const run_backend_tests = b.addRunArtifact(backend_tests);
 
-    const cli_tests = b.addTest(.{ .root_module = cli_module, .use_llvm = use_llvm });
+    const cli_tests = b.addTest(.{ .root_module = cli_module, .use_llvm = cli_use_llvm });
     const run_cli_tests = b.addRunArtifact(cli_tests);
 
     const chat_tests_module = b.createModule(.{
@@ -138,7 +140,7 @@ pub fn build(b: *std.Build) void {
     });
     const chat_tests = b.addTest(.{
         .root_module = chat_tests_module,
-        .use_llvm = use_llvm,
+        .use_llvm = cli_use_llvm,
         .filters = &.{ "Markdown draw storage remains valid", "tool", "mouse", "clipboard", "image" },
     });
     const run_chat_tests = b.addRunArtifact(chat_tests);
