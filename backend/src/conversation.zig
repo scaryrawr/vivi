@@ -1,5 +1,6 @@
 const std = @import("std");
 const tool_activity = @import("tool_activity.zig");
+const image = @import("image.zig");
 
 pub const Wake = struct {
     context: *anyopaque,
@@ -27,6 +28,79 @@ pub const OwnedText = struct {
         self.* = undefined;
     }
 };
+
+pub const Prompt = struct {
+    text: []const u8,
+    image_paths: []const []const u8 = &.{},
+};
+
+pub const PromptContent = struct {
+    text: []const u8,
+    images: []const image.Image = &.{},
+};
+
+pub const OwnedPrompt = struct {
+    text: OwnedText,
+    images: []image.Image = &.{},
+
+    fn init(allocator: std.mem.Allocator, io: std.Io, prompt: Prompt) !OwnedPrompt {
+        var text = try OwnedText.init(allocator, prompt.text);
+        errdefer text.deinit();
+        const values = try allocator.alloc(image.Image, prompt.image_paths.len);
+        errdefer allocator.free(values);
+        var initialized: usize = 0;
+        errdefer for (values[0..initialized]) |*value| value.deinit(allocator);
+        for (prompt.image_paths, 0..) |path, index| {
+            values[index] = try image.Image.fromFile(allocator, io, path);
+            initialized += 1;
+        }
+        return .{ .text = text, .images = values };
+    }
+
+    pub fn borrow(self: *const OwnedPrompt) PromptContent {
+        return .{ .text = self.text.bytes, .images = self.images };
+    }
+
+    pub fn deinit(self: *OwnedPrompt) void {
+        for (self.images) |*value| value.deinit(self.text.allocator);
+        self.text.allocator.free(self.images);
+        self.text.deinit();
+        self.* = undefined;
+    }
+};
+
+test "image prompt owns submitted bytes even after the file changes or disappears" {
+    const allocator = std.testing.allocator;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "image.png", .data = "\x89PNG\r\n\x1a\noriginal" });
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const len = try temporary.dir.realPath(std.testing.io, &path_buffer);
+    const path = try std.fs.path.join(allocator, &.{ path_buffer[0..len], "image.png" });
+    defer allocator.free(path);
+    const text = try allocator.dupe(u8, "look here");
+    var prompt = try OwnedPrompt.init(allocator, std.testing.io, .{ .text = text, .image_paths = &.{path} });
+    defer prompt.deinit();
+    allocator.free(text);
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "image.png", .data = "changed" });
+    try temporary.dir.deleteFile(std.testing.io, "image.png");
+    try std.testing.expectEqualStrings("look here", prompt.borrow().text);
+    try std.testing.expectEqualStrings("\x89PNG\r\n\x1a\noriginal", prompt.borrow().images[0].bytes);
+    try std.testing.expectEqualStrings("image.png", prompt.borrow().images[0].description);
+}
+
+test "image prompt rejects non-absolute and NUL paths" {
+    try std.testing.expectError(error.InvalidImagePath, OwnedPrompt.init(
+        std.testing.allocator,
+        std.testing.io,
+        .{ .text = "", .image_paths = &.{"image.png"} },
+    ));
+    try std.testing.expectError(error.InvalidImagePath, OwnedPrompt.init(
+        std.testing.allocator,
+        std.testing.io,
+        .{ .text = "", .image_paths = &.{"/tmp/image\x00.png"} },
+    ));
+}
 
 pub const Failure = struct {
     kind: FailureKind,
@@ -386,7 +460,7 @@ pub const Event = union(enum) {
 
 pub const Command = union(enum) {
     prompt: struct {
-        text: OwnedText,
+        message: OwnedPrompt,
         delivery: PromptDelivery,
     },
     refresh_commands,
@@ -404,7 +478,7 @@ pub const Command = union(enum) {
 
     pub fn deinit(self: *Command) void {
         switch (self.*) {
-            .prompt => |*prompt| prompt.text.deinit(),
+            .prompt => |*prompt| prompt.message.deinit(),
             .switch_model, .execute_command => |*text| text.deinit(),
             .user_input_response => |*response| {
                 response.request_id.deinit();
@@ -777,10 +851,10 @@ pub const Conversation = struct {
 
     pub fn submit(
         self: *Conversation,
-        prompt: []const u8,
+        prompt: Prompt,
         delivery: PromptDelivery,
     ) !void {
-        if (std.mem.trim(u8, prompt, " \t\r\n").len == 0) {
+        if (std.mem.trim(u8, prompt.text, " \t\r\n").len == 0 and prompt.image_paths.len == 0) {
             return error.EmptyPrompt;
         }
 
@@ -793,14 +867,14 @@ pub const Conversation = struct {
             .stopping => return error.Stopping,
             .closed => return error.Closed,
         }
-        const owned_prompt = try OwnedText.init(self.core.allocator, prompt);
+        const owned_prompt = try OwnedPrompt.init(self.core.allocator, self.core.io, prompt);
         errdefer {
             var mutable = owned_prompt;
             mutable.deinit();
         }
         try self.core.commands.append(self.core.allocator, .{
             .prompt = .{
-                .text = owned_prompt,
+                .message = owned_prompt,
                 .delivery = delivery,
             },
         });
@@ -1074,7 +1148,7 @@ test "conversation transfers streamed events without SDK access" {
         }
     }
 
-    try conversation.submit("hello", .enqueue);
+    try conversation.submit(.{ .text = "hello" }, .enqueue);
     var received: usize = 0;
     while (received < 3) {
         if (try conversation.tryTakeEvent()) |event_value| {
@@ -1179,7 +1253,7 @@ test "conversation accepts steering and queued prompts while streaming" {
                 },
             };
             if (first_prompt.delivery != .enqueue or
-                !std.mem.eql(u8, first_prompt.text.bytes, "first"))
+                !std.mem.eql(u8, first_prompt.message.text.bytes, "first"))
             {
                 worker.closeFailure(.stream, "Unexpected first prompt.");
                 return;
@@ -1195,7 +1269,7 @@ test "conversation accepts steering and queued prompts while streaming" {
                 },
             };
             if (steer_prompt.delivery != .immediate or
-                !std.mem.eql(u8, steer_prompt.text.bytes, "steer"))
+                !std.mem.eql(u8, steer_prompt.message.text.bytes, "steer"))
             {
                 worker.closeFailure(.stream, "Unexpected steering prompt.");
                 return;
@@ -1211,7 +1285,7 @@ test "conversation accepts steering and queued prompts while streaming" {
                 },
             };
             if (queued_prompt.delivery != .enqueue or
-                !std.mem.eql(u8, queued_prompt.text.bytes, "later"))
+                !std.mem.eql(u8, queued_prompt.message.text.bytes, "later"))
             {
                 worker.closeFailure(.stream, "Unexpected queued prompt.");
                 return;
@@ -1251,9 +1325,9 @@ test "conversation accepts steering and queued prompts while streaming" {
         }
     }
 
-    try conversation.submit("first", .enqueue);
-    try conversation.submit("steer", .immediate);
-    try conversation.submit("later", .enqueue);
+    try conversation.submit(.{ .text = "first" }, .enqueue);
+    try conversation.submit(.{ .text = "steer" }, .immediate);
+    try conversation.submit(.{ .text = "later" }, .enqueue);
 }
 
 test "conversation accepts an answer only while user input is pending" {
@@ -1337,7 +1411,7 @@ test "conversation accepts an answer only while user input is pending" {
         error.NotAwaitingInput,
         conversation.respondToUserInput("request-1", "two", false),
     );
-    try conversation.submit("ask", .immediate);
+    try conversation.submit(.{ .text = "ask" }, .immediate);
 
     while (true) {
         if (try conversation.tryTakeEvent()) |event_value| {
@@ -1381,7 +1455,7 @@ test "waiting for user input preserves queued prompts" {
     }
     try core.commands.append(std.testing.allocator, .{
         .prompt = .{
-            .text = try OwnedText.init(std.testing.allocator, "later"),
+            .message = try OwnedPrompt.init(std.testing.allocator, std.testing.io, .{ .text = "later" }),
             .delivery = .enqueue,
         },
     });
@@ -1404,5 +1478,5 @@ test "waiting for user input preserves queued prompts" {
     var queued = worker.tryTakeCommand().?;
     defer queued.deinit();
     try std.testing.expect(queued == .prompt);
-    try std.testing.expectEqualStrings("later", queued.prompt.text.bytes);
+    try std.testing.expectEqualStrings("later", queued.prompt.message.text.bytes);
 }

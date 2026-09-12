@@ -3,6 +3,9 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const use_llvm = b.option(bool, "llvm", "Override compiler backend selection");
+    // Zig 0.16's default x86_64 backend crashes compiling the image decoder.
+    const cli_use_llvm = use_llvm orelse true;
     const backend_linkage = b.option(
         std.builtin.LinkMode,
         "backend-linkage",
@@ -52,6 +55,7 @@ pub fn build(b: *std.Build) void {
         .name = "vivi_backend",
         .root_module = c_api,
         .linkage = backend_linkage,
+        .use_llvm = use_llvm,
     });
     library.installHeader(
         b.path("backend/include/vivi_backend.h"),
@@ -72,6 +76,7 @@ pub fn build(b: *std.Build) void {
     });
     cli_module.addImport("vivi_backend", backend);
     cli_module.addImport("vaxis", vaxis.module("vaxis"));
+    addClipboard(b, cli_module, target);
     addSyntaxHighlighting(
         cli_module,
         tree_sitter,
@@ -92,6 +97,7 @@ pub fn build(b: *std.Build) void {
     const cli = b.addExecutable(.{
         .name = "vivi",
         .root_module = cli_module,
+        .use_llvm = cli_use_llvm,
     });
     const install_cli = b.addInstallArtifact(cli, .{});
     b.getInstallStep().dependOn(&install_cli.step);
@@ -101,10 +107,10 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the vivi CLI");
     run_step.dependOn(&run_cli.step);
 
-    const backend_tests = b.addTest(.{ .root_module = backend });
+    const backend_tests = b.addTest(.{ .root_module = backend, .use_llvm = use_llvm });
     const run_backend_tests = b.addRunArtifact(backend_tests);
 
-    const cli_tests = b.addTest(.{ .root_module = cli_module });
+    const cli_tests = b.addTest(.{ .root_module = cli_module, .use_llvm = cli_use_llvm });
     const run_cli_tests = b.addRunArtifact(cli_tests);
 
     const chat_tests_module = b.createModule(.{
@@ -115,6 +121,7 @@ pub fn build(b: *std.Build) void {
     });
     chat_tests_module.addImport("vivi_backend", backend);
     chat_tests_module.addImport("vaxis", vaxis.module("vaxis"));
+    addClipboard(b, chat_tests_module, target);
     addSyntaxHighlighting(
         chat_tests_module,
         tree_sitter,
@@ -133,7 +140,8 @@ pub fn build(b: *std.Build) void {
     });
     const chat_tests = b.addTest(.{
         .root_module = chat_tests_module,
-        .filters = &.{ "Markdown draw storage remains valid", "tool", "mouse" },
+        .use_llvm = cli_use_llvm,
+        .filters = &.{ "Markdown draw storage remains valid", "tool", "mouse", "clipboard", "image" },
     });
     const run_chat_tests = b.addRunArtifact(chat_tests);
 
@@ -151,7 +159,7 @@ pub fn build(b: *std.Build) void {
         tree_sitter_bash,
         tree_sitter_json,
     );
-    const tool_tests = b.addTest(.{ .root_module = tool_tests_module });
+    const tool_tests = b.addTest(.{ .root_module = tool_tests_module, .use_llvm = use_llvm });
     const run_tool_tests = b.addRunArtifact(tool_tests);
 
     const markdown_tests_module = b.createModule(.{
@@ -179,6 +187,7 @@ pub fn build(b: *std.Build) void {
     });
     const markdown_tests = b.addTest(.{
         .root_module = markdown_tests_module,
+        .use_llvm = use_llvm,
     });
     const run_markdown_tests = b.addRunArtifact(markdown_tests);
 
@@ -196,6 +205,7 @@ pub fn build(b: *std.Build) void {
     const c_smoke = b.addExecutable(.{
         .name = "vivi-c-abi-smoke",
         .root_module = c_smoke_module,
+        .use_llvm = use_llvm,
     });
     c_smoke.root_module.linkLibrary(library);
     const run_c_smoke = b.addRunArtifact(c_smoke);
@@ -213,6 +223,15 @@ pub fn build(b: *std.Build) void {
         "Install the C-compatible backend library and headers",
     );
     install_c_api.dependOn(&install_library.step);
+}
+
+fn addClipboard(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget) void {
+    if (target.result.os.tag != .macos) return;
+    module.addCSourceFile(.{
+        .file = b.path("cli/src/clipboard_macos.m"),
+        .flags = &.{"-fobjc-arc"},
+    });
+    module.linkFramework("AppKit", .{});
 }
 
 fn addSyntaxHighlighting(

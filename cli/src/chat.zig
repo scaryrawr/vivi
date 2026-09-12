@@ -3,6 +3,9 @@ const backend = @import("vivi_backend");
 const highlight = @import("highlight.zig");
 const markdown = @import("markdown.zig");
 const tool_renderer = @import("tool_renderer.zig");
+const clipboard = @import("clipboard.zig");
+const images = @import("images.zig");
+const image_preview = @import("image_preview.zig");
 const vaxis = @import("vaxis");
 
 const TextInput = vaxis.widgets.TextInput;
@@ -27,6 +30,9 @@ const AppEvent = union(enum) {
     key_press: vaxis.Key,
     mouse: vaxis.Mouse,
     winsize: vaxis.Winsize,
+    paste_start,
+    paste_end,
+    input_error: anyerror,
     conversation_wake,
 };
 
@@ -46,6 +52,32 @@ const Role = enum {
 
 fn isBlank(text: []const u8) bool {
     return std.mem.trim(u8, text, " \t\r\n").len == 0;
+}
+
+fn imagePasteFailureMessage(
+    allocator: std.mem.Allocator,
+    err: anyerror,
+    platform: std.Target.Os.Tag,
+) ![]u8 {
+    const hint: ?[]const u8 = switch (err) {
+        error.ClipboardToolUnavailable => switch (platform) {
+            .linux => "Install wl-clipboard (wl-paste) for Wayland or xclip for X11, and ensure it is on PATH",
+            .windows => "Make Windows PowerShell (powershell.exe) available on PATH",
+            else => null,
+        },
+        error.ClipboardSessionUnavailable => "Run Vivi inside a Wayland or X11 desktop session; neither WAYLAND_DISPLAY nor DISPLAY is available",
+        error.ClipboardToolFailed => switch (platform) {
+            .linux => "The wl-paste/xclip helper failed; check that it can access your current desktop clipboard",
+            .windows => "Windows PowerShell could not read the clipboard; use an interactive desktop session and copy the image again",
+            else => null,
+        },
+        error.ClipboardTimedOut => "The clipboard helper timed out; check that your desktop session is responsive and try again",
+        error.NoImageOnClipboard => "Copy an image to the clipboard on the machine running Vivi, then try again",
+        else => null,
+    };
+    if (hint) |message|
+        return std.fmt.allocPrint(allocator, "Image paste failed: {s} ({s}).", .{ message, @errorName(err) });
+    return std.fmt.allocPrint(allocator, "Image paste failed: {s}.", .{@errorName(err)});
 }
 
 fn slashCommandQuery(input: []const u8) ?[]const u8 {
@@ -124,6 +156,7 @@ const ToolEntry = struct {
     input_display: []u8,
     output: ?[]u8 = null,
     output_display: ?[]u8 = null,
+    preview: ?image_preview.Preview = null,
     input_highlights: []highlight.Span,
     output_highlights: ?[]highlight.Span = null,
     output_language: ?highlight.Language,
@@ -133,6 +166,7 @@ const ToolEntry = struct {
 
     const Completion = union(enum) {
         succeeded: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+        image: [std.crypto.hash.sha2.Sha256.digest_length]u8,
         failed: [std.crypto.hash.sha2.Sha256.digest_length]u8,
 
         fn eql(self: Completion, other: Completion) bool {
@@ -143,15 +177,19 @@ const ToolEntry = struct {
                         hash[0..],
                         candidate[0..],
                     ),
-                    .failed => false,
+                    .failed, .image => false,
                 },
                 .failed => |hash| switch (other) {
-                    .succeeded => false,
+                    .succeeded, .image => false,
                     .failed => |candidate| std.mem.eql(
                         u8,
                         hash[0..],
                         candidate[0..],
                     ),
+                },
+                .image => |hash| switch (other) {
+                    .image => |candidate| std.mem.eql(u8, &hash, &candidate),
+                    .succeeded, .failed => false,
                 },
             };
         }
@@ -229,6 +267,13 @@ const ToolEntry = struct {
             .failed => |text| .{
                 .failed = hashToolPayload(text),
             },
+            .image => |value| blk: {
+                var hash = std.crypto.hash.sha2.Sha256.init(.{});
+                hash.update(@tagName(value.format));
+                hash.update(value.description);
+                hash.update(value.bytes);
+                break :blk .{ .image = hash.finalResult() };
+            },
         };
         if (self.completion) |existing| {
             if (!existing.eql(completion)) {
@@ -238,23 +283,33 @@ const ToolEntry = struct {
         }
         const text = switch (finished.result) {
             .succeeded, .failed => |text| text,
+            .image => |value| value.description,
         };
         const output = try allocator.dupe(u8, text);
         errdefer allocator.free(output);
         const succeeded = switch (completion) {
-            .succeeded => true,
+            .succeeded, .image => true,
             .failed => false,
         };
-        const output_display = if (self.output_markdown and succeeded)
+        const output_display = if (self.output_markdown and succeeded and completion != .image)
             try tool_renderer.renderMarkdown(allocator, output)
         else
             try tool_renderer.renderLiteral(allocator, output);
         errdefer allocator.free(output_display);
+        const preview = if (finished.result == .image)
+            try image_preview.Preview.init(allocator, finished.result.image.bytes)
+        else
+            null;
         self.output = output;
         self.output_display = output_display;
+        self.preview = preview;
+        if (completion == .image) {
+            self.output_language = null;
+            self.output_markdown = false;
+        }
         self.completion = completion;
         const marker = switch (completion) {
-            .succeeded => "✓",
+            .succeeded, .image => "✓",
             .failed => "✗",
         };
         std.debug.assert(std.mem.startsWith(u8, self.compact, "◌"));
@@ -268,7 +323,7 @@ const ToolEntry = struct {
         if (self.output_highlights != null) return;
         const output = self.output_display orelse return;
         const succeeded = if (self.completion) |completion| switch (completion) {
-            .succeeded => true,
+            .succeeded, .image => true,
             .failed => false,
         } else false;
         self.output_highlights = if (succeeded)
@@ -281,6 +336,7 @@ const ToolEntry = struct {
     }
 
     fn deinit(self: *ToolEntry, allocator: std.mem.Allocator) void {
+        if (self.preview) |*preview| preview.deinit(allocator);
         self.output_markdown_cache.deinit(allocator);
         allocator.free(self.compact);
         allocator.free(self.input);
@@ -874,6 +930,7 @@ const LineKind = enum {
     tool_output_label,
     tool_output,
     tool_output_markdown,
+    tool_image,
 };
 
 const RenderLine = struct {
@@ -971,7 +1028,7 @@ const Projection = struct {
                         });
                         const render_markdown = tool.output_markdown and
                             if (tool.completion) |completion| switch (completion) {
-                                .succeeded => true,
+                                .succeeded, .image => true,
                                 .failed => false,
                             } else false;
                         if (render_markdown) {
@@ -986,6 +1043,17 @@ const Projection = struct {
                             );
                         } else {
                             try projection.appendWrapped(allocator, entry_index, tool.output_display orelse "Running…", window, .tool_output, 4);
+                        }
+                        if (tool.preview) |preview| {
+                            const size = preview.cellSize(window.child(.{ .width = window.width -| 4 }));
+                            for (0..size.rows) |row| {
+                                try projection.lines.append(allocator, .{
+                                    .kind = .tool_image,
+                                    .entry_index = entry_index,
+                                    .start = row,
+                                    .end = size.rows,
+                                });
+                            }
                         }
                     }
                 },
@@ -1339,6 +1407,8 @@ const ChatUi = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     input: TextInput,
+    pasted_images: ?images.Store = null,
+    bracketed_paste: bool = false,
     transcript: Transcript = .{},
     cwd: []u8,
     phase: UiPhase = .connecting,
@@ -1390,6 +1460,7 @@ const ChatUi = struct {
     }
 
     fn deinit(self: *ChatUi) void {
+        if (self.pasted_images) |*store| store.deinit();
         self.tool_hits.deinit(self.allocator);
         self.menu.deinit(self.allocator);
         if (self.saved_input) |*input| input.deinit();
@@ -1408,6 +1479,24 @@ const ChatUi = struct {
         key: vaxis.Key,
         conversation: *backend.Conversation,
     ) !KeyOutcome {
+        if (self.bracketed_paste) {
+            if (self.phase == .ready or self.phase == .responding or
+                self.phase == .loading_commands or self.phase == .awaiting_input)
+            {
+                if (key.text) |text| {
+                    const pasted = try self.allocator.dupe(u8, text);
+                    defer self.allocator.free(pasted);
+                    for (pasted) |*byte| {
+                        if (byte.* < 0x20 or byte.* == 0x7f) byte.* = ' ';
+                    }
+                    try self.input.insertSliceAtCursor(pasted);
+                } else if (key.codepoint == vaxis.Key.enter) {
+                    try self.input.insertSliceAtCursor(" ");
+                }
+                self.input_revision +%= 1;
+            }
+            return .keep_running;
+        }
         if (key.matches('c', .{ .ctrl = true })) {
             if (self.phase == .stopping) return .force_exit;
             self.phase = .stopping;
@@ -1490,35 +1579,30 @@ const ChatUi = struct {
         if (self.handleToolKey(key)) return .keep_running;
 
         if (key.matches(vaxis.Key.enter, .{})) {
-            const prompt = try self.input.toOwnedContents(self.allocator);
-            defer self.allocator.free(prompt);
-            conversation.submit(prompt, .immediate) catch |err| switch (err) {
-                error.EmptyPrompt, error.Busy => return .keep_running,
-                else => return err,
-            };
-            try self.transcript.append(self.allocator, .user, prompt);
-            self.input.clearRetainingCapacity();
-            self.phase = .responding;
-            self.followTail();
+            try self.submitPrompt(conversation, .immediate);
             return .keep_running;
         }
 
         if (key.matches(vaxis.Key.enter, .{ .ctrl = true })) {
-            const prompt = try self.input.toOwnedContents(self.allocator);
-            defer self.allocator.free(prompt);
-            conversation.submit(prompt, .enqueue) catch |err| switch (err) {
-                error.EmptyPrompt, error.Busy => return .keep_running,
-                else => return err,
-            };
-            try self.transcript.append(self.allocator, .queued, prompt);
-            self.input.clearRetainingCapacity();
-            self.phase = .responding;
-            self.followTail();
+            try self.submitPrompt(conversation, .enqueue);
             return .keep_running;
         }
-        const previous_menu_mode = self.menu_mode;
         try self.input.update(.{ .key_press = key });
+        try self.inputChanged(conversation);
+        return .keep_running;
+    }
+
+    fn inputChanged(self: *ChatUi, conversation: *backend.Conversation) !void {
         self.input_revision +%= 1;
+        if (self.phase == .awaiting_input) {
+            self.invalid_user_input = false;
+            const contents = try self.input.toOwnedContents(self.allocator);
+            defer self.allocator.free(contents);
+            if (self.hasFreeformChoice() and !isBlank(contents))
+                self.selected_user_input_choice = self.pending_user_input.?.choices.len;
+            return;
+        }
+        const previous_menu_mode = self.menu_mode;
         if (self.phase == .ready or self.phase == .loading_commands) {
             try self.syncSlashMenu();
         } else {
@@ -1526,12 +1610,46 @@ const ChatUi = struct {
         }
         if (previous_menu_mode == .closed and self.menu_mode == .commands) {
             conversation.refreshCommands() catch |err| switch (err) {
-                error.Busy => return .keep_running,
+                error.Busy => return,
                 else => return err,
             };
             self.phase = .loading_commands;
         }
-        return .keep_running;
+    }
+
+    fn submitPrompt(self: *ChatUi, conversation: *backend.Conversation, delivery: backend.PromptDelivery) !void {
+        const text = try self.input.toOwnedContents(self.allocator);
+        defer self.allocator.free(text);
+        const paths = if (self.pasted_images) |*store|
+            try store.selectedPaths(text)
+        else
+            try self.allocator.alloc([]const u8, 0);
+        defer self.allocator.free(paths);
+        conversation.submit(.{ .text = text, .image_paths = paths }, delivery) catch |err| switch (err) {
+            error.EmptyPrompt, error.Busy => return,
+            else => {
+                const message = try std.fmt.allocPrint(self.allocator, "Message not sent: {s}. Your draft is unchanged.", .{@errorName(err)});
+                defer self.allocator.free(message);
+                try self.transcript.append(self.allocator, .status, message);
+                self.followTail();
+                return;
+            },
+        };
+        try self.transcript.append(self.allocator, if (delivery == .enqueue) .queued else .user, text);
+        self.input.clearRetainingCapacity();
+        self.phase = .responding;
+        self.followTail();
+    }
+
+    fn insertImage(self: *ChatUi, png: []const u8, directory: []const u8) !void {
+        if (self.pasted_images == null)
+            self.pasted_images = try images.Store.init(self.allocator, self.io, directory);
+        const token = try self.pasted_images.?.save(png);
+        const insertion = try std.fmt.allocPrint(self.allocator, " {s} ", .{token});
+        defer self.allocator.free(insertion);
+        try self.input.insertSliceAtCursor(insertion);
+        self.input_revision +%= 1;
+        self.clearToolFocus();
     }
 
     fn clearToolFocus(self: *ChatUi) void {
@@ -2666,7 +2784,7 @@ const ChatUi = struct {
 
         for (projection.lines.items[first_row..last_row], 0..) |line, row| {
             try self.tool_hits.append(self.allocator, switch (line.kind) {
-                .tool, .tool_input_label, .tool_input, .tool_output_label, .tool_output, .tool_output_markdown => line.entry_index,
+                .tool, .tool_input_label, .tool_input, .tool_output_label, .tool_output, .tool_output_markdown, .tool_image => line.entry_index,
                 else => null,
             });
             self.drawTranscriptLine(
@@ -2675,6 +2793,21 @@ const ChatUi = struct {
                 projection,
                 line,
             );
+        }
+        for (projection.lines.items[first_row..last_row], 0..) |line, row| {
+            if (line.kind != .tool_image) continue;
+            if (row > 0 and projection.lines.items[first_row + row - 1].kind == .tool_image and
+                projection.lines.items[first_row + row - 1].entry_index == line.entry_index) continue;
+            const preview = self.transcript.entries.items[line.entry_index].tool.preview.?;
+            const area = window.child(.{ .width = window.width -| 4 });
+            const size = preview.cellSize(area);
+            const visible = @min(line.end - line.start, last_row - first_row - row);
+            try preview.draw(window.child(.{
+                .x_off = 4,
+                .y_off = @intCast(row),
+                .width = window.width -| 4,
+                .height = @intCast(visible),
+            }), size, line.start);
         }
         self.last_total_rows = total_rows;
         self.last_viewport_rows = viewport_rows;
@@ -2824,7 +2957,7 @@ const ChatUi = struct {
                 const focused = self.focusedToolIndex() == line.entry_index;
                 const color = if (tool.completion) |completion|
                     switch (completion) {
-                        .succeeded => accent,
+                        .succeeded, .image => accent,
                         .failed => vaxis.Color{ .index = 203 },
                     }
                 else
@@ -2868,7 +3001,7 @@ const ChatUi = struct {
                 const text = switch (line.kind) {
                     .tool_input_label => "Input",
                     .tool_output_label => if (tool.completion) |completion| switch (completion) {
-                        .succeeded => "Output",
+                        .succeeded, .image => "Output",
                         .failed => "Output (failed)",
                     } else "Output (running)",
                     .tool_input => tool.input_display[line.start..line.end],
@@ -2900,6 +3033,20 @@ const ChatUi = struct {
                         highlights,
                         .{ .fg = reasoning_color, .bg = tool_detail_background },
                     );
+                }
+            },
+            .tool_image => {
+                const line_window = window.child(.{ .y_off = row, .height = 1 });
+                line_window.fill(.{
+                    .char = .{ .grapheme = " ", .width = 1 },
+                    .style = .{ .bg = tool_detail_background },
+                });
+                if (entry.tool.preview.?.notice()) |notice| {
+                    var segments = [_]vaxis.Segment{.{
+                        .text = notice,
+                        .style = .{ .fg = reasoning_color, .bg = tool_detail_background, .dim = true },
+                    }};
+                    _ = line_window.print(&segments, .{ .col_offset = @min(window.width -| 1, 4), .wrap = .none });
                 }
             },
         }
@@ -3181,6 +3328,7 @@ fn handleMouseBatch(
 const App = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
+    environ: *const std.process.Environ.Map,
     tty_buffer: [1024]u8,
     tty: vaxis.Tty,
     vx: vaxis.Vaxis,
@@ -3198,6 +3346,7 @@ const App = struct {
     ) !void {
         self.allocator = init_args.gpa;
         self.io = init_args.io;
+        self.environ = init_args.environ_map;
 
         self.tty = try vaxis.Tty.init(init_args.io, &self.tty_buffer);
         errdefer self.tty.deinit();
@@ -3239,6 +3388,7 @@ const App = struct {
 
     fn deinit(self: *App) void {
         self.conversation.deinit();
+        self.releaseImages();
         self.ui.deinit();
         self.loop.stop();
         self.vx.deinit(self.allocator, self.tty.writer());
@@ -3252,10 +3402,15 @@ const App = struct {
     }
 
     fn run(self: *App) !void {
-        try self.loop.start();
+        if (@import("builtin").os.tag == .windows) {
+            self.loop.thread = try self.io.concurrent(runWindowsInput, .{&self.loop});
+        } else {
+            try self.loop.start();
+        }
         try self.vx.enterAltScreen(self.tty.writer());
         try self.vx.queryTerminal(self.tty.writer(), .fromSeconds(1));
         try self.vx.setMouseMode(self.tty.writer(), true);
+        try self.vx.setBracketedPaste(self.tty.writer(), true);
         const use_signal_resize = !self.vx.state.in_band_resize;
         if (use_signal_resize) try self.loop.installResizeHandler();
         defer if (use_signal_resize) self.loop.uninstallResizeHandler();
@@ -3267,9 +3422,25 @@ const App = struct {
             pending = null;
             var redraw = true;
             switch (event) {
-                .key_press => |key| switch (try self.ui.handleKey(key, &self.conversation)) {
-                    .keep_running => {},
-                    .force_exit => self.hardExit(),
+                .key_press => |key| {
+                    if (!self.ui.bracketed_paste and
+                        (key.matches('v', .{ .ctrl = true }) or key.matches('v', .{ .alt = true })))
+                    {
+                        self.pasteImage() catch |err| {
+                            const message = try imagePasteFailureMessage(self.allocator, err, @import("builtin").os.tag);
+                            defer self.allocator.free(message);
+                            try self.ui.transcript.append(self.allocator, .status, message);
+                            self.ui.followTail();
+                        };
+                    } else switch (try self.ui.handleKey(key, &self.conversation)) {
+                        .keep_running => {},
+                        .force_exit => self.hardExit(),
+                    }
+                },
+                .paste_start => self.ui.bracketed_paste = true,
+                .paste_end => {
+                    self.ui.bracketed_paste = false;
+                    try self.ui.inputChanged(&self.conversation);
                 },
                 .mouse => |mouse| {
                     const batch = try handleMouseBatch(&self.ui, &self.loop, mouse);
@@ -3284,11 +3455,53 @@ const App = struct {
                     );
                 },
                 .conversation_wake => {},
+                .input_error => |err| return err,
             }
             const conversation_changed = try self.drainConversation();
             if (!self.closed and (redraw or conversation_changed))
                 try self.render();
         }
+    }
+
+    fn runWindowsInput(loop: *vaxis.Loop(AppEvent)) void {
+        readWindowsInput(loop) catch |err| {
+            if (loop.should_quit) return;
+            loop.postEvent(.{ .input_error = err }) catch |post_error|
+                std.log.err("Unable to report terminal input failure {s}: {s}", .{ @errorName(err), @errorName(post_error) });
+        };
+    }
+
+    fn readWindowsInput(loop: *vaxis.Loop(AppEvent)) !void {
+        var parser: vaxis.Parser = .{};
+        var cache: vaxis.GraphemeCache = .{};
+        while (!loop.should_quit) {
+            const event = try loop.tty.nextEvent(&parser, null);
+            try forwardTerminalEvent(loop, &cache, event);
+        }
+    }
+
+    fn forwardTerminalEvent(loop: *vaxis.Loop(AppEvent), cache: *vaxis.GraphemeCache, event: vaxis.Event) !void {
+        // The pinned libvaxis Windows adapter drops these parser events.
+        switch (event) {
+            .paste_start => try loop.postEvent(.paste_start),
+            .paste_end => try loop.postEvent(.paste_end),
+            else => try vaxis.loop.handleEventGeneric(loop, loop.vaxis, cache, AppEvent, event, null),
+        }
+    }
+
+    fn pasteImage(self: *App) !void {
+        if ((self.ui.phase != .ready and self.ui.phase != .responding and
+            self.ui.phase != .loading_commands) or self.ui.menu_mode != .closed)
+            return error.ImagePasteRequiresChatComposer;
+        const png = try clipboard.readImage(self.allocator, self.io, self.environ) orelse
+            return error.NoImageOnClipboard;
+        defer self.allocator.free(png);
+        const directory = if (@import("builtin").os.tag == .windows)
+            self.environ.get("TEMP") orelse self.environ.get("TMP") orelse
+                return error.MissingTemporaryDirectory
+        else
+            self.environ.get("TMPDIR") orelse "/tmp";
+        try self.ui.insertImage(png, directory);
     }
 
     fn drainConversation(self: *App) !bool {
@@ -3305,6 +3518,12 @@ const App = struct {
     }
 
     fn render(self: *App) !void {
+        for (self.ui.transcript.entries.items) |*entry| {
+            if (entry.* == .tool and entry.tool.expanded) {
+                if (entry.tool.preview) |*preview|
+                    try preview.prepare(self.allocator, &self.vx, self.tty.writer());
+            }
+        }
         const root = self.vx.window();
         root.clear();
         var projection = try self.ui.draw(root);
@@ -3315,9 +3534,18 @@ const App = struct {
 
     fn hardExit(self: *App) noreturn {
         self.loop.stop();
+        self.releaseImages();
         self.vx.deinit(self.allocator, self.tty.writer());
         self.tty.deinit();
         std.process.exit(130);
+    }
+
+    fn releaseImages(self: *App) void {
+        for (self.ui.transcript.entries.items) |*entry| {
+            if (entry.* == .tool) {
+                if (entry.tool.preview) |*preview| preview.release(&self.vx, self.tty.writer());
+            }
+        }
     }
 };
 
@@ -4840,6 +5068,188 @@ test "ask-user input preserves the existing composer draft" {
     const restored = try ui.input.toOwnedContents(std.testing.allocator);
     defer std.testing.allocator.free(restored);
     try std.testing.expectEqualStrings("unfinished draft", restored);
+}
+
+test "image clipboard setup failures name missing dependencies and desktop sessions" {
+    const cases = .{
+        .{
+            error.ClipboardToolUnavailable,
+            std.Target.Os.Tag.linux,
+            "Image paste failed: Install wl-clipboard (wl-paste) for Wayland or xclip for X11, and ensure it is on PATH (ClipboardToolUnavailable).",
+        },
+        .{
+            error.ClipboardToolUnavailable,
+            std.Target.Os.Tag.windows,
+            "Image paste failed: Make Windows PowerShell (powershell.exe) available on PATH (ClipboardToolUnavailable).",
+        },
+        .{
+            error.ClipboardSessionUnavailable,
+            std.Target.Os.Tag.linux,
+            "Image paste failed: Run Vivi inside a Wayland or X11 desktop session; neither WAYLAND_DISPLAY nor DISPLAY is available (ClipboardSessionUnavailable).",
+        },
+        .{
+            error.AccessDenied,
+            std.Target.Os.Tag.macos,
+            "Image paste failed: AccessDenied.",
+        },
+    };
+    inline for (cases) |case| {
+        const message = try imagePasteFailureMessage(std.testing.allocator, case[0], case[1]);
+        defer std.testing.allocator.free(message);
+        try std.testing.expectEqualStrings(case[2], message);
+    }
+}
+
+test "image pasted paths survive ask-user drafts and deletion removes attachment" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const len = try temporary.dir.realPath(std.testing.io, &path_buffer);
+    var ui: ChatUi = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .input = TextInput.init(std.testing.allocator),
+        .cwd = try std.testing.allocator.dupe(u8, "."),
+        .phase = .ready,
+    };
+    defer ui.deinit();
+    try ui.input.insertSliceAtCursor("Look:");
+    try ui.insertImage("\x89PNG\r\n\x1a\n", path_buffer[0..len]);
+    const before = try ui.input.toOwnedContents(std.testing.allocator);
+    defer std.testing.allocator.free(before);
+    try std.testing.expect(std.mem.indexOf(u8, before, "vivi-image-") != null);
+    ui.prepareInputForUserQuestion();
+    try ui.input.insertSliceAtCursor("Answer");
+    ui.restoreInputAfterUserInput();
+    const restored = try ui.input.toOwnedContents(std.testing.allocator);
+    defer std.testing.allocator.free(restored);
+    try std.testing.expectEqualStrings(before, restored);
+    const selected = try ui.pasted_images.?.selectedPaths(restored);
+    defer std.testing.allocator.free(selected);
+    try std.testing.expectEqual(@as(usize, 1), selected.len);
+    ui.input.clearRetainingCapacity();
+    const deleted = try ui.pasted_images.?.selectedPaths("");
+    defer std.testing.allocator.free(deleted);
+    try std.testing.expectEqual(@as(usize, 0), deleted.len);
+}
+
+test "image bracketed text paste never submits or executes shortcuts" {
+    var ui: ChatUi = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .input = TextInput.init(std.testing.allocator),
+        .cwd = try std.testing.allocator.dupe(u8, "."),
+        .phase = .ready,
+        .bracketed_paste = true,
+    };
+    defer ui.deinit();
+    var unused: backend.Conversation = undefined;
+    _ = try ui.handleKey(.{ .codepoint = 'a', .text = "hello" }, &unused);
+    _ = try ui.handleKey(.{ .codepoint = vaxis.Key.enter }, &unused);
+    _ = try ui.handleKey(.{ .codepoint = 'b', .text = "there\r\n" }, &unused);
+    _ = try ui.handleKey(.{ .codepoint = 'c', .mods = .{ .ctrl = true } }, &unused);
+    const text = try ui.input.toOwnedContents(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("hello there  ", text);
+    try std.testing.expectEqual(UiPhase.ready, ui.phase);
+    try std.testing.expectEqual(@as(usize, 0), ui.transcript.entries.items.len);
+}
+
+test "image paste boundaries survive terminal parser and event forwarding" {
+    var tty: vaxis.Tty = undefined;
+    var vx: vaxis.Vaxis = undefined;
+    var loop = vaxis.Loop(AppEvent).init(std.testing.io, &tty, &vx);
+    var cache: vaxis.GraphemeCache = .{};
+    var parser: vaxis.Parser = .{};
+    var remaining: []const u8 = "\x1b[200~hello\rthere\x03\x1b[201~";
+    while (remaining.len > 0) {
+        const parsed = try parser.parse(remaining, null);
+        try std.testing.expect(parsed.n > 0);
+        remaining = remaining[parsed.n..];
+        if (parsed.event) |event| try App.forwardTerminalEvent(&loop, &cache, event);
+    }
+    var ui: ChatUi = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .input = TextInput.init(std.testing.allocator),
+        .cwd = try std.testing.allocator.dupe(u8, "."),
+        .phase = .ready,
+    };
+    defer ui.deinit();
+    var unused: backend.Conversation = undefined;
+    var boundaries: usize = 0;
+    while (try loop.tryEvent()) |event| switch (event) {
+        .paste_start => {
+            try std.testing.expect(!ui.bracketed_paste);
+            ui.bracketed_paste = true;
+            boundaries += 1;
+        },
+        .paste_end => {
+            try std.testing.expect(ui.bracketed_paste);
+            ui.bracketed_paste = false;
+            boundaries += 1;
+        },
+        .key_press => |key| try std.testing.expect((try ui.handleKey(key, &unused)) == .keep_running),
+        else => return error.UnexpectedEvent,
+    };
+    const text = try ui.input.toOwnedContents(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("hello there", text);
+    try std.testing.expectEqual(@as(usize, 2), boundaries);
+    try std.testing.expect(!ui.bracketed_paste);
+    try std.testing.expectEqual(UiPhase.ready, ui.phase);
+    try std.testing.expectEqual(@as(usize, 0), ui.transcript.entries.items.len);
+}
+
+test "image tool previews retain read bytes and reserve rows only when expanded" {
+    const allocator = std.testing.allocator;
+    var started = try backend.ToolStarted.init(allocator, "image-read", "{\"path\":\"image.png\"}", .{ .read = .{
+        .path = "image.png",
+        .offset = null,
+        .limit = null,
+    } });
+    defer started.deinit();
+    var finished = try backend.ToolFinished.init(allocator, "image-read", .{ .image = .{
+        .bytes = "snapshot",
+        .format = .png,
+        .description = "Image: image.png",
+    } });
+    defer finished.deinit();
+    var ui: ChatUi = .{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .input = TextInput.init(allocator),
+        .cwd = try allocator.dupe(u8, "."),
+    };
+    defer ui.deinit();
+    try ui.transcript.applyToolActivity(allocator, &.{ .started = started });
+    try ui.transcript.applyToolActivity(allocator, &.{ .finished = finished });
+    const tool = &ui.transcript.entries.items[0].tool;
+    try std.testing.expectEqualStrings("snapshot", tool.preview.?.state.pending);
+    try std.testing.expectEqualStrings("Image: image.png", tool.output_display.?);
+    tool.preview.?.deinit(allocator);
+    tool.preview = .{ .state = .{ .ready = vaxis.Image.init(9, 320, 160) } };
+    var screen: vaxis.Screen = .{ .width = 80, .height = 30, .width_pix = 640, .height_pix = 480 };
+    const window: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 80,
+        .height = 30,
+        .screen = &screen,
+    };
+    var collapsed = try Projection.build(allocator, &ui.transcript, window);
+    defer collapsed.deinit(allocator);
+    for (collapsed.lines.items) |line| try std.testing.expect(line.kind != .tool_image);
+    tool.expanded = true;
+    var expanded = try Projection.build(allocator, &ui.transcript, window);
+    defer expanded.deinit(allocator);
+    var image_rows: usize = 0;
+    for (expanded.lines.items) |line| {
+        if (line.kind == .tool_image) image_rows += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 10), image_rows);
 }
 
 test "slash command parsing preserves argument suffixes" {
