@@ -3255,7 +3255,7 @@ const App = struct {
         try self.loop.start();
         try self.vx.enterAltScreen(self.tty.writer());
         try self.vx.queryTerminal(self.tty.writer(), .fromSeconds(1));
-        try self.vx.setMouseMode(self.tty.writer(), true);
+        try self.vx.setMouseMode(self.tty.writer(), false);
         const use_signal_resize = !self.vx.state.in_band_resize;
         if (use_signal_resize) try self.loop.installResizeHandler();
         defer if (use_signal_resize) self.loop.uninstallResizeHandler();
