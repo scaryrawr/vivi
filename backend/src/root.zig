@@ -2746,10 +2746,25 @@ test "workspace customization uses explicit absolute directories" {
     var config = copilot.SessionConfig{};
     directories.apply(&config);
 
+    const expected_github = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ "/workspace", ".github/skills" },
+    );
+    defer std.testing.allocator.free(expected_github);
+    const expected_agents = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ "/workspace", ".agents/skills" },
+    );
+    defer std.testing.allocator.free(expected_agents);
+    const expected_claude = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ "/workspace", ".claude/skills" },
+    );
+    defer std.testing.allocator.free(expected_claude);
     const expected_skills = [_][]const u8{
-        "/workspace/.github/skills",
-        "/workspace/.agents/skills",
-        "/workspace/.claude/skills",
+        expected_github,
+        expected_agents,
+        expected_claude,
     };
     for (expected_skills, config.skill_directories.?) |expected, actual| {
         try std.testing.expectEqualStrings(expected, actual);
