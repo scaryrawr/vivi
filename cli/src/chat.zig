@@ -25,9 +25,15 @@ const syntax_operator = vaxis.Color{ .rgb = .{ 244, 114, 182 } };
 
 const AppEvent = union(enum) {
     key_press: vaxis.Key,
+    mouse: vaxis.Mouse,
     winsize: vaxis.Winsize,
     conversation_wake,
 };
+
+fn isMouseWheel(mouse: vaxis.Mouse) bool {
+    return mouse.type == .press and
+        (mouse.button == .wheel_up or mouse.button == .wheel_down);
+}
 
 const Role = enum {
     user,
@@ -1080,6 +1086,8 @@ const KeyOutcome = enum {
     force_exit,
 };
 
+const mouse_wheel_rows: usize = 3;
+
 const MenuDetail = union(enum) {
     text: []const u8,
     model: struct {
@@ -1349,6 +1357,7 @@ const ChatUi = struct {
     rows_from_tail: usize = 0,
     last_total_rows: usize = 0,
     last_viewport_rows: usize = 0,
+    last_transcript_region: Region = .{},
     tool_hits: std.ArrayList(?usize) = .empty,
     tool_anchor: ?struct { entry_index: usize, row: usize } = null,
     // Borrowed from the transcript; call IDs survive entry insertion and growth.
@@ -1598,6 +1607,31 @@ const ChatUi = struct {
             self.reveal_tool_focus = true;
         }
         return true;
+    }
+
+    fn handleMouse(self: *ChatUi, mouse: vaxis.Mouse) bool {
+        if (!self.last_transcript_region.contains(mouse.col, mouse.row))
+            return false;
+
+        if (mouse.type != .press) return false;
+        return switch (mouse.button) {
+            .wheel_up => self.scrollUp(mouse_wheel_rows),
+            .wheel_down => self.scrollDown(mouse_wheel_rows),
+            .left => blk: {
+                var row: usize = @as(usize, @intCast(mouse.row)) - self.last_transcript_region.y;
+                if (row >= self.tool_hits.items.len) break :blk false;
+                const entry_index = self.tool_hits.items[row] orelse break :blk false;
+                if (entry_index >= self.transcript.entries.items.len) break :blk false;
+                const entry = &self.transcript.entries.items[entry_index];
+                if (entry.* != .tool) break :blk false;
+                self.clearToolFocus();
+                while (row > 0 and self.tool_hits.items[row - 1] == entry_index) row -= 1;
+                entry.tool.expanded = !entry.tool.expanded;
+                self.tool_anchor = .{ .entry_index = entry_index, .row = row };
+                break :blk true;
+            },
+            else => false,
+        };
     }
 
     fn submitUserInput(
@@ -2200,6 +2234,7 @@ const ChatUi = struct {
             root.height,
             desired_menu_rows,
         );
+        self.last_transcript_region = layout.transcript;
         self.tool_hits.clearRetainingCapacity();
         if (layout.transcript.height > 0) {
             const transcript_window = layout.transcript.child(root);
@@ -3125,6 +3160,24 @@ const ChatUi = struct {
     }
 };
 
+fn handleMouseBatch(
+    ui: *ChatUi,
+    loop: *vaxis.Loop(AppEvent),
+    first: vaxis.Mouse,
+) !struct { redraw: bool, next: ?AppEvent = null } {
+    var redraw = ui.handleMouse(first);
+    if (!isMouseWheel(first)) return .{ .redraw = redraw };
+
+    // Bound each batch so continuous wheel input cannot starve rendering or backend events.
+    for (1..512) |_| {
+        const event = try loop.tryEvent() orelse break;
+        if (event != .mouse or !isMouseWheel(event.mouse))
+            return .{ .redraw = redraw, .next = event };
+        redraw = ui.handleMouse(event.mouse) or redraw;
+    }
+    return .{ .redraw = redraw };
+}
+
 const App = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -3202,19 +3255,26 @@ const App = struct {
         try self.loop.start();
         try self.vx.enterAltScreen(self.tty.writer());
         try self.vx.queryTerminal(self.tty.writer(), .fromSeconds(1));
-        try self.vx.setMouseMode(self.tty.writer(), false);
+        try self.vx.setMouseMode(self.tty.writer(), true);
         const use_signal_resize = !self.vx.state.in_band_resize;
         if (use_signal_resize) try self.loop.installResizeHandler();
         defer if (use_signal_resize) self.loop.uninstallResizeHandler();
         try self.render();
 
+        var pending: ?AppEvent = null;
         while (!self.closed) {
-            const event = try self.loop.nextEvent();
-            const redraw = true;
+            const event = pending orelse try self.loop.nextEvent();
+            pending = null;
+            var redraw = true;
             switch (event) {
                 .key_press => |key| switch (try self.ui.handleKey(key, &self.conversation)) {
                     .keep_running => {},
                     .force_exit => self.hardExit(),
+                },
+                .mouse => |mouse| {
+                    const batch = try handleMouseBatch(&self.ui, &self.loop, mouse);
+                    redraw = batch.redraw;
+                    pending = batch.next;
                 },
                 .winsize => |winsize| {
                     try self.vx.resize(
@@ -4138,13 +4198,12 @@ test "tool keyboard navigation reveals focused headers and retains focus through
     try std.testing.expectEqual(null, ui.focused_tool);
 }
 
-test "tool disclosure keyboard controls preserve wrapping scrolling resizing and completion" {
+test "tool disclosure hit mapping follows wrapping scrolling resizing and completion" {
     var ui: ChatUi = .{
         .allocator = std.testing.allocator,
         .io = std.testing.io,
         .input = TextInput.init(std.testing.allocator),
         .cwd = try std.testing.allocator.dupe(u8, "."),
-        .phase = .responding,
     };
     defer ui.deinit();
     var started = try toolStarted(
@@ -4173,10 +4232,18 @@ test "tool disclosure keyboard controls preserve wrapping scrolling resizing and
     };
     var projection = (try ui.draw(window)).?;
     projection.deinit(std.testing.allocator);
-    try std.testing.expect(ui.handleToolKey(.{ .codepoint = vaxis.Key.f6 }));
-    try std.testing.expect(ui.handleToolKey(.{ .codepoint = vaxis.Key.enter }));
+    const click: vaxis.Mouse = .{
+        .col = @intCast(ui.last_transcript_region.x + 2),
+        .row = 1,
+        .button = .left,
+        .mods = .{},
+        .type = .press,
+    };
+    try std.testing.expectEqual(@as(?usize, 0), ui.tool_hits.items[1]);
+    try std.testing.expect(ui.handleMouse(click));
     try std.testing.expect(ui.transcript.entries.items[0].tool.expanded);
     projection = (try ui.draw(window)).?;
+    try std.testing.expectEqual(@as(?usize, 0), ui.tool_hits.items[0]);
     var saw_input = false;
     var saw_output = false;
     for (projection.lines.items) |line| {
@@ -4213,7 +4280,10 @@ test "tool disclosure keyboard controls preserve wrapping scrolling resizing and
     _ = ui.scrollDown(3);
     projection = (try ui.draw(window)).?;
     projection.deinit(std.testing.allocator);
-    try std.testing.expect(ui.handleToolKey(.{ .codepoint = vaxis.Key.enter }));
+    var release = click;
+    release.type = .release;
+    try std.testing.expect(!ui.handleMouse(release));
+    try std.testing.expect(ui.handleMouse(click));
     try std.testing.expect(!ui.transcript.entries.items[0].tool.expanded);
     projection = (try ui.draw(window)).?;
     defer projection.deinit(std.testing.allocator);
@@ -4221,6 +4291,7 @@ test "tool disclosure keyboard controls preserve wrapping scrolling resizing and
         try std.testing.expect(line.kind != .tool_input and line.kind != .tool_output);
     }
     try std.testing.expect(!std.meta.eql(tool_detail_background, screen.readCell(4, 0).?.style.bg));
+    try std.testing.expectEqual(@as(?usize, 0), ui.tool_hits.items[0]);
 }
 
 test "tool events preserve a scrolled transcript position" {
@@ -4258,6 +4329,170 @@ test "tool events preserve a scrolled transcript position" {
 
     _ = try ui.applyConversationEvent(&finished_event);
     try std.testing.expectEqual(@as(usize, 5), ui.rows_from_tail);
+}
+
+test "mouse wheel scrolls the transcript within its bounds" {
+    var ui: ChatUi = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .input = TextInput.init(std.testing.allocator),
+        .cwd = try std.testing.allocator.dupe(u8, "."),
+        .last_total_rows = 20,
+        .last_viewport_rows = 8,
+        .last_transcript_region = .{
+            .x = 2,
+            .width = 96,
+            .height = 8,
+        },
+    };
+    defer ui.deinit();
+
+    try std.testing.expect(ui.handleMouse(.{
+        .col = 2,
+        .row = 4,
+        .button = .wheel_up,
+        .mods = .{},
+        .type = .press,
+    }));
+    try std.testing.expectEqual(mouse_wheel_rows, ui.rows_from_tail);
+
+    try std.testing.expect(ui.handleMouse(.{
+        .col = 2,
+        .row = 4,
+        .button = .wheel_down,
+        .mods = .{},
+        .type = .press,
+    }));
+    try std.testing.expectEqual(@as(usize, 0), ui.rows_from_tail);
+
+    for (0..10) |_| {
+        _ = ui.handleMouse(.{
+            .col = 2,
+            .row = 4,
+            .button = .wheel_up,
+            .mods = .{},
+            .type = .press,
+        });
+    }
+    try std.testing.expectEqual(@as(usize, 12), ui.rows_from_tail);
+}
+
+test "mouse wheel batch preserves bounds direction and following input" {
+    var ui: ChatUi = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .input = TextInput.init(std.testing.allocator),
+        .cwd = try std.testing.allocator.dupe(u8, "."),
+        .last_total_rows = 20,
+        .last_viewport_rows = 8,
+        .last_transcript_region = .{ .width = 96, .height = 8 },
+    };
+    defer ui.deinit();
+    var tty: vaxis.Tty = undefined;
+    var vx: vaxis.Vaxis = undefined;
+    var loop = vaxis.Loop(AppEvent).init(std.testing.io, &tty, &vx);
+    const up: vaxis.Mouse = .{
+        .col = 2,
+        .row = 4,
+        .button = .wheel_up,
+        .mods = .{},
+        .type = .press,
+    };
+    var down = up;
+    down.button = .wheel_down;
+    const barriers: []const AppEvent = &.{
+        .{ .key_press = .{ .codepoint = 'x' } },
+        .{ .key_press = .{ .codepoint = 'c', .mods = .{ .ctrl = true } } },
+        .{ .mouse = .{ .col = 2, .row = 4, .button = .left, .mods = .{}, .type = .press } },
+        .{ .winsize = .{ .cols = 80, .rows = 24, .x_pixel = 0, .y_pixel = 0 } },
+        .conversation_wake,
+    };
+    for (barriers) |barrier| {
+        ui.rows_from_tail = 0;
+        for (0..200) |_| try loop.postEvent(.{ .mouse = up });
+        try loop.postEvent(.{ .mouse = down });
+        var outside = up;
+        outside.row = 9;
+        try loop.postEvent(.{ .mouse = outside });
+        try loop.postEvent(barrier);
+        try loop.postEvent(.{ .mouse = down });
+
+        const batch = try handleMouseBatch(&ui, &loop, up);
+        try std.testing.expect(batch.redraw);
+        try std.testing.expectEqual(@as(usize, 12) - mouse_wheel_rows, ui.rows_from_tail);
+        try std.testing.expectEqualDeep(barrier, batch.next.?);
+        try std.testing.expectEqualDeep(AppEvent{ .mouse = down }, (try loop.tryEvent()).?);
+        try std.testing.expectEqual(null, try loop.tryEvent());
+    }
+}
+
+test "mouse wheel batch is bounded and does not drain after clicks" {
+    var ui: ChatUi = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .input = TextInput.init(std.testing.allocator),
+        .cwd = try std.testing.allocator.dupe(u8, "."),
+    };
+    defer ui.deinit();
+    var tty: vaxis.Tty = undefined;
+    var vx: vaxis.Vaxis = undefined;
+    var loop = vaxis.Loop(AppEvent).init(std.testing.io, &tty, &vx);
+    const up: vaxis.Mouse = .{
+        .col = 2,
+        .row = 4,
+        .button = .wheel_up,
+        .mods = .{},
+        .type = .press,
+    };
+    for (0..512) |_| try loop.postEvent(.{ .mouse = up });
+    const batch = try handleMouseBatch(&ui, &loop, up);
+    try std.testing.expect(!batch.redraw);
+    try std.testing.expectEqual(null, batch.next);
+    var click = up;
+    click.button = .left;
+    _ = try handleMouseBatch(&ui, &loop, click);
+    try std.testing.expectEqualDeep(AppEvent{ .mouse = up }, (try loop.tryEvent()).?);
+    try std.testing.expectEqual(null, try loop.tryEvent());
+}
+
+test "mouse wheel outside the transcript does not scroll" {
+    var ui: ChatUi = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .input = TextInput.init(std.testing.allocator),
+        .cwd = try std.testing.allocator.dupe(u8, "."),
+        .last_total_rows = 20,
+        .last_viewport_rows = 8,
+        .last_transcript_region = .{
+            .x = 2,
+            .width = 96,
+            .height = 8,
+        },
+    };
+    defer ui.deinit();
+
+    try std.testing.expect(!ui.handleMouse(.{
+        .col = 2,
+        .row = 8,
+        .button = .wheel_up,
+        .mods = .{},
+        .type = .press,
+    }));
+    try std.testing.expect(!ui.handleMouse(.{
+        .col = 1,
+        .row = 4,
+        .button = .wheel_up,
+        .mods = .{},
+        .type = .press,
+    }));
+    try std.testing.expect(!ui.handleMouse(.{
+        .col = 2,
+        .row = 4,
+        .button = .none,
+        .mods = .{},
+        .type = .motion,
+    }));
+    try std.testing.expectEqual(@as(usize, 0), ui.rows_from_tail);
 }
 
 test "tool activity draws its compact row to the terminal screen" {
@@ -4376,6 +4611,7 @@ test "successful Markdown reads use the transcript Markdown renderer" {
     var saw_bold = false;
     var saw_table_border = false;
     var saw_link = false;
+    var markdown_hit_rows: usize = 0;
     for (0..screen.height) |row| {
         var text: std.ArrayList(u8) = .empty;
         defer text.deinit(std.testing.allocator);
@@ -4387,6 +4623,9 @@ test "successful Markdown reads use the transcript Markdown renderer" {
             try text.appendSlice(std.testing.allocator, cell.char.grapheme);
             saw_link = saw_link or
                 std.mem.eql(u8, cell.link.uri, "https://example.com");
+        }
+        if (row < ui.tool_hits.items.len and ui.tool_hits.items[row] == 0) {
+            markdown_hit_rows += 1;
         }
         if (std.mem.indexOf(u8, text.items, "Rendered Heading")) |heading| {
             saw_heading = true;
@@ -4406,6 +4645,7 @@ test "successful Markdown reads use the transcript Markdown renderer" {
     try std.testing.expect(saw_bold);
     try std.testing.expect(saw_table_border);
     try std.testing.expect(saw_link);
+    try std.testing.expect(markdown_hit_rows > 3);
     try std.testing.expectEqualStrings(
         "# Rendered Heading\n\n**bold text** and [docs](https://example.com)\n\n" ++
             "| Feature | Status |\n| --- | --- |\n| Markdown | Rich |\n\n\tcode",

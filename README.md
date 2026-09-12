@@ -42,15 +42,20 @@ panel with arrow-key choice selection. Typed choice numbers, exact choice text,
 and free-form input when allowed remain supported. Tool output is returned
 whole; Copilot owns any large-result handling.
 
-In the terminal transcript, tool calls start collapsed. Expanded running calls
-show their output when they finish, including failures. Press F6 from the
-composer to focus the first visible tool (or the first tool if none is
-visible), use Up/Down to move between tools, and Enter or Space to
-expand/collapse. A `>` marker and highlighted summary identify focus;
-navigation scrolls the tool into view. Escape or F6 returns to the unchanged
-composer. Menus and pending questions retain their own keys; Page Up/Down
-scroll the transcript. Terminal selection and copying are available through
-the terminal's standard gestures and shortcuts.
+Mouse-wheel bursts are processed in bounded batches with one redraw per batch,
+so rapid scrolling does not replay a separate frame for every queued tick.
+
+In the terminal transcript, tool calls start collapsed. Click a tool row
+(marked `▸`) to expand its complete actual input and output; click it again
+to collapse (`▾`). Expanded running calls show their output when they finish,
+including failures. For keyboard access, press F6 from the composer to focus
+the first visible tool (or the first tool if none is visible), use Up/Down to
+move between tools, and Enter or Space to expand/collapse. A `>` marker and
+highlighted summary identify focus; navigation scrolls the tool into view.
+Escape or F6 returns to the unchanged composer. Menus and pending questions
+retain their own keys; Page Up/Down and mouse scrolling still work.
+Hold Shift while dragging to use the terminal's standard text selection, then
+copy with the terminal's copy command.
 Details wrap with the terminal width and scroll with the
 transcript, on a subtly contrasting background. Input arguments use readable
 labels with decoded strings and line breaks, including all additional fields;
