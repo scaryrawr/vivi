@@ -15,6 +15,7 @@ pub const ConversationEvent = conversation.Event;
 pub const ConversationWake = conversation.Wake;
 pub const OwnedText = conversation.OwnedText;
 pub const PromptDelivery = conversation.PromptDelivery;
+pub const Prompt = conversation.Prompt;
 pub const CommandCatalog = conversation.CommandCatalog;
 pub const UserInputRequest = conversation.UserInputRequest;
 pub const ModelCatalog = conversation.ModelCatalog;
@@ -27,6 +28,8 @@ pub const ToolStarted = tool_activity.ToolStarted;
 pub const ToolFinished = tool_activity.ToolFinished;
 pub const ToolCallId = tool_activity.ToolCallId;
 pub const ToolLifecycle = tool_activity.ToolLifecycle;
+pub const Image = @import("image.zig").Image;
+pub const max_image_bytes = @import("image.zig").max_bytes;
 pub const ToolSummary = tool_activity.ToolSummary;
 pub const ReadToolSummary = tool_activity.ReadSummary;
 pub const BashToolSummary = tool_activity.BashSummary;
@@ -208,6 +211,9 @@ const MinimalCodingAgent = struct {
         omlx: OmlxOptions,
     ) copilot.SessionConfig {
         return .{
+            .model_capabilities = if (model) |selected| .{
+                .supports = .{ .vision = selected.supports_vision },
+            } else null,
             .provider = if (model) |selected| .{
                 .base_url = omlx.base_url,
                 .authentication = if (omlx.api_key) |api_key|
@@ -289,19 +295,74 @@ fn settingsFailure(
 
 fn sendPrompt(
     session: copilot.Session,
-    prompt: []const u8,
+    prompt: conversation.PromptContent,
     delivery: conversation.PromptDelivery,
 ) !void {
+    const attachments = try sdkImageAttachments(session.client.allocator, prompt.images);
+    defer {
+        for (attachments) |attachment| session.client.allocator.free(attachment.data);
+        session.client.allocator.free(attachments);
+    }
     const parsed = try session.client.callRpc(
         struct { messageId: []const u8 },
         "session.send",
         .{
             .sessionId = session.id,
-            .prompt = prompt,
+            .prompt = prompt.text,
             .mode = @tagName(delivery),
+            .attachments = attachments,
         },
     );
     parsed.deinit();
+}
+
+const SdkImageAttachment = struct {
+    type: enum { blob } = .blob,
+    data: []const u8,
+    mimeType: []const u8,
+    displayName: []const u8,
+};
+
+fn sdkImageAttachments(
+    allocator: std.mem.Allocator,
+    values: []const Image,
+) ![]SdkImageAttachment {
+    const attachments = try allocator.alloc(SdkImageAttachment, values.len);
+    errdefer allocator.free(attachments);
+    var initialized: usize = 0;
+    errdefer for (attachments[0..initialized]) |attachment| allocator.free(attachment.data);
+    const encoder = std.base64.standard.Encoder;
+    for (values, attachments) |value, *attachment| {
+        const encoded = try allocator.alloc(u8, encoder.calcSize(value.bytes.len));
+        _ = encoder.encode(encoded, value.bytes);
+        attachment.* = .{
+            .data = encoded,
+            .mimeType = value.format.mimeType(),
+            .displayName = value.description,
+        };
+        initialized += 1;
+    }
+    return attachments;
+}
+
+fn imageToolResultJson(
+    allocator: std.mem.Allocator,
+    value: Image,
+) ![]u8 {
+    const encoder = std.base64.standard.Encoder;
+    const encoded = try allocator.alloc(u8, encoder.calcSize(value.bytes.len));
+    defer allocator.free(encoded);
+    _ = encoder.encode(encoded, value.bytes);
+    return std.json.Stringify.valueAlloc(allocator, .{
+        .textResultForLlm = value.description,
+        .resultType = "success",
+        .binaryResultsForLlm = .{.{
+            .type = "image",
+            .mimeType = value.format.mimeType(),
+            .data = encoded,
+            .description = value.description,
+        }},
+    }, .{});
 }
 
 const ForwardResult = enum {
@@ -322,7 +383,7 @@ fn forwardImmediatePrompts(
             .prompt => |prompt| {
                 try sendPrompt(
                     session,
-                    prompt.text.bytes,
+                    prompt.message.borrow(),
                     prompt.delivery,
                 );
                 result = .sent;
@@ -352,7 +413,7 @@ fn startNextQueuedPrompt(
     defer command.deinit();
     switch (command) {
         .prompt => |prompt| {
-            try sendPrompt(session, prompt.text.bytes, .immediate);
+            try sendPrompt(session, prompt.message.borrow(), .immediate);
             try worker.assistantStarted();
             return .sent;
         },
@@ -1256,6 +1317,7 @@ fn streamSessionResponse(
                     request.tool_call_id,
                     switch (result) {
                         .text => |text| .{ .succeeded = text },
+                        .image => |value| .{ .image = value },
                         .failure => |message| .{ .failed = message },
                     },
                 ) catch |err| {
@@ -1267,6 +1329,23 @@ fn streamSessionResponse(
                     return .failed;
                 };
                 switch (result) {
+                    .image => {
+                        const json = imageToolResultJson(
+                            worker.allocator(),
+                            result.image,
+                        ) catch |err| {
+                            worker.closeFailure(.stream, @errorName(err));
+                            return .failed;
+                        };
+                        defer worker.allocator().free(json);
+                        session.respondToToolResultJson(
+                            request.request_id,
+                            json,
+                        ) catch |err| {
+                            worker.closeFailure(.stream, @errorName(err));
+                            return .failed;
+                        };
+                    },
                     .text => |text| session.respondToTool(
                         request.request_id,
                         text,
@@ -1848,7 +1927,7 @@ fn runSdkConversation(
                             break :command_execution;
                         },
                         .agent_prompt => |prompt| {
-                            sendPrompt(session, prompt, .immediate) catch |err| {
+                            sendPrompt(session, .{ .text = prompt }, .immediate) catch |err| {
                                 worker.closeFailure(.stream, @errorName(err));
                                 return;
                             };
@@ -2276,7 +2355,7 @@ fn runSdkConversation(
             .prompt => |prompt| {
                 sendPrompt(
                     session,
-                    prompt.text.bytes,
+                    prompt.message.borrow(),
                     prompt.delivery,
                 ) catch |err| {
                     worker.closeFailure(.stream, @errorName(err));
@@ -2322,6 +2401,54 @@ test "scaffold status is stable" {
 
     try std.testing.expectEqual(abi_version, status.abi_version);
     try std.testing.expectEqual(Lifecycle.scaffold, status.lifecycle);
+}
+
+test "image tool result serializes binary content for Copilot, not the transcript" {
+    const allocator = std.testing.allocator;
+    var result: tools.Result = .{ .image = .{
+        .bytes = try allocator.dupe(u8, "\x89PNG\r\n\x1a\n\x00"),
+        .format = .png,
+        .description = try allocator.dupe(u8, "Image: sample.png"),
+    } };
+    defer result.deinit(allocator);
+    const json = try imageToolResultJson(allocator, result.image);
+    defer allocator.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    try std.testing.expectEqualStrings("success", object.get("resultType").?.string);
+    try std.testing.expectEqualStrings("Image: sample.png", object.get("textResultForLlm").?.string);
+    const binary = object.get("binaryResultsForLlm").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), binary.len);
+    try std.testing.expectEqualStrings("image", binary[0].object.get("type").?.string);
+    try std.testing.expectEqualStrings("image/png", binary[0].object.get("mimeType").?.string);
+    const encoded = binary[0].object.get("data").?.string;
+    const decoder = std.base64.standard.Decoder;
+    const decoded = try allocator.alloc(u8, try decoder.calcSizeForSlice(encoded));
+    defer allocator.free(decoded);
+    try decoder.decode(decoded, encoded);
+    try std.testing.expectEqualSlices(u8, result.image.bytes, decoded);
+}
+
+test "image attachments use the SDK blob shape with immutable bytes" {
+    const attachments = try sdkImageAttachments(std.testing.allocator, &.{.{
+        .bytes = "image bytes",
+        .format = .png,
+        .description = "first image.png",
+    }});
+    defer {
+        for (attachments) |attachment| std.testing.allocator.free(attachment.data);
+        std.testing.allocator.free(attachments);
+    }
+    const json = try std.json.Stringify.valueAlloc(std.testing.allocator, attachments, .{});
+    defer std.testing.allocator.free(json);
+    try std.testing.expectEqualStrings(
+        "[{\"type\":\"blob\",\"data\":\"aW1hZ2UgYnl0ZXM=\",\"mimeType\":\"image/png\",\"displayName\":\"first image.png\"}]",
+        json,
+    );
+    const empty = try sdkImageAttachments(std.testing.allocator, &.{});
+    defer std.testing.allocator.free(empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
 }
 
 test "Copilot SDK dependency is compile-visible" {
@@ -2513,6 +2640,7 @@ test "minimal coding agent replaces the system prompt with Vivi tools" {
     );
 
     try std.testing.expect(config.streaming);
+    try std.testing.expect(config.model_capabilities == null);
     try std.testing.expectEqual(@as(usize, 4), config.tools.len);
     try std.testing.expect(!config.request_permission);
     try std.testing.expect(config.on_permission_request.? == copilot.approveAll);
@@ -2677,7 +2805,7 @@ test "slash command invocation handles all interactive result kinds" {
     }
 }
 
-test "OMLX model configuration carries detected token limits" {
+test "OMLX model configuration carries detected token limits and vision capability" {
     var model = models.Model{
         .id = @constCast("omlx/Qwen3.5-9B-mxfp4"),
         .provider_model_id = @constCast("Qwen3.5-9B-mxfp4"),
@@ -2709,4 +2837,9 @@ test "OMLX model configuration carries detected token limits" {
         @as(?u64, 49_152),
         provider.max_output_tokens,
     );
+    try std.testing.expectEqual(false, config.model_capabilities.?.supports.?.vision.?);
+    model.supports_vision = true;
+    const vision_config = MinimalCodingAgent.sessionConfig("prompt", "/workspace", &model, .{});
+    try std.testing.expectEqual(true, vision_config.model_capabilities.?.supports.?.vision.?);
+    try std.testing.expectEqualStrings("Qwen3.5-9B-mxfp4", vision_config.provider.?.wire_model.?);
 }

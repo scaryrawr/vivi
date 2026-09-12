@@ -1,4 +1,5 @@
 const std = @import("std");
+const image = @import("image.zig");
 
 pub const ToolCallId = struct {
     bytes: []u8,
@@ -150,11 +151,13 @@ pub const ToolInvocation = struct {
 
 pub const ToolResult = union(enum) {
     succeeded: []u8,
+    image: image.Image,
     failed: []u8,
 
     pub fn clone(self: ToolResult, allocator: std.mem.Allocator) !ToolResult {
         return switch (self) {
             .succeeded => |text| .{ .succeeded = try allocator.dupe(u8, text) },
+            .image => |value| .{ .image = try value.clone(allocator) },
             .failed => |text| .{ .failed = try allocator.dupe(u8, text) },
         };
     }
@@ -163,11 +166,15 @@ pub const ToolResult = union(enum) {
         return switch (self) {
             .succeeded => |text| switch (other) {
                 .succeeded => |candidate| std.mem.eql(u8, text, candidate),
-                .failed => false,
+                .failed, .image => false,
             },
             .failed => |text| switch (other) {
-                .succeeded => false,
+                .succeeded, .image => false,
                 .failed => |candidate| std.mem.eql(u8, text, candidate),
+            },
+            .image => |value| switch (other) {
+                .image => |candidate| value.eql(candidate),
+                .succeeded, .failed => false,
             },
         };
     }
@@ -175,6 +182,7 @@ pub const ToolResult = union(enum) {
     pub fn deinit(self: *ToolResult, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .succeeded, .failed => |text| allocator.free(text),
+            .image => |*value| value.deinit(allocator),
         }
         self.* = undefined;
     }
@@ -235,6 +243,7 @@ pub const ToolFinished = struct {
         call_id: []const u8,
         result: union(enum) {
             succeeded: []const u8,
+            image: image.Image,
             failed: []const u8,
         },
     ) !ToolFinished {
@@ -250,6 +259,7 @@ pub const ToolFinished = struct {
                 .succeeded => |text| .{
                     .succeeded = try allocator.dupe(u8, text),
                 },
+                .image => |value| .{ .image = try value.clone(allocator) },
                 .failed => |text| .{
                     .failed = try allocator.dupe(u8, text),
                 },
@@ -340,6 +350,29 @@ pub const ToolActivity = struct {
         self.* = undefined;
     }
 };
+
+test "image tool completion owns bytes and compares image content" {
+    const allocator = std.testing.allocator;
+    const bytes = try allocator.dupe(u8, "original pixels");
+    var finished = try ToolFinished.init(allocator, "read-image", .{ .image = .{
+        .bytes = bytes,
+        .format = .png,
+        .description = "picture.png",
+    } });
+    defer finished.deinit();
+    allocator.free(bytes);
+    var copied = try finished.result.clone(allocator);
+    defer copied.deinit(allocator);
+    try std.testing.expectEqualStrings("original pixels", copied.image.bytes);
+    try std.testing.expect(finished.result.eql(copied));
+    var different = try ToolFinished.init(allocator, "read-image", .{ .image = .{
+        .bytes = "different pixels",
+        .format = .png,
+        .description = "picture.png",
+    } });
+    defer different.deinit();
+    try std.testing.expect(!finished.eql(different));
+}
 
 test "tool activity accepts equal duplicate finish and rejects conflict" {
     const summary = ToolSummary{ .other = .{ .name = "search" } };

@@ -72,6 +72,7 @@ pub fn build(b: *std.Build) void {
     });
     cli_module.addImport("vivi_backend", backend);
     cli_module.addImport("vaxis", vaxis.module("vaxis"));
+    addClipboard(b, cli_module, target);
     addSyntaxHighlighting(
         cli_module,
         tree_sitter,
@@ -115,6 +116,7 @@ pub fn build(b: *std.Build) void {
     });
     chat_tests_module.addImport("vivi_backend", backend);
     chat_tests_module.addImport("vaxis", vaxis.module("vaxis"));
+    addClipboard(b, chat_tests_module, target);
     addSyntaxHighlighting(
         chat_tests_module,
         tree_sitter,
@@ -133,7 +135,7 @@ pub fn build(b: *std.Build) void {
     });
     const chat_tests = b.addTest(.{
         .root_module = chat_tests_module,
-        .filters = &.{ "Markdown draw storage remains valid", "tool", "mouse" },
+        .filters = &.{ "Markdown draw storage remains valid", "tool", "mouse", "clipboard", "image" },
     });
     const run_chat_tests = b.addRunArtifact(chat_tests);
 
@@ -213,6 +215,15 @@ pub fn build(b: *std.Build) void {
         "Install the C-compatible backend library and headers",
     );
     install_c_api.dependOn(&install_library.step);
+}
+
+fn addClipboard(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget) void {
+    if (target.result.os.tag != .macos) return;
+    module.addCSourceFile(.{
+        .file = b.path("cli/src/clipboard_macos.m"),
+        .flags = &.{"-fobjc-arc"},
+    });
+    module.linkFramework("AppKit", .{});
 }
 
 fn addSyntaxHighlighting(

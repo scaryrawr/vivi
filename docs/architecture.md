@@ -71,6 +71,17 @@ layout, and a wrapped-row viewport used for Page Up and Page Down scrolling.
 This keeps SDK values and their allocator lifetimes off the UI thread while
 keeping terminal policy out of the backend.
 
+Image clipboard access and temporary-file ownership belong to the CLI.
+The composer inserts a literal quoted path, and only retained pasted-path
+tokens are selected as attachments at submission. `Conversation.submit`
+snapshots the selected image bytes into an owned message, so queued sends
+and steering never borrow editor memory or reread modified files. The image
+store outlives the conversation worker and removes only the temporary files it created after
+that worker stops. Saved ask-user drafts retain their visible image paths.
+Only `root.zig` maps the snapshots into `session.send` blob attachments through
+the SDK's RPC API; the pinned typed `MessageOptions` is currently text-only.
+No chat operation is exposed through the scaffold C ABI.
+
 The initial coding-agent policy is private to `backend/src/root.zig`. Copilot
 CLI starts with the SDK's curated session-isolated built-in tools enabled for
 planning and subagent coordination, while built-in MCP servers and custom
@@ -81,13 +92,22 @@ Source-qualified tool filters keep host-affecting built-ins unavailable
 without suppressing Vivi tools.
 
 `backend/src/tools.zig` owns SDK-free tool behavior: JSON argument validation,
-workspace-relative path resolution, text reads, Bash execution, exact
+workspace-relative path resolution, text/image reads, Bash execution, exact
 multi-edit planning, line-ending/BOM preservation, and file writes. It returns
-owned text or an actionable failure. `backend/src/root.zig` owns the four SDK
+owned text, image bytes with a detected format and display summary, or an
+actionable failure. `backend/src/root.zig` owns the four SDK
 declarations and explicitly resolves `external_tool_requested` events so full
 failure messages reach the model rather than being reduced to Zig error names.
 The tool layer does not truncate output or create spill files because Copilot
 owns large-result handling.
+Image results are translated there into the SDK's structured
+`binaryResultsForLlm` with base64 data and a MIME type. The tool-activity queue
+carries an owned image snapshot and summary; base64 never becomes transcript
+text. Expanded tool results load previews through libvaxis/zigimg, reserve
+bounded rows in the transcript projection, and crop placements to the visible
+viewport. Terminal graphics handles live until app shutdown; unsupported
+terminals or decoder formats show a notice instead. The SDK-free read service
+rejects text line ranges on images and unsupported binary text reads.
 
 `backend/src/models.zig` owns the first local-model integration: OMLX discovery
 through `/v1/models/status`, response validation, stable `omlx/<model-id>`
@@ -113,6 +133,10 @@ entries, filters policy-disabled models, and preserves `copilot/default` as
 the no-explicit-selection identity. Explicit hosted plans retain the raw SDK
 model ID and pass it through `SessionConfig.model`; OMLX plans continue to use
 `ProviderConfig`.
+Vivi also passes the detected vision capability through
+`SessionConfig.model_capabilities` on both session creation and resume.
+Unknown BYOK model names otherwise default to no vision in Copilot, which
+removes image content before it reaches OMLX.
 
 The SDK's generic `Client.callRpc` adapts `session.commands.list` into the
 SDK-free command catalog owned by

@@ -45,6 +45,36 @@ whole; Copilot owns any large-result handling.
 Mouse-wheel bursts are processed in bounded batches with one redraw per batch,
 so rapid scrolling does not replay a separate frame for every queued tick.
 
+Press **Ctrl-V** (or **Alt-V** if your terminal intercepts Ctrl-V) to paste an
+image from the system clipboard. Vivi saves it as a private temporary PNG and
+inserts its quoted file path at the cursor. Enter and Ctrl-Enter submit the
+image as a Copilot attachment along with your message, including steering and
+queued follow-ups. You can paste several images, or send just an image.
+Images are snapshotted when you submit, so later file changes cannot alter a
+queued message. Each image may be up to 20 MiB.
+Removing a pasted path from the composer excludes that image from the send;
+there are no hidden attachment placeholders. Use a vision-capable model.
+
+Use your terminal's usual paste command for text (for example, Cmd-V on
+macOS). Bracketed text paste does not submit embedded newlines or execute
+shortcuts. Bitmap paste reads the clipboard on the machine running Vivi;
+it does not transfer your desktop clipboard over SSH. macOS uses AppKit,
+Linux requires `wl-paste` on Wayland or `xclip` on X11, and Windows uses
+Windows PowerShell's clipboard support. Clipboard errors leave the draft intact.
+Pasted files stay available for the lifetime of the chat, including queued
+messages and tool reads, and are removed on normal exit. Their temporary paths
+are not durable references for later `/resume` sessions.
+
+The `read` tool also returns PNG, JPEG, GIF, and WebP files as image content
+to the model, detecting their format from the bytes rather than the extension.
+Image reads show a short file/MIME summary in the transcript, never base64.
+`offset` and `limit` apply only to text and are rejected for images.
+Expand an image-read result to see a bounded, aspect-preserving preview using
+libvaxis's built-in Kitty graphics support. It scrolls and clips with the tool
+details. Terminals without Kitty graphics retain the summary; unsupported
+preview formats show a notice without changing the image sent to the model.
+The current libvaxis decoder supports PNG, JPEG, and GIF previews, but not WebP.
+
 In the terminal transcript, tool calls start collapsed. Click a tool row
 (marked `▸`) to expand its complete actual input and output; click it again
 to collapse (`▾`). Expanded running calls show their output when they finish,
