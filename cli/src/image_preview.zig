@@ -1,6 +1,9 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
 
+const max_preview_memory = 64 * 1024 * 1024;
+const max_preview_pixels = 16 * 1024 * 1024;
+
 pub const Preview = struct {
     state: union(enum) {
         pending: []u8,
@@ -42,12 +45,34 @@ pub const Preview = struct {
     }
 
     fn load(allocator: std.mem.Allocator, vx: *vaxis.Vaxis, tty: *std.Io.Writer, bytes: []const u8) !vaxis.Image {
-        var decoded = try vaxis.zigimg.Image.fromMemory(allocator, bytes);
-        defer decoded.deinit(allocator);
-        if (decoded.width == 0 or decoded.height == 0 or
-            decoded.width > std.math.maxInt(u16) or decoded.height > std.math.maxInt(u16))
+        const png = vaxis.zigimg.formats.png;
+        if (std.mem.startsWith(u8, bytes, png.magic_header)) {
+            var stream = vaxis.zigimg.io.ReadStream.initMemory(bytes);
+            const header = try png.loadHeader(&stream);
+            try checkDimensions(header.width, header.height);
+        }
+        const memory = try allocator.alloc(u8, max_preview_memory);
+        defer allocator.free(memory);
+        var fixed = std.heap.FixedBufferAllocator.init(memory);
+        const scratch = fixed.allocator();
+        var decoded = vaxis.zigimg.Image.fromMemory(scratch, bytes) catch |err| switch (err) {
+            error.OutOfMemory => return error.ImagePreviewTooLarge,
+            else => return err,
+        };
+        defer decoded.deinit(scratch);
+        try checkDimensions(decoded.width, decoded.height);
+        return vx.transmitImage(scratch, tty, &decoded, .png) catch |err| switch (err) {
+            error.OutOfMemory => return error.ImagePreviewTooLarge,
+            else => return err,
+        };
+    }
+
+    fn checkDimensions(width: usize, height: usize) !void {
+        if (@as(u64, width) *| height > max_preview_pixels)
+            return error.ImagePreviewTooLarge;
+        if (width == 0 or height == 0 or
+            width > std.math.maxInt(u16) or height > std.math.maxInt(u16))
             return error.InvalidImageDimensions;
-        return vx.transmitImage(allocator, tty, &decoded, .png);
     }
 
     pub fn cellSize(self: Preview, window: vaxis.Window) vaxis.Image.CellSize {
@@ -150,4 +175,44 @@ test "image preview clips visible source rows and clears its placement on redraw
     try std.testing.expect(screen.readCell(2, 7).?.image == null);
     screen.clear();
     try std.testing.expect(screen.readCell(2, 4).?.image == null);
+}
+
+test "image preview rejects expanded pixel buffers and still renders normal images" {
+    const allocator = std.testing.allocator;
+    var original = try vaxis.zigimg.Image.create(allocator, 32, 32, .rgba32);
+    defer original.deinit(allocator);
+    @memset(original.pixels.rgba32, .{ .r = 40, .g = 120, .b = 180, .a = 255 });
+    var png_buffer: [4096]u8 = undefined;
+    const png = try original.writeToMemory(allocator, &png_buffer, .{ .png = .{} });
+    const oversized = try allocator.dupe(u8, png);
+    defer allocator.free(oversized);
+
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var vx = try vaxis.init(std.testing.io, allocator, &environ, .{});
+    defer vx.deinit(allocator, &output.writer);
+    vx.caps.kitty_graphics = true;
+    for ([_]u32{ 100000, 65535, 4096 }) |dimension| {
+        std.mem.writeInt(u32, oversized[16..20], dimension, .big);
+        std.mem.writeInt(u32, oversized[20..24], dimension, .big);
+        std.mem.writeInt(u32, oversized[29..33], std.hash.Crc32.hash(oversized[12..29]), .big);
+        var preview = try Preview.init(allocator, oversized);
+        defer preview.deinit(allocator);
+        try preview.prepare(allocator, &vx, &output.writer);
+        try std.testing.expectEqualStrings(
+            "Image preview unavailable: ImagePreviewTooLarge.",
+            preview.notice().?,
+        );
+        try std.testing.expectEqual(@as(usize, 0), output.written().len);
+    }
+    var preview = try Preview.init(allocator, png);
+    defer preview.deinit(allocator);
+    try preview.prepare(allocator, &vx, &output.writer);
+    try std.testing.expect(preview.state == .ready);
+    try std.testing.expectEqual(@as(u16, 32), preview.state.ready.width);
+    try std.testing.expectEqual(@as(u16, 32), preview.state.ready.height);
+    try std.testing.expect(std.mem.startsWith(u8, output.written(), "\x1b_Gf=100,s=32,v=32,"));
+    preview.release(&vx, &output.writer);
 }

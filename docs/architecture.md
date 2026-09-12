@@ -110,8 +110,11 @@ carries an owned image snapshot and summary; base64 never becomes transcript
 text. Expanded tool results load previews through libvaxis/zigimg, reserve
 bounded rows in the transcript projection, and crop placements to the visible
 viewport. Terminal graphics handles live until app shutdown; unsupported
-terminals or decoder formats show a notice instead. The SDK-free read service
-rejects text line ranges on images and unsupported binary text reads.
+terminals or decoder formats show a notice instead. Preview decoding and
+encoding share a capped 64 MiB scratch allocator. PNG dimensions are checked
+before decoding, and previews are limited to 16,777,216 pixels. The SDK-free read
+service separately limits image-file bytes and rejects text line ranges on
+images and unsupported binary text reads.
 Reads inspect a fixed-size prefix on one open file handle before allocating
 contents. Recognized images use a bounded reader; ordinary text keeps its
 existing unlimited behavior.

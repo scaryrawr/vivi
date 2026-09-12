@@ -74,6 +74,9 @@ libvaxis's built-in Kitty graphics support. It scrolls and clips with the tool
 details. Terminals without Kitty graphics retain the summary; unsupported
 preview formats show a notice without changing the image sent to the model.
 The current libvaxis decoder supports PNG, JPEG, and GIF previews, but not WebP.
+Preview decoding and encoding share a 64 MiB scratch-memory budget, with a
+16,777,216-pixel limit; exceeding either shows an unavailable notice without
+changing the image sent to the model.
 
 In the terminal transcript, tool calls start collapsed. Click a tool row
 (marked `▸`) to expand its complete actual input and output; click it again
