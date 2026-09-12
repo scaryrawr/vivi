@@ -14,10 +14,10 @@ the session returns to the ready state.
   before the corresponding Vivi response.
 - `tool-activity` shows compact running, successful, or failed rows for
   `read`, `bash`, `edit`, and `write` calls.
-- `transcript-scroll` uses Page Up/Page Down to read chat history after it
-  grows beyond the visible transcript.
-- `transcript-select-copy` lets the terminal handle text selection and copying
-  from the transcript.
+- `transcript-scroll` uses the mouse wheel or Page Up/Page Down to read chat
+  history after it grows beyond the visible transcript.
+- `transcript-select-copy` uses Shift-drag to select transcript text and the
+  terminal's normal copy command.
 - `response-steer` keeps the composer active and sends Enter submissions into
   the current turn.
 - `response-queue` sends Ctrl+Enter submissions as FIFO follow-up turns.
@@ -30,9 +30,10 @@ the session returns to the ready state.
 - Press Enter.
 - While Vivi is responding, type a correction and press Enter to steer.
 - While Vivi is responding, type a follow-up and press Ctrl+Enter to queue it.
-- Use Page Up/Page Down to read older or newer messages.
-- Drag over transcript text with the terminal's normal selection gesture, then
-  use the terminal's copy command.
+- Move the pointer over the transcript and use the mouse wheel to read older
+  or newer messages.
+- Hold Shift while dragging over transcript text, then use the terminal's copy
+  command.
 - Models that expose reasoning stream it into a muted `Thinking` transcript
   entry while the final response remains under `Vivi`.
 
@@ -50,10 +51,10 @@ Preconditions:
   for streaming, and shuts down with Ctrl-C.
 - **Manually verify selection and copying.** Run `./zig-out/bin/vivi chat` in
   a fresh terminal and submit a prompt that produces distinct response text.
-  Drag over part of the rendered transcript with the terminal's standard
-  selection gesture, copy it with the terminal's copy command, focus the
-  composer, and paste it. Verify the copied text appears in the composer
-  unchanged, then press Ctrl-C to shut down.
+  Hold Shift while dragging over part of the rendered transcript, copy it with
+  the terminal's copy command, focus the composer, and paste it. Verify the
+  copied text appears in the composer unchanged, then press Ctrl-C to shut
+  down.
 - **Observe the action.** Open `chat-streaming.contact-sheet.png`, then
   inspect individual PNGs under `chat-streaming.frames/` for the idle
   composer, typed prompt, `Responding...` state, `You` entry, `Vivi`
