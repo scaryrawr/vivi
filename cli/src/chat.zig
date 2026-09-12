@@ -54,6 +54,32 @@ fn isBlank(text: []const u8) bool {
     return std.mem.trim(u8, text, " \t\r\n").len == 0;
 }
 
+fn imagePasteFailureMessage(
+    allocator: std.mem.Allocator,
+    err: anyerror,
+    platform: std.Target.Os.Tag,
+) ![]u8 {
+    const hint: ?[]const u8 = switch (err) {
+        error.ClipboardToolUnavailable => switch (platform) {
+            .linux => "Install wl-clipboard (wl-paste) for Wayland or xclip for X11, and ensure it is on PATH",
+            .windows => "Make Windows PowerShell (powershell.exe) available on PATH",
+            else => null,
+        },
+        error.ClipboardSessionUnavailable => "Run Vivi inside a Wayland or X11 desktop session; neither WAYLAND_DISPLAY nor DISPLAY is available",
+        error.ClipboardToolFailed => switch (platform) {
+            .linux => "The wl-paste/xclip helper failed; check that it can access your current desktop clipboard",
+            .windows => "Windows PowerShell could not read the clipboard; use an interactive desktop session and copy the image again",
+            else => null,
+        },
+        error.ClipboardTimedOut => "The clipboard helper timed out; check that your desktop session is responsive and try again",
+        error.NoImageOnClipboard => "Copy an image to the clipboard on the machine running Vivi, then try again",
+        else => null,
+    };
+    if (hint) |message|
+        return std.fmt.allocPrint(allocator, "Image paste failed: {s} ({s}).", .{ message, @errorName(err) });
+    return std.fmt.allocPrint(allocator, "Image paste failed: {s}.", .{@errorName(err)});
+}
+
 fn slashCommandQuery(input: []const u8) ?[]const u8 {
     if (input.len == 0 or input[0] != '/') return null;
     const command = input[1..];
@@ -3401,7 +3427,7 @@ const App = struct {
                         (key.matches('v', .{ .ctrl = true }) or key.matches('v', .{ .alt = true })))
                     {
                         self.pasteImage() catch |err| {
-                            const message = try std.fmt.allocPrint(self.allocator, "Image paste failed: {s}.", .{@errorName(err)});
+                            const message = try imagePasteFailureMessage(self.allocator, err, @import("builtin").os.tag);
                             defer self.allocator.free(message);
                             try self.ui.transcript.append(self.allocator, .status, message);
                             self.ui.followTail();
@@ -5042,6 +5068,36 @@ test "ask-user input preserves the existing composer draft" {
     const restored = try ui.input.toOwnedContents(std.testing.allocator);
     defer std.testing.allocator.free(restored);
     try std.testing.expectEqualStrings("unfinished draft", restored);
+}
+
+test "image clipboard setup failures name missing dependencies and desktop sessions" {
+    const cases = .{
+        .{
+            error.ClipboardToolUnavailable,
+            std.Target.Os.Tag.linux,
+            "Image paste failed: Install wl-clipboard (wl-paste) for Wayland or xclip for X11, and ensure it is on PATH (ClipboardToolUnavailable).",
+        },
+        .{
+            error.ClipboardToolUnavailable,
+            std.Target.Os.Tag.windows,
+            "Image paste failed: Make Windows PowerShell (powershell.exe) available on PATH (ClipboardToolUnavailable).",
+        },
+        .{
+            error.ClipboardSessionUnavailable,
+            std.Target.Os.Tag.linux,
+            "Image paste failed: Run Vivi inside a Wayland or X11 desktop session; neither WAYLAND_DISPLAY nor DISPLAY is available (ClipboardSessionUnavailable).",
+        },
+        .{
+            error.AccessDenied,
+            std.Target.Os.Tag.macos,
+            "Image paste failed: AccessDenied.",
+        },
+    };
+    inline for (cases) |case| {
+        const message = try imagePasteFailureMessage(std.testing.allocator, case[0], case[1]);
+        defer std.testing.allocator.free(message);
+        try std.testing.expectEqualStrings(case[2], message);
+    }
 }
 
 test "image pasted paths survive ask-user drafts and deletion removes attachment" {
