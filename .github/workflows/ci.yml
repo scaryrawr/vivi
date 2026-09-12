@@ -30,8 +30,24 @@ jobs:
         with:
           version: 0.16.0
 
+      - name: Enable compiler crash diagnostics
+        run: sudo sysctl -w "kernel.core_pattern=$RUNNER_TEMP/vivi-zig-core.%p"
+
       - name: Check Zig and CLI
-        run: ./scripts/check-zig.sh
+        run: |
+          ulimit -c unlimited
+          ./scripts/check-zig.sh
+
+      - name: Report compiler crash backtrace
+        if: failure()
+        run: |
+          for core in "$RUNNER_TEMP"/vivi-zig-core.*; do
+            [ -f "$core" ] || continue
+            gdb --batch \
+              -ex "set print frame-arguments none" \
+              -ex "thread apply all bt" \
+              "$(command -v zig)" "$core"
+          done
 
   c-api-cross:
     name: C API cross-builds
