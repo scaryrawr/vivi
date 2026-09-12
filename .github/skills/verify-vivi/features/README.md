@@ -69,5 +69,8 @@ user-visible behavior. It then uses exactly four H2 sections in this order:
   detection, and an OMLX-backed chat session.
 - [Slash model menu](./slash-model-menu.md) covers slash completion, the model
   picker, explicit hosted/local switching, and transcript/history behavior.
+- [Workspace customization](./workspace-customization.md) covers repository
+  instructions, project skill discovery, slash-menu visibility, and skill
+  invocation.
 - [Session resume](./session-resume.md) covers durable Vivi session indexing,
   the `/resume` finder, and continued Copilot history across processes.

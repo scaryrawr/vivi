@@ -40,12 +40,16 @@ to `zig build` or `./scripts/check-zig.sh`; both run the same tests and checks.
 workspace context, and a compact bottom composer. It streams responses as they
 arrive and restores the composer after each completed turn. Vivi enables
 Copilot's session-isolated built-in tools for planning and subagent
-coordination while keeping built-in MCP servers and custom instructions
-disabled. The SDK supplies `ask_user`, while Vivi supplies `read`, `bash`,
-`edit`, and `write`; the terminal presents questions in a separate decision
-panel with arrow-key choice selection. Typed choice numbers, exact choice text,
-and free-form input when allowed remain supported. Tool output is returned
-whole; Copilot owns any large-result handling.
+coordination while keeping built-in MCP servers disabled. Copilot loads the
+workspace's instruction files, including top-level `AGENTS.md`, and discovers
+project skills from `.github/skills/`, `.agents/skills/`, and
+`.claude/skills/`. Skills marked `user-invocable: true` appear in the `/` menu
+and run through Copilot's skill prompt when selected. The SDK supplies
+`ask_user`, while Vivi supplies `read`, `bash`, `edit`, and `write`; the
+terminal presents questions in a separate decision panel with arrow-key choice
+selection. Typed choice numbers, exact choice text, and free-form input when
+allowed remain supported. Tool output is returned whole; Copilot owns any
+large-result handling.
 
 Mouse-wheel bursts are processed in bounded batches with one redraw per batch,
 so rapid scrolling does not replay a separate frame for every queued tick.

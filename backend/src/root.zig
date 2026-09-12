@@ -178,7 +178,6 @@ const MinimalCodingAgent = struct {
     const cli_args = [_][]const u8{
         "--available-tools=custom:*,builtin:ask_user,builtin:task_complete,builtin:exit_plan_mode,builtin:task,builtin:read_agent,builtin:write_agent,builtin:list_agents,builtin:send_inbox,builtin:context_board,builtin:skill",
         "--disable-builtin-mcps",
-        "--no-custom-instructions",
     };
 
     const system_prompt =
@@ -226,10 +225,13 @@ const MinimalCodingAgent = struct {
                 .max_output_tokens = selected.max_output_tokens,
             } else null,
             .working_directory = working_directory,
+            .enable_config_discovery = true,
+            .skip_custom_instructions = false,
+            .enable_on_demand_instruction_discovery = true,
             .streaming = true,
             .tools = &sdk_tools,
             .system_message = .{
-                .mode = .replace,
+                .mode = .append,
                 .content = prompt,
             },
             .on_permission_request = copilot.approveAll,
@@ -2619,7 +2621,6 @@ test "minimal coding agent enables isolated builtins" {
         &.{
             "--available-tools=custom:*,builtin:ask_user,builtin:task_complete,builtin:exit_plan_mode,builtin:task,builtin:read_agent,builtin:write_agent,builtin:list_agents,builtin:send_inbox,builtin:context_board,builtin:skill",
             "--disable-builtin-mcps",
-            "--no-custom-instructions",
         },
         &MinimalCodingAgent.cli_args,
     );
@@ -2631,7 +2632,7 @@ test "minimal coding agent enables isolated builtins" {
     );
 }
 
-test "minimal coding agent replaces the system prompt with Vivi tools" {
+test "minimal coding agent appends Vivi tools to discovered instructions" {
     const config = MinimalCodingAgent.sessionConfig(
         "minimal system prompt",
         "/workspace",
@@ -2657,8 +2658,14 @@ test "minimal coding agent replaces the system prompt with Vivi tools" {
         "/workspace",
         config.working_directory.?,
     );
+    try std.testing.expectEqual(true, config.enable_config_discovery.?);
+    try std.testing.expectEqual(false, config.skip_custom_instructions.?);
     try std.testing.expectEqual(
-        copilot.SystemMessageMode.replace,
+        true,
+        config.enable_on_demand_instruction_discovery.?,
+    );
+    try std.testing.expectEqual(
+        copilot.SystemMessageMode.append,
         config.system_message.?.mode,
     );
     try std.testing.expectEqualStrings(

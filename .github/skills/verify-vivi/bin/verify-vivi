@@ -16,10 +16,11 @@ Usage:
   verify-vivi chat-markdown-read <run-id>
   verify-vivi chat-ask-user <run-id>
   verify-vivi chat-model-menu <run-id>
+  verify-vivi chat-customization <run-id>
   verify-vivi chat-session-resume <run-id>
   verify-vivi chat-shutdown <run-id>
-  verify-vivi extract-frames <run-id> <chat-streaming|chat-streaming-input|chat-markdown|chat-markdown-read|chat-ask-user|chat-model-menu|chat-session-resume|chat-shutdown>
-  verify-vivi frame-check <run-id> <chat-streaming|chat-streaming-input|chat-markdown|chat-markdown-read|chat-ask-user|chat-model-menu|chat-session-resume|chat-shutdown>
+  verify-vivi extract-frames <run-id> <chat-streaming|chat-streaming-input|chat-markdown|chat-markdown-read|chat-ask-user|chat-model-menu|chat-customization|chat-session-resume|chat-shutdown>
+  verify-vivi frame-check <run-id> <chat-streaming|chat-streaming-input|chat-markdown|chat-markdown-read|chat-ask-user|chat-model-menu|chat-customization|chat-session-resume|chat-shutdown>
   verify-vivi cleanup <run-id>
 EOF
 }
@@ -120,9 +121,9 @@ cli_discovery() {
 
 validate_capture_name() {
     case "$1" in
-        chat-streaming|chat-streaming-input|chat-markdown|chat-markdown-read|chat-ask-user|chat-model-menu|chat-session-resume|chat-shutdown) ;;
+        chat-streaming|chat-streaming-input|chat-markdown|chat-markdown-read|chat-ask-user|chat-model-menu|chat-customization|chat-session-resume|chat-shutdown) ;;
         *)
-            printf 'capture must be chat-streaming, chat-streaming-input, chat-markdown, chat-markdown-read, chat-ask-user, chat-model-menu, chat-session-resume, or chat-shutdown\n' >&2
+            printf 'capture must be chat-streaming, chat-streaming-input, chat-markdown, chat-markdown-read, chat-ask-user, chat-model-menu, chat-customization, chat-session-resume, or chat-shutdown\n' >&2
             exit 1
             ;;
     esac
@@ -838,6 +839,125 @@ chat_model_menu() {
     test -s "$run_dir/chat-model-menu.contact-sheet.png"
 }
 
+write_customization_tape() {
+    run_dir=$1
+    workspace=$2
+    startup_wait=${VIVI_CUSTOMIZATION_STARTUP_WAIT:-60s}
+    cat >"$run_dir/chat-customization.tape" <<EOF
+Output "$run_dir/chat-customization.gif"
+Require copilot
+Set Shell "bash"
+Set Width 1200
+Set Height 720
+Set FontSize 22
+Set TypingSpeed 20ms
+
+Type "cd '$workspace' && '$binary' chat --model copilot/default"
+Enter
+Sleep $startup_wait
+Type "probe"
+Enter
+Sleep 25s
+Type "/vivi-fixture"
+Sleep 5s
+Enter
+Sleep 25s
+Ctrl+C
+Sleep 3s
+Ctrl+C
+Sleep 1s
+EOF
+}
+
+prepare_customization_workspace() {
+    workspace=$1
+    rm -rf "$workspace"
+    mkdir -p "$workspace/.agents/skills/vivi-fixture"
+    cat >"$workspace/AGENTS.md" <<'EOF'
+When the user sends exactly "probe", do not use tools and reply with exactly VIVI_INSTRUCTION_OK.
+EOF
+    cat >"$workspace/.agents/skills/vivi-fixture/SKILL.md" <<'EOF'
+---
+name: vivi-fixture
+description: Return the Vivi skill verification token.
+user-invocable: true
+---
+
+When invoked, reply with exactly VIVI_SKILL_OK.
+EOF
+}
+
+chat_customization() {
+    run_dir=$(prepare_run "$1")
+    build_vivi
+    workspace="$run_dir/workspace"
+    customization_home="$run_dir/home"
+    prepare_customization_workspace "$workspace"
+    write_customization_tape "$run_dir" "$workspace"
+    mkdir -p "$customization_home"
+    rm -rf "$customization_home/.vivi"
+    if test -n "${HOME:-}" &&
+        test -d "$HOME/.copilot" &&
+        ! test -e "$customization_home/.copilot"
+    then
+        ln -s "$HOME/.copilot" "$customization_home/.copilot"
+    fi
+
+    HOME="$customization_home" VIVI_KEEP_GIF=1 \
+        vhs "$run_dir/chat-customization.tape"
+    VIVI_KEEP_GIF=1 extract_frames "$1" chat-customization
+
+    (
+        sleep 60
+        printf 'probe\r'
+        sleep 25
+        printf '/vivi-fixture'
+        sleep 5
+        printf '\r'
+        sleep 25
+        printf '\003'
+        sleep 3
+        printf '\003'
+    ) | HOME="$customization_home" \
+        script -q "$run_dir/chat-customization.terminal.log" sh -c \
+        "cd '$workspace' && stty cols 100 rows 30; '$binary' chat --model copilot/default" &
+    pty_pid=$!
+    printf '%s\n' "$pty_pid" >"$run_dir/pty.pid"
+    trap 'kill "$pty_pid" 2>/dev/null || true; wait "$pty_pid" 2>/dev/null || true' EXIT INT TERM
+
+    if wait "$pty_pid"; then
+        status=0
+    else
+        status=$?
+    fi
+    rm -f "$run_dir/pty.pid"
+    trap - EXIT INT TERM
+
+    perl -0pe \
+        's/\e\[[0-?]*[ -\/]*[@-~]//g; s/\e\][^\a]*(?:\a|\e\\)//g' \
+        "$run_dir/chat-customization.terminal.log" |
+        tr -d '\r\b' >"$run_dir/chat-customization.normalized.txt"
+
+    {
+        printf 'exit=%s\n' "$status"
+        printf 'instruction_seen='
+        grep -q 'VIVI_INSTRUCTION_OK' "$run_dir/chat-customization.normalized.txt" &&
+            printf 'yes\n' || printf 'no\n'
+        printf 'skill_menu_seen='
+        grep -q 'vivi-fixture' "$run_dir/chat-customization.normalized.txt" &&
+            printf 'yes\n' || printf 'no\n'
+        printf 'skill_response_seen='
+        grep -q 'VIVI_SKILL_OK' "$run_dir/chat-customization.normalized.txt" &&
+            printf 'yes\n' || printf 'no\n'
+    } >"$run_dir/chat-customization.assertions.txt"
+
+    test "$status" -eq 0
+    grep -q 'VIVI_INSTRUCTION_OK' "$run_dir/chat-customization.normalized.txt"
+    grep -q 'vivi-fixture' "$run_dir/chat-customization.normalized.txt"
+    grep -q 'VIVI_SKILL_OK' "$run_dir/chat-customization.normalized.txt"
+    test -s "$run_dir/chat-customization.contact-sheet.png"
+}
+
 write_session_resume_tape() {
     run_dir=$1
     cat >"$run_dir/chat-session-resume.tape" <<EOF
@@ -1090,6 +1210,13 @@ case "${1:-}" in
             exit 2
         }
         chat_model_menu "$2"
+        ;;
+    chat-customization)
+        test "$#" -eq 2 || {
+            usage >&2
+            exit 2
+        }
+        chat_customization "$2"
         ;;
     chat-session-resume)
         test "$#" -eq 2 || {
