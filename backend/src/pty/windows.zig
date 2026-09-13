@@ -292,7 +292,7 @@ fn spawn(
         attribute_list,
         0,
         pseudo_console_attribute,
-        @ptrCast(&pseudo_console.?),
+        pseudo_console.?,
         @sizeOf(windows.HANDLE),
         null,
         null,
