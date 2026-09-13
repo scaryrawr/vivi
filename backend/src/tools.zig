@@ -1,4 +1,5 @@
 const std = @import("std");
+const bash_sessions = @import("bash_sessions.zig");
 const tool_activity = @import("tool_activity.zig");
 const image = @import("image.zig");
 
@@ -18,9 +19,9 @@ pub const descriptors = [_]Descriptor{
     },
     .{
         .name = "bash",
-        .description = "Run a Bash command in the workspace. timeout is optional, defaults to 120 seconds, and may not exceed 600 seconds. Returns combined stdout and stderr without Vivi-side truncation.",
+        .description = "Run commands or manage persistent Bash PTYs. action defaults to run. run requires command and accepts timeout (default 120 seconds, maximum 600). start requires command and returns a shell_id. list takes no other fields. read requires shell_id and accepts max_bytes (default 16384, maximum 32768) and wait_ms (default 100, maximum 5000). write requires shell_id and data, with encoding utf8 (default) or base64; decoded input may not exceed 16384 bytes. stop requires shell_id and is idempotent.",
         .parameters_json =
-        \\{"type":"object","additionalProperties":false,"properties":{"command":{"type":"string","minLength":1},"timeout":{"type":"number","exclusiveMinimum":0,"maximum":600}},"required":["command"]}
+        \\{"type":"object","additionalProperties":false,"properties":{"action":{"type":"string","enum":["run","start","list","read","write","stop"],"default":"run"},"command":{"type":"string","minLength":1},"timeout":{"type":"number","exclusiveMinimum":0,"maximum":600},"shell_id":{"type":"string","pattern":"^bash_[0-9A-Fa-f]{32}$"},"max_bytes":{"type":"integer","minimum":1,"maximum":32768},"wait_ms":{"type":"integer","minimum":0,"maximum":5000},"data":{"type":"string"},"encoding":{"type":"string","enum":["utf8","base64"]}}}
         ,
     },
     .{
@@ -59,9 +60,17 @@ const ReadArguments = struct {
     limit: ?usize = null,
 };
 
+const BashAction = tool_activity.BashAction;
+
 const BashArguments = struct {
-    command: []const u8,
+    action: BashAction = .run,
+    command: ?[]const u8 = null,
     timeout: ?f64 = null,
+    shell_id: ?[]const u8 = null,
+    max_bytes: ?usize = null,
+    wait_ms: ?u32 = null,
+    data: ?[]const u8 = null,
+    encoding: ?bash_sessions.Encoding = null,
 };
 
 const TextEdit = struct {
@@ -79,6 +88,204 @@ const WriteArguments = struct {
     content: []const u8,
 };
 
+const RunBash = struct {
+    command: []const u8,
+    timeout_seconds: f64,
+};
+
+const StartBash = struct {
+    command: []const u8,
+};
+
+const ReadBash = struct {
+    id: bash_sessions.ShellId,
+    shell_id: []const u8,
+    max_bytes: usize,
+    wait_ms: u32,
+};
+
+const WriteBash = struct {
+    id: bash_sessions.ShellId,
+    shell_id: []const u8,
+    bytes: []const u8,
+};
+
+const StopBash = struct {
+    id: bash_sessions.ShellId,
+    shell_id: []const u8,
+};
+
+const BashOperation = union(BashAction) {
+    run: RunBash,
+    start: StartBash,
+    list: void,
+    read: ReadBash,
+    write: WriteBash,
+    stop: StopBash,
+};
+
+const PreparedBash = struct {
+    allocator: std.mem.Allocator,
+    parsed: std.json.Parsed(BashArguments),
+    decoded_input: ?[]u8,
+    operation: BashOperation,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        parsed_value: std.json.Parsed(BashArguments),
+    ) !PreparedBash {
+        var parsed = parsed_value;
+        errdefer parsed.deinit();
+        var decoded_input: ?[]u8 = null;
+        errdefer if (decoded_input) |bytes| allocator.free(bytes);
+        const arguments = parsed.value;
+        const operation: BashOperation = switch (arguments.action) {
+            .run => blk: {
+                if (arguments.shell_id != null or
+                    arguments.max_bytes != null or
+                    arguments.wait_ms != null or
+                    arguments.data != null or
+                    arguments.encoding != null)
+                {
+                    return error.UnexpectedBashArgument;
+                }
+                const command = arguments.command orelse
+                    return error.MissingCommand;
+                try validateCommand(command);
+                const timeout_seconds = arguments.timeout orelse 120;
+                try validateTimeout(timeout_seconds);
+                break :blk .{ .run = .{
+                    .command = command,
+                    .timeout_seconds = timeout_seconds,
+                } };
+            },
+            .start => blk: {
+                if (arguments.timeout != null)
+                    return error.AsyncTimeoutUnsupported;
+                if (arguments.shell_id != null or
+                    arguments.max_bytes != null or
+                    arguments.wait_ms != null or
+                    arguments.data != null or
+                    arguments.encoding != null)
+                {
+                    return error.UnexpectedBashArgument;
+                }
+                const command = arguments.command orelse
+                    return error.MissingCommand;
+                try validateCommand(command);
+                break :blk .{ .start = .{ .command = command } };
+            },
+            .list => blk: {
+                if (arguments.command != null or
+                    arguments.timeout != null or
+                    arguments.shell_id != null or
+                    arguments.max_bytes != null or
+                    arguments.wait_ms != null or
+                    arguments.data != null or
+                    arguments.encoding != null)
+                {
+                    return error.UnexpectedBashArgument;
+                }
+                break :blk .list;
+            },
+            .read => blk: {
+                if (arguments.command != null or
+                    arguments.timeout != null or
+                    arguments.data != null or
+                    arguments.encoding != null)
+                {
+                    return error.UnexpectedBashArgument;
+                }
+                const shell_id = arguments.shell_id orelse
+                    return error.MissingShellId;
+                const id = try bash_sessions.ShellId.parse(shell_id);
+                const max_bytes = arguments.max_bytes orelse
+                    bash_sessions.default_read_bytes;
+                if (max_bytes == 0 or max_bytes > bash_sessions.max_read_bytes)
+                    return error.InvalidReadLimit;
+                const wait_ms = arguments.wait_ms orelse
+                    bash_sessions.default_wait_ms;
+                if (wait_ms > bash_sessions.max_wait_ms)
+                    return error.InvalidWait;
+                break :blk .{ .read = .{
+                    .id = id,
+                    .shell_id = shell_id,
+                    .max_bytes = max_bytes,
+                    .wait_ms = wait_ms,
+                } };
+            },
+            .write => blk: {
+                if (arguments.command != null or
+                    arguments.timeout != null or
+                    arguments.max_bytes != null or
+                    arguments.wait_ms != null)
+                {
+                    return error.UnexpectedBashArgument;
+                }
+                const shell_id = arguments.shell_id orelse
+                    return error.MissingShellId;
+                const id = try bash_sessions.ShellId.parse(shell_id);
+                const data = arguments.data orelse return error.MissingData;
+                const bytes = switch (arguments.encoding orelse .utf8) {
+                    .utf8 => data,
+                    .base64 => decoded: {
+                        const decoder = std.base64.standard.Decoder;
+                        if (data.len > std.base64.standard.Encoder.calcSize(
+                            bash_sessions.max_write_bytes,
+                        )) return error.InputTooLarge;
+                        const size = decoder.calcSizeForSlice(data) catch
+                            return error.InvalidBase64;
+                        if (size > bash_sessions.max_write_bytes)
+                            return error.InputTooLarge;
+                        const buffer = try allocator.alloc(u8, size);
+                        errdefer allocator.free(buffer);
+                        decoder.decode(buffer, data) catch
+                            return error.InvalidBase64;
+                        decoded_input = buffer;
+                        break :decoded buffer;
+                    },
+                };
+                if (bytes.len > bash_sessions.max_write_bytes)
+                    return error.InputTooLarge;
+                break :blk .{ .write = .{
+                    .id = id,
+                    .shell_id = shell_id,
+                    .bytes = bytes,
+                } };
+            },
+            .stop => blk: {
+                if (arguments.command != null or
+                    arguments.timeout != null or
+                    arguments.max_bytes != null or
+                    arguments.wait_ms != null or
+                    arguments.data != null or
+                    arguments.encoding != null)
+                {
+                    return error.UnexpectedBashArgument;
+                }
+                const shell_id = arguments.shell_id orelse
+                    return error.MissingShellId;
+                break :blk .{ .stop = .{
+                    .id = try bash_sessions.ShellId.parse(shell_id),
+                    .shell_id = shell_id,
+                } };
+            },
+        };
+        return .{
+            .allocator = allocator,
+            .parsed = parsed,
+            .decoded_input = decoded_input,
+            .operation = operation,
+        };
+    }
+
+    fn deinit(self: *PreparedBash) void {
+        if (self.decoded_input) |bytes| self.allocator.free(bytes);
+        self.parsed.deinit();
+        self.* = undefined;
+    }
+};
+
 pub const PreparedCall = struct {
     allocator: std.mem.Allocator,
     arguments_json: []u8,
@@ -86,7 +293,7 @@ pub const PreparedCall = struct {
 
     const Operation = union(enum) {
         read: std.json.Parsed(ReadArguments),
-        bash: std.json.Parsed(BashArguments),
+        bash: PreparedBash,
         edit: std.json.Parsed(EditArguments),
         write: std.json.Parsed(WriteArguments),
         rejected: struct {
@@ -106,9 +313,7 @@ pub const PreparedCall = struct {
                 .offset = parsed.value.offset,
                 .limit = parsed.value.limit,
             } },
-            .bash => |parsed| .{ .bash = .{
-                .command = parsed.value.command,
-            } },
+            .bash => |prepared| .{ .bash = bashSummary(prepared.operation) },
             .edit => |parsed| .{ .edit = .{
                 .path = parsed.value.path,
                 .replacement_count = parsed.value.edits.len,
@@ -133,7 +338,7 @@ pub const PreparedCall = struct {
         self.allocator.free(self.arguments_json);
         switch (self.operation) {
             .read => |*parsed| parsed.deinit(),
-            .bash => |*parsed| parsed.deinit(),
+            .bash => |*prepared| prepared.deinit(),
             .edit => |*parsed| parsed.deinit(),
             .write => |*parsed| parsed.deinit(),
             .rejected => |rejected_call| {
@@ -155,6 +360,7 @@ pub const Service = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     workspace: []u8,
+    bash_manager: ?*bash_sessions.Manager = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -169,6 +375,10 @@ pub const Service = struct {
     }
 
     pub fn deinit(self: *Service) void {
+        if (self.bash_manager) |manager_ptr| {
+            manager_ptr.deinit();
+            self.allocator.destroy(manager_ptr);
+        }
         self.allocator.free(self.workspace);
         self.* = undefined;
     }
@@ -194,16 +404,15 @@ pub const Service = struct {
             };
         }
         if (std.mem.eql(u8, name, "bash")) {
-            var parsed = self.parse(BashArguments, arguments_json) catch |err|
+            const parsed = self.parse(BashArguments, arguments_json) catch |err|
                 return self.rejectedParse(owned_arguments, name, err);
-            validateBashArguments(parsed.value) catch |err| {
-                parsed.deinit();
+            const prepared = PreparedBash.init(self.allocator, parsed) catch |err| {
                 return self.rejectedExecution(owned_arguments, name, err);
             };
             return .{
                 .allocator = self.allocator,
                 .arguments_json = owned_arguments,
-                .operation = .{ .bash = parsed },
+                .operation = .{ .bash = prepared },
             };
         }
         if (std.mem.eql(u8, name, "edit")) {
@@ -250,12 +459,12 @@ pub const Service = struct {
 
     pub fn execute(
         self: *Service,
-        prepared: *const PreparedCall,
+        call: *const PreparedCall,
     ) !Result {
-        return switch (prepared.operation) {
+        return switch (call.operation) {
             .read => |parsed| self.runRead(parsed.value) catch |err|
                 self.toolFailure("read", err),
-            .bash => |parsed| self.runBash(parsed.value) catch |err|
+            .bash => |prepared| self.runBash(prepared.operation) catch |err|
                 self.toolFailure("bash", err),
             .edit => |parsed| self.runEdit(parsed.value) catch |err|
                 self.toolFailure("edit", err),
@@ -278,6 +487,23 @@ pub const Service = struct {
             arguments_json,
             .{ .allocate = .alloc_always },
         );
+    }
+
+    fn parsePrepared(
+        self: *Service,
+        comptime Arguments: type,
+        owned_arguments: []u8,
+        name: []const u8,
+        arguments_json: []const u8,
+        comptime tag: std.meta.Tag(PreparedCall.Operation),
+    ) !PreparedCall {
+        const parsed = self.parse(Arguments, arguments_json) catch |err|
+            return self.rejectedParse(owned_arguments, name, err);
+        return .{
+            .allocator = self.allocator,
+            .arguments_json = owned_arguments,
+            .operation = @unionInit(PreparedCall.Operation, @tagName(tag), parsed),
+        };
     }
 
     fn rejectedParse(
@@ -413,13 +639,29 @@ pub const Service = struct {
         return .{ .text = try output.toOwnedSlice(self.allocator) };
     }
 
-    fn runBash(self: *Service, arguments: BashArguments) !Result {
-        const timeout_seconds = arguments.timeout orelse 120;
+    fn runBash(self: *Service, operation: BashOperation) !Result {
+        return switch (operation) {
+            .run => |arguments| self.runSynchronousBash(
+                arguments.command,
+                arguments.timeout_seconds,
+            ),
+            .start => |arguments| self.runAsyncBash(arguments.command),
+            .list => self.runListBash(),
+            .read => |arguments| self.runReadBash(arguments),
+            .write => |arguments| self.runWriteBash(arguments),
+            .stop => |arguments| self.runStopBash(arguments),
+        };
+    }
 
+    fn runSynchronousBash(
+        self: *Service,
+        command: []const u8,
+        timeout_seconds: f64,
+    ) !Result {
         const script = try std.fmt.allocPrint(
             self.allocator,
             "exec 2>&1\n{s}",
-            .{arguments.command},
+            .{command},
         );
         defer self.allocator.free(script);
         const milliseconds: i64 = @intFromFloat(timeout_seconds * 1000);
@@ -470,6 +712,121 @@ pub const Service = struct {
                 .{ output, status },
             ),
         };
+    }
+
+    fn getBashManager(self: *Service) !*bash_sessions.Manager {
+        if (self.bash_manager) |manager_ptr| return manager_ptr;
+        const manager_ptr = try self.allocator.create(bash_sessions.Manager);
+        errdefer self.allocator.destroy(manager_ptr);
+        manager_ptr.* = try bash_sessions.Manager.init(
+            self.allocator,
+            self.io,
+            self.workspace,
+            .{},
+        );
+        self.bash_manager = manager_ptr;
+        return manager_ptr;
+    }
+
+    fn runAsyncBash(
+        self: *Service,
+        command: []const u8,
+    ) !Result {
+        const manager_ptr = try self.getBashManager();
+        var started = try manager_ptr.start(.{
+            .command = command,
+        });
+        defer started.output.deinit();
+        errdefer _ = manager_ptr.stop(started.id) catch {};
+        return .{ .text = try formatStart(self.allocator, started) };
+    }
+
+    fn runListBash(self: *Service) !Result {
+        const manager_ptr = self.bash_manager orelse
+            return .{ .text = try self.allocator.dupe(u8, "{\"sessions\":[]}") };
+        const snapshots = try manager_ptr.list(self.allocator);
+        defer self.allocator.free(snapshots);
+        const JsonSnapshot = struct {
+            shell_id: []const u8,
+            state: []const u8,
+            exit: ?JsonExit,
+            unread_bytes: usize,
+            dropped_bytes: u64,
+        };
+        const values = try self.allocator.alloc(JsonSnapshot, snapshots.len);
+        defer self.allocator.free(values);
+        const ids = try self.allocator.alloc([37]u8, snapshots.len);
+        defer self.allocator.free(ids);
+        for (snapshots, values, ids) |snapshot, *value, *id_buffer| {
+            value.* = .{
+                .shell_id = snapshot.id.format(id_buffer),
+                .state = stateName(snapshot.state),
+                .exit = stateExit(snapshot.state),
+                .unread_bytes = snapshot.unread_bytes,
+                .dropped_bytes = snapshot.dropped_bytes,
+            };
+        }
+        return .{ .text = try std.json.Stringify.valueAlloc(
+            self.allocator,
+            .{ .sessions = values },
+            .{},
+        ) };
+    }
+
+    fn runReadBash(
+        self: *Service,
+        arguments: ReadBash,
+    ) !Result {
+        const manager_ptr = self.bash_manager orelse return error.UnknownShell;
+        var result = try manager_ptr.read(
+            self.allocator,
+            arguments.id,
+            arguments.max_bytes,
+            arguments.wait_ms,
+        );
+        defer result.output.deinit();
+        return .{ .text = try formatRead(self.allocator, result) };
+    }
+
+    fn runWriteBash(
+        self: *Service,
+        arguments: WriteBash,
+    ) !Result {
+        const manager_ptr = self.bash_manager orelse return error.UnknownShell;
+        const result = try manager_ptr.write(
+            arguments.id,
+            arguments.bytes,
+        );
+        var id_buffer: [37]u8 = undefined;
+        return .{ .text = try std.json.Stringify.valueAlloc(
+            self.allocator,
+            .{
+                .shell_id = result.id.format(&id_buffer),
+                .state = stateName(result.state),
+                .exit = stateExit(result.state),
+                .accepted_bytes = result.accepted_bytes,
+            },
+            .{},
+        ) };
+    }
+
+    fn runStopBash(
+        self: *Service,
+        arguments: StopBash,
+    ) !Result {
+        const stopped = if (self.bash_manager) |manager_ptr|
+            try manager_ptr.stop(arguments.id)
+        else
+            bash_sessions.StopResult{ .id = arguments.id, .was_present = false };
+        var id_buffer: [37]u8 = undefined;
+        return .{ .text = try std.json.Stringify.valueAlloc(
+            self.allocator,
+            .{
+                .shell_id = stopped.id.format(&id_buffer),
+                .was_present = stopped.was_present,
+            },
+            .{},
+        ) };
     }
 
     fn runEdit(self: *Service, arguments: EditArguments) !Result {
@@ -585,9 +942,13 @@ fn validateReadArguments(arguments: ReadArguments) !void {
     }
 }
 
-fn validateBashArguments(arguments: BashArguments) !void {
-    if (arguments.command.len == 0) return error.EmptyCommand;
-    const timeout_seconds = arguments.timeout orelse 120;
+fn validateCommand(command: []const u8) !void {
+    if (command.len == 0) return error.EmptyCommand;
+    if (std.mem.indexOfScalar(u8, command, 0) != null)
+        return error.InvalidCommand;
+}
+
+fn validateTimeout(timeout_seconds: f64) !void {
     if (!std.math.isFinite(timeout_seconds) or
         timeout_seconds <= 0 or
         timeout_seconds > 600)
@@ -606,6 +967,79 @@ fn validateEditArguments(arguments: EditArguments) !void {
 
 fn validateWriteArguments(arguments: WriteArguments) !void {
     try validatePath(arguments.path);
+}
+
+const JsonExit = struct {
+    kind: []const u8,
+    value: ?u32,
+};
+
+fn stateName(state: bash_sessions.State) []const u8 {
+    return switch (state) {
+        .running => "running",
+        .exited => "exited",
+    };
+}
+
+fn bashSummary(operation: BashOperation) tool_activity.BashSummary {
+    return switch (operation) {
+        .run => |arguments| .{ .run = .{ .command = arguments.command } },
+        .start => |arguments| .{ .start = .{ .command = arguments.command } },
+        .list => .list,
+        .read => |arguments| .{ .read = .{
+            .shell_id = arguments.shell_id,
+        } },
+        .write => |arguments| .{ .write = .{
+            .shell_id = arguments.shell_id,
+        } },
+        .stop => |arguments| .{ .stop = .{
+            .shell_id = arguments.shell_id,
+        } },
+    };
+}
+
+fn stateExit(state: bash_sessions.State) ?JsonExit {
+    return switch (state) {
+        .running => null,
+        .exited => |value| switch (value) {
+            .code => |code| .{ .kind = "code", .value = code },
+            .signal => |signal| .{ .kind = "signal", .value = signal },
+            .terminated => .{ .kind = "terminated", .value = null },
+            .unknown => .{ .kind = "unknown", .value = null },
+        },
+    };
+}
+
+fn formatStart(
+    allocator: std.mem.Allocator,
+    result: bash_sessions.StartResult,
+) ![]u8 {
+    var id_buffer: [37]u8 = undefined;
+    return std.json.Stringify.valueAlloc(allocator, .{
+        .shell_id = result.id.format(&id_buffer),
+        .state = stateName(result.state),
+        .exit = stateExit(result.state),
+        .output = result.output.bytes,
+        .encoding = @tagName(result.output.encoding),
+        .more = result.output.more,
+        .dropped_bytes = result.output.dropped_bytes,
+    }, .{});
+}
+
+fn formatRead(
+    allocator: std.mem.Allocator,
+    result: bash_sessions.ReadResult,
+) ![]u8 {
+    var id_buffer: [37]u8 = undefined;
+    return std.json.Stringify.valueAlloc(allocator, .{
+        .shell_id = result.id.format(&id_buffer),
+        .state = stateName(result.state),
+        .exit = stateExit(result.state),
+        .output = result.output.bytes,
+        .encoding = @tagName(result.output.encoding),
+        .more = result.output.more,
+        .dropped_bytes = result.output.dropped_bytes,
+    }, .{});
 }
 
 fn writeFile(io: std.Io, path: []const u8, content: []const u8) !void {
@@ -871,6 +1305,364 @@ test "bash returns complete output and status" {
     try std.testing.expect(std.mem.indexOf(u8, failure.failure, "code 7") != null);
 }
 
+test "async bash starts, lists, accepts input, reads, and stops idempotently" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try temporary.dir.realPath(std.testing.io, &path_buffer);
+    var service = try Service.init(
+        std.testing.allocator,
+        std.testing.io,
+        path_buffer[0..path_len],
+    );
+    defer service.deinit();
+
+    var start_call = try service.prepare("bash",
+        \\{"action":"start","command":"read line; printf 'TOOL:%s\\n' \"$line\""}
+    );
+    defer start_call.deinit();
+    var start_result = try service.execute(&start_call);
+    defer start_result.deinit(std.testing.allocator);
+    try std.testing.expect(start_result == .text);
+    var start_json = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        start_result.text,
+        .{},
+    );
+    defer start_json.deinit();
+    const shell_id = start_json.value.object.get("shell_id").?.string;
+    try std.testing.expectEqual(@as(usize, 37), shell_id.len);
+
+    var list_call = try service.prepare("bash", "{\"action\":\"list\"}");
+    defer list_call.deinit();
+    var list_result = try service.execute(&list_call);
+    defer list_result.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, list_result.text, shell_id) != null);
+
+    const write_arguments = try std.json.Stringify.valueAlloc(
+        std.testing.allocator,
+        .{ .action = "write", .shell_id = shell_id, .data = "ready\n" },
+        .{},
+    );
+    defer std.testing.allocator.free(write_arguments);
+    var write_call = try service.prepare("bash", write_arguments);
+    defer write_call.deinit();
+    var write_result = try service.execute(&write_call);
+    defer write_result.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        write_result.text,
+        "\"accepted_bytes\":6",
+    ) != null);
+
+    const read_arguments = try std.json.Stringify.valueAlloc(
+        std.testing.allocator,
+        .{ .action = "read", .shell_id = shell_id, .wait_ms = 500 },
+        .{},
+    );
+    defer std.testing.allocator.free(read_arguments);
+    var found = false;
+    for (0..10) |_| {
+        var read_call = try service.prepare("bash", read_arguments);
+        defer read_call.deinit();
+        var read_result = try service.execute(&read_call);
+        defer read_result.deinit(std.testing.allocator);
+        if (std.mem.indexOf(u8, read_result.text, "TOOL:ready") != null) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+
+    const stop_arguments = try std.json.Stringify.valueAlloc(
+        std.testing.allocator,
+        .{ .action = "stop", .shell_id = shell_id },
+        .{},
+    );
+    defer std.testing.allocator.free(stop_arguments);
+    for ([_]bool{ true, false }) |was_present| {
+        var stop_call = try service.prepare("bash", stop_arguments);
+        defer stop_call.deinit();
+        var stop_result = try service.execute(&stop_call);
+        defer stop_result.deinit(std.testing.allocator);
+        const expected = if (was_present)
+            "\"was_present\":true"
+        else
+            "\"was_present\":false";
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            stop_result.text,
+            expected,
+        ) != null);
+    }
+}
+
+test "bash prepares every action with defaults" {
+    var service = try Service.init(
+        std.testing.allocator,
+        std.testing.io,
+        ".",
+    );
+    defer service.deinit();
+
+    var sync_call = try service.prepare("bash", "{\"command\":\"printf sync\"}");
+    defer sync_call.deinit();
+    try std.testing.expectEqual(
+        @as(f64, 120),
+        sync_call.operation.bash.operation.run.timeout_seconds,
+    );
+
+    const shell_id = "bash_0123456789abcdef0123456789abcdef";
+    var read_call = try service.prepare(
+        "bash",
+        "{\"action\":\"read\",\"shell_id\":\"bash_0123456789abcdef0123456789abcdef\"}",
+    );
+    defer read_call.deinit();
+    try std.testing.expectEqual(
+        @as(usize, bash_sessions.default_read_bytes),
+        read_call.operation.bash.operation.read.max_bytes,
+    );
+    try std.testing.expectEqual(
+        bash_sessions.default_wait_ms,
+        read_call.operation.bash.operation.read.wait_ms,
+    );
+
+    var write_call = try service.prepare(
+        "bash",
+        "{\"action\":\"write\",\"shell_id\":\"bash_0123456789abcdef0123456789abcdef\",\"data\":\"input\"}",
+    );
+    defer write_call.deinit();
+    try std.testing.expectEqualStrings(
+        "input",
+        write_call.operation.bash.operation.write.bytes,
+    );
+    try std.testing.expectEqualStrings(
+        shell_id,
+        write_call.operation.bash.operation.write.shell_id,
+    );
+}
+
+test "bash rejects missing and action-forbidden fields during prepare" {
+    var service = try Service.init(
+        std.testing.allocator,
+        std.testing.io,
+        ".",
+    );
+    defer service.deinit();
+
+    const cases = [_]struct {
+        arguments: []const u8,
+        expected: []const u8,
+    }{
+        .{ .arguments = "{}", .expected = "bash failed: MissingCommand." },
+        .{ .arguments = "{\"action\":\"start\"}", .expected = "bash failed: MissingCommand." },
+        .{ .arguments = "{\"action\":\"read\"}", .expected = "bash failed: MissingShellId." },
+        .{ .arguments = "{\"action\":\"write\",\"shell_id\":\"bash_0123456789abcdef0123456789abcdef\"}", .expected = "bash failed: MissingData." },
+        .{ .arguments = "{\"action\":\"stop\"}", .expected = "bash failed: MissingShellId." },
+        .{ .arguments = "{\"command\":\"true\",\"shell_id\":\"bash_0123456789abcdef0123456789abcdef\"}", .expected = "bash failed: UnexpectedBashArgument." },
+        .{ .arguments = "{\"action\":\"start\",\"command\":\"true\",\"timeout\":1}", .expected = "bash failed: AsyncTimeoutUnsupported." },
+        .{ .arguments = "{\"action\":\"list\",\"command\":\"true\"}", .expected = "bash failed: UnexpectedBashArgument." },
+        .{ .arguments = "{\"action\":\"read\",\"shell_id\":\"bash_0123456789abcdef0123456789abcdef\",\"data\":\"x\"}", .expected = "bash failed: UnexpectedBashArgument." },
+        .{ .arguments = "{\"action\":\"write\",\"shell_id\":\"bash_0123456789abcdef0123456789abcdef\",\"data\":\"x\",\"wait_ms\":1}", .expected = "bash failed: UnexpectedBashArgument." },
+        .{ .arguments = "{\"action\":\"stop\",\"shell_id\":\"bash_0123456789abcdef0123456789abcdef\",\"encoding\":\"utf8\"}", .expected = "bash failed: UnexpectedBashArgument." },
+    };
+    for (cases) |case| {
+        var rejected = try service.prepare("bash", case.arguments);
+        defer rejected.deinit();
+        var result = try service.execute(&rejected);
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings(case.expected, result.failure);
+    }
+}
+
+test "bash actions expose operation-specific activity summaries" {
+    var service = try Service.init(
+        std.testing.allocator,
+        std.testing.io,
+        ".",
+    );
+    defer service.deinit();
+    const shell_id = "bash_0123456789abcdef0123456789abcdef";
+    const cases = [_]struct {
+        arguments: []const u8,
+        action: tool_activity.BashAction,
+    }{
+        .{
+            .arguments = "{\"command\":\"true\"}",
+            .action = .run,
+        },
+        .{
+            .arguments = "{\"action\":\"start\",\"command\":\"sleep 1\"}",
+            .action = .start,
+        },
+        .{ .arguments = "{\"action\":\"list\"}", .action = .list },
+        .{
+            .arguments = "{\"action\":\"read\",\"shell_id\":\"bash_0123456789abcdef0123456789abcdef\"}",
+            .action = .read,
+        },
+        .{
+            .arguments = "{\"action\":\"write\",\"shell_id\":\"bash_0123456789abcdef0123456789abcdef\",\"data\":\"x\"}",
+            .action = .write,
+        },
+        .{
+            .arguments = "{\"action\":\"stop\",\"shell_id\":\"bash_0123456789abcdef0123456789abcdef\"}",
+            .action = .stop,
+        },
+    };
+    for (cases) |case| {
+        var prepared = try service.prepare("bash", case.arguments);
+        defer prepared.deinit();
+        var started = try prepared.started(std.testing.allocator, "call");
+        defer started.deinit();
+        const summary = started.invocation.summary.bash;
+        try std.testing.expectEqual(case.action, std.meta.activeTag(summary));
+        switch (summary) {
+            .read => |value| {
+                try std.testing.expectEqualStrings(shell_id, value.shell_id);
+            },
+            .write => |value| {
+                try std.testing.expectEqualStrings(shell_id, value.shell_id);
+            },
+            .stop => |value| {
+                try std.testing.expectEqualStrings(shell_id, value.shell_id);
+            },
+            else => {},
+        }
+    }
+}
+
+test "async Bash validates IDs, limits, and base64 before execution" {
+    var service = try Service.init(
+        std.testing.allocator,
+        std.testing.io,
+        ".",
+    );
+    defer service.deinit();
+    const cases = [_]struct {
+        arguments: []const u8,
+        expected: []const u8,
+    }{
+        .{
+            .arguments = "{\"command\":\"true\",\"timeout\":0}",
+            .expected = "bash failed: InvalidTimeout.",
+        },
+        .{
+            .arguments = "{\"command\":\"true\",\"timeout\":601}",
+            .expected = "bash failed: InvalidTimeout.",
+        },
+        .{
+            .arguments = "{\"action\":\"read\",\"shell_id\":\"bad\",\"wait_ms\":6000}",
+            .expected = "bash failed: InvalidShellId.",
+        },
+        .{
+            .arguments = "{\"action\":\"read\",\"shell_id\":\"bash_0123456789abcdef0123456789abcdef\",\"max_bytes\":0}",
+            .expected = "bash failed: InvalidReadLimit.",
+        },
+        .{
+            .arguments = "{\"action\":\"read\",\"shell_id\":\"bash_0123456789abcdef0123456789abcdef\",\"max_bytes\":32769}",
+            .expected = "bash failed: InvalidReadLimit.",
+        },
+        .{
+            .arguments = "{\"action\":\"read\",\"shell_id\":\"bash_0123456789abcdef0123456789abcdef\",\"wait_ms\":5001}",
+            .expected = "bash failed: InvalidWait.",
+        },
+        .{
+            .arguments = "{\"action\":\"write\",\"shell_id\":\"bash_0123456789abcdef0123456789abcdef\",\"data\":\"%%%\",\"encoding\":\"base64\"}",
+            .expected = "bash failed: InvalidBase64.",
+        },
+    };
+    for (cases) |case| {
+        var prepared = try service.prepare("bash", case.arguments);
+        defer prepared.deinit();
+        var result = try service.execute(&prepared);
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings(case.expected, result.failure);
+    }
+
+    const oversized = try std.testing.allocator.alloc(
+        u8,
+        bash_sessions.max_write_bytes + 1,
+    );
+    defer std.testing.allocator.free(oversized);
+    @memset(oversized, 'x');
+    const arguments = try std.json.Stringify.valueAlloc(
+        std.testing.allocator,
+        .{
+            .action = "write",
+            .shell_id = "bash_0123456789abcdef0123456789abcdef",
+            .data = oversized,
+        },
+        .{},
+    );
+    defer std.testing.allocator.free(arguments);
+    var rejected = try service.prepare("bash", arguments);
+    defer rejected.deinit();
+    var result = try service.execute(&rejected);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(
+        "bash failed: InputTooLarge.",
+        result.failure,
+    );
+
+    const oversized_base64 = try std.testing.allocator.alloc(
+        u8,
+        std.base64.standard.Encoder.calcSize(
+            bash_sessions.max_write_bytes,
+        ) + 4,
+    );
+    defer std.testing.allocator.free(oversized_base64);
+    @memset(oversized_base64, 'A');
+    const base64_arguments = try std.json.Stringify.valueAlloc(
+        std.testing.allocator,
+        .{
+            .action = "write",
+            .shell_id = "bash_0123456789abcdef0123456789abcdef",
+            .data = oversized_base64,
+            .encoding = "base64",
+        },
+        .{},
+    );
+    defer std.testing.allocator.free(base64_arguments);
+    var rejected_base64 = try service.prepare("bash", base64_arguments);
+    defer rejected_base64.deinit();
+    var base64_result = try service.execute(&rejected_base64);
+    defer base64_result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(
+        "bash failed: InputTooLarge.",
+        base64_result.failure,
+    );
+}
+
+test "prepared Bash owns parsed strings and decoded base64 input" {
+    var service = try Service.init(
+        std.testing.allocator,
+        std.testing.io,
+        ".",
+    );
+    defer service.deinit();
+    const mutable_arguments = try std.testing.allocator.dupe(
+        u8,
+        "{\"action\":\"write\",\"shell_id\":\"bash_0123456789abcdef0123456789abcdef\",\"data\":\"/w==\",\"encoding\":\"base64\"}",
+    );
+    var prepared = try service.prepare("bash", mutable_arguments);
+    std.testing.allocator.free(mutable_arguments);
+    defer prepared.deinit();
+
+    try std.testing.expectEqualSlices(
+        u8,
+        &.{0xff},
+        prepared.operation.bash.operation.write.bytes,
+    );
+    var started = try prepared.started(std.testing.allocator, "owned");
+    defer started.deinit();
+    try std.testing.expectEqualStrings(
+        "bash_0123456789abcdef0123456789abcdef",
+        started.invocation.summary.bash.write.shell_id,
+    );
+}
+
 test "prepare derives built-in summaries from executable arguments" {
     var service = try Service.init(
         std.testing.allocator,
@@ -922,7 +1714,7 @@ test "prepare derives built-in summaries from executable arguments" {
             },
             1 => try std.testing.expectEqualStrings(
                 "printf hi",
-                started.invocation.summary.bash.command,
+                started.invocation.summary.bash.run.command,
             ),
             2 => {
                 const summary = started.invocation.summary.edit;

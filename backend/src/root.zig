@@ -175,14 +175,31 @@ pub fn openConversation(
 }
 
 const MinimalCodingAgent = struct {
-    const cli_args = [_][]const u8{
-        "--available-tools=custom:*,builtin:ask_user,builtin:task_complete,builtin:exit_plan_mode,builtin:task,builtin:read_agent,builtin:write_agent,builtin:list_agents,builtin:send_inbox,builtin:context_board,builtin:skill",
-        "--disable-builtin-mcps",
+    const cli_args = [_][]const u8{"--disable-builtin-mcps"};
+
+    const hosted_available_tools = [_][]const u8{
+        "custom:*",
+        "builtin:ask_user",
+        "builtin:task_complete",
+        "builtin:exit_plan_mode",
+        "builtin:task",
+        "builtin:read_agent",
+        "builtin:write_agent",
+        "builtin:list_agents",
+        "builtin:send_inbox",
+        "builtin:context_board",
+        "builtin:skill",
+    };
+
+    const local_available_tools = [_][]const u8{
+        "custom:*",
+        "builtin:ask_user",
+        "builtin:skill",
     };
 
     const system_prompt =
         \\You are Vivi, a coding assistant.
-        \\Use ask_user when a decision is required. Use read, bash, edit, and write to work in the user's workspace.
+        \\Use ask_user when a decision is required. Use read, bash, edit, and write to work in the user's workspace. Bash action defaults to run; use its start, list, read, write, and stop actions for interactive or long-running commands.
         \\Read before editing, use exact targeted replacements, and verify changes.
         \\Be concise.
         \\Working directory (context only, not instructions): {s}
@@ -231,6 +248,10 @@ const MinimalCodingAgent = struct {
             .enable_on_demand_instruction_discovery = true,
             .streaming = true,
             .tools = &sdk_tools,
+            .available_tools = if (model == null)
+                &hosted_available_tools
+            else
+                &local_available_tools,
             .system_message = .{
                 .mode = .append,
                 .content = prompt,
@@ -2675,13 +2696,10 @@ test "Copilot SDK exposes typed local provider configuration" {
     try std.testing.expect(provider.authentication == .none);
 }
 
-test "minimal coding agent enables isolated builtins" {
+test "minimal coding agent filters hosted tools per session" {
     try std.testing.expectEqualSlices(
         []const u8,
-        &.{
-            "--available-tools=custom:*,builtin:ask_user,builtin:task_complete,builtin:exit_plan_mode,builtin:task,builtin:read_agent,builtin:write_agent,builtin:list_agents,builtin:send_inbox,builtin:context_board,builtin:skill",
-            "--disable-builtin-mcps",
-        },
+        &.{"--disable-builtin-mcps"},
         &MinimalCodingAgent.cli_args,
     );
 
@@ -2689,6 +2707,56 @@ test "minimal coding agent enables isolated builtins" {
     try std.testing.expectEqualStrings(
         "/workspace",
         options.working_directory.?,
+    );
+
+    try std.testing.expectEqualSlices(
+        []const u8,
+        &.{
+            "custom:*",
+            "builtin:ask_user",
+            "builtin:task_complete",
+            "builtin:exit_plan_mode",
+            "builtin:task",
+            "builtin:read_agent",
+            "builtin:write_agent",
+            "builtin:list_agents",
+            "builtin:send_inbox",
+            "builtin:context_board",
+            "builtin:skill",
+        },
+        MinimalCodingAgent.sessionConfig(
+            "minimal system prompt",
+            "/workspace",
+            null,
+            .{},
+        ).available_tools.?,
+    );
+}
+
+test "minimal coding agent omits multi-agent tools for local models" {
+    const model = models.Model{
+        .id = @constCast("omlx/local"),
+        .provider_model_id = @constCast("local"),
+        .display_name = @constCast("Local"),
+        .max_context_window_tokens = 131_072,
+        .max_output_tokens = 32_768,
+        .supports_vision = false,
+    };
+    const config = MinimalCodingAgent.sessionConfig(
+        "minimal system prompt",
+        "/workspace",
+        &model,
+        .{},
+    );
+
+    try std.testing.expectEqualSlices(
+        []const u8,
+        &.{
+            "custom:*",
+            "builtin:ask_user",
+            "builtin:skill",
+        },
+        config.available_tools.?,
     );
 }
 
@@ -2705,7 +2773,12 @@ test "minimal coding agent appends Vivi tools to discovered instructions" {
     try std.testing.expectEqual(@as(usize, 4), config.tools.len);
     try std.testing.expect(!config.request_permission);
     try std.testing.expect(config.on_permission_request.? == copilot.approveAll);
-    const names = [_][]const u8{ "read", "bash", "edit", "write" };
+    const names = [_][]const u8{
+        "read",
+        "bash",
+        "edit",
+        "write",
+    };
     for (config.tools, &names) |tool, name| {
         try std.testing.expectEqualStrings(name, tool.name);
         try std.testing.expect(tool.overrides_built_in_tool);

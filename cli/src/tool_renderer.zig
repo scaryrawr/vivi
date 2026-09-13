@@ -251,12 +251,72 @@ fn renderBash(
     marker: []const u8,
     summary: backend.BashToolSummary,
 ) ![]u8 {
-    const preview = try compactDisplayText(allocator, summary.command);
+    return switch (summary) {
+        .run => |value| renderBashCommand(
+            allocator,
+            marker,
+            "Run",
+            value.command,
+        ),
+        .start => |value| renderBashCommand(
+            allocator,
+            marker,
+            "Start Bash",
+            value.command,
+        ),
+        .list => std.fmt.allocPrint(
+            allocator,
+            "{s} List Bash sessions",
+            .{marker},
+        ),
+        .read => |value| renderBashSession(
+            allocator,
+            marker,
+            "Read Bash",
+            value.shell_id,
+        ),
+        .write => |value| renderBashSession(
+            allocator,
+            marker,
+            "Write Bash",
+            value.shell_id,
+        ),
+        .stop => |value| renderBashSession(
+            allocator,
+            marker,
+            "Stop Bash",
+            value.shell_id,
+        ),
+    };
+}
+
+fn renderBashCommand(
+    allocator: std.mem.Allocator,
+    marker: []const u8,
+    action: []const u8,
+    command: []const u8,
+) ![]u8 {
+    const preview = try compactDisplayText(allocator, command);
     defer allocator.free(preview);
     return std.fmt.allocPrint(
         allocator,
-        "{s} Run {s}",
-        .{ marker, preview },
+        "{s} {s} {s}",
+        .{ marker, action, preview },
+    );
+}
+
+fn renderBashSession(
+    allocator: std.mem.Allocator,
+    marker: []const u8,
+    action: []const u8,
+    shell_id: []const u8,
+) ![]u8 {
+    const id = try compactDisplayText(allocator, shell_id);
+    defer allocator.free(id);
+    return std.fmt.allocPrint(
+        allocator,
+        "{s} {s} {s}",
+        .{ marker, action, id },
     );
 }
 
@@ -371,10 +431,38 @@ test "built-in summaries and lifecycle chrome are distinct" {
             .expected = "◌ Read src/main.zig lines 10-29",
         },
         .{
-            .summary = .{ .bash = .{
+            .summary = .{ .bash = .{ .run = .{
                 .command = "zig\n  build\t test",
-            } },
+            } } },
             .expected = "◌ Run zig\\n  build\\t test",
+        },
+        .{
+            .summary = .{ .bash = .{ .start = .{
+                .command = "python3 -q",
+            } } },
+            .expected = "◌ Start Bash python3 -q",
+        },
+        .{
+            .summary = .{ .bash = .{ .read = .{
+                .shell_id = "bash_0123456789abcdef0123456789abcdef",
+            } } },
+            .expected = "◌ Read Bash bash_0123456789abcdef0123456789abcdef",
+        },
+        .{
+            .summary = .{ .bash = .list },
+            .expected = "◌ List Bash sessions",
+        },
+        .{
+            .summary = .{ .bash = .{ .write = .{
+                .shell_id = "bash_0123456789abcdef0123456789abcdef",
+            } } },
+            .expected = "◌ Write Bash bash_0123456789abcdef0123456789abcdef",
+        },
+        .{
+            .summary = .{ .bash = .{ .stop = .{
+                .shell_id = "bash_0123456789abcdef0123456789abcdef",
+            } } },
+            .expected = "◌ Stop Bash bash_0123456789abcdef0123456789abcdef",
         },
         .{
             .summary = .{ .edit = .{

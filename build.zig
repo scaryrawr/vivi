@@ -42,6 +42,7 @@ pub fn build(b: *std.Build) void {
     });
     backend.addImport("copilot_sdk", sdk.module("copilot_sdk"));
     backend.addOptions("build_options", build_options);
+    addPty(b, backend, target);
 
     const c_api = b.createModule(.{
         .root_source_file = b.path("backend/src/c_api.zig"),
@@ -232,6 +233,28 @@ fn addClipboard(b: *std.Build, module: *std.Build.Module, target: std.Build.Reso
         .flags = &.{"-fobjc-arc"},
     });
     module.linkFramework("AppKit", .{});
+}
+
+fn addPty(
+    b: *std.Build,
+    module: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+) void {
+    module.addIncludePath(b.path("backend/src/pty"));
+    switch (target.result.os.tag) {
+        .linux, .macos => {
+            module.link_libc = true;
+            module.addCSourceFile(.{
+                .file = b.path("backend/src/pty/posix.c"),
+                .flags = &.{"-std=c11"},
+            });
+            if (target.result.os.tag == .linux) {
+                module.linkSystemLibrary("util", .{});
+            }
+        },
+        .windows => {},
+        else => @panic("Vivi requires a PTY implementation for this target"),
+    }
 }
 
 fn addSyntaxHighlighting(
