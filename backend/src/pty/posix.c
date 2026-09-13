@@ -6,7 +6,8 @@
 #include <fcntl.h>
 #include <poll.h>
 #if defined(__APPLE__)
-#include <util.h>
+#include <termios.h>
+extern int openpty(int *, int *, char *, struct termios *, struct winsize *);
 #else
 #include <pty.h>
 #endif
