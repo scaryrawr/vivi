@@ -1,11 +1,203 @@
+#ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0A00
+#endif
 #include "native.h"
 
-#include <windows.h>
+typedef void *HANDLE;
+typedef HANDLE HPCON;
+typedef int BOOL;
+typedef long HRESULT;
+typedef unsigned char BYTE;
+typedef short SHORT;
+typedef unsigned short WORD;
+typedef unsigned long DWORD;
+typedef unsigned long ULONG;
+typedef uintptr_t ULONG_PTR;
+typedef unsigned long long ULONGLONG;
+typedef wchar_t WCHAR;
+typedef WCHAR *LPWSTR;
+typedef const WCHAR *LPCWSTR;
+typedef void *LPVOID;
+typedef const void *LPCVOID;
+typedef size_t SIZE_T;
 
-#include <stdint.h>
-#include <stdlib.h>
-#include <string.h>
+typedef struct {
+    short X;
+    short Y;
+} COORD;
+
+typedef union {
+    struct {
+        DWORD LowPart;
+        long HighPart;
+    };
+    long long QuadPart;
+} LARGE_INTEGER;
+
+typedef struct {
+    DWORD nLength;
+    LPVOID lpSecurityDescriptor;
+    BOOL bInheritHandle;
+} SECURITY_ATTRIBUTES;
+
+typedef struct {
+    DWORD cb;
+    LPWSTR lpReserved;
+    LPWSTR lpDesktop;
+    LPWSTR lpTitle;
+    DWORD dwX;
+    DWORD dwY;
+    DWORD dwXSize;
+    DWORD dwYSize;
+    DWORD dwXCountChars;
+    DWORD dwYCountChars;
+    DWORD dwFillAttribute;
+    DWORD dwFlags;
+    WORD wShowWindow;
+    WORD cbReserved2;
+    BYTE *lpReserved2;
+    HANDLE hStdInput;
+    HANDLE hStdOutput;
+    HANDLE hStdError;
+} STARTUPINFOW;
+
+typedef struct _PROC_THREAD_ATTRIBUTE_LIST PROC_THREAD_ATTRIBUTE_LIST;
+typedef PROC_THREAD_ATTRIBUTE_LIST *PPROC_THREAD_ATTRIBUTE_LIST;
+
+typedef struct {
+    STARTUPINFOW StartupInfo;
+    PPROC_THREAD_ATTRIBUTE_LIST lpAttributeList;
+} STARTUPINFOEXW;
+
+typedef struct {
+    HANDLE hProcess;
+    HANDLE hThread;
+    DWORD dwProcessId;
+    DWORD dwThreadId;
+} PROCESS_INFORMATION;
+
+typedef struct {
+    LARGE_INTEGER PerProcessUserTimeLimit;
+    LARGE_INTEGER PerJobUserTimeLimit;
+    DWORD LimitFlags;
+    SIZE_T MinimumWorkingSetSize;
+    SIZE_T MaximumWorkingSetSize;
+    DWORD ActiveProcessLimit;
+    ULONG_PTR Affinity;
+    DWORD PriorityClass;
+    DWORD SchedulingClass;
+} JOBOBJECT_BASIC_LIMIT_INFORMATION;
+
+typedef struct {
+    ULONGLONG ReadOperationCount;
+    ULONGLONG WriteOperationCount;
+    ULONGLONG OtherOperationCount;
+    ULONGLONG ReadTransferCount;
+    ULONGLONG WriteTransferCount;
+    ULONGLONG OtherTransferCount;
+} IO_COUNTERS;
+
+typedef struct {
+    JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation;
+    IO_COUNTERS IoInfo;
+    SIZE_T ProcessMemoryLimit;
+    SIZE_T JobMemoryLimit;
+    SIZE_T PeakProcessMemoryUsed;
+    SIZE_T PeakJobMemoryUsed;
+} JOBOBJECT_EXTENDED_LIMIT_INFORMATION;
+
+#define WINAPI __attribute__((stdcall))
+#define DLLIMPORT __declspec(dllimport)
+#define FALSE 0
+#define CP_UTF8 65001
+#define MB_ERR_INVALID_CHARS 8
+#define HEAP_ZERO_MEMORY 8
+#define PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE ((DWORD_PTR)0x00020016)
+#define EXTENDED_STARTUPINFO_PRESENT 0x00080000
+#define CREATE_SUSPENDED 0x00000004
+#define CREATE_UNICODE_ENVIRONMENT 0x00000400
+#define JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE 0x00002000
+#define JobObjectExtendedLimitInformation 9
+#define WAIT_OBJECT_0 0
+#define INFINITE 0xffffffff
+#define ERROR_BROKEN_PIPE 109
+#define ERROR_OPERATION_ABORTED 995
+#define INVALID_HANDLE_VALUE ((HANDLE)(intptr_t)-1)
+#define FAILED(value) ((HRESULT)(value) < 0)
+
+typedef ULONG_PTR DWORD_PTR;
+
+DLLIMPORT int WINAPI MultiByteToWideChar(
+    unsigned int, DWORD, const char *, int, WCHAR *, int
+);
+DLLIMPORT HANDLE WINAPI GetProcessHeap(void);
+DLLIMPORT LPVOID WINAPI HeapAlloc(HANDLE, DWORD, SIZE_T);
+DLLIMPORT BOOL WINAPI HeapFree(HANDLE, DWORD, LPVOID);
+DLLIMPORT BOOL WINAPI CreatePipe(
+    HANDLE *, HANDLE *, SECURITY_ATTRIBUTES *, DWORD
+);
+DLLIMPORT HRESULT WINAPI CreatePseudoConsole(
+    COORD, HANDLE, HANDLE, DWORD, HPCON *
+);
+DLLIMPORT void WINAPI ClosePseudoConsole(HPCON);
+DLLIMPORT BOOL WINAPI CloseHandle(HANDLE);
+DLLIMPORT BOOL WINAPI InitializeProcThreadAttributeList(
+    PPROC_THREAD_ATTRIBUTE_LIST, DWORD, DWORD, SIZE_T *
+);
+DLLIMPORT BOOL WINAPI UpdateProcThreadAttribute(
+    PPROC_THREAD_ATTRIBUTE_LIST,
+    DWORD,
+    DWORD_PTR,
+    LPVOID,
+    SIZE_T,
+    LPVOID,
+    SIZE_T *
+);
+DLLIMPORT void WINAPI DeleteProcThreadAttributeList(
+    PPROC_THREAD_ATTRIBUTE_LIST
+);
+DLLIMPORT HANDLE WINAPI CreateJobObjectW(LPVOID, LPCWSTR);
+DLLIMPORT BOOL WINAPI SetInformationJobObject(
+    HANDLE, int, LPVOID, DWORD
+);
+DLLIMPORT BOOL WINAPI CreateProcessW(
+    LPCWSTR,
+    LPWSTR,
+    LPVOID,
+    LPVOID,
+    BOOL,
+    DWORD,
+    LPVOID,
+    LPCWSTR,
+    STARTUPINFOW *,
+    PROCESS_INFORMATION *
+);
+DLLIMPORT BOOL WINAPI AssignProcessToJobObject(HANDLE, HANDLE);
+DLLIMPORT DWORD WINAPI ResumeThread(HANDLE);
+DLLIMPORT BOOL WINAPI TerminateProcess(HANDLE, unsigned int);
+DLLIMPORT BOOL WINAPI ReadFile(HANDLE, LPVOID, DWORD, DWORD *, LPVOID);
+DLLIMPORT BOOL WINAPI WriteFile(HANDLE, LPCVOID, DWORD, DWORD *, LPVOID);
+DLLIMPORT DWORD WINAPI GetLastError(void);
+DLLIMPORT DWORD WINAPI WaitForSingleObject(HANDLE, DWORD);
+DLLIMPORT BOOL WINAPI TerminateJobObject(HANDLE, unsigned int);
+DLLIMPORT BOOL WINAPI GetExitCodeProcess(HANDLE, DWORD *);
+
+static void zero_bytes(void *destination, size_t length) {
+    unsigned char *bytes = (unsigned char *)destination;
+    while (length-- != 0) *bytes++ = 0;
+}
+
+static void copy_bytes(void *destination, const void *source, size_t length) {
+    unsigned char *output = (unsigned char *)destination;
+    const unsigned char *input = (const unsigned char *)source;
+    while (length-- != 0) *output++ = *input++;
+}
+
+static size_t wide_length(const wchar_t *text) {
+    size_t length = 0;
+    while (text[length] != L'\0') ++length;
+    return length;
+}
 
 static HANDLE value_handle(const vivi_pty_endpoint_t *endpoint, int index) {
     return (HANDLE)(uintptr_t)endpoint->values[index];
@@ -30,7 +222,7 @@ static wchar_t *utf8_to_wide(const char *text) {
 static wchar_t *make_command_line(const wchar_t *command) {
     const wchar_t prefix[] = L"bash.exe --noprofile --norc -i +m -c \"";
     size_t prefix_len = (sizeof(prefix) / sizeof(prefix[0])) - 1;
-    size_t command_len = lstrlenW(command);
+    size_t command_len = wide_length(command);
     size_t capacity = prefix_len + command_len * 2 + 3;
     wchar_t *line = (wchar_t *)HeapAlloc(
         GetProcessHeap(),
@@ -38,7 +230,7 @@ static wchar_t *make_command_line(const wchar_t *command) {
         capacity * sizeof(wchar_t)
     );
     if (line == NULL) return NULL;
-    memcpy(line, prefix, prefix_len * sizeof(wchar_t));
+    copy_bytes(line, prefix, prefix_len * sizeof(wchar_t));
     size_t out = prefix_len;
     size_t index = 0;
     while (index < command_len) {
@@ -90,9 +282,9 @@ int vivi_pty_spawn(
     STARTUPINFOEXW startup;
     SIZE_T attribute_bytes = 0;
     SECURITY_ATTRIBUTES security = { sizeof(security), NULL, FALSE };
-    memset(endpoint, 0, sizeof(*endpoint));
-    memset(&process, 0, sizeof(process));
-    memset(&startup, 0, sizeof(startup));
+    zero_bytes(endpoint, sizeof(*endpoint));
+    zero_bytes(&process, sizeof(process));
+    zero_bytes(&startup, sizeof(startup));
     startup.StartupInfo.cb = sizeof(startup);
 
     if (!CreatePipe(&input_read, &input_write, &security, 0)) goto failed;
@@ -136,7 +328,7 @@ int vivi_pty_spawn(
     job = CreateJobObjectW(NULL, NULL);
     if (job == NULL) goto failed;
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits;
-    memset(&limits, 0, sizeof(limits));
+    zero_bytes(&limits, sizeof(limits));
     limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
     if (!SetInformationJobObject(
         job,

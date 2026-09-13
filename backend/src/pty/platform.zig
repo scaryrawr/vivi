@@ -1,4 +1,10 @@
 const std = @import("std");
+const builtin = @import("builtin");
+
+comptime {
+    if (builtin.os.tag == .windows and builtin.abi == .msvc)
+        _ = @import("windows.zig");
+}
 
 const c = @cImport({
     @cInclude("native.h");

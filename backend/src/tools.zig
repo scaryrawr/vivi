@@ -230,8 +230,13 @@ const PreparedBash = struct {
                     .utf8 => data,
                     .base64 => decoded: {
                         const decoder = std.base64.standard.Decoder;
+                        if (data.len > std.base64.standard.Encoder.calcSize(
+                            bash_sessions.max_write_bytes,
+                        )) return error.InputTooLarge;
                         const size = decoder.calcSizeForSlice(data) catch
                             return error.InvalidBase64;
+                        if (size > bash_sessions.max_write_bytes)
+                            return error.InputTooLarge;
                         const buffer = try allocator.alloc(u8, size);
                         errdefer allocator.free(buffer);
                         decoder.decode(buffer, data) catch
@@ -1599,6 +1604,34 @@ test "async Bash validates IDs, limits, and base64 before execution" {
     try std.testing.expectEqualStrings(
         "bash failed: InputTooLarge.",
         result.failure,
+    );
+
+    const oversized_base64 = try std.testing.allocator.alloc(
+        u8,
+        std.base64.standard.Encoder.calcSize(
+            bash_sessions.max_write_bytes,
+        ) + 4,
+    );
+    defer std.testing.allocator.free(oversized_base64);
+    @memset(oversized_base64, 'A');
+    const base64_arguments = try std.json.Stringify.valueAlloc(
+        std.testing.allocator,
+        .{
+            .action = "write",
+            .shell_id = "bash_0123456789abcdef0123456789abcdef",
+            .data = oversized_base64,
+            .encoding = "base64",
+        },
+        .{},
+    );
+    defer std.testing.allocator.free(base64_arguments);
+    var rejected_base64 = try service.prepare("bash", base64_arguments);
+    defer rejected_base64.deinit();
+    var base64_result = try service.execute(&rejected_base64);
+    defer base64_result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(
+        "bash failed: InputTooLarge.",
+        base64_result.failure,
     );
 }
 
