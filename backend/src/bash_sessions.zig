@@ -229,22 +229,21 @@ const Session = struct {
         }
     }
 
-    fn requestTermination(self: *Session, grace_ms: u32) void {
+    fn requestTermination(self: *Session, grace_ms: u32) !void {
         self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         if (self.termination_requested) {
-            self.mutex.unlock(self.io);
             return;
         }
+        try self.endpoint.terminateTree(grace_ms);
         self.termination_requested = true;
-        self.mutex.unlock(self.io);
-        _ = self.endpoint.terminateTree(grace_ms) catch {};
     }
 
     fn readerMain(self: *Session) void {
         var buffer: [16 * 1024]u8 = undefined;
         while (true) {
             const read_result = self.endpoint.read(&buffer) catch {
-                self.requestTermination(0);
+                _ = self.requestTermination(0) catch {};
                 self.mutex.lockUncancelable(self.io);
                 self.output_eof = true;
                 self.publishExitIfComplete();
@@ -291,7 +290,7 @@ const Session = struct {
             self.mutex.unlock(self.io);
 
             self.endpoint.writeAll(buffer[0..amount]) catch {
-                self.requestTermination(0);
+                _ = self.requestTermination(0) catch {};
                 return;
             };
 
@@ -304,7 +303,7 @@ const Session = struct {
 
     fn waiterMain(self: *Session) void {
         const exit = self.endpoint.wait() catch blk: {
-            self.requestTermination(0);
+            _ = self.requestTermination(0) catch {};
             break :blk Exit.unknown;
         };
         self.mutex.lockUncancelable(self.io);
@@ -502,7 +501,7 @@ pub const Manager = struct {
         session.changed.broadcast(self.io);
         session.mutex.unlock(self.io);
 
-        session.requestTermination(self.options.stop_grace_ms);
+        try session.requestTermination(self.options.stop_grace_ms);
         if (session.waiter) |thread| thread.join();
         if (session.reader) |thread| thread.join();
         session.mutex.lockUncancelable(self.io);

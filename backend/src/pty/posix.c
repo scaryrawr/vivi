@@ -280,7 +280,7 @@ int vivi_pty_spawn(
     endpoint->values[1] = (intptr_t)control[1];
     endpoint->values[2] = (intptr_t)status[0];
     endpoint->values[3] = (intptr_t)supervisor;
-    endpoint->values[4] = (intptr_t)ready.value;
+    endpoint->values[4] = -1;
     return 0;
 
 failed:
@@ -348,11 +348,7 @@ int vivi_pty_terminate(vivi_pty_endpoint_t *endpoint, uint32_t grace_ms) {
 #endif
         );
         if (amount < 0 && errno == EINTR) continue;
-        if (amount <= 0) {
-            pid_t child = (pid_t)endpoint->values[4];
-            if (child > 0) kill(-child, SIGKILL);
-            break;
-        }
+        if (amount <= 0) break;
         cursor += (size_t)amount;
         remaining -= (size_t)amount;
     }
