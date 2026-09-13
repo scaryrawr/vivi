@@ -2,8 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 comptime {
-    if (builtin.os.tag == .windows and builtin.abi == .msvc)
-        _ = @import("windows.zig");
+    if (builtin.os.tag == .windows) _ = @import("windows.zig");
 }
 
 const c = @cImport({
@@ -11,7 +10,7 @@ const c = @cImport({
 });
 
 pub const Exit = union(enum) {
-    code: u8,
+    code: u32,
     signal: u16,
     terminated,
     unknown,
@@ -63,7 +62,7 @@ pub const Endpoint = struct {
         if (c.vivi_pty_wait(&self.native, &kind, &value) != 0)
             return error.PtyWaitFailed;
         return switch (kind) {
-            c.VIVI_PTY_EXIT_CODE => .{ .code = @intCast(@min(value, 255)) },
+            c.VIVI_PTY_EXIT_CODE => .{ .code = value },
             c.VIVI_PTY_EXIT_SIGNAL => .{ .signal = @intCast(@min(value, 65535)) },
             c.VIVI_PTY_EXIT_TERMINATED => .terminated,
             else => .unknown,

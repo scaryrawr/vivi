@@ -1282,7 +1282,7 @@ EOF
     grep -a -q 'List Bash sessions' "$run_dir/chat-async-bash.terminal.log"
     grep -a -q 'Write Bash' "$run_dir/chat-async-bash.terminal.log"
     grep -a -q 'Read Bash' "$run_dir/chat-async-bash.terminal.log"
-    grep -a -q 'Stop Bash' "$run_dir/chat-async-bash.terminal.log"
+    test "$(grep -a -c 'Stop Bash' "$run_dir/chat-async-bash.terminal.log")" -ge 2
     grep -q 'VIVI_ASYNC_BASH_OK' "$run_dir/chat-async-bash.normalized.txt"
 }
 

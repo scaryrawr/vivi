@@ -143,7 +143,7 @@ supervisor reports exit independently of PTY EOF; the reader normalizes Linux
 `EIO` and macOS zero-length reads, and natural exit is published only after
 both output EOF and process status arrive. Windows uses ConPTY and launches
 `bash.exe` suspended before assigning it to a kill-on-close Job Object. Only
-target-selected C sources are compiled. No PTY handle, PID, ConPTY type, or
+the target-selected native adapter is compiled. No PTY handle, PID, ConPTY type, or
 libvaxis dependency crosses into the tool or SDK layers.
 
 `backend/src/models.zig` owns the first local-model integration: OMLX discovery

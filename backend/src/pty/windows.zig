@@ -68,7 +68,7 @@ extern "kernel32" fn CreatePseudoConsole(
     output: windows.HANDLE,
     flags: windows.DWORD,
     pseudo_console: *windows.HANDLE,
-) callconv(.winapi) windows.HRESULT;
+) callconv(.winapi) i32;
 extern "kernel32" fn ClosePseudoConsole(
     pseudo_console: windows.HANDLE,
 ) callconv(.winapi) void;
@@ -248,20 +248,20 @@ fn spawn(
     var security = windows.SECURITY_ATTRIBUTES{
         .nLength = @sizeOf(windows.SECURITY_ATTRIBUTES),
         .lpSecurityDescriptor = null,
-        .bInheritHandle = windows.FALSE,
+        .bInheritHandle = .FALSE,
     };
     if (CreatePipe(
         &input_read.?,
         &input_write.?,
         &security,
         0,
-    ) == windows.FALSE) return error.CreatePipeFailed;
+    ) == .FALSE) return error.CreatePipeFailed;
     if (CreatePipe(
         &output_read.?,
         &output_write.?,
         &security,
         0,
-    ) == windows.FALSE) return error.CreatePipeFailed;
+    ) == .FALSE) return error.CreatePipeFailed;
     if (CreatePseudoConsole(
         .{ .x = @intCast(columns), .y = @intCast(rows) },
         input_read.?,
@@ -286,7 +286,7 @@ fn spawn(
         1,
         0,
         &attribute_bytes,
-    ) == windows.FALSE) return error.AttributeListFailed;
+    ) == .FALSE) return error.AttributeListFailed;
     defer DeleteProcThreadAttributeList(attribute_list);
     if (UpdateProcThreadAttribute(
         attribute_list,
@@ -296,7 +296,7 @@ fn spawn(
         @sizeOf(windows.HANDLE),
         null,
         null,
-    ) == windows.FALSE) return error.AttributeUpdateFailed;
+    ) == .FALSE) return error.AttributeUpdateFailed;
 
     var startup: StartupInfoEx = std.mem.zeroes(StartupInfoEx);
     startup.startup_info.cb = @sizeOf(StartupInfoEx);
@@ -311,13 +311,13 @@ fn spawn(
         job_object_extended_limit_information,
         &limits,
         @sizeOf(JobExtendedLimitInformation),
-    ) == windows.FALSE) return error.JobConfigurationFailed;
+    ) == .FALSE) return error.JobConfigurationFailed;
     if (CreateProcessW(
         null,
         command_line.ptr,
         null,
         null,
-        windows.FALSE,
+        .FALSE,
         extended_startup_info_present |
             create_suspended |
             create_unicode_environment,
@@ -325,12 +325,12 @@ fn spawn(
         cwd.ptr,
         &startup.startup_info,
         &process,
-    ) == windows.FALSE) return error.CreateProcessFailed;
+    ) == .FALSE) return error.CreateProcessFailed;
     process_created = true;
     if (AssignProcessToJobObject(
         job.?,
         process.hProcess,
-    ) == windows.FALSE) return error.AssignJobFailed;
+    ) == .FALSE) return error.AssignJobFailed;
     if (ResumeThread(process.hThread) == 0xffffffff)
         return error.ResumeThreadFailed;
     _ = CloseHandle(process.hThread);
@@ -378,7 +378,7 @@ export fn vivi_pty_read(
         @intCast(@min(length, std.math.maxInt(windows.DWORD))),
         &amount,
         null,
-    ) == windows.FALSE) {
+    ) == .FALSE) {
         const code = GetLastError();
         if (code == error_broken_pipe or code == error_operation_aborted)
             return 0;
@@ -405,7 +405,7 @@ export fn vivi_pty_write_all(
             )),
             &amount,
             null,
-        ) == windows.FALSE or amount == 0) return -1;
+        ) == .FALSE or amount == 0) return -1;
         written += amount;
     }
     return 0;
@@ -421,10 +421,10 @@ export fn vivi_pty_terminate(
         if (WaitForSingleObject(value, 0) == wait_object_0) return 0;
     }
     if (handle(endpoint, 3)) |job| {
-        if (TerminateJobObject(job, 1) != windows.FALSE) return 0;
+        if (TerminateJobObject(job, 1) != .FALSE) return 0;
     }
     if (process) |value| {
-        if (TerminateProcess(value, 1) != windows.FALSE) return 0;
+        if (TerminateProcess(value, 1) != .FALSE) return 0;
         if (WaitForSingleObject(value, 0) == wait_object_0) return 0;
     }
     return -1;
@@ -438,7 +438,7 @@ export fn vivi_pty_wait(
     const process = handle(endpoint, 2) orelse return -1;
     if (WaitForSingleObject(process, infinite) != wait_object_0) return -1;
     var exit_code: windows.DWORD = 0;
-    if (GetExitCodeProcess(process, &exit_code) == windows.FALSE) return -1;
+    if (GetExitCodeProcess(process, &exit_code) == .FALSE) return -1;
     if (handle(endpoint, 3)) |job| _ = TerminateJobObject(job, exit_code);
     if (handle(endpoint, 4)) |pseudo_console| {
         ClosePseudoConsole(pseudo_console);
