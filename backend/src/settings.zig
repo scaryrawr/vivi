@@ -377,6 +377,23 @@ test "settings load legacy model as reasoning off" {
         conversation.ReasoningEffort.off,
         rewritten.default_selection.?.reasoning,
     );
+    const content = try temporary.dir.readFileAlloc(
+        std.testing.io,
+        "settings.json",
+        std.testing.allocator,
+        .limited(1024 * 1024),
+    );
+    defer std.testing.allocator.free(content);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        content,
+        "\"version\": 2",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        content,
+        "\"reasoning\": \"off\"",
+    ) != null);
 }
 
 test "settings reject malformed write IDs before allocating selections" {
