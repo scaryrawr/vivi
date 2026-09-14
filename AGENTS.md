@@ -12,6 +12,7 @@ platform-native UX:
 - `windows/` documents the future WinUI 3 / Windows App SDK host.
 - `linux/` documents the future GNOME GTK 4 / libadwaita host.
 - `build.zig.zon` is the sole SDK dependency pin. Build products belong in ignored `.zig-cache/`, `zig-pkg/`, `zig-out/`, or Xcode Derived Data.
+- Vendored or derived third-party code must retain the applicable upstream license notice and document its exact source revision under `third_party/`.
 
 Native hosts share domain semantics through the C ABI, not widgets or view
 models. Do not add speculative sessions, generic JSON bridges, daemons, shared
@@ -50,6 +51,16 @@ test, and native binding/UX behavior in each platform's test framework.
 Default tests must not require Copilot credentials or a running Copilot CLI.
 Any C ABI change must update the header, Zig adapter, smoke test, and every
 implemented native binding together.
+
+`zig build test` does not compile test blocks in every imported backend module.
+When changing `backend/src/settings.zig` or `backend/src/session_store.zig`,
+also run `zig test` directly on the changed module.
+
+Version every persisted settings or session-shard schema change. Parse each
+supported older version explicitly, migrate it in memory, and test the next
+write/compaction. Do not rely on `ignore_unknown_fields` for forward
+compatibility because an older writer can discard new fields while compacting
+sibling shards.
 
 C API cross-builds do not compile the CLI. For platform-specific clipboard or
 terminal-input changes, also cross-build the executable:

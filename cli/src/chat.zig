@@ -1199,6 +1199,7 @@ const MenuDetail = union(enum) {
         context_tokens: u64,
         output_tokens: u64,
         supports_vision: bool,
+        reasoning: backend.ReasoningEffort,
     },
     session: struct {
         model_id: []const u8,
@@ -1209,16 +1210,22 @@ const MenuDetail = union(enum) {
 
 const MenuIdentity = union(enum) {
     text: []const u8,
+    model_selection: backend.ModelSelection,
     resume_key: backend.ResumeKey,
 
     fn eql(left: MenuIdentity, right: MenuIdentity) bool {
         return switch (left) {
             .text => |value| switch (right) {
                 .text => |other| std.mem.eql(u8, value, other),
-                .resume_key => false,
+                .model_selection, .resume_key => false,
+            },
+            .model_selection => |value| switch (right) {
+                .model_selection => |other| value.reasoning == other.reasoning and
+                    std.mem.eql(u8, value.model_id, other.model_id),
+                .text, .resume_key => false,
             },
             .resume_key => |value| switch (right) {
-                .text => false,
+                .text, .model_selection => false,
                 .resume_key => |other| value.generation == other.generation and
                     value.slot == other.slot and value.scope == other.scope,
             },
@@ -1336,7 +1343,10 @@ fn matchRank(entry: MenuEntry, query: []const u8) ?u2 {
         asciiContainsIgnoreCase(entry.primary, query) or
         switch (entry.detail) {
             .text => |text| asciiContainsIgnoreCase(text, query),
-            .model => false,
+            .model => |model| asciiContainsIgnoreCase(
+                @tagName(model.reasoning),
+                query,
+            ),
             .session => |session| asciiContainsIgnoreCase(session.model_id, query) or
                 if (session.summary) |summary|
                     asciiContainsIgnoreCase(summary, query)
@@ -1993,21 +2003,39 @@ const ChatUi = struct {
         const catalog = self.models orelse return;
         const query = try self.input.toOwnedContents(self.allocator);
         defer self.allocator.free(query);
-        const entries = try self.allocator.alloc(MenuEntry, catalog.models.len);
+        var entry_count: usize = 0;
+        for (catalog.models) |model| {
+            entry_count += model.reasoning.selectable.count();
+        }
+        const entries = try self.allocator.alloc(MenuEntry, entry_count);
         defer self.allocator.free(entries);
-        for (catalog.models, 0..) |model, index| {
-            entries[index] = .{
-                .identity = .{ .text = model.id },
-                .key = model.id,
-                .primary = model.display_name,
-                .detail = .{ .model = .{
-                    .context_tokens = model.max_context_window_tokens,
-                    .output_tokens = model.max_output_tokens,
-                    .supports_vision = model.supports_vision,
-                } },
-                .current = std.mem.eql(u8, catalog.selected_id, model.id),
-                .source_index = index,
-            };
+        var entry_index: usize = 0;
+        for (catalog.models, 0..) |model, model_index| {
+            for (std.meta.tags(backend.ReasoningEffort)) |reasoning| {
+                if (!model.reasoning.selectable.contains(reasoning)) continue;
+                entries[entry_index] = .{
+                    .identity = .{ .model_selection = .{
+                        .model_id = model.id,
+                        .reasoning = reasoning,
+                    } },
+                    .key = model.id,
+                    .primary = model.display_name,
+                    .detail = .{ .model = .{
+                        .context_tokens = model.max_context_window_tokens,
+                        .output_tokens = model.max_output_tokens,
+                        .supports_vision = model.supports_vision,
+                        .reasoning = reasoning,
+                    } },
+                    .current = catalog.selected.reasoning == reasoning and
+                        std.mem.eql(
+                            u8,
+                            catalog.selected.model_id,
+                            model.id,
+                        ),
+                    .source_index = model_index,
+                };
+                entry_index += 1;
+            }
         }
         try self.menu.rebuild(self.allocator, entries, query);
     }
@@ -2107,7 +2135,14 @@ const ChatUi = struct {
             .models => {
                 const catalog = self.models orelse return;
                 const model = catalog.models[selected.source_index];
-                conversation.switchModel(model.id) catch |err| switch (err) {
+                const detail = switch (selected.detail) {
+                    .model => |value| value,
+                    else => unreachable,
+                };
+                conversation.switchModel(.{
+                    .model_id = model.id,
+                    .reasoning = detail.reasoning,
+                }) catch |err| switch (err) {
                     error.Busy => return,
                     else => return err,
                 };
@@ -2176,20 +2211,23 @@ const ChatUi = struct {
                 self.tool_anchor = null;
                 self.phase = .ready;
                 switch (result) {
-                    .unchanged => |model| {
-                        try self.updateSelectedModel(model.id);
+                    .unchanged => |success| {
+                        try self.updateSelectedModel(success.selection.view());
                         try self.transcript.append(
                             self.allocator,
                             .status,
-                            "Already using the selected model.",
+                            "Already using the selected model and reasoning level.",
                         );
                     },
-                    .default_updated => |model| {
-                        try self.updateSelectedModel(model.id);
+                    .default_updated => |success| {
+                        try self.updateSelectedModel(success.selection.view());
                         const message = try std.fmt.allocPrint(
                             self.allocator,
-                            "{s} is now the default for future Vivi chats.",
-                            .{model.display_name},
+                            "{s} with reasoning {s} is now the default for future Vivi chats.",
+                            .{
+                                success.model.display_name,
+                                @tagName(success.selection.reasoning),
+                            },
                         );
                         defer self.allocator.free(message);
                         try self.transcript.append(
@@ -2199,12 +2237,13 @@ const ChatUi = struct {
                         );
                     },
                     .switched => |success| {
-                        try self.updateSelectedModel(success.model.id);
+                        try self.updateSelectedModel(success.selection.view());
                         const message = try std.fmt.allocPrint(
                             self.allocator,
-                            "Switched to {s}{s}. Server-side conversation history was reset; the visible Vivi transcript remains.{s}",
+                            "Switched to {s} with reasoning {s}{s}. Server-side conversation history was reset; the visible Vivi transcript remains.{s}",
                             .{
                                 success.model.display_name,
+                                @tagName(success.selection.reasoning),
                                 if (success.default_saved)
                                     " and saved it as the default"
                                 else
@@ -2322,7 +2361,10 @@ const ChatUi = struct {
                             .status,
                             message,
                         );
-                        try self.updateSelectedModel(success.session.model_id);
+                        try self.updateSelectedModel(.{
+                            .model_id = success.session.model_id,
+                            .reasoning = success.session.reasoning,
+                        });
                         self.clearToolFocus();
                         self.tool_anchor = null;
                         self.allocator.free(self.cwd);
@@ -2414,11 +2456,17 @@ const ChatUi = struct {
         return .keep_running;
     }
 
-    fn updateSelectedModel(self: *ChatUi, model_id: []const u8) !void {
+    fn updateSelectedModel(
+        self: *ChatUi,
+        selection: backend.ModelSelection,
+    ) !void {
         if (self.models) |*catalog| {
-            const replacement = try self.allocator.dupe(u8, model_id);
-            self.allocator.free(catalog.selected_id);
-            catalog.selected_id = replacement;
+            const replacement = try backend.OwnedModelSelection.init(
+                self.allocator,
+                selection,
+            );
+            catalog.selected.deinit();
+            catalog.selected = replacement;
         }
     }
 
@@ -2713,25 +2761,31 @@ const ChatUi = struct {
             .model => |model| {
                 const buffer = &self.menu_detail_storage[row];
                 const rendered = if (model.context_tokens == 0)
-                    std.fmt.bufPrint(buffer, "hosted", .{}) catch return
+                    std.fmt.bufPrint(
+                        buffer,
+                        "hosted  reasoning {s}",
+                        .{@tagName(model.reasoning)},
+                    ) catch return
                 else if (window.width >= 56)
                     std.fmt.bufPrint(
                         buffer,
-                        "context {d}  output {d}{s}",
+                        "context {d}  output {d}{s}  reasoning {s}",
                         .{
                             model.context_tokens,
                             model.output_tokens,
                             if (model.supports_vision) "  vision" else "",
+                            @tagName(model.reasoning),
                         },
                     ) catch return
                 else
                     std.fmt.bufPrint(
                         buffer,
-                        "{d} / {d}{s}",
+                        "{d} / {d}{s}  {s}",
                         .{
                             model.context_tokens,
                             model.output_tokens,
                             if (model.supports_vision) "  vision" else "",
+                            @tagName(model.reasoning),
                         },
                     ) catch return;
                 var segments = [_]vaxis.Segment{.{
@@ -3304,11 +3358,11 @@ const ChatUi = struct {
     fn selectedModelDisplayName(self: *const ChatUi) ?[]const u8 {
         const catalog = self.models orelse return null;
         for (catalog.models) |model| {
-            if (std.mem.eql(u8, model.id, catalog.selected_id)) {
+            if (std.mem.eql(u8, model.id, catalog.selected.model_id)) {
                 return model.display_name;
             }
         }
-        return catalog.selected_id;
+        return catalog.selected.model_id;
     }
 
     fn hasInputChoices(self: *const ChatUi) bool {
@@ -3441,6 +3495,7 @@ const App = struct {
         self: *App,
         init_args: std.process.Init,
         model: ?[]const u8,
+        reasoning: ?backend.ReasoningEffort,
         settings_path: ?[]const u8,
         sessions_directory: ?[]const u8,
     ) !void {
@@ -3474,6 +3529,7 @@ const App = struct {
             .{ .context = self, .notify = wake },
             .{
                 .model = model,
+                .reasoning = reasoning,
                 .settings_path = settings_path,
                 .sessions_directory = sessions_directory,
                 .omlx = .{
@@ -3652,12 +3708,13 @@ const App = struct {
 pub fn run(
     init: std.process.Init,
     model: ?[]const u8,
+    reasoning: ?backend.ReasoningEffort,
     settings_path: ?[]const u8,
     sessions_directory: ?[]const u8,
 ) !void {
     const app = try init.gpa.create(App);
     defer init.gpa.destroy(app);
-    try app.init(init, model, settings_path, sessions_directory);
+    try app.init(init, model, reasoning, settings_path, sessions_directory);
     defer app.deinit();
     try app.run();
 }
@@ -3945,6 +4002,7 @@ test "resuming replaces the visible transcript with the owned history snapshot" 
                     u8,
                     "copilot/default",
                 ),
+                .reasoning = .off,
                 .last_used_unix_ms = 1,
                 .current = true,
             },
@@ -5576,6 +5634,7 @@ test "model menu detail owns no composer text" {
             .context_tokens = 131_072,
             .output_tokens = 32_768,
             .supports_vision = false,
+            .reasoning = .off,
         } },
         .source_index = 0,
     }};
@@ -5594,6 +5653,7 @@ test "model menu matches provider-qualified identifiers" {
             .context_tokens = 1_050_000,
             .output_tokens = 128_000,
             .supports_vision = true,
+            .reasoning = .high,
         } },
         .source_index = 0,
     }};
@@ -5663,6 +5723,7 @@ test "session menu labels colliding workspaces with unique path suffixes" {
             .key = .{ .generation = 1, .slot = 0, .scope = .local },
             .working_directory = &first_path,
             .model_id = &first_model,
+            .reasoning = .off,
             .last_used_unix_ms = 20,
             .current = false,
         },
@@ -5671,6 +5732,7 @@ test "session menu labels colliding workspaces with unique path suffixes" {
             .key = .{ .generation = 1, .slot = 1, .scope = .local },
             .working_directory = &second_path,
             .model_id = &second_model,
+            .reasoning = .medium,
             .last_used_unix_ms = 10,
             .current = false,
         },
@@ -5679,6 +5741,7 @@ test "session menu labels colliding workspaces with unique path suffixes" {
             .key = .{ .generation = 1, .slot = 2, .scope = .local },
             .working_directory = &unique_path,
             .model_id = &third_model,
+            .reasoning = .high,
             .last_used_unix_ms = 5,
             .current = false,
         },

@@ -122,6 +122,7 @@ test "session catalog snapshots retain scoped opaque keys and owned display text
         .key = .{ .generation = 4, .slot = 2, .scope = .broader },
         .working_directory = try std.testing.allocator.dupe(u8, "/work/vivi"),
         .model_id = try std.testing.allocator.dupe(u8, "copilot/default"),
+        .reasoning = .off,
         .title = try std.testing.allocator.dupe(u8, "Remote session"),
         .summary = try std.testing.allocator.dupe(u8, "A saved task"),
         .last_used_unix_ms = 1,
@@ -196,6 +197,7 @@ pub const ModelInfo = struct {
     max_context_window_tokens: u64,
     max_output_tokens: u64,
     supports_vision: bool,
+    reasoning: ReasoningProfile,
 
     pub fn deinit(self: *ModelInfo) void {
         self.allocator.free(self.id);
@@ -216,18 +218,110 @@ pub const ModelInfo = struct {
             .max_context_window_tokens = self.max_context_window_tokens,
             .max_output_tokens = self.max_output_tokens,
             .supports_vision = self.supports_vision,
+            .reasoning = self.reasoning,
         };
+    }
+};
+
+pub const ReasoningEffort = enum {
+    off,
+    low,
+    medium,
+    high,
+    xhigh,
+    max,
+
+    pub fn parse(value: []const u8) !ReasoningEffort {
+        inline for (std.meta.tags(ReasoningEffort)) |effort| {
+            if (std.mem.eql(u8, value, @tagName(effort))) return effort;
+        }
+        return error.InvalidReasoningEffort;
+    }
+};
+
+pub const ReasoningEffortSet = packed struct(u8) {
+    off: bool = false,
+    low: bool = false,
+    medium: bool = false,
+    high: bool = false,
+    xhigh: bool = false,
+    max: bool = false,
+    reserved: u2 = 0,
+
+    pub fn contains(self: ReasoningEffortSet, effort: ReasoningEffort) bool {
+        return switch (effort) {
+            .off => self.off,
+            .low => self.low,
+            .medium => self.medium,
+            .high => self.high,
+            .xhigh => self.xhigh,
+            .max => self.max,
+        };
+    }
+
+    pub fn count(self: ReasoningEffortSet) usize {
+        var result: usize = 0;
+        inline for (std.meta.tags(ReasoningEffort)) |effort| {
+            if (self.contains(effort)) result += 1;
+        }
+        return result;
+    }
+};
+
+pub const ReasoningProfile = struct {
+    selectable: ReasoningEffortSet,
+    advertised_default: ?ReasoningEffort,
+};
+
+pub const ModelSelection = struct {
+    model_id: []const u8,
+    reasoning: ReasoningEffort,
+};
+
+pub const OwnedModelSelection = struct {
+    allocator: std.mem.Allocator,
+    model_id: []u8,
+    reasoning: ReasoningEffort,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        selection: ModelSelection,
+    ) !OwnedModelSelection {
+        return .{
+            .allocator = allocator,
+            .model_id = try allocator.dupe(u8, selection.model_id),
+            .reasoning = selection.reasoning,
+        };
+    }
+
+    pub fn view(self: *const OwnedModelSelection) ModelSelection {
+        return .{
+            .model_id = self.model_id,
+            .reasoning = self.reasoning,
+        };
+    }
+
+    pub fn clone(
+        self: *const OwnedModelSelection,
+        allocator: std.mem.Allocator,
+    ) !OwnedModelSelection {
+        return init(allocator, self.view());
+    }
+
+    pub fn deinit(self: *OwnedModelSelection) void {
+        self.allocator.free(self.model_id);
+        self.* = undefined;
     }
 };
 
 pub const ModelCatalog = struct {
     allocator: std.mem.Allocator,
-    selected_id: []u8,
+    selected: OwnedModelSelection,
     models: []ModelInfo,
 
     pub fn deinit(self: *ModelCatalog) void {
         allocatorFreeModels(self.allocator, self.models);
-        self.allocator.free(self.selected_id);
+        self.selected.deinit();
         self.* = undefined;
     }
 
@@ -245,7 +339,7 @@ pub const ModelCatalog = struct {
         }
         return .{
             .allocator = allocator,
-            .selected_id = try allocator.dupe(u8, self.selected_id),
+            .selected = try self.selected.clone(allocator),
             .models = values,
         };
     }
@@ -256,6 +350,7 @@ pub const SessionSummary = struct {
     key: ResumeKey,
     working_directory: []u8,
     model_id: []u8,
+    reasoning: ReasoningEffort,
     title: ?[]u8 = null,
     summary: ?[]u8 = null,
     last_used_unix_ms: i64,
@@ -294,6 +389,7 @@ pub const SessionSummary = struct {
             .key = self.key,
             .working_directory = working_directory,
             .model_id = model_id,
+            .reasoning = self.reasoning,
             .title = title,
             .summary = summary,
             .last_used_unix_ms = self.last_used_unix_ms,
@@ -468,10 +564,17 @@ pub const HistoryEffect = enum {
 };
 
 pub const ModelSwitchResult = union(enum) {
-    unchanged: ModelInfo,
-    default_updated: ModelInfo,
+    unchanged: struct {
+        model: ModelInfo,
+        selection: OwnedModelSelection,
+    },
+    default_updated: struct {
+        model: ModelInfo,
+        selection: OwnedModelSelection,
+    },
     switched: struct {
         model: ModelInfo,
+        selection: OwnedModelSelection,
         history: HistoryEffect,
         default_saved: bool,
         cleanup_failed: bool,
@@ -480,9 +583,18 @@ pub const ModelSwitchResult = union(enum) {
 
     pub fn deinit(self: *ModelSwitchResult) void {
         switch (self.*) {
-            .unchanged => |*model| model.deinit(),
-            .default_updated => |*model| model.deinit(),
-            .switched => |*result| result.model.deinit(),
+            .unchanged => |*result| {
+                result.model.deinit();
+                result.selection.deinit();
+            },
+            .default_updated => |*result| {
+                result.model.deinit();
+                result.selection.deinit();
+            },
+            .switched => |*result| {
+                result.model.deinit();
+                result.selection.deinit();
+            },
             .failed => |*message| message.deinit(),
         }
         self.* = undefined;
@@ -620,7 +732,7 @@ pub const Command = union(enum) {
     refresh_commands,
     refresh_models,
     refresh_sessions: SessionCatalogRequest,
-    switch_model: OwnedText,
+    switch_model: OwnedModelSelection,
     resume_session: ResumeKey,
     execute_command: OwnedText,
     user_input_response: struct {
@@ -633,7 +745,8 @@ pub const Command = union(enum) {
     pub fn deinit(self: *Command) void {
         switch (self.*) {
             .prompt => |*prompt| prompt.message.deinit(),
-            .switch_model, .execute_command => |*text| text.deinit(),
+            .switch_model => |*selection| selection.deinit(),
+            .execute_command => |*text| text.deinit(),
             .user_input_response => |*response| {
                 response.request_id.deinit();
                 response.answer.deinit();
@@ -1057,12 +1170,15 @@ pub const Conversation = struct {
         try self.enqueueControl(.{ .refresh_sessions = request });
     }
 
-    pub fn switchModel(self: *Conversation, model_id: []const u8) !void {
-        if (std.mem.trim(u8, model_id, " \t\r\n").len == 0) {
+    pub fn switchModel(self: *Conversation, selection: ModelSelection) !void {
+        if (std.mem.trim(u8, selection.model_id, " \t\r\n").len == 0) {
             return error.EmptyModel;
         }
         try self.enqueueControl(.{
-            .switch_model = try OwnedText.init(self.core.allocator, model_id),
+            .switch_model = try OwnedModelSelection.init(
+                self.core.allocator,
+                selection,
+            ),
         });
     }
 

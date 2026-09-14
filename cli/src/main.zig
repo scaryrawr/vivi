@@ -4,6 +4,7 @@ const chat = @import("chat.zig");
 
 const ChatOptions = struct {
     model: ?[]const u8 = null,
+    reasoning: ?backend.ReasoningEffort = null,
 };
 
 const Command = union(enum) {
@@ -31,12 +32,21 @@ const Command = union(enum) {
             return .models;
         }
         if (std.mem.eql(u8, args[1], "chat")) {
-            if (args.len == 2) return .{ .chat = .{} };
-            if (args.len == 4 and
-                std.mem.eql(u8, args[2], "--model"))
-            {
-                return .{ .chat = .{ .model = args[3] } };
+            var options: ChatOptions = .{};
+            var index: usize = 2;
+            while (index < args.len) : (index += 2) {
+                if (index + 1 >= args.len) return error.InvalidArguments;
+                if (std.mem.eql(u8, args[index], "--model")) {
+                    options.model = args[index + 1];
+                } else if (std.mem.eql(u8, args[index], "--reasoning")) {
+                    options.reasoning = backend.ReasoningEffort.parse(
+                        args[index + 1],
+                    ) catch return error.InvalidArguments;
+                } else {
+                    return error.InvalidArguments;
+                }
             }
+            return .{ .chat = options };
         }
         return error.InvalidArguments;
     }
@@ -75,6 +85,7 @@ pub fn main(init: std.process.Init) !void {
             return chat.run(
                 init,
                 options.model,
+                options.reasoning,
                 settings_path,
                 sessions_directory,
             );
@@ -120,7 +131,7 @@ fn usableHome(value: ?[]const u8) ?[]const u8 {
 
 fn writeHelp(writer: *std.Io.Writer) !void {
     try writer.writeAll(
-        \\Usage: vivi [--help] [--version] [models] [chat [--model MODEL]]
+        \\Usage: vivi [--help] [--version] [models] [chat [--model MODEL] [--reasoning LEVEL]]
         \\
         \\Vivi command-line interface.
         \\
@@ -146,7 +157,7 @@ fn listModels(init: std.process.Init, writer: *std.Io.Writer) !void {
 
     for (catalog.models) |model| {
         try writer.print(
-            "{s}\t{s}\tcontext={d}\toutput={d}\tvision={s}\n",
+            "{s}\t{s}\tcontext={d}\toutput={d}\tvision={s}\treasoning=",
             .{
                 model.id,
                 model.display_name,
@@ -154,6 +165,20 @@ fn listModels(init: std.process.Init, writer: *std.Io.Writer) !void {
                 model.max_output_tokens,
                 if (model.supports_vision) "yes" else "no",
             },
+        );
+        var first = true;
+        for (std.meta.tags(backend.ReasoningEffort)) |effort| {
+            if (!model.reasoning.selectable.contains(effort)) continue;
+            if (!first) try writer.writeByte(',');
+            try writer.writeAll(@tagName(effort));
+            first = false;
+        }
+        try writer.print(
+            "\tdefault={s}\n",
+            .{if (model.reasoning.advertised_default) |value|
+                @tagName(value)
+            else
+                "unknown"},
         );
     }
 }
@@ -185,6 +210,24 @@ test "command parser accepts scaffold commands" {
     try std.testing.expectEqualStrings(
         "omlx/model",
         chat_model.chat.model.?,
+    );
+    const chat_reasoning = try Command.parse(
+        &.{
+            "vivi",
+            "chat",
+            "--reasoning",
+            "high",
+            "--model",
+            "copilot/model",
+        },
+    );
+    try std.testing.expectEqual(
+        backend.ReasoningEffort.high,
+        chat_reasoning.chat.reasoning.?,
+    );
+    try std.testing.expectEqualStrings(
+        "copilot/model",
+        chat_reasoning.chat.model.?,
     );
 }
 
