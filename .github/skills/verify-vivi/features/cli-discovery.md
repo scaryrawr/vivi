@@ -17,6 +17,7 @@ command without starting Copilot.
 - Run `vivi`.
 - Run `vivi --help`.
 - Run `vivi --version`.
+- Run `vivi models`.
 
 ## Driving it with verify-vivi
 
@@ -30,13 +31,16 @@ Preconditions:
   `help.stdout` contains
   `models     List available Copilot and OMLX models.` and
   `chat       Start an interactive streaming Vivi chat.`, `version.stdout`
-  starts with `vivi `, and both exit statuses are `0`.
+  starts with `vivi `, `models.stdout` includes tab-separated `reasoning=` and
+  `default=` fields, and all three exit statuses are `0`.
 - **Proof.** Retain `help.stdout`, `help.stderr`, `version.stdout`,
-  `version.stderr`, and `cli-discovery.assertions.txt` under the run directory.
+  `version.stderr`, `models.stdout`, `models.stderr`, and
+  `cli-discovery.assertions.txt` under the run directory.
 
 ## Gotchas
 
-- This feature does not prove Copilot authentication or terminal rendering.
+- Model discovery requires Copilot authentication but does not prove terminal
+  rendering.
 - Use the built binary from `zig-out/bin/vivi`; `zig build run` adds build
   runner behavior to the observed command.
 - An empty stderr is expected on success but is not sufficient proof by itself.

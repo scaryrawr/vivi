@@ -266,12 +266,26 @@ fn parseWriteId(value: ?[]const u8) !?[write_id_hex_len]u8 {
     return write_id;
 }
 
+fn temporaryPath(
+    allocator: std.mem.Allocator,
+    directory: std.Io.Dir,
+    sub_path: []const u8,
+) ![]u8 {
+    const root = try directory.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        allocator,
+    );
+    defer allocator.free(root);
+    return std.fs.path.join(allocator, &.{ root, sub_path });
+}
+
 test "missing settings use no explicit default selection" {
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
-    const path = try temporary.dir.realPathAlloc(
-        std.testing.io,
+    const path = try temporaryPath(
         std.testing.allocator,
+        temporary.dir,
         "settings.json",
     );
     defer std.testing.allocator.free(path);
@@ -284,9 +298,9 @@ test "missing settings use no explicit default selection" {
 test "settings round trip a model and reasoning selection" {
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
-    const path = try temporary.dir.realPathAlloc(
-        std.testing.io,
+    const path = try temporaryPath(
         std.testing.allocator,
+        temporary.dir,
         "nested/settings.json",
     );
     defer std.testing.allocator.free(path);
@@ -329,9 +343,9 @@ test "settings load legacy model as reasoning off" {
         .sub_path = "settings.json",
         .data = "{\"version\":1,\"default_model\":\"copilot/test\"}",
     });
-    const path = try temporary.dir.realPathAlloc(
-        std.testing.io,
+    const path = try temporaryPath(
         std.testing.allocator,
+        temporary.dir,
         "settings.json",
     );
     defer std.testing.allocator.free(path);
@@ -346,14 +360,31 @@ test "settings load legacy model as reasoning off" {
         conversation.ReasoningEffort.off,
         value.default_selection.?.reasoning,
     );
+
+    try saveDefaultSelection(
+        std.testing.allocator,
+        std.testing.io,
+        path,
+        value.default_selection.?.view(),
+    );
+    var rewritten = try load(std.testing.allocator, std.testing.io, path);
+    defer rewritten.deinit();
+    try std.testing.expectEqualStrings(
+        "copilot/test",
+        rewritten.default_selection.?.model_id,
+    );
+    try std.testing.expectEqual(
+        conversation.ReasoningEffort.off,
+        rewritten.default_selection.?.reasoning,
+    );
 }
 
 test "settings reject malformed write IDs before allocating selections" {
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
-    const path = try temporary.dir.realPathAlloc(
-        std.testing.io,
+    const path = try temporaryPath(
         std.testing.allocator,
+        temporary.dir,
         "settings.json",
     );
     defer std.testing.allocator.free(path);
@@ -384,9 +415,9 @@ test "settings reject malformed write IDs before allocating selections" {
 test "settings rollback only replaces its exact write" {
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
-    const path = try temporary.dir.realPathAlloc(
-        std.testing.io,
+    const path = try temporaryPath(
         std.testing.allocator,
+        temporary.dir,
         "settings.json",
     );
     defer std.testing.allocator.free(path);
@@ -452,9 +483,9 @@ test "settings rollback only replaces its exact write" {
 test "settings rollback refuses a legacy rewrite" {
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
-    const path = try temporary.dir.realPathAlloc(
-        std.testing.io,
+    const path = try temporaryPath(
         std.testing.allocator,
+        temporary.dir,
         "settings.json",
     );
     defer std.testing.allocator.free(path);

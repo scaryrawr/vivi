@@ -96,10 +96,16 @@ cli_discovery() {
     else
         version_status=$?
     fi
+    if "$binary" models >"$run_dir/models.stdout" 2>"$run_dir/models.stderr"; then
+        models_status=0
+    else
+        models_status=$?
+    fi
 
     {
         printf 'help_exit=%s\n' "$help_status"
         printf 'version_exit=%s\n' "$version_status"
+        printf 'models_exit=%s\n' "$models_status"
         printf 'help_contains_chat='
         if grep -q 'chat       Start an interactive streaming Vivi chat.' "$run_dir/help.stdout"; then
             printf 'yes\n'
@@ -112,13 +118,21 @@ cli_discovery() {
         else
             printf 'no\n'
         fi
+        printf 'models_contain_reasoning='
+        if grep -Eq '	reasoning=[^	]+	default=' "$run_dir/models.stdout"; then
+            printf 'yes\n'
+        else
+            printf 'no\n'
+        fi
     } >"$run_dir/cli-discovery.assertions.txt"
 
     test "$help_status" -eq 0
     test "$version_status" -eq 0
+    test "$models_status" -eq 0
     grep -q 'chat       Start an interactive streaming Vivi chat.' "$run_dir/help.stdout"
     grep -q 'models     List available Copilot and OMLX models.' "$run_dir/help.stdout"
     grep -q '^vivi ' "$run_dir/version.stdout"
+    grep -Eq '	reasoning=[^	]+	default=' "$run_dir/models.stdout"
 }
 
 validate_capture_name() {
@@ -820,7 +834,7 @@ chat_model_menu() {
     {
         printf 'exit=%s\n' "$status"
         printf 'persisted_default_seen='
-        if grep -q 'Already using the selected model.' "$run_dir/chat-model-menu.normalized.txt"; then
+        if grep -q 'Already using the selected model and reasoning level.' "$run_dir/chat-model-menu.normalized.txt"; then
             printf 'yes\n'
         else
             printf 'no\n'
@@ -834,9 +848,11 @@ chat_model_menu() {
     } >"$run_dir/chat-model-menu.assertions.txt"
 
     test "$status" -eq 0
-    grep -q 'Already using the selected model.' "$run_dir/chat-model-menu.normalized.txt"
+    grep -q 'Already using the selected model and reasoning level.' "$run_dir/chat-model-menu.normalized.txt"
     grep -q 'VIVI_HOSTED_MODEL_SWITCH_OK' "$run_dir/chat-model-menu.normalized.txt"
-    grep -q '"default_model": "copilot/gpt-5.6-sol"' \
+    grep -q '"model_id": "copilot/gpt-5.6-sol"' \
+        "$settings_home/.vivi/settings.json"
+    grep -q '"reasoning": "off"' \
         "$settings_home/.vivi/settings.json"
     test -s "$run_dir/chat-model-menu.contact-sheet.png"
 }
