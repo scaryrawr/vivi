@@ -87,6 +87,7 @@ fn loadV1(allocator: std.mem.Allocator, content: []const u8) !Settings {
         .{ .ignore_unknown_fields = true },
     );
     defer parsed.deinit();
+    const write_id = try parseWriteId(parsed.value.write_id);
     const selection = if (parsed.value.default_model) |model| blk: {
         try validateModel(model);
         break :blk try conversation.OwnedModelSelection.init(allocator, .{
@@ -97,7 +98,7 @@ fn loadV1(allocator: std.mem.Allocator, content: []const u8) !Settings {
     return .{
         .allocator = allocator,
         .default_selection = selection,
-        .write_id = try parseWriteId(parsed.value.write_id),
+        .write_id = write_id,
     };
 }
 
@@ -109,6 +110,7 @@ fn loadV2(allocator: std.mem.Allocator, content: []const u8) !Settings {
         .{ .ignore_unknown_fields = true },
     );
     defer parsed.deinit();
+    const write_id = try parseWriteId(parsed.value.write_id);
     const selection = if (parsed.value.default_selection) |value| blk: {
         try validateModel(value.model_id);
         break :blk try conversation.OwnedModelSelection.init(allocator, .{
@@ -119,7 +121,7 @@ fn loadV2(allocator: std.mem.Allocator, content: []const u8) !Settings {
     return .{
         .allocator = allocator,
         .default_selection = selection,
-        .write_id = try parseWriteId(parsed.value.write_id),
+        .write_id = write_id,
     };
 }
 
@@ -343,6 +345,39 @@ test "settings load legacy model as reasoning off" {
     try std.testing.expectEqual(
         conversation.ReasoningEffort.off,
         value.default_selection.?.reasoning,
+    );
+}
+
+test "settings reject malformed write IDs before allocating selections" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporary.dir.realPathAlloc(
+        std.testing.io,
+        std.testing.allocator,
+        "settings.json",
+    );
+    defer std.testing.allocator.free(path);
+
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = "settings.json",
+        .data =
+        \\{"version":1,"default_model":"copilot/test","write_id":"invalid"}
+        ,
+    });
+    try std.testing.expectError(
+        error.InvalidSettingsWriteId,
+        load(std.testing.allocator, std.testing.io, path),
+    );
+
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = "settings.json",
+        .data =
+        \\{"version":2,"default_selection":{"model_id":"copilot/test","reasoning":"high"},"write_id":"invalid"}
+        ,
+    });
+    try std.testing.expectError(
+        error.InvalidSettingsWriteId,
+        load(std.testing.allocator, std.testing.io, path),
     );
 }
 
