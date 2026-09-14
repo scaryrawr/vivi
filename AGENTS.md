@@ -12,6 +12,7 @@ platform-native UX:
 - `windows/` documents the future WinUI 3 / Windows App SDK host.
 - `linux/` documents the future GNOME GTK 4 / libadwaita host.
 - `build.zig.zon` is the sole SDK dependency pin. Build products belong in ignored `.zig-cache/`, `zig-pkg/`, `zig-out/`, or Xcode Derived Data.
+- Vendored or derived third-party code must retain the applicable upstream license notice and document its exact source revision under `third_party/`.
 
 Native hosts share domain semantics through the C ABI, not widgets or view
 models. Do not add speculative sessions, generic JSON bridges, daemons, shared
