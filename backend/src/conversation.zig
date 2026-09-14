@@ -102,6 +102,36 @@ test "image prompt rejects non-absolute and NUL paths" {
     ));
 }
 
+test "session catalog snapshots retain scoped opaque keys and owned display text" {
+    const source_items = try std.testing.allocator.alloc(TranscriptItem, 1);
+    var source = TranscriptSnapshot{
+        .allocator = std.testing.allocator,
+        .items = source_items,
+    };
+    defer source.deinit();
+    source.items[0] = try TranscriptItem.init(
+        std.testing.allocator,
+        .assistant,
+        "persisted answer",
+    );
+    var snapshot = try source.clone(std.testing.allocator);
+    defer snapshot.deinit();
+
+    var summary = SessionSummary{
+        .allocator = std.testing.allocator,
+        .key = .{ .generation = 4, .slot = 2, .scope = .broader },
+        .working_directory = try std.testing.allocator.dupe(u8, "/work/vivi"),
+        .model_id = try std.testing.allocator.dupe(u8, "copilot/default"),
+        .title = try std.testing.allocator.dupe(u8, "Remote session"),
+        .summary = try std.testing.allocator.dupe(u8, "A saved task"),
+        .last_used_unix_ms = 1,
+        .current = false,
+    };
+    defer summary.deinit();
+    try std.testing.expectEqual(SessionCatalogScope.broader, summary.key.scope);
+    try std.testing.expectEqualStrings("persisted answer", snapshot.items[0].text);
+}
+
 pub const Failure = struct {
     kind: FailureKind,
     message: OwnedText,
@@ -223,15 +253,19 @@ pub const ModelCatalog = struct {
 
 pub const SessionSummary = struct {
     allocator: std.mem.Allocator,
-    key: u64,
+    key: ResumeKey,
     working_directory: []u8,
     model_id: []u8,
+    title: ?[]u8 = null,
+    summary: ?[]u8 = null,
     last_used_unix_ms: i64,
     current: bool,
 
     pub fn deinit(self: *SessionSummary) void {
         self.allocator.free(self.working_directory);
         self.allocator.free(self.model_id);
+        if (self.title) |value| self.allocator.free(value);
+        if (self.summary) |value| self.allocator.free(value);
         self.* = undefined;
     }
 
@@ -244,25 +278,73 @@ pub const SessionSummary = struct {
             self.working_directory,
         );
         errdefer allocator.free(working_directory);
+        const model_id = try allocator.dupe(u8, self.model_id);
+        errdefer allocator.free(model_id);
+        const title = if (self.title) |value|
+            try allocator.dupe(u8, value)
+        else
+            null;
+        errdefer if (title) |value| allocator.free(value);
+        const summary = if (self.summary) |value|
+            try allocator.dupe(u8, value)
+        else
+            null;
         return .{
             .allocator = allocator,
             .key = self.key,
             .working_directory = working_directory,
-            .model_id = try allocator.dupe(u8, self.model_id),
+            .model_id = model_id,
+            .title = title,
+            .summary = summary,
             .last_used_unix_ms = self.last_used_unix_ms,
             .current = self.current,
         };
     }
 };
 
+/// A catalog key is valid only for the refresh generation and catalog scope
+/// that created it. The SDK session ID never leaves root.zig.
+pub const ResumeKey = struct {
+    generation: u64,
+    slot: u32,
+    scope: SessionCatalogScope,
+};
+
+pub const SessionCatalogScope = enum {
+    local,
+    broader,
+
+    pub fn label(self: SessionCatalogScope) []const u8 {
+        return switch (self) {
+            .local => "Saved Vivi sessions",
+            .broader => "Copilot sessions in this workspace",
+        };
+    }
+};
+
+pub const SessionCatalogRequest = enum {
+    local,
+    all,
+
+    pub fn scope(self: SessionCatalogRequest) SessionCatalogScope {
+        return switch (self) {
+            .local => .local,
+            .all => .broader,
+        };
+    }
+};
+
 pub const SessionCatalog = struct {
     allocator: std.mem.Allocator,
+    scope: SessionCatalogScope,
+    label: []u8,
     sessions: []SessionSummary,
     skipped_invalid_shards: bool,
 
     pub fn deinit(self: *SessionCatalog) void {
         for (self.sessions) |*session| session.deinit();
         self.allocator.free(self.sessions);
+        self.allocator.free(self.label);
         self.* = undefined;
     }
 
@@ -270,6 +352,8 @@ pub const SessionCatalog = struct {
         self: *const SessionCatalog,
         allocator: std.mem.Allocator,
     ) !SessionCatalog {
+        const label = try allocator.dupe(u8, self.label);
+        errdefer allocator.free(label);
         const sessions = try allocator.alloc(
             SessionSummary,
             self.sessions.len,
@@ -283,22 +367,90 @@ pub const SessionCatalog = struct {
         }
         return .{
             .allocator = allocator,
+            .scope = self.scope,
+            .label = label,
             .sessions = sessions,
             .skipped_invalid_shards = self.skipped_invalid_shards,
         };
     }
 };
 
+pub const TranscriptRole = enum {
+    user,
+    assistant,
+    reasoning,
+};
+
+pub const TranscriptItem = struct {
+    allocator: std.mem.Allocator,
+    role: TranscriptRole,
+    text: []u8,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        role: TranscriptRole,
+        text: []const u8,
+    ) !TranscriptItem {
+        return .{
+            .allocator = allocator,
+            .role = role,
+            .text = try allocator.dupe(u8, text),
+        };
+    }
+
+    pub fn deinit(self: *TranscriptItem) void {
+        self.allocator.free(self.text);
+        self.* = undefined;
+    }
+
+    pub fn clone(
+        self: *const TranscriptItem,
+        allocator: std.mem.Allocator,
+    ) !TranscriptItem {
+        return init(allocator, self.role, self.text);
+    }
+};
+
+pub const TranscriptSnapshot = struct {
+    allocator: std.mem.Allocator,
+    items: []TranscriptItem,
+
+    pub fn deinit(self: *TranscriptSnapshot) void {
+        for (self.items) |*item| item.deinit();
+        self.allocator.free(self.items);
+        self.* = undefined;
+    }
+
+    pub fn clone(
+        self: *const TranscriptSnapshot,
+        allocator: std.mem.Allocator,
+    ) !TranscriptSnapshot {
+        const items = try allocator.alloc(TranscriptItem, self.items.len);
+        errdefer allocator.free(items);
+        var initialized: usize = 0;
+        errdefer for (items[0..initialized]) |*item| item.deinit();
+        for (self.items, 0..) |item, index| {
+            items[index] = try item.clone(allocator);
+            initialized += 1;
+        }
+        return .{ .allocator = allocator, .items = items };
+    }
+};
+
 pub const SessionResumeResult = union(enum) {
     resumed: struct {
         session: SessionSummary,
+        transcript: TranscriptSnapshot,
         cleanup_failed: bool,
     },
     failed: OwnedText,
 
     pub fn deinit(self: *SessionResumeResult) void {
         switch (self.*) {
-            .resumed => |*result| result.session.deinit(),
+            .resumed => |*result| {
+                result.session.deinit();
+                result.transcript.deinit();
+            },
             .failed => |*message| message.deinit(),
         }
         self.* = undefined;
@@ -422,6 +574,7 @@ pub const Event = union(enum) {
     session_catalog_failed: OwnedText,
     session_tracking_failed: OwnedText,
     session_resume: SessionResumeResult,
+    status: OwnedText,
     assistant_started,
     reasoning_delta: OwnedText,
     reasoning_complete: OwnedText,
@@ -451,6 +604,7 @@ pub const Event = union(enum) {
             .session_catalog_failed => |*text| text.deinit(),
             .session_tracking_failed => |*text| text.deinit(),
             .session_resume => |*result| result.deinit(),
+            .status => |*text| text.deinit(),
             .closed => |*closed| closed.deinit(),
             .ready, .assistant_started, .idle => {},
         }
@@ -465,9 +619,9 @@ pub const Command = union(enum) {
     },
     refresh_commands,
     refresh_models,
-    refresh_sessions,
+    refresh_sessions: SessionCatalogRequest,
     switch_model: OwnedText,
-    resume_session: u64,
+    resume_session: ResumeKey,
     execute_command: OwnedText,
     user_input_response: struct {
         request_id: OwnedText,
@@ -761,6 +915,12 @@ pub const Worker = struct {
         });
     }
 
+    pub fn status(self: *Worker, message: []const u8) !void {
+        try self.publish(.{
+            .status = try OwnedText.init(self.core.allocator, message),
+        });
+    }
+
     pub fn completeSessionResume(
         self: *Worker,
         result: SessionResumeResult,
@@ -890,8 +1050,11 @@ pub const Conversation = struct {
         try self.enqueueControl(.refresh_commands);
     }
 
-    pub fn refreshSessions(self: *Conversation) !void {
-        try self.enqueueControl(.refresh_sessions);
+    pub fn refreshSessions(
+        self: *Conversation,
+        request: SessionCatalogRequest,
+    ) !void {
+        try self.enqueueControl(.{ .refresh_sessions = request });
     }
 
     pub fn switchModel(self: *Conversation, model_id: []const u8) !void {
@@ -918,8 +1081,8 @@ pub const Conversation = struct {
         });
     }
 
-    pub fn resumeSession(self: *Conversation, key: u64) !void {
-        if (key == 0) return error.InvalidSessionKey;
+    pub fn resumeSession(self: *Conversation, key: ResumeKey) !void {
+        if (key.generation == 0) return error.InvalidSessionKey;
         try self.enqueueControl(.{ .resume_session = key });
     }
 

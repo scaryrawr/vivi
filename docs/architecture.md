@@ -78,8 +78,9 @@ snapshots the selected image bytes into an owned message, so queued sends
 and steering never borrow editor memory or reread modified files. The image
 store outlives the conversation worker and removes only the temporary files it created after
 that worker stops. Saved ask-user drafts retain their visible image paths.
-Only `root.zig` maps the snapshots into `session.send` blob attachments through
-the SDK's RPC API; the pinned typed `MessageOptions` is currently text-only.
+Only `root.zig` maps the snapshots into typed `session.send` blob attachments
+through `MessageOptions.message_attachments`; the SDK's RPC details stay out of
+the SDK-free conversation boundary.
 No chat operation is exposed through the scaffold C ABI.
 On Windows, Vivi drives the libvaxis terminal parser and existing event queue
 directly to preserve paste-boundary events omitted by the pinned library's
@@ -234,12 +235,19 @@ recency, refreshing recency after each completed response; Copilot CLI remains
 the sole transcript/history store.
 
 `/resume` is a first-class broker control operation rather than an SDK slash
-command. The terminal receives display-ready rows with request-local numeric
-keys, while `backend/src/root.zig` privately resolves the selected record and
-calls `Client.joinSession`. Joining, durable recency update, active-session
-commit, and previous-session cleanup form one backend transaction. Candidate
-tools and the system prompt are rebuilt for the recorded working directory;
-any failure before commit leaves the current session active.
+command. Bare `/resume` lists only Vivi's private local index. `/resume all`
+uses the SDK's cwd-filtered session listing and discards rows without the exact
+active working-directory context; it neither merges those rows into the local
+catalog nor persists them merely for display. The terminal receives
+display-ready summaries with refresh-scoped opaque generation-and-slot keys,
+while `backend/src/root.zig` privately resolves SDK IDs and calls
+`Client.joinSession`. Joining fetches and projects the owned message history
+before durable recency update, active-session commit, and previous-session
+cleanup. Candidate tools and the system prompt are rebuilt for the recorded
+working directory; any failure before commit disconnects the candidate and
+leaves the current session and visible transcript active. A successful resume,
+including a same-session selection, atomically replaces the terminal transcript
+from the owned snapshot before reporting success.
 
 Cancellation is cooperative because the pinned SDK has no documented
 cross-thread operation that interrupts a blocked `Session.nextEvent`.

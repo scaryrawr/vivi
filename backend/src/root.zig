@@ -22,6 +22,11 @@ pub const ModelCatalog = conversation.ModelCatalog;
 pub const ModelInfo = conversation.ModelInfo;
 pub const SessionCatalog = conversation.SessionCatalog;
 pub const SessionSummary = conversation.SessionSummary;
+pub const SessionCatalogRequest = conversation.SessionCatalogRequest;
+pub const SessionCatalogScope = conversation.SessionCatalogScope;
+pub const ResumeKey = conversation.ResumeKey;
+pub const TranscriptSnapshot = conversation.TranscriptSnapshot;
+pub const TranscriptItem = conversation.TranscriptItem;
 pub const ToolActivity = tool_activity.ToolActivity;
 pub const ToolActivityUpdate = tool_activity.ToolActivityUpdate;
 pub const ToolStarted = tool_activity.ToolStarted;
@@ -323,50 +328,69 @@ fn sendPrompt(
     delivery: conversation.PromptDelivery,
 ) !void {
     const attachments = try sdkImageAttachments(session.client.allocator, prompt.images);
-    defer {
-        for (attachments) |attachment| session.client.allocator.free(attachment.data);
-        session.client.allocator.free(attachments);
-    }
-    const parsed = try session.client.callRpc(
-        struct { messageId: []const u8 },
-        "session.send",
-        .{
-            .sessionId = session.id,
-            .prompt = prompt.text,
-            .mode = @tagName(delivery),
-            .attachments = attachments,
+    defer freeSdkImageAttachments(session.client.allocator, attachments);
+    const message_id = try session.send(.{
+        .prompt = prompt.text,
+        .mode = switch (delivery) {
+            .immediate => .immediate,
+            .enqueue => .enqueue,
         },
-    );
-    parsed.deinit();
+        .message_attachments = attachments,
+    });
+    session.client.allocator.free(message_id);
 }
-
-const SdkImageAttachment = struct {
-    type: enum { blob } = .blob,
-    data: []const u8,
-    mimeType: []const u8,
-    displayName: []const u8,
-};
 
 fn sdkImageAttachments(
     allocator: std.mem.Allocator,
     values: []const Image,
-) ![]SdkImageAttachment {
-    const attachments = try allocator.alloc(SdkImageAttachment, values.len);
+) ![]copilot.MessageAttachment {
+    const attachments = try allocator.alloc(copilot.MessageAttachment, values.len);
     errdefer allocator.free(attachments);
     var initialized: usize = 0;
-    errdefer for (attachments[0..initialized]) |attachment| allocator.free(attachment.data);
+    errdefer for (attachments[0..initialized]) |attachment| {
+        allocator.free(attachment.blob.data);
+    };
     const encoder = std.base64.standard.Encoder;
     for (values, attachments) |value, *attachment| {
         const encoded = try allocator.alloc(u8, encoder.calcSize(value.bytes.len));
         _ = encoder.encode(encoded, value.bytes);
-        attachment.* = .{
+        attachment.* = .{ .blob = .{
             .data = encoded,
-            .mimeType = value.format.mimeType(),
-            .displayName = value.description,
-        };
+            .mime_type = value.format.mimeType(),
+            .display_name = value.description,
+        } };
         initialized += 1;
     }
     return attachments;
+}
+
+fn freeSdkImageAttachments(
+    allocator: std.mem.Allocator,
+    attachments: []const copilot.MessageAttachment,
+) void {
+    for (attachments) |attachment| switch (attachment) {
+        .blob => |blob| allocator.free(blob.data),
+        else => unreachable,
+    };
+    allocator.free(attachments);
+}
+
+test "image attachments use the SDK blob message shape" {
+    const values = [_]Image{.{
+        .bytes = "pixels",
+        .format = .png,
+        .description = "image.png",
+    }};
+    const attachments = try sdkImageAttachments(std.testing.allocator, &values);
+    defer freeSdkImageAttachments(std.testing.allocator, attachments);
+    switch (attachments[0]) {
+        .blob => |blob| {
+            try std.testing.expectEqualStrings("cGl4ZWxz", blob.data);
+            try std.testing.expectEqualStrings("image/png", blob.mime_type);
+            try std.testing.expectEqualStrings("image.png", blob.display_name.?);
+        },
+        else => unreachable,
+    }
 }
 
 fn imageToolResultJson(
@@ -1139,6 +1163,7 @@ fn buildSessionCatalog(
     allocator: std.mem.Allocator,
     index: *const session_store.Index,
     active_session_id: []const u8,
+    generation: u64,
 ) !conversation.SessionCatalog {
     const sessions = try allocator.alloc(
         conversation.SessionSummary,
@@ -1155,7 +1180,11 @@ fn buildSessionCatalog(
         errdefer allocator.free(working_directory);
         sessions[record_index] = .{
             .allocator = allocator,
-            .key = record_index + 1,
+            .key = .{
+                .generation = generation,
+                .slot = @intCast(record_index),
+                .scope = .local,
+            },
             .working_directory = working_directory,
             .model_id = try allocator.dupe(u8, record.model_id),
             .last_used_unix_ms = record.last_used_unix_ms,
@@ -1165,8 +1194,310 @@ fn buildSessionCatalog(
     }
     return .{
         .allocator = allocator,
+        .scope = .local,
+        .label = try allocator.dupe(
+            u8,
+            conversation.SessionCatalogScope.local.label(),
+        ),
         .sessions = sessions,
         .skipped_invalid_shards = index.skipped_invalid_shards,
+    };
+}
+
+const RemoteResumeTarget = struct {
+    id: []u8,
+    working_directory: []u8,
+    title: ?[]u8,
+    modified_time: []u8,
+
+    fn deinit(self: *RemoteResumeTarget, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.working_directory);
+        if (self.title) |value| allocator.free(value);
+        allocator.free(self.modified_time);
+        self.* = undefined;
+    }
+};
+
+const ResumeTargets = union(enum) {
+    local: session_store.Index,
+    broader: []RemoteResumeTarget,
+
+    fn deinit(self: *ResumeTargets, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .local => |*index| index.deinit(),
+            .broader => |targets| {
+                for (targets) |*target| target.deinit(allocator);
+                allocator.free(targets);
+            },
+        }
+        self.* = undefined;
+    }
+};
+
+fn buildBroaderSessionCatalog(
+    allocator: std.mem.Allocator,
+    client: *copilot.Client,
+    active_working_directory: []const u8,
+    active_session_id: []const u8,
+    active_model_id: []const u8,
+    generation: u64,
+) !struct {
+    catalog: conversation.SessionCatalog,
+    targets: ResumeTargets,
+} {
+    var listed = try client.listSessions(.{
+        .cwd = active_working_directory,
+    });
+    defer listed.deinit();
+
+    var remote = std.ArrayList(RemoteResumeTarget).empty;
+    errdefer {
+        for (remote.items) |*target| target.deinit(allocator);
+        remote.deinit(allocator);
+    }
+    for (listed.sessions) |metadata| {
+        const context = metadata.context orelse continue;
+        if (!std.mem.eql(u8, context.cwd, active_working_directory)) continue;
+        var target = blk: {
+            const id = try allocator.dupe(u8, metadata.session_id);
+            errdefer allocator.free(id);
+            const working_directory = try allocator.dupe(u8, context.cwd);
+            errdefer allocator.free(working_directory);
+            const modified_time = try allocator.dupe(
+                u8,
+                metadata.modified_time,
+            );
+            errdefer allocator.free(modified_time);
+            var value = RemoteResumeTarget{
+                .id = id,
+                .working_directory = working_directory,
+                .title = null,
+                .modified_time = modified_time,
+            };
+            errdefer value.deinit(allocator);
+            if (metadata.summary) |summary| {
+                value.title = try allocator.dupe(u8, summary);
+            }
+            break :blk value;
+        };
+        errdefer target.deinit(allocator);
+        try remote.append(allocator, target);
+    }
+
+    const targets = try remote.toOwnedSlice(allocator);
+    errdefer {
+        for (targets) |*target| target.deinit(allocator);
+        allocator.free(targets);
+    }
+    const sessions = try allocator.alloc(conversation.SessionSummary, targets.len);
+    errdefer allocator.free(sessions);
+    var initialized: usize = 0;
+    errdefer for (sessions[0..initialized]) |*session| session.deinit();
+    for (targets, 0..) |target, index| {
+        var summary = blk: {
+            const working_directory = try allocator.dupe(
+                u8,
+                target.working_directory,
+            );
+            errdefer allocator.free(working_directory);
+            const model_id = try allocator.dupe(u8, active_model_id);
+            errdefer allocator.free(model_id);
+            var value = conversation.SessionSummary{
+                .allocator = allocator,
+                .key = .{
+                    .generation = generation,
+                    .slot = @intCast(index),
+                    .scope = .broader,
+                },
+                .working_directory = working_directory,
+                .model_id = model_id,
+                .title = null,
+                .summary = null,
+                .last_used_unix_ms = unixMilliseconds(client.io),
+                .current = std.mem.eql(u8, target.id, active_session_id),
+            };
+            errdefer value.deinit();
+            if (target.title) |title| {
+                value.title = try allocator.dupe(u8, title);
+            }
+            value.summary = try std.fmt.allocPrint(
+                allocator,
+                "Updated {s}",
+                .{target.modified_time},
+            );
+            break :blk value;
+        };
+        errdefer summary.deinit();
+        sessions[index] = summary;
+        initialized += 1;
+    }
+    return .{
+        .catalog = .{
+            .allocator = allocator,
+            .scope = .broader,
+            .label = try allocator.dupe(
+                u8,
+                conversation.SessionCatalogScope.broader.label(),
+            ),
+            .sessions = sessions,
+            .skipped_invalid_shards = false,
+        },
+        .targets = .{ .broader = targets },
+    };
+}
+
+fn projectTranscriptSnapshot(
+    allocator: std.mem.Allocator,
+    history: *const copilot.SessionEventHistory,
+) !conversation.TranscriptSnapshot {
+    var items = std.ArrayList(conversation.TranscriptItem).empty;
+    errdefer {
+        for (items.items) |*item| item.deinit();
+        items.deinit(allocator);
+    }
+    try items.ensureTotalCapacity(allocator, history.events.len);
+    for (history.events) |event| switch (event) {
+        .user_message => |message| items.appendAssumeCapacity(
+            try conversation.TranscriptItem.init(
+                allocator,
+                .user,
+                message.data.content,
+            ),
+        ),
+        .assistant_message => |message| items.appendAssumeCapacity(
+            try conversation.TranscriptItem.init(
+                allocator,
+                .assistant,
+                message.content,
+            ),
+        ),
+        .assistant_reasoning => |reasoning| items.appendAssumeCapacity(
+            try conversation.TranscriptItem.init(
+                allocator,
+                .reasoning,
+                reasoning.content,
+            ),
+        ),
+        else => {},
+    };
+    return .{
+        .allocator = allocator,
+        .items = try items.toOwnedSlice(allocator),
+    };
+}
+
+fn projectTranscriptSnapshotFromRawHistory(
+    allocator: std.mem.Allocator,
+    events: []const std.json.Value,
+) !conversation.TranscriptSnapshot {
+    var items = std.ArrayList(conversation.TranscriptItem).empty;
+    errdefer {
+        for (items.items) |*item| item.deinit();
+        items.deinit(allocator);
+    }
+    try items.ensureTotalCapacity(allocator, events.len);
+    for (events) |event| {
+        const object = switch (event) {
+            .object => |value| value,
+            else => continue,
+        };
+        const event_type = switch (object.get("type") orelse continue) {
+            .string => |value| value,
+            else => continue,
+        };
+        const data = switch (object.get("data") orelse continue) {
+            .object => |value| value,
+            else => continue,
+        };
+        const content = switch (data.get("content") orelse continue) {
+            .string => |value| value,
+            else => continue,
+        };
+        const role: conversation.TranscriptRole = if (std.mem.eql(
+            u8,
+            event_type,
+            "user.message",
+        ))
+            .user
+        else if (std.mem.eql(u8, event_type, "assistant.message"))
+            .assistant
+        else if (std.mem.eql(u8, event_type, "assistant.reasoning"))
+            .reasoning
+        else
+            continue;
+        items.appendAssumeCapacity(
+            try conversation.TranscriptItem.init(allocator, role, content),
+        );
+    }
+    return .{
+        .allocator = allocator,
+        .items = try items.toOwnedSlice(allocator),
+    };
+}
+
+fn hydrateTranscriptSnapshot(
+    allocator: std.mem.Allocator,
+    client: *copilot.Client,
+    session: copilot.Session,
+) !conversation.TranscriptSnapshot {
+    var history = session.getEvents() catch |err| {
+        if (err != error.InvalidSessionEvent) return err;
+        const RawHistory = struct {
+            events: []const std.json.Value,
+        };
+        var raw = try client.callRpc(
+            RawHistory,
+            "session.getMessages",
+            .{ .sessionId = session.id },
+        );
+        defer raw.deinit();
+        return projectTranscriptSnapshotFromRawHistory(
+            allocator,
+            raw.value.events,
+        );
+    };
+    defer history.deinit();
+    return projectTranscriptSnapshot(allocator, &history);
+}
+
+test "raw history projection ignores malformed events" {
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        \\{"events":[{"type":"user.message","data":{"content":"question"}},{"type":"assistant.message","data":{"content":"answer"}},{"type":"assistant.message","data":{"missing":"content"}},{"type":"tool.execution_start","data":{"toolName":"read"}}]}
+    ,
+        .{},
+    );
+    defer parsed.deinit();
+    const events = parsed.value.object.get("events").?.array.items;
+    var snapshot = try projectTranscriptSnapshotFromRawHistory(
+        std.testing.allocator,
+        events,
+    );
+    defer snapshot.deinit();
+    try std.testing.expectEqual(@as(usize, 2), snapshot.items.len);
+    try std.testing.expectEqual(.user, snapshot.items[0].role);
+    try std.testing.expectEqualStrings("question", snapshot.items[0].text);
+    try std.testing.expectEqual(.assistant, snapshot.items[1].role);
+    try std.testing.expectEqualStrings("answer", snapshot.items[1].text);
+}
+
+fn sessionSummaryFromRecord(
+    allocator: std.mem.Allocator,
+    key: conversation.ResumeKey,
+    record: *const session_store.Record,
+    current: bool,
+) !conversation.SessionSummary {
+    const working_directory = try allocator.dupe(u8, record.working_directory);
+    errdefer allocator.free(working_directory);
+    return .{
+        .allocator = allocator,
+        .key = key,
+        .working_directory = working_directory,
+        .model_id = try allocator.dupe(u8, record.model_id),
+        .last_used_unix_ms = record.last_used_unix_ms,
+        .current = current,
     };
 }
 
@@ -1265,12 +1596,118 @@ fn automaticPermissionFailure(
     };
 }
 
+fn isViviTool(name: []const u8) bool {
+    inline for (tools.descriptors) |descriptor| {
+        if (std.mem.eql(u8, name, descriptor.name)) return true;
+    }
+    return false;
+}
+
+fn containsToolCall(ids: []const []const u8, call_id: []const u8) bool {
+    for (ids) |id| {
+        if (std.mem.eql(u8, id, call_id)) return true;
+    }
+    return false;
+}
+
+fn emitTypedToolStart(
+    worker: *conversation.Worker,
+    active_calls: *std.ArrayList([]u8),
+    call_id: []const u8,
+    tool_name: []const u8,
+) !void {
+    if (isViviTool(tool_name) or containsToolCall(active_calls.items, call_id)) {
+        return;
+    }
+    const started = try tool_activity.ToolStarted.init(
+        worker.allocator(),
+        call_id,
+        "{}",
+        .{ .other = .{ .name = tool_name } },
+    );
+    errdefer {
+        var mutable = started;
+        mutable.deinit();
+    }
+    try worker.toolActivity(.{ .started = started });
+    const call_id_copy = try worker.allocator().dupe(u8, call_id);
+    errdefer worker.allocator().free(call_id_copy);
+    try active_calls.append(worker.allocator(), call_id_copy);
+}
+
+fn emitTypedToolComplete(
+    worker: *conversation.Worker,
+    active_calls: *std.ArrayList([]u8),
+    complete: anytype,
+) !void {
+    const index = for (active_calls.items, 0..) |call_id, index| {
+        if (std.mem.eql(u8, call_id, complete.tool_call_id)) break index;
+    } else return;
+    defer worker.allocator().free(active_calls.orderedRemove(index));
+    const output = if (complete.success)
+        if (complete.result) |result| result.content else "Completed."
+    else if (complete.error_) |failure|
+        failure.message
+    else
+        "Failed.";
+    const finished = try tool_activity.ToolFinished.init(
+        worker.allocator(),
+        complete.tool_call_id,
+        if (complete.success)
+            .{ .succeeded = output }
+        else
+            .{ .failed = output },
+    );
+    try worker.toolActivity(.{ .finished = finished });
+}
+
+fn reportStreamStatus(
+    worker: *conversation.Worker,
+    message: []const u8,
+    failure_message: []const u8,
+) bool {
+    worker.status(message) catch {
+        worker.closeFailure(.stream, failure_message);
+        return false;
+    };
+    return true;
+}
+
+test "typed stream tool projection leaves Vivi tools to external events" {
+    try std.testing.expect(isViviTool("read"));
+    try std.testing.expect(isViviTool("bash"));
+    try std.testing.expect(!isViviTool("github-mcp-server-search_code"));
+    try std.testing.expect(containsToolCall(
+        &.{ "call-one", "call-two" },
+        "call-two",
+    ));
+}
+
+fn refreshCommandCatalog(
+    worker: *conversation.Worker,
+    client: *copilot.Client,
+    session: copilot.Session,
+) void {
+    if (buildCommandCatalog(
+        worker.allocator(),
+        client,
+        session,
+    )) |catalog| {
+        worker.commandCatalog(catalog) catch {};
+    } else |_| {}
+}
+
 fn streamSessionResponse(
     worker: *conversation.Worker,
     client: *copilot.Client,
     session: copilot.Session,
     tool_service: *tools.Service,
 ) StreamResult {
+    var typed_tool_calls = std.ArrayList([]u8).empty;
+    defer {
+        for (typed_tool_calls.items) |call_id| worker.allocator().free(call_id);
+        typed_tool_calls.deinit(worker.allocator());
+    }
     while (true) {
         var event = session.nextEvent() catch |err| {
             worker.closeFailure(.stream, @errorName(err));
@@ -1445,21 +1882,163 @@ fn streamSessionResponse(
                     },
                 }
             },
+            .commands_changed => refreshCommandCatalog(
+                worker,
+                client,
+                session,
+            ),
+            .tool_execution_start => |started| emitTypedToolStart(
+                worker,
+                &typed_tool_calls,
+                started.data.tool_call_id,
+                started.data.tool_name,
+            ) catch {
+                worker.closeFailure(.stream, "Unable to display tool activity.");
+                return .failed;
+            },
+            .tool_execution_progress => |progress| {
+                const message = std.fmt.allocPrint(
+                    worker.allocator(),
+                    "Tool progress: {s}",
+                    .{progress.data.progress_message},
+                ) catch {
+                    worker.closeFailure(.stream, "Unable to display tool progress.");
+                    return .failed;
+                };
+                defer worker.allocator().free(message);
+                if (!reportStreamStatus(
+                    worker,
+                    message,
+                    "Unable to display tool progress.",
+                )) return .failed;
+            },
+            .tool_execution_partial_result => {},
+            .tool_execution_complete => |complete| emitTypedToolComplete(
+                worker,
+                &typed_tool_calls,
+                complete.data,
+            ) catch {
+                worker.closeFailure(.stream, "Unable to display tool completion.");
+                return .failed;
+            },
+            .subagent_started => |started| {
+                const message = std.fmt.allocPrint(
+                    worker.allocator(),
+                    "Subagent started: {s}.",
+                    .{started.data.agent_display_name},
+                ) catch {
+                    worker.closeFailure(.stream, "Unable to display subagent status.");
+                    return .failed;
+                };
+                defer worker.allocator().free(message);
+                if (!reportStreamStatus(
+                    worker,
+                    message,
+                    "Unable to display subagent status.",
+                )) return .failed;
+            },
+            .subagent_completed => |completed| {
+                const message = std.fmt.allocPrint(
+                    worker.allocator(),
+                    "Subagent completed: {s}.",
+                    .{completed.data.agent_display_name},
+                ) catch {
+                    worker.closeFailure(.stream, "Unable to display subagent status.");
+                    return .failed;
+                };
+                defer worker.allocator().free(message);
+                if (!reportStreamStatus(
+                    worker,
+                    message,
+                    "Unable to display subagent status.",
+                )) return .failed;
+            },
+            .subagent_failed => |failed| {
+                const message = std.fmt.allocPrint(
+                    worker.allocator(),
+                    "Subagent failed: {s}: {s}",
+                    .{ failed.data.agent_display_name, failed.data.error_ },
+                ) catch {
+                    worker.closeFailure(.stream, "Unable to display subagent status.");
+                    return .failed;
+                };
+                defer worker.allocator().free(message);
+                if (!reportStreamStatus(
+                    worker,
+                    message,
+                    "Unable to display subagent status.",
+                )) return .failed;
+            },
+            .session_warning => |warning| {
+                const message = std.fmt.allocPrint(
+                    worker.allocator(),
+                    "Warning ({s}): {s}",
+                    .{ warning.data.warning_type, warning.data.message },
+                ) catch {
+                    worker.closeFailure(.stream, "Unable to display warning.");
+                    return .failed;
+                };
+                defer worker.allocator().free(message);
+                if (!reportStreamStatus(
+                    worker,
+                    message,
+                    "Unable to display warning.",
+                )) return .failed;
+            },
+            .session_title_changed => |title| {
+                const message = std.fmt.allocPrint(
+                    worker.allocator(),
+                    "Session title: {s}",
+                    .{title.data.title},
+                ) catch {
+                    worker.closeFailure(.stream, "Unable to display session title.");
+                    return .failed;
+                };
+                defer worker.allocator().free(message);
+                if (!reportStreamStatus(
+                    worker,
+                    message,
+                    "Unable to display session title.",
+                )) return .failed;
+            },
+            .session_context_changed => {
+                if (!reportStreamStatus(
+                    worker,
+                    "Session context updated.",
+                    "Unable to display session context.",
+                )) return .failed;
+            },
+            .session_context_cleared => {
+                if (!reportStreamStatus(
+                    worker,
+                    "Session context cleared.",
+                    "Unable to display session context.",
+                )) return .failed;
+            },
+            .session_session_limits_changed => {
+                if (!reportStreamStatus(
+                    worker,
+                    "Session limits updated.",
+                    "Unable to display session limits.",
+                )) return .failed;
+            },
+            .session_limits_exhausted_requested => {
+                if (!reportStreamStatus(
+                    worker,
+                    "Session limits exhausted.",
+                    "Unable to display session limits.",
+                )) return .failed;
+            },
             .unknown => |unknown| {
                 if (std.mem.eql(
                     u8,
                     unknown.event_type,
                     "commands.changed",
                 )) {
-                    if (buildCommandCatalog(
-                        worker.allocator(),
-                        client,
-                        session,
-                    )) |catalog| {
-                        worker.commandCatalog(catalog) catch {};
-                    } else |_| {}
+                    refreshCommandCatalog(worker, client, session);
                 }
             },
+            else => {},
         }
 
         switch (forwardImmediatePrompts(
@@ -1550,8 +2129,9 @@ fn runSdkConversation(
     else
         null;
     defer if (store) |*value| value.deinit();
-    var resume_index: ?session_store.Index = null;
-    defer if (resume_index) |*index| index.deinit();
+    var resume_targets: ?ResumeTargets = null;
+    defer if (resume_targets) |*targets| targets.deinit(worker.allocator());
+    var resume_generation: u64 = 0;
     var persisted_settings = if (context.settings_path) |path|
         settings.load(worker.allocator(), worker.io(), path) catch |err| {
             const message = std.fmt.allocPrint(
@@ -1690,9 +2270,60 @@ fn runSdkConversation(
                     return;
                 };
             },
-            .refresh_sessions => {
-                var new_index: session_store.Index = if (store) |*value|
-                    value.list() catch |err| {
+            .refresh_sessions => |request| {
+                resume_generation +%= 1;
+                if (resume_generation == 0) resume_generation = 1;
+                if (request == .local) {
+                    var new_index: session_store.Index = if (store) |*value|
+                        value.list() catch |err| {
+                            worker.completeSessionRefreshFailure(
+                                @errorName(err),
+                            ) catch {
+                                worker.closeFailure(.stream, @errorName(err));
+                                return;
+                            };
+                            continue;
+                        }
+                    else
+                        .{
+                            .allocator = worker.allocator(),
+                            .records = worker.allocator().alloc(
+                                session_store.Record,
+                                0,
+                            ) catch |err| {
+                                worker.closeFailure(.stream, @errorName(err));
+                                return;
+                            },
+                        };
+                    const catalog = buildSessionCatalog(
+                        worker.allocator(),
+                        &new_index,
+                        session.id,
+                        resume_generation,
+                    ) catch |err| {
+                        new_index.deinit();
+                        worker.closeFailure(.stream, @errorName(err));
+                        return;
+                    };
+                    worker.completeSessionRefresh(catalog) catch {
+                        new_index.deinit();
+                        worker.closeFailure(
+                            .stream,
+                            "Unable to deliver the session catalog.",
+                        );
+                        return;
+                    };
+                    if (resume_targets) |*targets| targets.deinit(worker.allocator());
+                    resume_targets = .{ .local = new_index };
+                } else {
+                    const result = buildBroaderSessionCatalog(
+                        worker.allocator(),
+                        &client,
+                        active_working_directory,
+                        session.id,
+                        active_plan.id(),
+                        resume_generation,
+                    ) catch |err| {
                         worker.completeSessionRefreshFailure(
                             @errorName(err),
                         ) catch {
@@ -1700,40 +2331,22 @@ fn runSdkConversation(
                             return;
                         };
                         continue;
-                    }
-                else
-                    .{
-                        .allocator = worker.allocator(),
-                        .records = worker.allocator().alloc(
-                            session_store.Record,
-                            0,
-                        ) catch |err| {
-                            worker.closeFailure(.stream, @errorName(err));
-                            return;
-                        },
                     };
-                const catalog = buildSessionCatalog(
-                    worker.allocator(),
-                    &new_index,
-                    session.id,
-                ) catch |err| {
-                    new_index.deinit();
-                    worker.closeFailure(.stream, @errorName(err));
-                    return;
-                };
-                worker.completeSessionRefresh(catalog) catch {
-                    new_index.deinit();
-                    worker.closeFailure(
-                        .stream,
-                        "Unable to deliver the session catalog.",
-                    );
-                    return;
-                };
-                if (resume_index) |*index| index.deinit();
-                resume_index = new_index;
+                    worker.completeSessionRefresh(result.catalog) catch {
+                        var targets = result.targets;
+                        targets.deinit(worker.allocator());
+                        worker.closeFailure(
+                            .stream,
+                            "Unable to deliver the session catalog.",
+                        );
+                        return;
+                    };
+                    if (resume_targets) |*targets| targets.deinit(worker.allocator());
+                    resume_targets = result.targets;
+                }
             },
             .resume_session => |key| {
-                const index = if (resume_index) |*value| value else {
+                const targets = if (resume_targets) |*value| value else {
                     worker.completeSessionResume(.{
                         .failed = conversation.OwnedText.init(
                             worker.allocator(),
@@ -1748,7 +2361,7 @@ fn runSdkConversation(
                     };
                     continue;
                 };
-                if (key == 0 or key > index.records.len) {
+                if (key.generation != resume_generation) {
                     worker.completeSessionResume(.{
                         .failed = conversation.OwnedText.init(
                             worker.allocator(),
@@ -1763,33 +2376,120 @@ fn runSdkConversation(
                     };
                     continue;
                 }
-                const target = &index.records[key - 1];
+                const broader = key.scope == .broader;
+                var target: session_store.Record = switch (targets.*) {
+                    .local => |index| blk: {
+                        if (key.scope != .local or key.slot >= index.records.len) {
+                            worker.completeSessionResume(.{
+                                .failed = conversation.OwnedText.init(
+                                    worker.allocator(),
+                                    "The selected session is no longer available.",
+                                ) catch {
+                                    worker.closeFailure(.stream, "Out of memory.");
+                                    return;
+                                },
+                            }) catch {
+                                worker.closeFailure(.stream, "Unable to report resume failure.");
+                                return;
+                            };
+                            continue;
+                        }
+                        break :blk index.records[key.slot].clone(worker.allocator()) catch |err| {
+                            worker.closeFailure(.stream, @errorName(err));
+                            return;
+                        };
+                    },
+                    .broader => |records| blk: {
+                        if (key.scope != .broader or key.slot >= records.len) {
+                            worker.completeSessionResume(.{
+                                .failed = conversation.OwnedText.init(
+                                    worker.allocator(),
+                                    "The selected session is no longer available.",
+                                ) catch {
+                                    worker.closeFailure(.stream, "Out of memory.");
+                                    return;
+                                },
+                            }) catch {
+                                worker.closeFailure(.stream, "Unable to report resume failure.");
+                                return;
+                            };
+                            continue;
+                        }
+                        const record = records[key.slot];
+                        break :blk session_store.Record.init(
+                            worker.allocator(),
+                            record.id,
+                            record.working_directory,
+                            active_plan.id(),
+                            0,
+                        ) catch |err| {
+                            worker.closeFailure(.stream, @errorName(err));
+                            return;
+                        };
+                    },
+                };
+                defer target.deinit();
                 if (std.mem.eql(u8, target.id, session.id)) {
-                    const summary_working_directory = worker.allocator().dupe(
-                        u8,
-                        target.working_directory,
+                    const snapshot = hydrateTranscriptSnapshot(
+                        worker.allocator(),
+                        &client,
+                        session,
                     ) catch |err| {
+                        worker.completeSessionResume(.{
+                            .failed = conversation.OwnedText.init(
+                                worker.allocator(),
+                                @errorName(err),
+                            ) catch {
+                                worker.closeFailure(.stream, @errorName(err));
+                                return;
+                            },
+                        }) catch {
+                            worker.closeFailure(.stream, @errorName(err));
+                            return;
+                        };
+                        continue;
+                    };
+                    const now = unixMilliseconds(worker.io());
+                    target.last_used_unix_ms = now;
+                    if (store) |*value| (if (broader)
+                        value.recordCreated(
+                            target.id,
+                            target.working_directory,
+                            target.model_id,
+                            now,
+                        )
+                    else
+                        value.touch(&target, now)) catch |err| {
+                        var mutable = snapshot;
+                        mutable.deinit();
+                        worker.completeSessionResume(.{
+                            .failed = conversation.OwnedText.init(
+                                worker.allocator(),
+                                @errorName(err),
+                            ) catch {
+                                worker.closeFailure(.stream, @errorName(err));
+                                return;
+                            },
+                        }) catch {
+                            worker.closeFailure(.stream, @errorName(err));
+                            return;
+                        };
+                        continue;
+                    };
+                    const summary = sessionSummaryFromRecord(
+                        worker.allocator(),
+                        key,
+                        &target,
+                        true,
+                    ) catch |err| {
+                        var mutable = snapshot;
+                        mutable.deinit();
                         worker.closeFailure(.stream, @errorName(err));
                         return;
-                    };
-                    const summary_model_id = worker.allocator().dupe(
-                        u8,
-                        target.model_id,
-                    ) catch |err| {
-                        worker.allocator().free(summary_working_directory);
-                        worker.closeFailure(.stream, @errorName(err));
-                        return;
-                    };
-                    const summary = conversation.SessionSummary{
-                        .allocator = worker.allocator(),
-                        .key = key,
-                        .working_directory = summary_working_directory,
-                        .model_id = summary_model_id,
-                        .last_used_unix_ms = target.last_used_unix_ms,
-                        .current = true,
                     };
                     worker.completeSessionResume(.{ .resumed = .{
                         .session = summary,
+                        .transcript = snapshot,
                         .cleanup_failed = false,
                     } }) catch {
                         worker.closeFailure(.stream, "Unable to report resumed session.");
@@ -1875,40 +2575,50 @@ fn runSdkConversation(
                     };
                     continue;
                 };
+                const snapshot = hydrateTranscriptSnapshot(
+                    worker.allocator(),
+                    &client,
+                    candidate,
+                ) catch |err| {
+                    candidate.disconnect() catch {};
+                    candidate_tools.deinit();
+                    target_plan.deinit(worker.allocator());
+                    worker.completeSessionResume(.{
+                        .failed = conversation.OwnedText.init(
+                            worker.allocator(),
+                            @errorName(err),
+                        ) catch {
+                            worker.closeFailure(.stream, @errorName(err));
+                            return;
+                        },
+                    }) catch {
+                        worker.closeFailure(.stream, @errorName(err));
+                        return;
+                    };
+                    continue;
+                };
                 const now = unixMilliseconds(worker.io());
+                target.last_used_unix_ms = now;
                 const candidate_working_directory = worker.allocator().dupe(
                     u8,
                     target.working_directory,
                 ) catch |err| {
+                    var mutable = snapshot;
+                    mutable.deinit();
                     candidate.disconnect() catch {};
                     candidate_tools.deinit();
                     target_plan.deinit(worker.allocator());
                     worker.closeFailure(.stream, @errorName(err));
                     return;
                 };
-                var summary = conversation.SessionSummary{
-                    .allocator = worker.allocator(),
-                    .key = key,
-                    .working_directory = worker.allocator().dupe(
-                        u8,
-                        target.working_directory,
-                    ) catch |err| {
-                        worker.allocator().free(candidate_working_directory);
-                        candidate.disconnect() catch {};
-                        candidate_tools.deinit();
-                        target_plan.deinit(worker.allocator());
-                        worker.closeFailure(.stream, @errorName(err));
-                        return;
-                    },
-                    .model_id = undefined,
-                    .last_used_unix_ms = now,
-                    .current = true,
-                };
-                summary.model_id = worker.allocator().dupe(
-                    u8,
-                    target.model_id,
+                const summary = sessionSummaryFromRecord(
+                    worker.allocator(),
+                    key,
+                    &target,
+                    true,
                 ) catch |err| {
-                    worker.allocator().free(summary.working_directory);
+                    var mutable = snapshot;
+                    mutable.deinit();
                     worker.allocator().free(candidate_working_directory);
                     candidate.disconnect() catch {};
                     candidate_tools.deinit();
@@ -1916,11 +2626,19 @@ fn runSdkConversation(
                     worker.closeFailure(.stream, @errorName(err));
                     return;
                 };
-                if (store) |*value| value.touch(
-                    target,
-                    now,
-                ) catch |err| {
-                    summary.deinit();
+                if (store) |*value| (if (broader)
+                    value.recordCreated(
+                        target.id,
+                        target.working_directory,
+                        target.model_id,
+                        now,
+                    )
+                else
+                    value.touch(&target, now)) catch |err| {
+                    var mutable_summary = summary;
+                    mutable_summary.deinit();
+                    var mutable_snapshot = snapshot;
+                    mutable_snapshot.deinit();
                     worker.allocator().free(candidate_working_directory);
                     candidate.disconnect() catch {};
                     candidate_tools.deinit();
@@ -1959,6 +2677,7 @@ fn runSdkConversation(
                 previous_plan.deinit(worker.allocator());
                 worker.completeSessionResume(.{ .resumed = .{
                     .session = summary,
+                    .transcript = snapshot,
                     .cleanup_failed = cleanup_failed,
                 } }) catch {
                     worker.closeFailure(
@@ -2511,27 +3230,6 @@ test "image tool result serializes binary content for Copilot, not the transcrip
     defer allocator.free(decoded);
     try decoder.decode(decoded, encoded);
     try std.testing.expectEqualSlices(u8, result.image.bytes, decoded);
-}
-
-test "image attachments use the SDK blob shape with immutable bytes" {
-    const attachments = try sdkImageAttachments(std.testing.allocator, &.{.{
-        .bytes = "image bytes",
-        .format = .png,
-        .description = "first image.png",
-    }});
-    defer {
-        for (attachments) |attachment| std.testing.allocator.free(attachment.data);
-        std.testing.allocator.free(attachments);
-    }
-    const json = try std.json.Stringify.valueAlloc(std.testing.allocator, attachments, .{});
-    defer std.testing.allocator.free(json);
-    try std.testing.expectEqualStrings(
-        "[{\"type\":\"blob\",\"data\":\"aW1hZ2UgYnl0ZXM=\",\"mimeType\":\"image/png\",\"displayName\":\"first image.png\"}]",
-        json,
-    );
-    const empty = try sdkImageAttachments(std.testing.allocator, &.{});
-    defer std.testing.allocator.free(empty);
-    try std.testing.expectEqual(@as(usize, 0), empty.len);
 }
 
 test "Copilot SDK dependency is compile-visible" {
