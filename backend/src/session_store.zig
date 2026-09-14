@@ -936,6 +936,7 @@ test "session store read cap accepts maximum serialized shard" {
             .id = &id,
             .working_directory = &working_directory,
             .model_id = &model_id,
+            .reasoning = .medium,
             .last_used_unix_ms = std.math.maxInt(i64),
         };
     }
@@ -984,10 +985,10 @@ test "session store uses owner-only POSIX permissions" {
 
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
-    const temporary_root = try temporary.dir.realPathAlloc(
+    const temporary_root = try temporary.dir.realPathFileAlloc(
         std.testing.io,
-        std.testing.allocator,
         ".",
+        std.testing.allocator,
     );
     defer std.testing.allocator.free(temporary_root);
     const directory = try std.fs.path.join(
@@ -1012,7 +1013,7 @@ test "session store uses owner-only POSIX permissions" {
     defer sessions.close(std.testing.io);
     try std.testing.expectEqual(
         @as(std.posix.mode_t, 0o700),
-        sessions.stat(std.testing.io).permissions.toMode() & 0o777,
+        (try sessions.stat(std.testing.io)).permissions.toMode() & 0o777,
     );
     var shard = try std.Io.Dir.openFileAbsolute(
         std.testing.io,
@@ -1022,7 +1023,7 @@ test "session store uses owner-only POSIX permissions" {
     defer shard.close(std.testing.io);
     try std.testing.expectEqual(
         @as(std.posix.mode_t, 0o600),
-        shard.stat(std.testing.io).permissions.toMode() & 0o777,
+        (try shard.stat(std.testing.io)).permissions.toMode() & 0o777,
     );
     var lock = try std.Io.Dir.openFileAbsolute(
         std.testing.io,
@@ -1032,6 +1033,6 @@ test "session store uses owner-only POSIX permissions" {
     defer lock.close(std.testing.io);
     try std.testing.expectEqual(
         @as(std.posix.mode_t, 0o600),
-        lock.stat(std.testing.io).permissions.toMode() & 0o777,
+        (try lock.stat(std.testing.io)).permissions.toMode() & 0o777,
     );
 }
