@@ -41,6 +41,16 @@ fn isMouseWheel(mouse: vaxis.Mouse) bool {
         (mouse.button == .wheel_up or mouse.button == .wheel_down);
 }
 
+fn resumeCatalogRequest(input: []const u8) backend.SessionCatalogRequest {
+    const suffix = std.mem.trim(u8, commandArgumentSuffix(input), " \t\r\n");
+    if (std.ascii.eqlIgnoreCase(suffix, "all") or
+        std.ascii.eqlIgnoreCase(suffix, "--all"))
+    {
+        return .all;
+    }
+    return .local;
+}
+
 const Role = enum {
     user,
     queued,
@@ -565,6 +575,26 @@ const Transcript = struct {
         for (self.entries.items) |*entry| entry.deinit(allocator);
         self.entries.deinit(allocator);
         self.* = undefined;
+    }
+
+    fn fromSnapshot(
+        allocator: std.mem.Allocator,
+        snapshot: *const backend.TranscriptSnapshot,
+    ) !Transcript {
+        var transcript: Transcript = .{};
+        errdefer transcript.deinit(allocator);
+        for (snapshot.items) |item| {
+            try transcript.append(
+                allocator,
+                switch (item.role) {
+                    .user => .user,
+                    .assistant => .assistant,
+                    .reasoning => .reasoning,
+                },
+                item.text,
+            );
+        }
+        return transcript;
     }
 
     fn append(
@@ -1172,23 +1202,25 @@ const MenuDetail = union(enum) {
     },
     session: struct {
         model_id: []const u8,
+        summary: ?[]const u8,
         last_used_unix_ms: i64,
     },
 };
 
 const MenuIdentity = union(enum) {
     text: []const u8,
-    number: u64,
+    resume_key: backend.ResumeKey,
 
     fn eql(left: MenuIdentity, right: MenuIdentity) bool {
         return switch (left) {
             .text => |value| switch (right) {
                 .text => |other| std.mem.eql(u8, value, other),
-                .number => false,
+                .resume_key => false,
             },
-            .number => |value| switch (right) {
+            .resume_key => |value| switch (right) {
                 .text => false,
-                .number => |other| value == other,
+                .resume_key => |other| value.generation == other.generation and
+                    value.slot == other.slot and value.scope == other.scope,
             },
         };
     }
@@ -1305,10 +1337,11 @@ fn matchRank(entry: MenuEntry, query: []const u8) ?u2 {
         switch (entry.detail) {
             .text => |text| asciiContainsIgnoreCase(text, query),
             .model => false,
-            .session => |session| asciiContainsIgnoreCase(
-                session.model_id,
-                query,
-            ),
+            .session => |session| asciiContainsIgnoreCase(session.model_id, query) or
+                if (session.summary) |summary|
+                    asciiContainsIgnoreCase(summary, query)
+                else
+                    false,
         })
     {
         return 2;
@@ -1990,19 +2023,27 @@ const ChatUi = struct {
         defer self.allocator.free(entries);
         for (catalog.sessions, 0..) |session, index| {
             entries[index] = .{
-                .identity = .{ .number = session.key },
+                .identity = .{ .resume_key = session.key },
                 .key = session.working_directory,
-                .primary = uniqueWorkspaceLabel(catalog.sessions, index),
+                .primary = session.title orelse
+                    uniqueWorkspaceLabel(catalog.sessions, index),
                 .detail = .{ .session = .{
                     .model_id = session.model_id,
+                    .summary = session.summary,
                     .last_used_unix_ms = session.last_used_unix_ms,
                 } },
                 .current = session.current,
-                .enabled = !session.current,
                 .source_index = index,
             };
         }
         try self.menu.rebuild(self.allocator, entries, query);
+        for (self.menu.matches.items, 0..) |entry_index, match_index| {
+            if (!self.menu.entries.items[entry_index].current) {
+                self.menu.selected_match = match_index;
+                self.menu.first_visible_match = match_index;
+                break;
+            }
+        }
     }
 
     fn activateMenu(
@@ -2015,9 +2056,15 @@ const ChatUi = struct {
                 const catalog = self.commands orelse return;
                 const command = catalog.commands[selected.source_index];
                 if (std.ascii.eqlIgnoreCase(command.name, "resume")) {
+                    const contents = try self.input.toOwnedContents(
+                        self.allocator,
+                    );
+                    defer self.allocator.free(contents);
                     self.input.clearRetainingCapacity();
                     self.menu_mode = .loading_sessions;
-                    conversation.refreshSessions() catch |err| switch (err) {
+                    conversation.refreshSessions(
+                        resumeCatalogRequest(contents),
+                    ) catch |err| switch (err) {
                         error.Busy => {
                             self.menu_mode = .closed;
                             return;
@@ -2175,11 +2222,15 @@ const ChatUi = struct {
                             message,
                         );
                     },
-                    .failed => |failure| try self.transcript.append(
-                        self.allocator,
-                        .status,
-                        failure.bytes,
-                    ),
+                    .failed => |failure| {
+                        self.clearToolFocus();
+                        self.tool_anchor = null;
+                        try self.transcript.append(
+                            self.allocator,
+                            .status,
+                            failure.bytes,
+                        );
+                    },
                 }
             },
             .session_catalog => |catalog| {
@@ -2194,6 +2245,17 @@ const ChatUi = struct {
                 if (self.menu_mode == .loading_sessions) {
                     self.menu_mode = .sessions;
                     try self.rebuildSessionMenu();
+                    const message = try std.fmt.allocPrint(
+                        self.allocator,
+                        "Showing {s}.",
+                        .{catalog.label},
+                    );
+                    defer self.allocator.free(message);
+                    try self.transcript.append(
+                        self.allocator,
+                        .status,
+                        message,
+                    );
                     if (catalog.skipped_invalid_shards) {
                         try self.transcript.append(
                             self.allocator,
@@ -2223,23 +2285,29 @@ const ChatUi = struct {
                     failure.bytes,
                 );
             },
+            .status => |message| try self.transcript.append(
+                self.allocator,
+                .status,
+                message.bytes,
+            ),
             .session_resume => |result| {
-                self.clearToolFocus();
-                self.tool_anchor = null;
                 if (self.phase == .resuming) self.phase = .ready;
                 self.menu_mode = .closed;
                 switch (result) {
                     .resumed => |success| {
+                        var replacement = try Transcript.fromSnapshot(
+                            self.allocator,
+                            &success.transcript,
+                        );
+                        errdefer replacement.deinit(self.allocator);
                         const resumed_cwd = try self.allocator.dupe(
                             u8,
                             success.session.working_directory,
                         );
-                        self.allocator.free(self.cwd);
-                        self.cwd = resumed_cwd;
-                        try self.updateSelectedModel(success.session.model_id);
+                        errdefer self.allocator.free(resumed_cwd);
                         const message = try std.fmt.allocPrint(
                             self.allocator,
-                            "Resumed {s}. Copilot history now comes from that session; the visible Vivi transcript remains.{s}",
+                            "Resumed {s}. Restored persisted Copilot history.{s}",
                             .{
                                 success.session.working_directory,
                                 if (success.cleanup_failed)
@@ -2249,17 +2317,30 @@ const ChatUi = struct {
                             },
                         );
                         defer self.allocator.free(message);
-                        try self.transcript.append(
+                        try replacement.append(
                             self.allocator,
                             .status,
                             message,
                         );
+                        try self.updateSelectedModel(success.session.model_id);
+                        self.clearToolFocus();
+                        self.tool_anchor = null;
+                        self.allocator.free(self.cwd);
+                        self.cwd = resumed_cwd;
+                        var previous = self.transcript;
+                        self.transcript = replacement;
+                        previous.deinit(self.allocator);
+                        self.rows_from_tail = 0;
                     },
-                    .failed => |failure| try self.transcript.append(
-                        self.allocator,
-                        .status,
-                        failure.bytes,
-                    ),
+                    .failed => |failure| {
+                        self.clearToolFocus();
+                        self.tool_anchor = null;
+                        try self.transcript.append(
+                            self.allocator,
+                            .status,
+                            failure.bytes,
+                        );
+                    },
                 }
             },
             .assistant_started => {
@@ -2664,6 +2745,18 @@ const ChatUi = struct {
                 });
             },
             .session => |session| {
+                if (session.summary) |summary| {
+                    var segments = [_]vaxis.Segment{.{
+                        .text = summary,
+                        .style = .{ .bg = style.bg, .dim = true },
+                    }};
+                    _ = window.print(&segments, .{
+                        .row_offset = row,
+                        .col_offset = @intCast(@min(window.width / 2, 36)),
+                        .wrap = .none,
+                    });
+                    return;
+                }
                 var age_buffer: [24]u8 = undefined;
                 const age_ms = @max(
                     @as(i64, 0),
@@ -3811,6 +3904,75 @@ test "transcript replaces streamed draft with completed response" {
         "hello",
         transcript.messageAt(0).text.items,
     );
+}
+
+test "resuming replaces the visible transcript with the owned history snapshot" {
+    var ui: ChatUi = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .input = TextInput.init(std.testing.allocator),
+        .cwd = try std.testing.allocator.dupe(u8, "/current"),
+        .phase = .resuming,
+        .rows_from_tail = 3,
+    };
+    defer ui.deinit();
+    try ui.transcript.append(std.testing.allocator, .user, "new chat draft");
+
+    const snapshot_items = try std.testing.allocator.alloc(
+        backend.TranscriptItem,
+        2,
+    );
+    snapshot_items[0] = try backend.TranscriptItem.init(
+        std.testing.allocator,
+        .user,
+        "saved prompt",
+    );
+    snapshot_items[1] = try backend.TranscriptItem.init(
+        std.testing.allocator,
+        .assistant,
+        "saved answer",
+    );
+    var event: backend.ConversationEvent = .{ .session_resume = .{
+        .resumed = .{
+            .session = .{
+                .allocator = std.testing.allocator,
+                .key = .{ .generation = 2, .slot = 0, .scope = .local },
+                .working_directory = try std.testing.allocator.dupe(
+                    u8,
+                    "/saved",
+                ),
+                .model_id = try std.testing.allocator.dupe(
+                    u8,
+                    "copilot/default",
+                ),
+                .last_used_unix_ms = 1,
+                .current = true,
+            },
+            .transcript = .{
+                .allocator = std.testing.allocator,
+                .items = snapshot_items,
+            },
+            .cleanup_failed = false,
+        },
+    } };
+    defer event.deinit();
+
+    _ = try ui.applyConversationEvent(&event);
+    try std.testing.expectEqual(@as(usize, 3), ui.transcript.entries.items.len);
+    try std.testing.expectEqual(Role.user, ui.transcript.messageAt(0).role);
+    try std.testing.expectEqualStrings(
+        "saved prompt",
+        ui.transcript.messageAt(0).text.items,
+    );
+    try std.testing.expectEqualStrings(
+        "saved answer",
+        ui.transcript.messageAt(1).text.items,
+    );
+    try std.testing.expectEqualStrings(
+        "Resumed /saved. Restored persisted Copilot history.",
+        ui.transcript.messageAt(2).text.items,
+    );
+    try std.testing.expectEqual(@as(usize, 0), ui.rows_from_tail);
 }
 
 test "empty assistant completion does not create or clear a draft" {
@@ -5277,6 +5439,18 @@ test "slash command parsing preserves argument suffixes" {
     try std.testing.expectEqualStrings("autopilot thorough", command_input);
     try std.testing.expectEqualStrings("", slashCommandQuery("/").?);
     try std.testing.expect(slashCommandQuery("not-a-command") == null);
+    try std.testing.expectEqual(
+        backend.SessionCatalogRequest.all,
+        resumeCatalogRequest("/resume all"),
+    );
+    try std.testing.expectEqual(
+        backend.SessionCatalogRequest.all,
+        resumeCatalogRequest("/resume --all"),
+    );
+    try std.testing.expectEqual(
+        backend.SessionCatalogRequest.local,
+        resumeCatalogRequest("/resume"),
+    );
 }
 
 test "arrow selection replaces typed ask-user input" {
@@ -5436,21 +5610,31 @@ test "model menu matches provider-qualified identifiers" {
 test "session menu preserves duplicate workspace selection by session key" {
     const entries = [_]MenuEntry{
         .{
-            .identity = .{ .number = 41 },
+            .identity = .{ .resume_key = .{
+                .generation = 1,
+                .slot = 41,
+                .scope = .local,
+            } },
             .key = "/work/project",
             .primary = "project",
             .detail = .{ .session = .{
                 .model_id = "copilot/first",
+                .summary = null,
                 .last_used_unix_ms = 20,
             } },
             .source_index = 0,
         },
         .{
-            .identity = .{ .number = 42 },
+            .identity = .{ .resume_key = .{
+                .generation = 1,
+                .slot = 42,
+                .scope = .local,
+            } },
             .key = "/work/project",
             .primary = "project",
             .detail = .{ .session = .{
                 .model_id = "copilot/second",
+                .summary = null,
                 .last_used_unix_ms = 10,
             } },
             .source_index = 1,
@@ -5476,7 +5660,7 @@ test "session menu labels colliding workspaces with unique path suffixes" {
     const sessions = [_]backend.SessionSummary{
         .{
             .allocator = undefined,
-            .key = 1,
+            .key = .{ .generation = 1, .slot = 0, .scope = .local },
             .working_directory = &first_path,
             .model_id = &first_model,
             .last_used_unix_ms = 20,
@@ -5484,7 +5668,7 @@ test "session menu labels colliding workspaces with unique path suffixes" {
         },
         .{
             .allocator = undefined,
-            .key = 2,
+            .key = .{ .generation = 1, .slot = 1, .scope = .local },
             .working_directory = &second_path,
             .model_id = &second_model,
             .last_used_unix_ms = 10,
@@ -5492,7 +5676,7 @@ test "session menu labels colliding workspaces with unique path suffixes" {
         },
         .{
             .allocator = undefined,
-            .key = 3,
+            .key = .{ .generation = 1, .slot = 2, .scope = .local },
             .working_directory = &unique_path,
             .model_id = &third_model,
             .last_used_unix_ms = 5,
@@ -5527,6 +5711,8 @@ test "session catalog failure closes stale cached finder" {
     ui.menu_mode = .loading_sessions;
     ui.sessions = .{
         .allocator = std.testing.allocator,
+        .scope = .local,
+        .label = try std.testing.allocator.dupe(u8, "Saved Vivi sessions"),
         .sessions = try std.testing.allocator.alloc(
             backend.SessionSummary,
             0,
@@ -5597,6 +5783,11 @@ test "session catalog completion restores ready after finder dismissal" {
     var event: backend.ConversationEvent = .{
         .session_catalog = .{
             .allocator = std.testing.allocator,
+            .scope = .local,
+            .label = try std.testing.allocator.dupe(
+                u8,
+                backend.SessionCatalogScope.local.label(),
+            ),
             .sessions = try std.testing.allocator.alloc(
                 backend.SessionSummary,
                 0,
@@ -5628,6 +5819,11 @@ test "late session catalog preserves stopping phase" {
     var event: backend.ConversationEvent = .{
         .session_catalog = .{
             .allocator = std.testing.allocator,
+            .scope = .local,
+            .label = try std.testing.allocator.dupe(
+                u8,
+                backend.SessionCatalogScope.local.label(),
+            ),
             .sessions = try std.testing.allocator.alloc(
                 backend.SessionSummary,
                 0,

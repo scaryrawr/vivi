@@ -976,9 +976,9 @@ Set TypingSpeed 20ms
 Type "./zig-out/bin/vivi chat --model copilot/default"
 Enter
 Sleep 10s
-Type "Remember the token VIVI_RESUME_MEMORY for this session. Reply exactly SAVED."
+Type "Transform vivi_resume_memory to uppercase and reply only with the transformed token."
 Enter
-Sleep 25s
+Sleep 60s
 Ctrl+C
 Sleep 3s
 Ctrl+C
@@ -992,9 +992,9 @@ Enter
 Sleep 5s
 Enter
 Sleep 8s
-Type "Reply with only the token I asked you to remember earlier."
+Type "Reply with only the transformed token from earlier."
 Enter
-Sleep 25s
+Sleep 60s
 Ctrl+C
 Sleep 3s
 Ctrl+C
@@ -1026,16 +1026,9 @@ chat_session_resume() {
     fi
 
     (
-        cd "$repo_root" &&
-            HOME="$vhs_home" VIVI_KEEP_GIF=1 \
-                vhs "$run_dir/chat-session-resume.tape"
-    )
-    VIVI_KEEP_GIF=1 extract_frames "$1" chat-session-resume
-
-    (
         sleep 10
-        printf 'Remember the token VIVI_RESUME_MEMORY for this session. Reply exactly SAVED.\r'
-        sleep 25
+        printf 'Transform vivi_resume_memory to uppercase and reply only with the transformed token.\r'
+        sleep 60
         printf '\003'
         sleep 3
         printf '\003'
@@ -1052,8 +1045,8 @@ chat_session_resume() {
         sleep 5
         printf '\r'
         sleep 8
-        printf 'Reply with only the token I asked you to remember earlier.\r'
-        sleep 25
+        printf 'Reply with only the transformed token from earlier.\r'
+        sleep 60
         printf '\003'
         sleep 3
         printf '\003'
@@ -1103,12 +1096,59 @@ chat_session_resume() {
         else
             printf 'no\n'
         fi
+        printf 'hydrated_transcript_seen='
+        if grep -Eq 'You[[:space:]]*Transform vivi_resume_memory' \
+            "$run_dir/chat-session-resume-second.normalized.txt"
+        then
+            printf 'yes\n'
+        else
+            printf 'no\n'
+        fi
     } >"$run_dir/chat-session-resume.assertions.txt"
 
     test "$status" -eq 0
     grep -q 'Resumed ' "$run_dir/chat-session-resume-second.normalized.txt"
     grep -Eq 'Vivi[[:space:]]*VIVI_RESUME_MEMORY' \
         "$run_dir/chat-session-resume-second.normalized.txt"
+    grep -Eq 'You[[:space:]]*Transform vivi_resume_memory' \
+        "$run_dir/chat-session-resume-second.normalized.txt"
+
+    (
+        cd "$repo_root" &&
+            HOME="$vhs_home" VIVI_KEEP_GIF=1 \
+                vhs "$run_dir/chat-session-resume.tape"
+    ) &
+    vhs_pid=$!
+    rm -f "$run_dir/chat-session-resume.vhs-timeout"
+    printf '%s\n' "$vhs_pid" >"$run_dir/vhs.pid"
+    (
+        sleep 240
+        if kill -0 "$vhs_pid" 2>/dev/null; then
+            : >"$run_dir/chat-session-resume.vhs-timeout"
+            kill "$vhs_pid"
+        fi
+    ) &
+    vhs_watchdog_pid=$!
+    trap 'kill "$vhs_watchdog_pid" 2>/dev/null || true; kill "$vhs_pid" 2>/dev/null || true; wait "$vhs_watchdog_pid" 2>/dev/null || true; wait "$vhs_pid" 2>/dev/null || true' EXIT INT TERM
+    if wait "$vhs_pid"; then
+        vhs_status=0
+    else
+        vhs_status=$?
+    fi
+    kill "$vhs_watchdog_pid" 2>/dev/null || true
+    wait "$vhs_watchdog_pid" 2>/dev/null || true
+    rm -f "$run_dir/vhs.pid"
+    trap - EXIT INT TERM
+    {
+        printf 'exit=%s\n' "$vhs_status"
+        if test -f "$run_dir/chat-session-resume.vhs-timeout"; then
+            printf 'timed_out=yes\n'
+        else
+            printf 'timed_out=no\n'
+        fi
+    } >"$run_dir/chat-session-resume.vhs-status.txt"
+    test "$vhs_status" -eq 0
+    VIVI_KEEP_GIF=1 extract_frames "$1" chat-session-resume
     test -s "$run_dir/chat-session-resume.contact-sheet.png"
 }
 
