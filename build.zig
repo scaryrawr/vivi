@@ -20,17 +20,14 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    const tree_sitter = b.dependency("tree_sitter", .{
-        .target = target,
-        .optimize = optimize,
-    });
-    const tree_sitter_zig = b.dependency("tree_sitter_zig", .{
-        .target = target,
-        .optimize = optimize,
-        .@"build-shared" = false,
-    });
+    const tree_sitter_core = b.dependency("tree_sitter_core", .{});
     const tree_sitter_bash = b.dependency("tree_sitter_bash", .{});
     const tree_sitter_json = b.dependency("tree_sitter_json", .{});
+    const tree_sitter = b.createModule(.{
+        .root_source_file = b.path("cli/src/tree_sitter.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", "0.1.0");
@@ -79,9 +76,10 @@ pub fn build(b: *std.Build) void {
     cli_module.addImport("vaxis", vaxis.module("vaxis"));
     addClipboard(b, cli_module, target);
     addSyntaxHighlighting(
+        b,
         cli_module,
+        tree_sitter_core,
         tree_sitter,
-        tree_sitter_zig,
         tree_sitter_bash,
         tree_sitter_json,
     );
@@ -124,9 +122,10 @@ pub fn build(b: *std.Build) void {
     chat_tests_module.addImport("vaxis", vaxis.module("vaxis"));
     addClipboard(b, chat_tests_module, target);
     addSyntaxHighlighting(
+        b,
         chat_tests_module,
+        tree_sitter_core,
         tree_sitter,
-        tree_sitter_zig,
         tree_sitter_bash,
         tree_sitter_json,
     );
@@ -154,9 +153,10 @@ pub fn build(b: *std.Build) void {
     tool_tests_module.addImport("vivi_backend", backend);
     tool_tests_module.addImport("vaxis", vaxis.module("vaxis"));
     addSyntaxHighlighting(
+        b,
         tool_tests_module,
+        tree_sitter_core,
         tree_sitter,
-        tree_sitter_zig,
         tree_sitter_bash,
         tree_sitter_json,
     );
@@ -171,9 +171,10 @@ pub fn build(b: *std.Build) void {
     });
     markdown_tests_module.addImport("vaxis", vaxis.module("vaxis"));
     addSyntaxHighlighting(
+        b,
         markdown_tests_module,
+        tree_sitter_core,
         tree_sitter,
-        tree_sitter_zig,
         tree_sitter_bash,
         tree_sitter_json,
     );
@@ -258,17 +259,30 @@ fn addPty(
 }
 
 fn addSyntaxHighlighting(
+    b: *std.Build,
     module: *std.Build.Module,
-    tree_sitter: *std.Build.Dependency,
-    tree_sitter_zig: *std.Build.Dependency,
+    tree_sitter_core: *std.Build.Dependency,
+    tree_sitter: *std.Build.Module,
     tree_sitter_bash: *std.Build.Dependency,
     tree_sitter_json: *std.Build.Dependency,
 ) void {
     const c_flags = &.{"-std=c11"};
-    module.addImport("tree-sitter", tree_sitter.module("tree_sitter"));
+    const core_c_flags = &.{
+        "-std=c11",
+        "-D_POSIX_C_SOURCE=200112L",
+        "-D_DEFAULT_SOURCE",
+    };
+    module.addImport("tree-sitter", tree_sitter);
     module.link_libc = true;
+    module.addIncludePath(tree_sitter_core.path("include"));
+    module.addIncludePath(tree_sitter_core.path("src"));
+    module.addIncludePath(b.path("third_party/tree-sitter-zig"));
     module.addCSourceFile(.{
-        .file = tree_sitter_zig.path("src/parser.c"),
+        .file = tree_sitter_core.path("src/lib.c"),
+        .flags = core_c_flags,
+    });
+    module.addCSourceFile(.{
+        .file = b.path("third_party/tree-sitter-zig/parser.c"),
         .flags = c_flags,
     });
     module.addCSourceFile(.{

@@ -20,6 +20,11 @@ pub const CommandCatalog = conversation.CommandCatalog;
 pub const UserInputRequest = conversation.UserInputRequest;
 pub const ModelCatalog = conversation.ModelCatalog;
 pub const ModelInfo = conversation.ModelInfo;
+pub const ModelSelection = conversation.ModelSelection;
+pub const OwnedModelSelection = conversation.OwnedModelSelection;
+pub const ReasoningEffort = conversation.ReasoningEffort;
+pub const ReasoningEffortSet = conversation.ReasoningEffortSet;
+pub const ReasoningProfile = conversation.ReasoningProfile;
 pub const SessionCatalog = conversation.SessionCatalog;
 pub const SessionSummary = conversation.SessionSummary;
 pub const SessionCatalogRequest = conversation.SessionCatalogRequest;
@@ -47,7 +52,7 @@ pub const OmlxOptions = models.OmlxOptions;
 pub const default_omlx_base_url = models.default_omlx_base_url;
 pub const Settings = settings.Settings;
 pub const loadSettings = settings.load;
-pub const saveDefaultModel = settings.saveDefaultModel;
+pub const saveDefaultSelection = settings.saveDefaultSelection;
 
 pub const Lifecycle = enum(u32) {
     scaffold = 0,
@@ -64,6 +69,7 @@ pub fn scaffoldStatus() Status {
 
 pub const ConversationOptions = struct {
     model: ?[]const u8 = null,
+    reasoning: ?ReasoningEffort = null,
     settings_path: ?[]const u8 = null,
     sessions_directory: ?[]const u8 = null,
     omlx: OmlxOptions = .{},
@@ -71,6 +77,7 @@ pub const ConversationOptions = struct {
 
 const ConversationContext = struct {
     model: ?[]u8,
+    reasoning: ?ReasoningEffort,
     settings_path: ?[]u8,
     sessions_directory: ?[]u8,
     omlx_base_url: []u8,
@@ -101,6 +108,7 @@ const ConversationContext = struct {
 
         context.* = .{
             .model = model,
+            .reasoning = options.reasoning,
             .settings_path = settings_path,
             .sessions_directory = sessions_directory,
             .omlx_base_url = undefined,
@@ -282,11 +290,27 @@ const MinimalCodingAgent = struct {
 
 const hosted_model_id = "copilot/default";
 
-fn effectiveStartupModel(
+fn effectiveStartupSelection(
     model_override: ?[]const u8,
-    persisted_model: ?[]const u8,
-) ?[]const u8 {
-    return model_override orelse persisted_model;
+    reasoning_override: ?ReasoningEffort,
+    persisted: ?ModelSelection,
+) ModelSelection {
+    if (model_override) |model_id| {
+        return .{
+            .model_id = model_id,
+            .reasoning = reasoning_override orelse .off,
+        };
+    }
+    if (persisted) |selection| {
+        return .{
+            .model_id = selection.model_id,
+            .reasoning = reasoning_override orelse selection.reasoning,
+        };
+    }
+    return .{
+        .model_id = hosted_model_id,
+        .reasoning = reasoning_override orelse .off,
+    };
 }
 
 const SameModelAction = enum {
@@ -294,18 +318,23 @@ const SameModelAction = enum {
     update_default,
 };
 
-fn sameModelAction(
-    active_model: []const u8,
-    persisted_model: ?[]const u8,
-    requested_model: []const u8,
+fn sameSelectionAction(
+    active: ModelSelection,
+    persisted: ?ModelSelection,
+    requested: ModelSelection,
     can_persist: bool,
 ) ?SameModelAction {
-    if (!std.mem.eql(u8, active_model, requested_model)) return null;
+    if (!sameSelection(active, requested)) return null;
     if (!can_persist) return .unchanged;
-    if (persisted_model) |persisted| {
-        if (std.mem.eql(u8, persisted, requested_model)) return .unchanged;
+    if (persisted) |value| {
+        if (sameSelection(value, requested)) return .unchanged;
     }
     return .update_default;
+}
+
+fn sameSelection(left: ModelSelection, right: ModelSelection) bool {
+    return left.reasoning == right.reasoning and
+        std.mem.eql(u8, left.model_id, right.model_id);
 }
 
 fn settingsFailure(
@@ -692,6 +721,8 @@ const SessionPlan = union(enum) {
         max_context_window_tokens: u64,
         max_output_tokens: u64,
         supports_vision: bool,
+        reasoning: ReasoningProfile,
+        selected_reasoning: ReasoningEffort,
     },
     omlx: struct {
         id: []u8,
@@ -701,6 +732,8 @@ const SessionPlan = union(enum) {
         max_context_window_tokens: u64,
         max_output_tokens: u64,
         supports_vision: bool,
+        reasoning: ReasoningProfile,
+        selected_reasoning: ReasoningEffort,
     },
 
     fn deinit(self: *SessionPlan, allocator: std.mem.Allocator) void {
@@ -729,6 +762,17 @@ const SessionPlan = union(enum) {
         };
     }
 
+    fn selection(self: *const SessionPlan) ModelSelection {
+        return .{
+            .model_id = self.id(),
+            .reasoning = switch (self.*) {
+                .hosted => .off,
+                .copilot => |value| value.selected_reasoning,
+                .omlx => |value| value.selected_reasoning,
+            },
+        };
+    }
+
     fn info(
         self: *const SessionPlan,
         allocator: std.mem.Allocator,
@@ -743,6 +787,7 @@ const SessionPlan = union(enum) {
                 .max_context_window_tokens = 0,
                 .max_output_tokens = 0,
                 .supports_vision = false,
+                .reasoning = offOnlyReasoningProfile(),
             },
             .copilot => |value| .{
                 .allocator = allocator,
@@ -751,6 +796,7 @@ const SessionPlan = union(enum) {
                 .max_context_window_tokens = value.max_context_window_tokens,
                 .max_output_tokens = value.max_output_tokens,
                 .supports_vision = value.supports_vision,
+                .reasoning = value.reasoning,
             },
             .omlx => |value| .{
                 .allocator = allocator,
@@ -759,6 +805,7 @@ const SessionPlan = union(enum) {
                 .max_context_window_tokens = value.max_context_window_tokens,
                 .max_output_tokens = value.max_output_tokens,
                 .supports_vision = value.supports_vision,
+                .reasoning = value.reasoning,
             },
         };
     }
@@ -768,10 +815,15 @@ fn resolveSessionPlan(
     allocator: std.mem.Allocator,
     client: *copilot.Client,
     io: std.Io,
-    requested_model: ?[]const u8,
+    requested: ModelSelection,
     omlx: OmlxOptions,
 ) !SessionPlan {
-    const model_id = requested_model orelse return .hosted;
+    const model_id = requested.model_id;
+    if (requested.reasoning != .off and
+        std.mem.eql(u8, model_id, hosted_model_id))
+    {
+        return error.UnsupportedReasoningEffort;
+    }
     if (std.mem.eql(u8, model_id, hosted_model_id)) return .hosted;
     if (std.mem.startsWith(u8, model_id, "copilot/")) {
         const provider_model_id = model_id["copilot/".len..];
@@ -782,7 +834,11 @@ fn resolveSessionPlan(
             if (isUsableHostedModel(model) and
                 std.mem.eql(u8, provider_model_id, model.id))
             {
-                return copilotSessionPlan(allocator, model);
+                return copilotSessionPlan(
+                    allocator,
+                    model,
+                    requested.reasoning,
+                );
             }
         }
         return error.SelectedModelUnavailable;
@@ -795,6 +851,9 @@ fn resolveSessionPlan(
     defer catalog.deinit();
     const selected = catalog.find(model_id) orelse
         return error.SelectedModelUnavailable;
+    if (!localReasoningProfile().selectable.contains(requested.reasoning)) {
+        return error.UnsupportedReasoningEffort;
+    }
     const base_url = try std.fmt.allocPrint(
         allocator,
         "{s}/v1",
@@ -818,13 +877,20 @@ fn resolveSessionPlan(
         .max_context_window_tokens = selected.max_context_window_tokens,
         .max_output_tokens = selected.max_output_tokens,
         .supports_vision = selected.supports_vision,
+        .reasoning = localReasoningProfile(),
+        .selected_reasoning = requested.reasoning,
     } };
 }
 
 fn copilotSessionPlan(
     allocator: std.mem.Allocator,
     model: copilot.Model,
+    selected_reasoning: ReasoningEffort,
 ) !SessionPlan {
+    const reasoning = hostedReasoningProfile(model);
+    if (!reasoning.selectable.contains(selected_reasoning)) {
+        return error.UnsupportedReasoningEffort;
+    }
     const id = try std.fmt.allocPrint(
         allocator,
         "copilot/{s}",
@@ -856,7 +922,85 @@ fn copilotSessionPlan(
             value.vision orelse false
         else
             false,
+        .reasoning = reasoning,
+        .selected_reasoning = selected_reasoning,
     } };
+}
+
+fn offOnlyReasoningProfile() ReasoningProfile {
+    return .{
+        .selectable = .{ .off = true },
+        .advertised_default = null,
+    };
+}
+
+fn localReasoningProfile() ReasoningProfile {
+    return .{
+        .selectable = .{
+            .off = true,
+            .low = true,
+            .medium = true,
+            .high = true,
+            .xhigh = true,
+        },
+        .advertised_default = .off,
+    };
+}
+
+fn hostedReasoningProfile(model: copilot.Model) ReasoningProfile {
+    var profile = offOnlyReasoningProfile();
+    if (model.capabilities.supports) |supports| {
+        if (supports.reasoningEffort == false) return profile;
+    }
+    if (model.supportedReasoningEfforts) |efforts| {
+        for (efforts) |value| {
+            if (parseSdkReasoningEffort(value)) |effort| {
+                setReasoningEffort(&profile.selectable, effort);
+            }
+        }
+    }
+    if (model.defaultReasoningEffort) |value| {
+        if (parseSdkReasoningEffort(value)) |effort| {
+            profile.advertised_default = effort;
+        }
+    }
+    return profile;
+}
+
+fn parseSdkReasoningEffort(value: []const u8) ?ReasoningEffort {
+    if (std.mem.eql(u8, value, "low")) return .low;
+    if (std.mem.eql(u8, value, "medium")) return .medium;
+    if (std.mem.eql(u8, value, "high")) return .high;
+    if (std.mem.eql(u8, value, "xhigh")) return .xhigh;
+    if (std.mem.eql(u8, value, "max")) return .max;
+    return null;
+}
+
+fn setReasoningEffort(
+    values: *ReasoningEffortSet,
+    effort: ReasoningEffort,
+) void {
+    switch (effort) {
+        .off => values.off = true,
+        .low => values.low = true,
+        .medium => values.medium = true,
+        .high => values.high = true,
+        .xhigh => values.xhigh = true,
+        .max => values.max = true,
+    }
+}
+
+fn sdkReasoningEffort(
+    effort: ReasoningEffort,
+) ?copilot.ReasoningEffort {
+    return switch (effort) {
+        .off => null,
+        .low => .low,
+        .medium => .medium,
+        .high => .high,
+        .xhigh => .xhigh,
+        .max => .max,
+    };
 }
 
 fn createSdkSession(
@@ -943,6 +1087,7 @@ fn sessionConfigForPlan(
         .copilot => |value| config.model = value.provider_model_id,
         .hosted, .omlx => {},
     }
+    config.reasoning_effort = sdkReasoningEffort(plan.selection().reasoning);
     return config;
 }
 
@@ -984,7 +1129,7 @@ fn buildModelCatalog(
             {
                 continue;
             }
-            var plan = try copilotSessionPlan(allocator, model);
+            var plan = try copilotSessionPlan(allocator, model, .off);
             defer plan.deinit(allocator);
             values[initialized] = try plan.info(allocator);
             initialized += 1;
@@ -999,6 +1144,7 @@ fn buildModelCatalog(
             .max_context_window_tokens = model.max_context_window_tokens,
             .max_output_tokens = model.max_output_tokens,
             .supports_vision = model.supports_vision,
+            .reasoning = localReasoningProfile(),
         };
         errdefer allocator.free(values[initialized].id);
         values[initialized].display_name = try allocator.dupe(
@@ -1009,7 +1155,10 @@ fn buildModelCatalog(
     };
     return .{
         .allocator = allocator,
-        .selected_id = try allocator.dupe(u8, selected.id()),
+        .selected = try conversation.OwnedModelSelection.init(
+            allocator,
+            selected.selection(),
+        ),
         .models = values,
     };
 }
@@ -1187,6 +1336,7 @@ fn buildSessionCatalog(
             },
             .working_directory = working_directory,
             .model_id = try allocator.dupe(u8, record.model_id),
+            .reasoning = record.reasoning,
             .last_used_unix_ms = record.last_used_unix_ms,
             .current = std.mem.eql(u8, active_session_id, record.id),
         };
@@ -1241,6 +1391,7 @@ fn buildBroaderSessionCatalog(
     active_working_directory: []const u8,
     active_session_id: []const u8,
     active_model_id: []const u8,
+    active_reasoning: ReasoningEffort,
     generation: u64,
 ) !struct {
     catalog: conversation.SessionCatalog,
@@ -1312,6 +1463,7 @@ fn buildBroaderSessionCatalog(
                 },
                 .working_directory = working_directory,
                 .model_id = model_id,
+                .reasoning = active_reasoning,
                 .title = null,
                 .summary = null,
                 .last_used_unix_ms = unixMilliseconds(client.io),
@@ -1496,6 +1648,7 @@ fn sessionSummaryFromRecord(
         .key = key,
         .working_directory = working_directory,
         .model_id = try allocator.dupe(u8, record.model_id),
+        .reasoning = record.reasoning,
         .last_used_unix_ms = record.last_used_unix_ms,
         .current = current,
     };
@@ -1512,6 +1665,7 @@ fn recordSessionRecency(
     session_id: []const u8,
     working_directory: []const u8,
     model_id: []const u8,
+    reasoning: ReasoningEffort,
 ) void {
     if (!tracking_enabled.*) return;
     const value = store orelse return;
@@ -1519,6 +1673,7 @@ fn recordSessionRecency(
         session_id,
         working_directory,
         model_id,
+        reasoning,
         unixMilliseconds(worker.io()),
     ) catch |err| {
         tracking_enabled.* = false;
@@ -2146,11 +2301,19 @@ fn runSdkConversation(
         settings.Settings{ .allocator = worker.allocator() };
     defer persisted_settings.deinit();
 
+    const persisted_startup = if (persisted_settings.default_selection) |*value|
+        value.view()
+    else
+        null;
     var active_plan = resolveSessionPlan(
         worker.allocator(),
         &client,
         worker.io(),
-        effectiveStartupModel(context.model, persisted_settings.default_model),
+        effectiveStartupSelection(
+            context.model,
+            context.reasoning,
+            persisted_startup,
+        ),
         omlx_options,
     ) catch |err| {
         worker.closeFailure(.startup, @errorName(err));
@@ -2176,6 +2339,7 @@ fn runSdkConversation(
             session.id,
             active_working_directory,
             active_plan.id(),
+            active_plan.selection().reasoning,
             unixMilliseconds(worker.io()),
         ) catch |err| {
             session.disconnect() catch {};
@@ -2318,6 +2482,7 @@ fn runSdkConversation(
                         active_working_directory,
                         session.id,
                         active_plan.id(),
+                        active_plan.selection().reasoning,
                         resume_generation,
                     ) catch |err| {
                         worker.completeSessionRefreshFailure(
@@ -2417,6 +2582,7 @@ fn runSdkConversation(
                             record.id,
                             record.working_directory,
                             active_plan.id(),
+                            active_plan.selection().reasoning,
                             0,
                         ) catch |err| {
                             worker.closeFailure(.stream, @errorName(err));
@@ -2452,6 +2618,7 @@ fn runSdkConversation(
                             target.id,
                             target.working_directory,
                             target.model_id,
+                            target.reasoning,
                             now,
                         )
                     else
@@ -2498,7 +2665,10 @@ fn runSdkConversation(
                     worker.allocator(),
                     &client,
                     worker.io(),
-                    target.model_id,
+                    .{
+                        .model_id = target.model_id,
+                        .reasoning = target.reasoning,
+                    },
                     omlx_options,
                 ) catch |err| {
                     worker.completeSessionResume(.{
@@ -2627,6 +2797,7 @@ fn runSdkConversation(
                         target.id,
                         target.working_directory,
                         target.model_id,
+                        target.reasoning,
                         now,
                     )
                 else
@@ -2756,6 +2927,7 @@ fn runSdkConversation(
                                 session.id,
                                 active_working_directory,
                                 active_plan.id(),
+                                active_plan.selection().reasoning,
                             );
                             break :command_execution;
                         },
@@ -2846,7 +3018,7 @@ fn runSdkConversation(
                     worker.allocator(),
                     &client,
                     worker.io(),
-                    requested.bytes,
+                    requested.view(),
                     omlx_options,
                 ) catch |err| {
                     worker.completeModelSwitch(.{
@@ -2894,10 +3066,15 @@ fn runSdkConversation(
                     persisted_settings.deinit();
                     persisted_settings = current_settings;
                 }
-                if (sameModelAction(
-                    active_plan.id(),
-                    persisted_settings.default_model,
-                    target_plan.id(),
+                const persisted_selection =
+                    if (persisted_settings.default_selection) |*value|
+                        value.view()
+                    else
+                        null;
+                if (sameSelectionAction(
+                    active_plan.selection(),
+                    persisted_selection,
+                    target_plan.selection(),
                     context.settings_path != null,
                 )) |action| {
                     const info = target_plan.info(worker.allocator()) catch |err| {
@@ -2905,28 +3082,40 @@ fn runSdkConversation(
                         worker.closeFailure(.stream, @errorName(err));
                         return;
                     };
+                    var selected = conversation.OwnedModelSelection.init(
+                        worker.allocator(),
+                        target_plan.selection(),
+                    ) catch |err| {
+                        target_plan.deinit(worker.allocator());
+                        var mutable = info;
+                        mutable.deinit();
+                        worker.closeFailure(.stream, @errorName(err));
+                        return;
+                    };
                     if (action == .update_default) {
                         const path = context.settings_path.?;
-                        const persisted_model = worker.allocator().dupe(
-                            u8,
-                            target_plan.id(),
+                        const persisted_value = selected.clone(
+                            worker.allocator(),
                         ) catch |err| {
                             target_plan.deinit(worker.allocator());
                             var mutable = info;
                             mutable.deinit();
+                            selected.deinit();
                             worker.closeFailure(.stream, @errorName(err));
                             return;
                         };
-                        settings.saveDefaultModel(
+                        settings.saveDefaultSelection(
                             worker.allocator(),
                             worker.io(),
                             path,
-                            target_plan.id(),
+                            target_plan.selection(),
                         ) catch |err| {
-                            worker.allocator().free(persisted_model);
+                            var mutable_persisted = persisted_value;
+                            mutable_persisted.deinit();
                             target_plan.deinit(worker.allocator());
                             var mutable = info;
                             mutable.deinit();
+                            selected.deinit();
                             worker.completeModelSwitch(.{
                                 .failed = settingsFailure(
                                     worker.allocator(),
@@ -2948,16 +3137,22 @@ fn runSdkConversation(
                             };
                             continue;
                         };
-                        if (persisted_settings.default_model) |current| {
-                            worker.allocator().free(current);
+                        if (persisted_settings.default_selection) |*current| {
+                            current.deinit();
                         }
-                        persisted_settings.default_model = persisted_model;
+                        persisted_settings.default_selection = persisted_value;
                     }
                     target_plan.deinit(worker.allocator());
                     worker.completeModelSwitch(if (action == .unchanged)
-                        .{ .unchanged = info }
+                        .{ .unchanged = .{
+                            .model = info,
+                            .selection = selected,
+                        } }
                     else
-                        .{ .default_updated = info }) catch {
+                        .{ .default_updated = .{
+                            .model = info,
+                            .selection = selected,
+                        } }) catch {
                         worker.closeFailure(
                             .stream,
                             "Unable to report the selected model.",
@@ -3006,30 +3201,41 @@ fn runSdkConversation(
                     worker.closeFailure(.stream, @errorName(err));
                     return;
                 };
-                var settings_update: ?settings.DefaultModelUpdate = null;
-                const persisted_model = if (context.settings_path) |path| blk: {
-                    const value = worker.allocator().dupe(
-                        u8,
-                        target_plan.id(),
-                    ) catch |err| {
+                var selected = conversation.OwnedModelSelection.init(
+                    worker.allocator(),
+                    target_plan.selection(),
+                ) catch |err| {
+                    candidate.disconnect() catch {};
+                    target_plan.deinit(worker.allocator());
+                    var mutable = info;
+                    mutable.deinit();
+                    worker.closeFailure(.stream, @errorName(err));
+                    return;
+                };
+                var settings_update: ?settings.DefaultSelectionUpdate = null;
+                const persisted_value = if (context.settings_path) |path| blk: {
+                    const value = selected.clone(worker.allocator()) catch |err| {
                         candidate.disconnect() catch {};
                         target_plan.deinit(worker.allocator());
                         var mutable = info;
                         mutable.deinit();
+                        selected.deinit();
                         worker.closeFailure(.stream, @errorName(err));
                         return;
                     };
-                    settings_update = settings.updateDefaultModel(
+                    settings_update = settings.updateDefaultSelection(
                         worker.allocator(),
                         worker.io(),
                         path,
-                        target_plan.id(),
+                        target_plan.selection(),
                     ) catch |err| {
-                        worker.allocator().free(value);
+                        var mutable_value = value;
+                        mutable_value.deinit();
                         candidate.disconnect() catch {};
                         target_plan.deinit(worker.allocator());
                         var mutable = info;
                         mutable.deinit();
+                        selected.deinit();
                         worker.completeModelSwitch(.{
                             .failed = settingsFailure(
                                 worker.allocator(),
@@ -3059,10 +3265,11 @@ fn runSdkConversation(
                             candidate.id,
                             active_working_directory,
                             target_plan.id(),
+                            target_plan.selection().reasoning,
                             unixMilliseconds(worker.io()),
                         ) catch |err| {
                             if (settings_update) |*update| {
-                                _ = settings.rollbackDefaultModel(
+                                _ = settings.rollbackDefaultSelection(
                                     worker.allocator(),
                                     worker.io(),
                                     context.settings_path.?,
@@ -3074,8 +3281,10 @@ fn runSdkConversation(
                                     target_plan.deinit(worker.allocator());
                                     var mutable = info;
                                     mutable.deinit();
-                                    if (persisted_model) |model| {
-                                        worker.allocator().free(model);
+                                    selected.deinit();
+                                    if (persisted_value) |saved| {
+                                        var mutable_value = saved;
+                                        mutable_value.deinit();
                                     }
                                     worker.closeFailure(
                                         .stream,
@@ -3090,8 +3299,10 @@ fn runSdkConversation(
                             target_plan.deinit(worker.allocator());
                             var mutable = info;
                             mutable.deinit();
-                            if (persisted_model) |model| {
-                                worker.allocator().free(model);
+                            selected.deinit();
+                            if (persisted_value) |saved| {
+                                var mutable_value = saved;
+                                mutable_value.deinit();
                             }
                             worker.completeModelSwitch(.{
                                 .failed = conversation.OwnedText.init(
@@ -3120,11 +3331,11 @@ fn runSdkConversation(
                 session_connected = true;
                 active_plan.deinit(worker.allocator());
                 active_plan = target_plan;
-                if (persisted_model) |value| {
-                    if (persisted_settings.default_model) |current| {
-                        worker.allocator().free(current);
+                if (persisted_value) |value| {
+                    if (persisted_settings.default_selection) |*current| {
+                        current.deinit();
                     }
-                    persisted_settings.default_model = value;
+                    persisted_settings.default_selection = value;
                 }
                 const cleanup_failed = if (previous_session.disconnect())
                     false
@@ -3132,8 +3343,9 @@ fn runSdkConversation(
                     true;
                 worker.completeModelSwitch(.{ .switched = .{
                     .model = info,
+                    .selection = selected,
                     .history = .reset_visible_transcript_preserved,
-                    .default_saved = persisted_model != null,
+                    .default_saved = persisted_value != null,
                     .cleanup_failed = cleanup_failed,
                 } }) catch {
                     worker.closeFailure(
@@ -3188,6 +3400,7 @@ fn runSdkConversation(
                     session.id,
                     active_working_directory,
                     active_plan.id(),
+                    active_plan.selection().reasoning,
                 );
             },
         }
@@ -3247,53 +3460,62 @@ test "automatic hosted model is a selectable no-provider plan" {
     try std.testing.expectEqual(@as(u64, 0), info.max_context_window_tokens);
 }
 
-test "explicit model overrides persisted startup default" {
+test "startup selection keeps model and reasoning coherent" {
+    const persisted = ModelSelection{
+        .model_id = "omlx/persisted",
+        .reasoning = .high,
+    };
+    const overridden = effectiveStartupSelection(
+        "copilot/override",
+        null,
+        persisted,
+    );
     try std.testing.expectEqualStrings(
         "copilot/override",
-        effectiveStartupModel(
-            "copilot/override",
-            "omlx/persisted",
-        ).?,
+        overridden.model_id,
     );
+    try std.testing.expectEqual(ReasoningEffort.off, overridden.reasoning);
+    const inherited = effectiveStartupSelection(null, null, persisted);
     try std.testing.expectEqualStrings(
         "omlx/persisted",
-        effectiveStartupModel(null, "omlx/persisted").?,
+        inherited.model_id,
     );
+    try std.testing.expectEqual(ReasoningEffort.high, inherited.reasoning);
 }
 
 test "active launch override can be promoted to the default" {
     try std.testing.expectEqual(
         SameModelAction.update_default,
-        sameModelAction(
-            "copilot/override",
-            "omlx/persisted",
-            "copilot/override",
+        sameSelectionAction(
+            .{ .model_id = "copilot/override", .reasoning = .high },
+            .{ .model_id = "omlx/persisted", .reasoning = .off },
+            .{ .model_id = "copilot/override", .reasoning = .high },
             true,
         ).?,
     );
     try std.testing.expectEqual(
         SameModelAction.unchanged,
-        sameModelAction(
-            "copilot/override",
-            "copilot/override",
-            "copilot/override",
+        sameSelectionAction(
+            .{ .model_id = "copilot/override", .reasoning = .high },
+            .{ .model_id = "copilot/override", .reasoning = .high },
+            .{ .model_id = "copilot/override", .reasoning = .high },
             true,
         ).?,
     );
     try std.testing.expectEqual(
         SameModelAction.unchanged,
-        sameModelAction(
-            "copilot/override",
+        sameSelectionAction(
+            .{ .model_id = "copilot/override", .reasoning = .high },
             null,
-            "copilot/override",
+            .{ .model_id = "copilot/override", .reasoning = .high },
             false,
         ).?,
     );
     try std.testing.expect(
-        sameModelAction(
-            "copilot/current",
+        sameSelectionAction(
+            .{ .model_id = "copilot/current", .reasoning = .off },
             null,
-            "copilot/other",
+            .{ .model_id = "copilot/other", .reasoning = .off },
             true,
         ) == null,
     );
@@ -3304,17 +3526,23 @@ test "hosted model mapping preserves raw SDK identity and capabilities" {
         .id = "gpt-test",
         .name = "GPT Test",
         .capabilities = .{
-            .supports = .{ .vision = true },
+            .supports = .{ .vision = true, .reasoningEffort = true },
             .limits = .{
                 .max_prompt_tokens = 200_000,
                 .max_output_tokens = 32_000,
             },
         },
+        .supportedReasoningEfforts = &.{ "low", "high", "future" },
+        .defaultReasoningEffort = "high",
         .policy = .{ .state = .enabled },
     };
 
     try std.testing.expect(isUsableHostedModel(sdk_model));
-    var plan = try copilotSessionPlan(std.testing.allocator, sdk_model);
+    var plan = try copilotSessionPlan(
+        std.testing.allocator,
+        sdk_model,
+        .high,
+    );
     defer plan.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("copilot/gpt-test", plan.id());
 
@@ -3324,6 +3552,14 @@ test "hosted model mapping preserves raw SDK identity and capabilities" {
     try std.testing.expectEqual(@as(u64, 200_000), info.max_context_window_tokens);
     try std.testing.expectEqual(@as(u64, 32_000), info.max_output_tokens);
     try std.testing.expect(info.supports_vision);
+    try std.testing.expect(info.reasoning.selectable.off);
+    try std.testing.expect(info.reasoning.selectable.low);
+    try std.testing.expect(info.reasoning.selectable.high);
+    try std.testing.expect(!info.reasoning.selectable.medium);
+    try std.testing.expectEqual(
+        ReasoningEffort.high,
+        info.reasoning.advertised_default.?,
+    );
 
     const config = sessionConfigForPlan(
         "prompt",
@@ -3333,6 +3569,41 @@ test "hosted model mapping preserves raw SDK identity and capabilities" {
     );
     try std.testing.expectEqualStrings("gpt-test", config.model.?);
     try std.testing.expect(config.provider == null);
+    try std.testing.expectEqual(copilot.ReasoningEffort.high, config.reasoning_effort.?);
+}
+
+test "local models expose the product reasoning profile" {
+    const profile = localReasoningProfile();
+    try std.testing.expect(profile.selectable.off);
+    try std.testing.expect(profile.selectable.low);
+    try std.testing.expect(profile.selectable.medium);
+    try std.testing.expect(profile.selectable.high);
+    try std.testing.expect(profile.selectable.xhigh);
+    try std.testing.expect(!profile.selectable.max);
+    try std.testing.expectEqual(
+        ReasoningEffort.off,
+        profile.advertised_default.?,
+    );
+}
+
+test "hosted models without reasoning advertise off only" {
+    const sdk_model: copilot.Model = .{
+        .id = "plain",
+        .name = "Plain",
+        .capabilities = .{
+            .supports = .{ .reasoningEffort = false },
+        },
+        .supportedReasoningEfforts = &.{"high"},
+        .defaultReasoningEffort = "high",
+    };
+    const profile = hostedReasoningProfile(sdk_model);
+    try std.testing.expect(profile.selectable.off);
+    try std.testing.expectEqual(@as(usize, 1), profile.selectable.count());
+    try std.testing.expect(profile.advertised_default == null);
+    try std.testing.expectError(
+        error.UnsupportedReasoningEffort,
+        copilotSessionPlan(std.testing.allocator, sdk_model, .high),
+    );
 }
 
 test "hosted model policy and reserved identities are filtered" {

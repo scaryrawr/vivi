@@ -8,7 +8,8 @@ command without starting Copilot.
 - `help-default` shows help when Vivi has no arguments.
 - `help-explicit` shows the same command list with `--help`.
 - `version` prints the installed Vivi version.
-- `models-listed` identifies OMLX model discovery and token-limit reporting.
+- `models-listed` identifies model discovery, token-limit reporting, and
+  selectable reasoning levels.
 - `chat-listed` identifies `chat` as an interactive streaming command.
 
 ## How to get to it (user POV)

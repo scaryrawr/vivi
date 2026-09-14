@@ -116,23 +116,29 @@ JSON-decoded or rendered as Markdown. Terminal control characters are escaped.
 `vivi models` lists the authenticated Copilot model catalog alongside OMLX
 models discovered from `http://localhost:8000/v1/models/status`. Each row
 reports its qualified ID, context window, maximum output tokens, and vision
-capability when known. Start chat with an explicit hosted model using
-`vivi chat --model copilot/<model-id>` or a discovered local model using
-`vivi chat --model omlx/<model-id>`. Set `OMLX_BASE_URL` and `OMLX_API_KEY` to
+capability when known, plus its selectable reasoning levels and advertised
+default. Start chat with an explicit hosted model using
+`vivi chat --model copilot/<model-id> --reasoning high` or a discovered local
+model using `vivi chat --model omlx/<model-id> --reasoning xhigh`. `off` sends
+no explicit reasoning effort and delegates to the model default. Hosted models
+use the levels advertised by GitHub; local models expose
+`off,low,medium,high,xhigh`. Set `OMLX_BASE_URL` and `OMLX_API_KEY` to
 override the local endpoint and credential. Vivi passes OMLX's
 `max_context_window` and `max_tokens` values into the Copilot SDK provider
 configuration; missing values default to 131072 and 32768 respectively.
-The most recently selected `/model` is stored in `~/.vivi/settings.json` and
-used by new chats. An explicit `--model` overrides that default for one launch
-without changing the stored preference.
+The most recently selected model and reasoning pair is stored in
+`~/.vivi/settings.json` and used by new chats. Explicit `--model` and
+`--reasoning` values override that default for one launch without changing the
+stored preference.
 
 During an active chat, type `/` to open Vivi's slash-command menu. The menu
 refreshes the Copilot SDK command catalog each time it opens so commands from
 late-registering extensions can appear without restarting Vivi. Select
-`/model` to switch among the Copilot default, authenticated Copilot models,
-and discovered OMLX models. Selecting the active model is a no-op. A successful switch keeps the
-visible Vivi transcript but starts a fresh server-side session, so prior turns
-are not part of the replacement model's context. Vivi currently executes
+`/model` to switch among each valid model and reasoning combination for the
+Copilot default, authenticated Copilot models, and discovered OMLX models.
+Selecting the active pair is a no-op. A successful switch keeps the visible
+Vivi transcript but starts a fresh server-side session, so prior turns are not
+part of the replacement model's context. Vivi currently executes
 `/model` with Vivi's model picker. Vivi records sessions it creates under
 `~/.vivi/sessions/`; select `/resume` to filter those private Vivi records by
 workspace and continue one later. Use `/resume all` (or `/resume --all`) to
