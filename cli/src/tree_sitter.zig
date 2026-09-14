@@ -1,3 +1,4 @@
+// Derived from tree-sitter/zig-tree-sitter. See third_party/zig-tree-sitter/LICENSE.
 pub const Language = opaque {};
 
 pub const Parser = opaque {
