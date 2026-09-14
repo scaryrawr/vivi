@@ -1119,6 +1119,7 @@ chat_session_resume() {
                 vhs "$run_dir/chat-session-resume.tape"
     ) &
     vhs_pid=$!
+    rm -f "$run_dir/chat-session-resume.vhs-timeout"
     printf '%s\n' "$vhs_pid" >"$run_dir/vhs.pid"
     (
         sleep 240

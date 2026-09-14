@@ -1625,10 +1625,6 @@ fn emitTypedToolStart(
         "{}",
         .{ .other = .{ .name = tool_name } },
     );
-    errdefer {
-        var mutable = started;
-        mutable.deinit();
-    }
     try worker.toolActivity(.{ .started = started });
     const call_id_copy = try worker.allocator().dupe(u8, call_id);
     errdefer worker.allocator().free(call_id_copy);

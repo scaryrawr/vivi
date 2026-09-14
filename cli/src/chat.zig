@@ -2033,11 +2033,17 @@ const ChatUi = struct {
                     .last_used_unix_ms = session.last_used_unix_ms,
                 } },
                 .current = session.current,
-                .enabled = !session.current,
                 .source_index = index,
             };
         }
         try self.menu.rebuild(self.allocator, entries, query);
+        for (self.menu.matches.items, 0..) |entry_index, match_index| {
+            if (!self.menu.entries.items[entry_index].current) {
+                self.menu.selected_match = match_index;
+                self.menu.first_visible_match = match_index;
+                break;
+            }
+        }
     }
 
     fn activateMenu(
@@ -5777,6 +5783,11 @@ test "session catalog completion restores ready after finder dismissal" {
     var event: backend.ConversationEvent = .{
         .session_catalog = .{
             .allocator = std.testing.allocator,
+            .scope = .local,
+            .label = try std.testing.allocator.dupe(
+                u8,
+                backend.SessionCatalogScope.local.label(),
+            ),
             .sessions = try std.testing.allocator.alloc(
                 backend.SessionSummary,
                 0,
@@ -5808,6 +5819,11 @@ test "late session catalog preserves stopping phase" {
     var event: backend.ConversationEvent = .{
         .session_catalog = .{
             .allocator = std.testing.allocator,
+            .scope = .local,
+            .label = try std.testing.allocator.dupe(
+                u8,
+                backend.SessionCatalogScope.local.label(),
+            ),
             .sessions = try std.testing.allocator.alloc(
                 backend.SessionSummary,
                 0,
