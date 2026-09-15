@@ -37,8 +37,11 @@ jobs:
       - name: Check Zig and CLI
         run: ./scripts/check-zig.sh
 
+      - name: Build Release CLI
+        run: zig build -Doptimize=ReleaseSafe
+
       - name: Upload Linux CLI artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: vivi-linux-x86_64
           path: zig-out/bin/vivi
@@ -62,22 +65,30 @@ jobs:
       - name: Cross-build C API
         run: ./scripts/check-c-api-cross.sh
 
+      - name: Package Release Windows C API
+        run: |
+          zig build install-c-api \
+              -Dtarget=x86_64-windows-msvc \
+              -Dbackend-linkage=dynamic \
+              -Doptimize=ReleaseSafe \
+              --prefix zig-out/cross/windows-x86_64-release
+
       - name: Upload Linux C API artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: vivi-linux-x86_64-capi
           path: zig-out/cross/linux-x86_64/
           if-no-files-found: error
 
       - name: Upload Windows C API artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: vivi-windows-x86_64
-          path: zig-out/cross/windows-x86_64/
+          path: zig-out/cross/windows-x86_64-release/
           if-no-files-found: error
 
       - name: Upload Windows ARM64 C API artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: vivi-windows-aarch64
           path: zig-out/cross/windows-aarch64/
@@ -103,8 +114,11 @@ jobs:
           zig build
           ./scripts/check-macos.sh
 
+      - name: Build Release CLI
+        run: zig build -Doptimize=ReleaseSafe
+
       - name: Upload macOS CLI artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: vivi-macos-arm64
           path: zig-out/bin/vivi
@@ -120,18 +134,18 @@ jobs:
     steps:
       - name: Download Artifacts
         id: download-artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@cc203385981b70ca67e1cc392babf9cc229d5806 # v4.1.9
 
       - name: List Files
         run: ls -R ${{ steps.download-artifacts.outputs.download-path }}
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2 (2.6.2)
         with:
           prerelease: ${{ contains(github.ref, 'rc') }}
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |
-            ${{ steps.download-artifacts.outputs.download-path }}/vivi-linux-x86_64/bin/vivi
-            ${{ steps.download-artifacts.outputs.download-path }}/vivi-macos-arm64/bin/vivi
+            ${{ steps.download-artifacts.outputs.download-path }}/vivi-linux-x86_64/vivi
+            ${{ steps.download-artifacts.outputs.download-path }}/vivi-macos-arm64/vivi
             ${{ steps.download-artifacts.outputs.download-path }}/vivi-windows-x86_64/bin/vivi_backend.dll
             ${{ steps.download-artifacts.outputs.download-path }}/vivi-windows-aarch64/bin/vivi_backend.dll
