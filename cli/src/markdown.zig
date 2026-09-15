@@ -83,6 +83,26 @@ pub const Layout = struct {
         width: u16,
         highlight_cache: ?*HighlightCache,
     ) !Layout {
+        return initCachedRange(
+            allocator,
+            source,
+            window,
+            width,
+            highlight_cache,
+            0,
+            std.math.maxInt(usize),
+        );
+    }
+
+    pub fn initCachedRange(
+        allocator: std.mem.Allocator,
+        source: []const u8,
+        window: vaxis.Window,
+        width: u16,
+        highlight_cache: ?*HighlightCache,
+        first_row: usize,
+        last_row: usize,
+    ) !Layout {
         if (source.len > std.math.maxInt(c.MD_SIZE)) {
             return error.MarkdownInputTooLarge;
         }
@@ -117,7 +137,11 @@ pub const Layout = struct {
 
         var layout = Layout{ .allocator = allocator };
         errdefer layout.deinit();
-        try builder.wrapInto(&layout.lines);
+        try builder.wrapRangeInto(
+            &layout.lines,
+            first_row,
+            last_row,
+        );
         return layout;
     }
 
@@ -528,13 +552,32 @@ const Builder = struct {
         self: *Builder,
         destination: *std.ArrayList(Line),
     ) !void {
+        try self.wrapRangeInto(
+            destination,
+            0,
+            std.math.maxInt(usize),
+        );
+    }
+
+    fn wrapRangeInto(
+        self: *Builder,
+        destination: *std.ArrayList(Line),
+        first_row: usize,
+        last_row: usize,
+    ) !void {
+        var sink = LineSink{
+            .allocator = self.allocator,
+            .destination = destination,
+            .first = first_row,
+            .last = last_row,
+        };
         for (self.lines.items) |*line| {
             try wrapLine(
                 self.allocator,
                 self.window,
                 self.width,
                 line,
-                destination,
+                &sink,
             );
         }
     }
@@ -884,12 +927,30 @@ fn lineWidth(window: vaxis.Window, line: Line) u16 {
     return width;
 }
 
+const LineSink = struct {
+    allocator: std.mem.Allocator,
+    destination: *std.ArrayList(Line),
+    first: usize,
+    last: usize,
+    index: usize = 0,
+
+    fn append(self: *LineSink, line: Line) !void {
+        var owned = line;
+        defer self.index += 1;
+        if (self.index < self.first or self.index >= self.last) {
+            owned.deinit(self.allocator);
+            return;
+        }
+        try self.destination.append(self.allocator, owned);
+    }
+};
+
 fn wrapLine(
     allocator: std.mem.Allocator,
     window: vaxis.Window,
     width: u16,
     source: *const Line,
-    destination: *std.ArrayList(Line),
+    destination: *LineSink,
 ) !void {
     if (source.code) {
         return wrapLineByGrapheme(
@@ -953,7 +1014,7 @@ fn wrapLine(
                 line_width +| word_width > width)
             {
                 removeTrailingWhitespace(&output, allocator);
-                try destination.append(allocator, output);
+                try destination.append(output);
                 output = .{ .code = source.code };
                 const first_grapheme_width = firstGraphemeWidth(window, word);
                 const continuation_indent = fitContinuationIndent(
@@ -984,7 +1045,7 @@ fn wrapLine(
         }
     }
     removeTrailingWhitespace(&output, allocator);
-    try destination.append(allocator, output);
+    try destination.append(output);
 }
 
 fn wrapLineByGrapheme(
@@ -992,7 +1053,7 @@ fn wrapLineByGrapheme(
     window: vaxis.Window,
     width: u16,
     source: *const Line,
-    destination: *std.ArrayList(Line),
+    destination: *LineSink,
 ) !void {
     var output: Line = .{ .code = true };
     errdefer output.deinit(allocator);
@@ -1012,7 +1073,7 @@ fn wrapLineByGrapheme(
             segment.uri,
         );
     }
-    try destination.append(allocator, output);
+    try destination.append(output);
 }
 
 fn appendGraphemeWrapped(
@@ -1022,7 +1083,7 @@ fn appendGraphemeWrapped(
     output: *Line,
     line_width: *u16,
     continuation_indent: u16,
-    destination: *std.ArrayList(Line),
+    destination: *LineSink,
     text: []const u8,
     style: Style,
     uri: ?[]const u8,
@@ -1041,7 +1102,7 @@ fn appendGraphemeWrapped(
                     uri,
                 );
             }
-            try destination.append(allocator, output.*);
+            try destination.append(output.*);
             output.* = .{ .code = output.code };
             const fitted_indent = fitContinuationIndent(
                 width,
@@ -1862,6 +1923,27 @@ test "prose wraps at word boundaries" {
     try appendLayoutText(std.testing.allocator, &rendered, &layout);
 
     try std.testing.expectEqualStrings("alpha beta\ngamma", rendered.items);
+}
+
+test "range layout retains only requested wrapped rows" {
+    var screen: vaxis.Screen = undefined;
+    const window = testWindow(&screen, 8);
+    var layout = try Layout.initCachedRange(
+        std.testing.allocator,
+        "alpha beta gamma delta epsilon",
+        window,
+        8,
+        null,
+        1,
+        3,
+    );
+    defer layout.deinit();
+    var rendered: std.ArrayList(u8) = .empty;
+    defer rendered.deinit(std.testing.allocator);
+    try appendLayoutText(std.testing.allocator, &rendered, &layout);
+
+    try std.testing.expectEqual(@as(usize, 2), layout.lines.items.len);
+    try std.testing.expectEqualStrings("beta\ngamma", rendered.items);
 }
 
 test "lists blockquotes tasks and code have readable structure" {

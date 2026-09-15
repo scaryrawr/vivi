@@ -1313,25 +1313,18 @@ const Projection = struct {
             }
             projection.last_visible_entry = entry_index;
 
-            var entry_projection: Projection = .{};
-            defer entry_projection.deinit(allocator);
-            try entry_projection.appendEntry(
+            const local_first = first_row -| entry_start;
+            const local_last = @min(
+                last_row -| entry_start,
+                layout.entry_rows[entry_index],
+            );
+            try projection.appendEntryRange(
                 allocator,
                 entry,
                 entry_index,
                 window,
-                true,
                 spool,
                 layout.entry_show_role[entry_index],
-            );
-            const local_first = first_row -| entry_start;
-            const local_last = @min(
-                last_row -| entry_start,
-                entry_projection.lines.items.len,
-            );
-            try projection.appendRange(
-                allocator,
-                &entry_projection,
                 local_first,
                 local_last,
             );
@@ -1512,6 +1505,95 @@ const Projection = struct {
         }
     }
 
+    fn appendEntryRange(
+        self: *Projection,
+        allocator: std.mem.Allocator,
+        entry: *Entry,
+        entry_index: usize,
+        window: vaxis.Window,
+        spool: ?*TranscriptSpool,
+        show_role: bool,
+        first: usize,
+        last: usize,
+    ) !void {
+        if (entry.* == .tool) {
+            var full: Projection = .{};
+            defer full.deinit(allocator);
+            try full.appendEntry(
+                allocator,
+                entry,
+                entry_index,
+                window,
+                true,
+                spool,
+                show_role,
+            );
+            return self.appendRange(
+                allocator,
+                &full,
+                first,
+                @min(last, full.lines.items.len),
+            );
+        }
+
+        try entry.message.ensureResident(allocator, spool);
+        const message = &entry.message;
+        switch (message.role) {
+            .reasoning, .assistant => {
+                const body_offset: usize = @intFromBool(show_role);
+                if (show_role and first == 0 and last > 0) {
+                    try self.lines.append(allocator, .{
+                        .kind = .role,
+                        .entry_index = entry_index,
+                    });
+                }
+                if (last > body_offset) {
+                    try self.appendMarkdownRange(
+                        allocator,
+                        entry_index,
+                        message.text.items,
+                        window,
+                        @max(window.width -| 2, 1),
+                        &message.highlight_cache,
+                        .markdown,
+                        first -| body_offset,
+                        last - body_offset,
+                    );
+                }
+            },
+            .user, .queued, .question => {
+                if (first == 0 and last > 0) {
+                    try self.lines.append(allocator, .{
+                        .kind = .role,
+                        .entry_index = entry_index,
+                    });
+                }
+                if (last > 1) {
+                    try self.appendWrappedRange(
+                        allocator,
+                        entry_index,
+                        message.text.items,
+                        window,
+                        .body,
+                        2,
+                        first -| 1,
+                        last - 1,
+                    );
+                }
+            },
+            .status => try self.appendWrappedRange(
+                allocator,
+                entry_index,
+                message.text.items,
+                window,
+                .status,
+                2,
+                first,
+                last,
+            ),
+        }
+    }
+
     fn appendRange(
         self: *Projection,
         allocator: std.mem.Allocator,
@@ -1546,12 +1628,39 @@ const Projection = struct {
         cache: ?*markdown.HighlightCache,
         kind: LineKind,
     ) !void {
-        var layout = try markdown.Layout.initCached(
+        try self.appendMarkdownRange(
+            allocator,
+            entry_index,
+            text,
+            window,
+            width,
+            cache,
+            kind,
+            0,
+            std.math.maxInt(usize),
+        );
+    }
+
+    fn appendMarkdownRange(
+        self: *Projection,
+        allocator: std.mem.Allocator,
+        entry_index: usize,
+        text: []const u8,
+        window: vaxis.Window,
+        width: u16,
+        cache: ?*markdown.HighlightCache,
+        kind: LineKind,
+        first: usize,
+        last: usize,
+    ) !void {
+        var layout = try markdown.Layout.initCachedRange(
             allocator,
             text,
             window,
             width,
             cache,
+            first,
+            last,
         );
         defer layout.deinit();
         for (layout.lines.items) |*line| {
@@ -1576,20 +1685,47 @@ const Projection = struct {
         kind: LineKind,
         indent: u16,
     ) !void {
+        try self.appendWrappedRange(
+            allocator,
+            entry_index,
+            text,
+            window,
+            kind,
+            indent,
+            0,
+            std.math.maxInt(usize),
+        );
+    }
+
+    fn appendWrappedRange(
+        self: *Projection,
+        allocator: std.mem.Allocator,
+        entry_index: usize,
+        text: []const u8,
+        window: vaxis.Window,
+        kind: LineKind,
+        indent: u16,
+        first: usize,
+        last: usize,
+    ) !void {
         const available_width = @max(window.width -| indent, 1);
         var iterator = vaxis.unicode.graphemeIterator(text);
         var line_start: usize = 0;
         var line_width: u16 = 0;
+        var row: usize = 0;
 
         while (iterator.next()) |grapheme| {
             const bytes = grapheme.bytes(text);
             if (std.mem.eql(u8, bytes, "\n")) {
-                try self.lines.append(allocator, .{
-                    .kind = kind,
-                    .entry_index = entry_index,
-                    .start = line_start,
-                    .end = grapheme.start,
-                });
+                if (row >= first and row < last) {
+                    try self.lines.append(allocator, .{
+                        .kind = kind,
+                        .entry_index = entry_index,
+                        .start = line_start,
+                        .end = grapheme.start,
+                    });
+                }
+                row += 1;
                 line_start = grapheme.start + grapheme.len;
                 line_width = 0;
                 continue;
@@ -1597,24 +1733,29 @@ const Projection = struct {
 
             const grapheme_width = window.gwidth(bytes);
             if (line_width > 0 and line_width + grapheme_width > available_width) {
-                try self.lines.append(allocator, .{
-                    .kind = kind,
-                    .entry_index = entry_index,
-                    .start = line_start,
-                    .end = grapheme.start,
-                });
+                if (row >= first and row < last) {
+                    try self.lines.append(allocator, .{
+                        .kind = kind,
+                        .entry_index = entry_index,
+                        .start = line_start,
+                        .end = grapheme.start,
+                    });
+                }
+                row += 1;
                 line_start = grapheme.start;
                 line_width = 0;
             }
             line_width +|= grapheme_width;
         }
 
-        try self.lines.append(allocator, .{
-            .kind = kind,
-            .entry_index = entry_index,
-            .start = line_start,
-            .end = text.len,
-        });
+        if (row >= first and row < last) {
+            try self.lines.append(allocator, .{
+                .kind = kind,
+                .entry_index = entry_index,
+                .start = line_start,
+                .end = text.len,
+            });
+        }
     }
 };
 
@@ -1949,7 +2090,7 @@ const ChatUi = struct {
     }
 
     fn deinit(self: *ChatUi) void {
-        if (self.transcript_spool) |*spool| spool.deinit();
+        self.deinitTranscriptSpool();
         if (self.pasted_images) |*store| store.deinit();
         self.tool_hits.deinit(self.allocator);
         self.menu.deinit(self.allocator);
@@ -1962,6 +2103,13 @@ const ChatUi = struct {
         self.transcript.deinit(self.allocator);
         self.input.deinit();
         self.* = undefined;
+    }
+
+    fn deinitTranscriptSpool(self: *ChatUi) void {
+        if (self.transcript_spool) |*spool| {
+            spool.deinit();
+            self.transcript_spool = null;
+        }
     }
 
     fn handleKey(
@@ -4025,6 +4173,18 @@ fn handleResizeBatch(
     return .{ .winsize = latest };
 }
 
+fn nextAppEvent(
+    loop: *vaxis.Loop(AppEvent),
+    pending: ?AppEvent,
+    conversation_backlog: bool,
+) !AppEvent {
+    if (pending) |event| return event;
+    if (conversation_backlog) {
+        return try loop.tryEvent() orelse .conversation_wake;
+    }
+    return loop.nextEvent();
+}
+
 const max_conversation_events_per_batch = 32;
 const stream_updates_before_overflow_redraw = 8;
 
@@ -4145,12 +4305,19 @@ const App = struct {
         try self.render();
 
         var pending: ?AppEvent = null;
+        var conversation_backlog = false;
         while (!self.closed) {
-            const event = pending orelse try self.loop.nextEvent();
+            const backlog_before_event = conversation_backlog;
+            const event = try nextAppEvent(
+                &self.loop,
+                pending,
+                conversation_backlog,
+            );
             pending = null;
+            conversation_backlog = false;
             var redraw = true;
             var composer_redraw = false;
-            var drain_conversation = false;
+            var drain_conversation = backlog_before_event;
             switch (event) {
                 .key_press => |key| {
                     if (!self.ui.bracketed_paste and
@@ -4203,8 +4370,7 @@ const App = struct {
                 else
                     .{ .redraw = false, .continue_drain = false };
             if (conversation_drain.continue_drain) {
-                std.debug.assert(pending == null);
-                pending = .conversation_wake;
+                conversation_backlog = true;
             }
             if (!self.closed) {
                 if (conversation_drain.redraw or
@@ -4329,6 +4495,7 @@ const App = struct {
     fn hardExit(self: *App) noreturn {
         self.loop.stop();
         self.releaseImages();
+        self.ui.deinitTranscriptSpool();
         if (self.rendered_projection) |*projection| {
             projection.deinit(self.allocator);
         }
@@ -4663,6 +4830,29 @@ test "completed message text pages to disk and reloads" {
     try std.testing.expectEqual(spool_length, spool.length);
 }
 
+test "transcript spool deinit removes its backing file" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try temporary.dir.realPath(
+        std.testing.io,
+        &path_buffer,
+    );
+    var spool = try TranscriptSpool.init(
+        std.testing.allocator,
+        std.testing.io,
+        path_buffer[0..path_len],
+    );
+    const path = try std.testing.allocator.dupe(u8, spool.path);
+    defer std.testing.allocator.free(path);
+
+    spool.deinit();
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().openFile(std.testing.io, path, .{}),
+    );
+}
+
 test "viewport projection retains only visible transcript rows" {
     var transcript: Transcript = .{};
     defer transcript.deinit(std.testing.allocator);
@@ -4735,6 +4925,63 @@ test "viewport projection retains only visible transcript rows" {
     try std.testing.expect(transcript.messageAt(active).layout_valid);
     try transcript.appendDelta(std.testing.allocator, " update");
     try std.testing.expect(!transcript.messageAt(active).layout_valid);
+}
+
+test "single long message materializes only its viewport range" {
+    var transcript: Transcript = .{};
+    defer transcript.deinit(std.testing.allocator);
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(std.testing.allocator);
+    for (0..200) |index| {
+        try text.writer(std.testing.allocator).print(
+            "row-{d} contains enough words to wrap\n",
+            .{index},
+        );
+    }
+    try transcript.append(std.testing.allocator, .assistant, text.items);
+
+    var screen = try vaxis.Screen.init(std.testing.allocator, .{
+        .rows = 5,
+        .cols = 18,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(std.testing.allocator);
+    const window: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = screen.width,
+        .height = screen.height,
+        .screen = &screen,
+    };
+    var layout = try TranscriptLayout.measure(
+        std.testing.allocator,
+        &transcript,
+        window,
+        null,
+    );
+    defer layout.deinit(std.testing.allocator);
+    var projection = try Projection.buildViewport(
+        std.testing.allocator,
+        &transcript,
+        &layout,
+        window,
+        50,
+        null,
+    );
+    defer projection.deinit(std.testing.allocator);
+
+    try std.testing.expect(layout.entry_rows[0] > 100);
+    try std.testing.expectEqual(
+        @as(usize, window.height),
+        projection.lines.items.len,
+    );
+    try std.testing.expectEqual(
+        @as(usize, window.height),
+        projection.markdown_lines.items.len,
+    );
 }
 
 test "offscreen messages page out and reload when scrolled into view" {
@@ -5843,6 +6090,23 @@ test "resize batch ignores transient zero dimensions" {
     try loop.postEvent(.{ .winsize = zero });
     const batch = try handleResizeBatch(&loop, zero);
     try std.testing.expectEqual(null, batch.winsize);
+}
+
+test "conversation backlog yields to queued terminal input" {
+    var tty: vaxis.Tty = undefined;
+    var vx: vaxis.Vaxis = undefined;
+    var loop = vaxis.Loop(AppEvent).init(std.testing.io, &tty, &vx);
+    const key: AppEvent = .{ .key_press = .{ .codepoint = 'x' } };
+    try loop.postEvent(key);
+
+    try std.testing.expectEqualDeep(
+        key,
+        try nextAppEvent(&loop, null, true),
+    );
+    try std.testing.expectEqualDeep(
+        AppEvent.conversation_wake,
+        try nextAppEvent(&loop, null, true),
+    );
 }
 
 test "mouse wheel outside the transcript does not scroll" {
