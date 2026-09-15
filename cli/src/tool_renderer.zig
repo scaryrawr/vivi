@@ -117,6 +117,10 @@ pub fn renderOutput(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     return renderSafeText(allocator, text, false, true);
 }
 
+pub fn renderSource(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    return renderSafeText(allocator, text, true, true);
+}
+
 pub fn renderMarkdown(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     return renderSafeText(allocator, text, true, true);
 }
@@ -301,6 +305,18 @@ test "tool output strips terminal sequences without hiding malformed controls" {
     );
     defer std.testing.allocator.free(rendered);
     try std.testing.expectEqualStrings("name v8.0.1 link red   \\x1b[31 \\x1bPbad\\x07", rendered);
+}
+
+test "source output normalizes line endings before syntax parsing" {
+    const rendered = try renderSource(
+        std.testing.allocator,
+        "def greet():\r\n\treturn \"hi\"\r\n",
+    );
+    defer std.testing.allocator.free(rendered);
+    try std.testing.expectEqualStrings(
+        "def greet():\n\treturn \"hi\"\n",
+        rendered,
+    );
 }
 
 test "malformed terminal strings are escaped without overlapping scans" {

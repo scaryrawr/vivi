@@ -65,10 +65,11 @@ pub const OutputPlan = union(enum) {
         }
         return switch (self) {
             .markdown => tool_renderer.renderMarkdown(allocator, raw),
-            .literal, .syntax, .syntax_fragment => tool_renderer.renderOutput(
+            .syntax, .syntax_fragment => tool_renderer.renderSource(
                 allocator,
                 raw,
             ),
+            .literal => tool_renderer.renderOutput(allocator, raw),
         };
     }
 
@@ -266,7 +267,12 @@ fn inferGit(words: []const []const u8) ?OutputPlan {
 fn planForPath(path: []const u8, complete: bool) OutputPlan {
     if (isMarkdownPath(path)) return .markdown;
     if (highlight.Language.fromPath(path)) |language| {
-        return if (complete)
+        const require_complete = complete and
+            !std.ascii.eqlIgnoreCase(
+                std.fs.path.extension(path),
+                ".jsonl",
+            );
+        return if (require_complete)
             .{ .syntax = language }
         else
             .{ .syntax_fragment = language };
@@ -289,6 +295,7 @@ test "output plans classify only static homogeneous commands" {
     }{
         .{ .command = "cat .github/workflows/ci.yml", .expected = .{ .syntax = .yaml } },
         .{ .command = "cat -- 'workflow.yaml'", .expected = .{ .syntax = .yaml } },
+        .{ .command = "cat records.jsonl", .expected = .{ .syntax_fragment = .json } },
         .{ .command = "git diff", .expected = .{ .syntax = .diff } },
         .{ .command = "git diff --cached", .expected = .{ .syntax = .diff } },
         .{ .command = "git --no-pager diff -- cli/src/chat.zig", .expected = .{ .syntax = .diff } },
@@ -378,4 +385,61 @@ test "partial reads use tolerant fragment highlighting" {
         }
     }
     return error.ExpectedReturnKeyword;
+}
+
+test "source rendering normalizes CRLF before strict parsing" {
+    const plan: OutputPlan = .{ .syntax = .python };
+    const display = try plan.render(
+        std.testing.allocator,
+        .succeeded,
+        "def greet():\r\n    return \"hi\"\r\n",
+    );
+    defer std.testing.allocator.free(display);
+    try std.testing.expectEqualStrings(
+        "def greet():\n    return \"hi\"\n",
+        display,
+    );
+
+    const highlighted = try plan.spans(
+        std.testing.allocator,
+        .succeeded,
+        display,
+    );
+    defer std.testing.allocator.free(highlighted);
+    for (highlighted) |span| {
+        if (span.token == .function and
+            std.mem.eql(u8, display[span.start..span.end], "greet"))
+        {
+            return;
+        }
+    }
+    return error.ExpectedFunctionName;
+}
+
+test "JSONL uses tolerant highlighting for multiple records" {
+    const plan = try OutputPlan.fromInvocation(
+        std.testing.allocator,
+        .{ .read = .{
+            .path = "records.jsonl",
+            .offset = null,
+            .limit = null,
+        } },
+    );
+    try std.testing.expectEqual(
+        OutputPlan{ .syntax_fragment = .json },
+        plan,
+    );
+
+    const source = "{\"first\": true}\n{\"second\": false}\n";
+    const highlighted = try plan.spans(
+        std.testing.allocator,
+        .succeeded,
+        source,
+    );
+    defer std.testing.allocator.free(highlighted);
+    var properties: usize = 0;
+    for (highlighted) |span| {
+        if (span.token == .property) properties += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), properties);
 }

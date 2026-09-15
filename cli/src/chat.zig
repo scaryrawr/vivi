@@ -5050,7 +5050,7 @@ test "bash output plans highlight YAML and diff through the ToolEntry lifecycle"
     defer yaml_finished.deinit();
     try yaml_entry.finish(std.testing.allocator, &yaml_finished);
     try std.testing.expectEqualStrings(
-        "name: CI\\x0d\nready: true\nunsafe: \\xff\\xe2\\x80\\xae\n",
+        "name: CI\nready: true\nunsafe: \\xff\\xe2\\x80\\xae\n",
         yaml_entry.output_display.?,
     );
     try std.testing.expect(yaml_entry.output_highlights == null);
