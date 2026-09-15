@@ -470,7 +470,13 @@ pub fn spans(
     language: Language,
     source: []const u8,
 ) ![]Span {
-    return (try parseSpans(allocator, language, source, false)) orelse
+    return (try parseSpans(
+        allocator,
+        language,
+        source,
+        false,
+        false,
+    )) orelse
         unreachable;
 }
 
@@ -488,7 +494,15 @@ pub fn completeSpansChecked(
     language: Language,
     source: []const u8,
 ) !?[]Span {
-    return parseSpans(allocator, language, source, true);
+    return parseSpans(allocator, language, source, true, true);
+}
+
+pub fn completeDocumentSpansChecked(
+    allocator: std.mem.Allocator,
+    language: Language,
+    source: []const u8,
+) !?[]Span {
+    return parseSpans(allocator, language, source, true, false);
 }
 
 fn parseSpans(
@@ -496,6 +510,7 @@ fn parseSpans(
     language: Language,
     source: []const u8,
     require_complete: bool,
+    require_signature: bool,
 ) !?[]Span {
     if (require_complete and source.len > max_source_bytes) {
         return null;
@@ -524,7 +539,12 @@ fn parseSpans(
                 root,
                 null,
             ) or
-            !try satisfiesRequirement(definition, bounded_source, root)))
+            (require_signature and
+                !try satisfiesRequirement(
+                    definition,
+                    bounded_source,
+                    root,
+                ))))
     {
         return null;
     }

@@ -1518,7 +1518,10 @@ const Projection = struct {
     ) !usize {
         if (entry.* == .tool and
             entry.tool.expanded and
-            std.meta.activeTag(entry.tool.output_plan) == .syntax)
+            switch (entry.tool.output_plan) {
+                .syntax, .syntax_document => true,
+                else => false,
+            })
         {
             try entry.tool.ensureOutputHighlights(allocators.persistent);
         }

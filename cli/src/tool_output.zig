@@ -13,6 +13,7 @@ pub const OutputPlan = union(enum) {
     literal,
     markdown,
     syntax: highlight.Language,
+    syntax_document: highlight.Language,
     syntax_fragment: highlight.Language,
 
     pub fn fromInvocation(
@@ -65,7 +66,7 @@ pub const OutputPlan = union(enum) {
         }
         return switch (self) {
             .markdown => tool_renderer.renderMarkdown(allocator, raw),
-            .syntax, .syntax_fragment => tool_renderer.renderSource(
+            .syntax, .syntax_document, .syntax_fragment => tool_renderer.renderSource(
                 allocator,
                 raw,
             ),
@@ -84,6 +85,11 @@ pub const OutputPlan = union(enum) {
         }
         return switch (self) {
             .syntax => |language| highlight.completeSpansChecked(
+                allocator,
+                language,
+                display,
+            ),
+            .syntax_document => |language| highlight.completeDocumentSpansChecked(
                 allocator,
                 language,
                 display,
@@ -272,6 +278,9 @@ fn planForPath(path: []const u8, complete: bool) OutputPlan {
                 std.fs.path.extension(path),
                 ".jsonl",
             );
+        if (require_complete and language == .diff) {
+            return .{ .syntax_document = language };
+        }
         return if (require_complete)
             .{ .syntax = language }
         else
@@ -296,6 +305,7 @@ test "output plans classify only static homogeneous commands" {
         .{ .command = "cat .github/workflows/ci.yml", .expected = .{ .syntax = .yaml } },
         .{ .command = "cat -- 'workflow.yaml'", .expected = .{ .syntax = .yaml } },
         .{ .command = "cat records.jsonl", .expected = .{ .syntax_fragment = .json } },
+        .{ .command = "cat changes.patch", .expected = .{ .syntax_document = .diff } },
         .{ .command = "git diff", .expected = .{ .syntax = .diff } },
         .{ .command = "git diff --cached", .expected = .{ .syntax = .diff } },
         .{ .command = "git --no-pager diff -- cli/src/chat.zig", .expected = .{ .syntax = .diff } },
@@ -442,4 +452,43 @@ test "JSONL uses tolerant highlighting for multiple records" {
         if (span.token == .property) properties += 1;
     }
     try std.testing.expectEqual(@as(usize, 2), properties);
+}
+
+test "standalone patch files use document diff validation" {
+    const plan = try OutputPlan.fromInvocation(
+        std.testing.allocator,
+        .{ .read = .{
+            .path = "changes.patch",
+            .offset = null,
+            .limit = null,
+        } },
+    );
+    try std.testing.expectEqual(
+        OutputPlan{ .syntax_document = .diff },
+        plan,
+    );
+
+    const source =
+        \\--- a/file.txt
+        \\+++ b/file.txt
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+    ++ "\n";
+    const highlighted = try plan.spans(
+        std.testing.allocator,
+        .succeeded,
+        source,
+    ) orelse return error.ExpectedValidSyntax;
+    defer std.testing.allocator.free(highlighted);
+    var saw_inserted = false;
+    var saw_deleted = false;
+    for (highlighted) |span| {
+        const text = source[span.start..span.end];
+        saw_inserted = saw_inserted or
+            (span.token == .inserted and std.mem.eql(u8, text, "+new"));
+        saw_deleted = saw_deleted or
+            (span.token == .deleted and std.mem.eql(u8, text, "-old"));
+    }
+    try std.testing.expect(saw_inserted and saw_deleted);
 }

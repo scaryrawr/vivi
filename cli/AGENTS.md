@@ -20,6 +20,9 @@ parsing rejects the source, re-render the raw payload with `renderOutput`;
 valid syntax with zero captures is not a rejection. Complete strict validation
 and any fallback before measuring expanded tool output so layout ranges match
 the final display buffer in the current frame.
+Keep producer-signature checks on command-derived output plans. Path-derived
+`.diff` and `.patch` documents are strict syntax, but must not require a
+`diff --git` header.
 
 When adding a Tree-sitter grammar in `build.zig`, compile its generated
 `parser.c` and every generated external scanner source shipped by that grammar.
