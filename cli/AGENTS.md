@@ -15,7 +15,9 @@ Sanitize tool output with `tool_renderer.renderOutput`, `renderSource`, or
 line endings so syntax spans index `output_display`, not the raw payload.
 Treat `read` results with an `offset` or `limit` as fragments and use tolerant
 highlighting. Reserve complete parsing for full-file or homogeneous command
-output, and reject oversized complete sources before truncation.
+output, and reject oversized complete sources before truncation. If complete
+parsing rejects the source, re-render the raw payload with `renderOutput`;
+valid syntax with zero captures is not a rejection.
 
 When adding a Tree-sitter grammar in `build.zig`, compile its generated
 `parser.c` and every generated external scanner source shipped by that grammar.

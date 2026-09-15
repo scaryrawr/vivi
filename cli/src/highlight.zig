@@ -470,7 +470,8 @@ pub fn spans(
     language: Language,
     source: []const u8,
 ) ![]Span {
-    return parseSpans(allocator, language, source, false);
+    return (try parseSpans(allocator, language, source, false)) orelse
+        unreachable;
 }
 
 pub fn completeSpans(
@@ -478,6 +479,15 @@ pub fn completeSpans(
     language: Language,
     source: []const u8,
 ) ![]Span {
+    return (try completeSpansChecked(allocator, language, source)) orelse
+        allocator.alloc(Span, 0);
+}
+
+pub fn completeSpansChecked(
+    allocator: std.mem.Allocator,
+    language: Language,
+    source: []const u8,
+) !?[]Span {
     return parseSpans(allocator, language, source, true);
 }
 
@@ -486,21 +496,23 @@ fn parseSpans(
     language: Language,
     source: []const u8,
     require_complete: bool,
-) ![]Span {
+) !?[]Span {
     if (require_complete and source.len > max_source_bytes) {
-        return allocator.alloc(Span, 0);
+        return null;
     }
     const bounded_source = source[0..@min(source.len, max_source_bytes)];
     if (bounded_source.len == 0) {
-        return allocator.alloc(Span, 0);
+        return try allocator.alloc(Span, 0);
     }
 
     const definition = language.definition();
     const parser = ts.Parser.create();
     defer parser.destroy();
     try parser.setLanguage(definition.language);
-    const tree = parser.parseString(bounded_source, null) orelse
-        return allocator.alloc(Span, 0);
+    const tree = parser.parseString(bounded_source, null) orelse {
+        if (require_complete) return null;
+        return try allocator.alloc(Span, 0);
+    };
     defer tree.destroy();
     const root = tree.rootNode();
     if (require_complete and
@@ -514,7 +526,7 @@ fn parseSpans(
             ) or
             !try satisfiesRequirement(definition, bounded_source, root)))
     {
-        return allocator.alloc(Span, 0);
+        return null;
     }
 
     var error_offset: u32 = 0;
@@ -562,7 +574,7 @@ fn parseSpans(
         });
         start = end;
     }
-    return result.toOwnedSlice(allocator);
+    return try result.toOwnedSlice(allocator);
 }
 
 fn satisfiesRequirement(

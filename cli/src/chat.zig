@@ -461,11 +461,24 @@ const ToolEntry = struct {
         if (self.output_highlights != null) return;
         const output = self.output_display orelse return;
         const completion = self.completion orelse return;
-        self.output_highlights = try self.output_plan.spans(
+        const spans = try self.output_plan.spans(
             allocator,
             completionOutcome(completion),
             output,
         );
+        if (spans) |highlighted| {
+            self.output_highlights = highlighted;
+            return;
+        }
+
+        const raw = self.output orelse return;
+        const literal = try tool_renderer.renderOutput(allocator, raw);
+        errdefer allocator.free(literal);
+        const empty = try allocator.alloc(highlight.Span, 0);
+        allocator.free(output);
+        self.output_display = literal;
+        self.output_highlights = empty;
+        self.layout_valid = false;
     }
 
     fn deinit(self: *ToolEntry, allocator: std.mem.Allocator) void {
@@ -5109,6 +5122,37 @@ test "bash output plans highlight YAML and diff through the ToolEntry lifecycle"
             (span.token == .meta and std.mem.startsWith(u8, text, "@@"));
     }
     try std.testing.expect(saw_inserted and saw_deleted and saw_meta);
+}
+
+test "strict syntax rejection restores literal output rendering" {
+    var started = try toolStarted(
+        "external-diff-output",
+        "{\"command\":\"git diff\"}",
+        .{ .bash = .{ .run = .{ .command = "git diff" } } },
+    );
+    defer started.deinit();
+    var entry = try ToolEntry.init(std.testing.allocator, &started);
+    defer entry.deinit(std.testing.allocator);
+    var finished = try toolFinished(
+        "external-diff-output",
+        .{ .succeeded = "external diff:\tchanged\r\n" },
+    );
+    defer finished.deinit();
+
+    try entry.finish(std.testing.allocator, &finished);
+    try std.testing.expectEqualStrings(
+        "external diff:\tchanged\n",
+        entry.output_display.?,
+    );
+    try entry.ensureOutputHighlights(std.testing.allocator);
+    try std.testing.expectEqualStrings(
+        "external diff:\\x09changed\\x0d\n",
+        entry.output_display.?,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        entry.output_highlights.?.len,
+    );
 }
 
 test "bash output plans fall back to literal for unsafe lifecycle cases" {

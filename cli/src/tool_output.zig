@@ -78,22 +78,22 @@ pub const OutputPlan = union(enum) {
         allocator: std.mem.Allocator,
         outcome: Outcome,
         display: []const u8,
-    ) ![]highlight.Span {
+    ) !?[]highlight.Span {
         if (outcome != .succeeded) {
-            return allocator.alloc(highlight.Span, 0);
+            return try allocator.alloc(highlight.Span, 0);
         }
         return switch (self) {
-            .syntax => |language| highlight.completeSpans(
+            .syntax => |language| highlight.completeSpansChecked(
                 allocator,
                 language,
                 display,
             ),
-            .syntax_fragment => |language| highlight.spans(
+            .syntax_fragment => |language| try highlight.spans(
                 allocator,
                 language,
                 display,
             ),
-            .literal, .markdown => allocator.alloc(highlight.Span, 0),
+            .literal, .markdown => try allocator.alloc(highlight.Span, 0),
         };
     }
 };
@@ -347,7 +347,7 @@ test "output plans sanitize before strict syntax highlighting" {
         std.testing.allocator,
         .succeeded,
         display,
-    );
+    ) orelse return error.ExpectedValidSyntax;
     defer std.testing.allocator.free(highlighted);
     try std.testing.expect(highlighted.len > 0);
     for (highlighted) |span| {
@@ -375,7 +375,7 @@ test "partial reads use tolerant fragment highlighting" {
         std.testing.allocator,
         .succeeded,
         source,
-    );
+    ) orelse return error.ExpectedValidSyntax;
     defer std.testing.allocator.free(highlighted);
     for (highlighted) |span| {
         if (span.token == .keyword and
@@ -404,7 +404,7 @@ test "source rendering normalizes CRLF before strict parsing" {
         std.testing.allocator,
         .succeeded,
         display,
-    );
+    ) orelse return error.ExpectedValidSyntax;
     defer std.testing.allocator.free(highlighted);
     for (highlighted) |span| {
         if (span.token == .function and
@@ -435,7 +435,7 @@ test "JSONL uses tolerant highlighting for multiple records" {
         std.testing.allocator,
         .succeeded,
         source,
-    );
+    ) orelse return error.ExpectedValidSyntax;
     defer std.testing.allocator.free(highlighted);
     var properties: usize = 0;
     for (highlighted) |span| {
