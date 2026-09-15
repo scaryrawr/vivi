@@ -8,7 +8,7 @@ on:
     branches:
       - main
     tags:
-      - vivi-*
+      - 'v*'
   workflow_dispatch:
 
 permissions:
@@ -38,7 +38,8 @@ jobs:
         run: ./scripts/check-zig.sh
 
       - name: Build Release CLI
-        run: zig build -Doptimize=ReleaseSafe
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        run: zig build -Doptimize=ReleaseSafe -Dversion="${GITHUB_REF_NAME#v}"
 
       - name: Upload Linux CLI artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -66,12 +67,24 @@ jobs:
         run: ./scripts/check-c-api-cross.sh
 
       - name: Package Release Windows C API
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         run: |
           zig build install-c-api \
               -Dtarget=x86_64-windows-msvc \
               -Dbackend-linkage=dynamic \
               -Doptimize=ReleaseSafe \
+              -Dversion="${GITHUB_REF_NAME#v}" \
               --prefix zig-out/cross/windows-x86_64-release
+
+      - name: Package Release Windows ARM64 C API
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        run: |
+          zig build install-c-api \
+              -Dtarget=aarch64-windows-msvc \
+              -Dbackend-linkage=dynamic \
+              -Doptimize=ReleaseSafe \
+              -Dversion="${GITHUB_REF_NAME#v}" \
+              --prefix zig-out/cross/windows-aarch64-release
 
       - name: Upload Linux C API artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -91,7 +104,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: vivi-windows-aarch64
-          path: zig-out/cross/windows-aarch64/
+          path: zig-out/cross/windows-aarch64-release/
           if-no-files-found: error
 
   macos:
@@ -127,7 +140,7 @@ jobs:
   release:
     name: Release
     needs: [zig, c-api-cross, macos]
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/vivi-')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -136,16 +149,23 @@ jobs:
         id: download-artifacts
         uses: actions/download-artifact@cc203385981b70ca67e1cc392babf9cc229d5806 # v4.1.9
 
-      - name: List Files
-        run: ls -R ${{ steps.download-artifacts.outputs.download-path }}
+      - name: Package release archives
+        run: |
+          set -eu
+          version="${GITHUB_REF_NAME#v}"
+          dl="${{ steps.download-artifacts.outputs.download-path }}"
+          assets="${GITHUB_WORKSPACE}/release-assets"
+          rm -rf "$assets"
+          mkdir -p "$assets"
+          zip -qj "$assets/vivi-${version}-linux-x86_64.zip" "$dl/vivi-linux-x86_64/vivi"
+          zip -qj "$assets/vivi-${version}-macos-arm64.zip" "$dl/vivi-macos-arm64/vivi"
+          (cd "$dl/vivi-windows-x86_64" && zip -qr "$assets/vivi-${version}-windows-x86_64.zip" bin include lib)
+          (cd "$dl/vivi-windows-aarch64" && zip -qr "$assets/vivi-${version}-windows-aarch64.zip" bin include lib)
+          ls -l "$assets"
 
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2 (2.6.2)
         with:
-          prerelease: ${{ contains(github.ref, 'rc') }}
+          prerelease: ${{ contains(github.ref, '-rc') }}
           generate_release_notes: true
           fail_on_unmatched_files: true
-          files: |
-            ${{ steps.download-artifacts.outputs.download-path }}/vivi-linux-x86_64/vivi
-            ${{ steps.download-artifacts.outputs.download-path }}/vivi-macos-arm64/vivi
-            ${{ steps.download-artifacts.outputs.download-path }}/vivi-windows-x86_64/bin/vivi_backend.dll
-            ${{ steps.download-artifacts.outputs.download-path }}/vivi-windows-aarch64/bin/vivi_backend.dll
+          files: release-assets/*.zip

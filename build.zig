@@ -29,8 +29,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const version = b.option(
+        []const u8,
+        "version",
+        "Version reported by vivi and the SDK client (release builds pass the tag here)",
+    ) orelse "0.1.0";
+
     const build_options = b.addOptions();
-    build_options.addOption([]const u8, "version", "0.1.0");
+    build_options.addOption([]const u8, "version", version);
 
     const backend = b.addModule("vivi_backend", .{
         .root_source_file = b.path("backend/src/root.zig"),
