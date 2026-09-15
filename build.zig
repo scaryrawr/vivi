@@ -141,7 +141,6 @@ pub fn build(b: *std.Build) void {
     const chat_tests = b.addTest(.{
         .root_module = chat_tests_module,
         .use_llvm = cli_use_llvm,
-        .filters = &.{ "Markdown draw storage remains valid", "tool", "mouse", "clipboard", "image" },
     });
     const run_chat_tests = b.addRunArtifact(chat_tests);
 

@@ -190,21 +190,7 @@ pub fn openConversation(
 const MinimalCodingAgent = struct {
     const cli_args = [_][]const u8{"--disable-builtin-mcps"};
 
-    const hosted_available_tools = [_][]const u8{
-        "custom:*",
-        "builtin:ask_user",
-        "builtin:task_complete",
-        "builtin:exit_plan_mode",
-        "builtin:task",
-        "builtin:read_agent",
-        "builtin:write_agent",
-        "builtin:list_agents",
-        "builtin:send_inbox",
-        "builtin:context_board",
-        "builtin:skill",
-    };
-
-    const local_available_tools = [_][]const u8{
+    const available_tools = [_][]const u8{
         "custom:*",
         "builtin:ask_user",
         "builtin:skill",
@@ -261,10 +247,7 @@ const MinimalCodingAgent = struct {
             .enable_on_demand_instruction_discovery = true,
             .streaming = true,
             .tools = &sdk_tools,
-            .available_tools = if (model == null)
-                &hosted_available_tools
-            else
-                &local_available_tools,
+            .available_tools = &available_tools,
             .system_message = .{
                 .mode = .append,
                 .content = prompt,
@@ -3661,7 +3644,7 @@ test "Copilot SDK exposes typed local provider configuration" {
     try std.testing.expect(provider.authentication == .none);
 }
 
-test "minimal coding agent filters hosted tools per session" {
+test "minimal coding agent limits hosted tools to simplified subset" {
     try std.testing.expectEqualSlices(
         []const u8,
         &.{"--disable-builtin-mcps"},
@@ -3679,14 +3662,6 @@ test "minimal coding agent filters hosted tools per session" {
         &.{
             "custom:*",
             "builtin:ask_user",
-            "builtin:task_complete",
-            "builtin:exit_plan_mode",
-            "builtin:task",
-            "builtin:read_agent",
-            "builtin:write_agent",
-            "builtin:list_agents",
-            "builtin:send_inbox",
-            "builtin:context_board",
             "builtin:skill",
         },
         MinimalCodingAgent.sessionConfig(
@@ -3698,7 +3673,7 @@ test "minimal coding agent filters hosted tools per session" {
     );
 }
 
-test "minimal coding agent omits multi-agent tools for local models" {
+test "minimal coding agent limits local tools to simplified subset" {
     const model = models.Model{
         .id = @constCast("omlx/local"),
         .provider_model_id = @constCast("local"),
