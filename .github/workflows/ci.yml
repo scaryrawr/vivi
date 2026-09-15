@@ -2,9 +2,13 @@ name: CI
 
 on:
   pull_request:
+    branches:
+      - main
   push:
     branches:
       - main
+    tags:
+      - vivi-*
   workflow_dispatch:
 
 permissions:
@@ -33,6 +37,13 @@ jobs:
       - name: Check Zig and CLI
         run: ./scripts/check-zig.sh
 
+      - name: Upload Linux CLI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vivi-linux-x86_64
+          path: zig-out/bin/vivi
+          if-no-files-found: error
+
   c-api-cross:
     name: C API cross-builds
     runs-on: ubuntu-latest
@@ -51,6 +62,27 @@ jobs:
       - name: Cross-build C API
         run: ./scripts/check-c-api-cross.sh
 
+      - name: Upload Linux C API artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vivi-linux-x86_64-capi
+          path: zig-out/cross/linux-x86_64/
+          if-no-files-found: error
+
+      - name: Upload Windows C API artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vivi-windows-x86_64
+          path: zig-out/cross/windows-x86_64/
+          if-no-files-found: error
+
+      - name: Upload Windows ARM64 C API artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vivi-windows-aarch64
+          path: zig-out/cross/windows-aarch64/
+          if-no-files-found: error
+
   macos:
     name: macOS app
     runs-on: macos-26
@@ -66,5 +98,40 @@ jobs:
         with:
           version: 0.16.0
 
-      - name: Check macOS app
-        run: ./scripts/check-macos.sh
+      - name: Build CLI and macOS app
+        run: |
+          zig build
+          ./scripts/check-macos.sh
+
+      - name: Upload macOS CLI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vivi-macos-arm64
+          path: zig-out/bin/vivi
+          if-no-files-found: error
+
+  release:
+    name: Release
+    needs: [zig, c-api-cross, macos]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/vivi-')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download Artifacts
+        id: download-artifacts
+        uses: actions/download-artifact@v4
+
+      - name: List Files
+        run: ls -R ${{ steps.download-artifacts.outputs.download-path }}
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          prerelease: ${{ contains(github.ref, 'rc') }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            ${{ steps.download-artifacts.outputs.download-path }}/vivi-linux-x86_64/bin/vivi
+            ${{ steps.download-artifacts.outputs.download-path }}/vivi-macos-arm64/bin/vivi
+            ${{ steps.download-artifacts.outputs.download-path }}/vivi-windows-x86_64/bin/vivi_backend.dll
+            ${{ steps.download-artifacts.outputs.download-path }}/vivi-windows-aarch64/bin/vivi_backend.dll
