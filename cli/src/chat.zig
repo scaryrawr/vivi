@@ -439,7 +439,7 @@ const ToolEntry = struct {
         const output_display = if (self.output_markdown and succeeded and completion != .image)
             try tool_renderer.renderMarkdown(allocator, output)
         else
-            try tool_renderer.renderLiteral(allocator, output);
+            try tool_renderer.renderOutput(allocator, output);
         errdefer allocator.free(output_display);
         const preview = if (finished.result == .image)
             try image_preview.Preview.init(allocator, finished.result.image.bytes)
@@ -5967,7 +5967,7 @@ test "tool disclosure hit mapping follows wrapping scrolling resizing and comple
     finished.deinit();
     try std.testing.expect(ui.transcript.entries.items[0].tool.expanded);
     try std.testing.expectEqualStrings("# literal failure\n\x1b[31mactual output", ui.transcript.entries.items[0].tool.output.?);
-    try std.testing.expectEqualStrings("# literal failure\n\\x1b[31mactual output", ui.transcript.entries.items[0].tool.output_display.?);
+    try std.testing.expectEqualStrings("# literal failure\nactual output", ui.transcript.entries.items[0].tool.output_display.?);
     window.width = 20;
     projection = (try ui.draw(window)).?;
     projection.deinit(std.testing.allocator);
