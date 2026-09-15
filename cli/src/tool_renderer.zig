@@ -240,7 +240,7 @@ fn stringSequence(
 ) TerminalSequence {
     var index = introducer_length;
     const limit = @min(text.len, max_terminal_sequence_bytes);
-    while (index < limit) : (index += 1) {
+    while (index < limit) {
         if (bell_terminated and text[index] == 0x07)
             return .{ .complete = index + 1 };
         if (text[index] == 0x9c)
@@ -252,6 +252,14 @@ fn stringSequence(
                 return .{ .complete = index + 2 };
             return .{ .incomplete = index };
         }
+        const utf8_length = std.unicode.utf8ByteSequenceLength(text[index]) catch 0;
+        if (utf8_length > 1 and index + utf8_length <= limit) {
+            if (std.unicode.utf8Decode(text[index..][0..utf8_length])) |_| {
+                index += utf8_length;
+                continue;
+            } else |_| {}
+        }
+        index += 1;
     }
     return .{ .incomplete = limit };
 }
@@ -315,6 +323,15 @@ test "cancelled terminal strings do not hide subsequent output" {
         "\\x1b]bad\\x18visible\\x07 \\x90bad\\x1anext \\x1b]badred",
         rendered,
     );
+}
+
+test "UTF-8 continuation bytes do not terminate control strings" {
+    const rendered = try renderOutput(
+        std.testing.allocator,
+        "\x1b]title=Ü hidden\x07visible",
+    );
+    defer std.testing.allocator.free(rendered);
+    try std.testing.expectEqualStrings("visible", rendered);
 }
 
 test "tool output keeps JSON literal rather than presenting arguments" {
