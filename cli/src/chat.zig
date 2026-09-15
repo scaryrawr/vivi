@@ -478,6 +478,7 @@ const ToolEntry = struct {
         allocator.free(output);
         self.output_display = literal;
         self.output_highlights = empty;
+        self.output_plan = .literal;
         self.layout_valid = false;
     }
 
@@ -5193,6 +5194,16 @@ test "strict syntax rejection restores literal output rendering" {
     try std.testing.expectEqual(
         @as(usize, 0),
         entry.output_highlights.?.len,
+    );
+    try std.testing.expectEqual(
+        tool_output.OutputPlan.literal,
+        entry.output_plan,
+    );
+    transcript.entries.items[0].releaseRenderCaches(std.testing.allocator);
+    try entry.ensureOutputHighlights(std.testing.allocator);
+    try std.testing.expectEqualStrings(
+        "external diff:\\x09changed\\x0d\n",
+        entry.output_display.?,
     );
 }
 

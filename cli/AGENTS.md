@@ -16,10 +16,11 @@ line endings so syntax spans index `output_display`, not the raw payload.
 Treat `read` results with an `offset` or `limit` as fragments and use tolerant
 highlighting. Reserve complete parsing for full-file or homogeneous command
 output, and reject oversized complete sources before truncation. If complete
-parsing rejects the source, re-render the raw payload with `renderOutput`;
-valid syntax with zero captures is not a rejection. Complete strict validation
-and any fallback before measuring expanded tool output so layout ranges match
-the final display buffer in the current frame.
+parsing rejects the source, re-render the raw payload with `renderOutput` and
+persist the plan as literal; valid syntax with zero captures is not a
+rejection. Complete strict validation and any fallback before measuring
+expanded tool output so layout ranges match the final display buffer in the
+current frame.
 Keep producer-signature checks on command-derived output plans. Path-derived
 `.diff` and `.patch` documents are strict syntax, but must not require a
 `diff --git` header.
