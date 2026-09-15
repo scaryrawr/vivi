@@ -86,6 +86,24 @@ jobs:
               -Dversion="${GITHUB_REF_NAME#v}" \
               --prefix zig-out/cross/windows-aarch64-release
 
+      - name: Package Release Windows CLI (x86_64)
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        run: |
+          zig build \
+              -Dtarget=x86_64-windows-gnu \
+              -Doptimize=ReleaseSafe \
+              -Dversion="${GITHUB_REF_NAME#v}" \
+              --prefix zig-out/cli/windows-x86_64
+
+      - name: Package Release Windows CLI (ARM64)
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        run: |
+          zig build \
+              -Dtarget=aarch64-windows-gnu \
+              -Doptimize=ReleaseSafe \
+              -Dversion="${GITHUB_REF_NAME#v}" \
+              --prefix zig-out/cli/windows-aarch64
+
       - name: Upload Linux C API artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -109,6 +127,22 @@ jobs:
           path: zig-out/cross/windows-aarch64-release/
           if-no-files-found: error
 
+      - name: Upload Windows CLI artifact (x86_64)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: vivi-windows-cli-x86_64
+          path: zig-out/cli/windows-x86_64/bin/vivi.exe
+          if-no-files-found: error
+
+      - name: Upload Windows CLI artifact (ARM64)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: vivi-windows-cli-aarch64
+          path: zig-out/cli/windows-aarch64/bin/vivi.exe
+          if-no-files-found: error
+
   macos:
     name: macOS app
     runs-on: macos-26
@@ -130,7 +164,8 @@ jobs:
           ./scripts/check-macos.sh
 
       - name: Build Release CLI
-        run: zig build -Doptimize=ReleaseSafe
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        run: zig build -Doptimize=ReleaseSafe -Dversion="${GITHUB_REF_NAME#v}"
 
       - name: Upload macOS CLI artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -159,10 +194,21 @@ jobs:
           assets="${GITHUB_WORKSPACE}/release-assets"
           rm -rf "$assets"
           mkdir -p "$assets"
+          # upload-artifact restores downloads as mode 0644; re-add the
+          # executable bit so zipped CLI binaries stay runnable.
+          chmod +x "$dl/vivi-linux-x86_64/vivi" "$dl/vivi-macos-arm64/vivi"
           zip -qj "$assets/vivi-${version}-linux-x86_64.zip" "$dl/vivi-linux-x86_64/vivi"
           zip -qj "$assets/vivi-${version}-macos-arm64.zip" "$dl/vivi-macos-arm64/vivi"
-          (cd "$dl/vivi-windows-x86_64" && zip -qr "$assets/vivi-${version}-windows-x86_64.zip" bin include lib)
-          (cd "$dl/vivi-windows-aarch64" && zip -qr "$assets/vivi-${version}-windows-aarch64.zip" bin include lib)
+          stage=$(mktemp -d)
+          cp -R "$dl/vivi-windows-x86_64/"* "$stage/"
+          cp "$dl/vivi-windows-cli-x86_64/vivi.exe" "$stage/bin/vivi.exe"
+          (cd "$stage" && zip -qr "$assets/vivi-${version}-windows-x86_64.zip" bin include lib)
+          rm -rf "$stage"
+          stage=$(mktemp -d)
+          cp -R "$dl/vivi-windows-aarch64/"* "$stage/"
+          cp "$dl/vivi-windows-cli-aarch64/vivi.exe" "$stage/bin/vivi.exe"
+          (cd "$stage" && zip -qr "$assets/vivi-${version}-windows-aarch64.zip" bin include lib)
+          rm -rf "$stage"
           ls -l "$assets"
 
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2 (2.6.2)
