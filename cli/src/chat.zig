@@ -996,6 +996,9 @@ const Projection = struct {
         var projection: Projection = .{};
         errdefer projection.deinit(allocator);
 
+        // Consecutive reasoning and assistant entries form one Vivi block;
+        // the heading is drawn once, above the thinking text.
+        var in_vivi_block = false;
         for (transcript.entries.items, 0..) |*entry, entry_index| {
             if (projection.lines.items.len > 0) {
                 try projection.lines.append(allocator, .{
@@ -1006,10 +1009,13 @@ const Projection = struct {
             switch (entry.*) {
                 .message => |*message| switch (message.role) {
                     .reasoning, .assistant => {
-                        try projection.lines.append(allocator, .{
-                            .kind = .role,
-                            .entry_index = entry_index,
-                        });
+                        if (!in_vivi_block) {
+                            try projection.lines.append(allocator, .{
+                                .kind = .role,
+                                .entry_index = entry_index,
+                            });
+                        }
+                        in_vivi_block = true;
                         try projection.appendMarkdown(
                             allocator,
                             entry_index,
@@ -1021,6 +1027,7 @@ const Projection = struct {
                         );
                     },
                     .user, .queued, .question => {
+                        in_vivi_block = false;
                         try projection.lines.append(allocator, .{
                             .kind = .role,
                             .entry_index = entry_index,
@@ -1034,16 +1041,20 @@ const Projection = struct {
                             2,
                         );
                     },
-                    .status => try projection.appendWrapped(
-                        allocator,
-                        entry_index,
-                        message.text.items,
-                        window,
-                        .status,
-                        2,
-                    ),
+                    .status => {
+                        in_vivi_block = false;
+                        try projection.appendWrapped(
+                            allocator,
+                            entry_index,
+                            message.text.items,
+                            window,
+                            .status,
+                            2,
+                        );
+                    },
                 },
                 .tool => |*tool| {
+                    in_vivi_block = false;
                     try projection.appendWrapped(
                         allocator,
                         entry_index,
@@ -2982,25 +2993,20 @@ const ChatUi = struct {
                 const role_text = switch (message.role) {
                     .user => "You",
                     .queued => "Queued",
-                    .reasoning => "Thinking",
-                    .assistant => "Vivi",
+                    .reasoning, .assistant => "Vivi",
                     .question => "Question",
                     .status => unreachable,
                 };
                 const role_color = switch (message.role) {
                     .user => user_color,
                     .queued => accent,
-                    .reasoning => reasoning_color,
-                    .assistant => assistant_color,
+                    .reasoning, .assistant => assistant_color,
                     .question => accent,
                     .status => unreachable,
                 };
                 var segments = [_]vaxis.Segment{.{
                     .text = role_text,
-                    .style = if (message.role == .reasoning)
-                        .{ .fg = role_color, .dim = true, .italic = true }
-                    else
-                        .{ .fg = role_color, .bold = true },
+                    .style = .{ .fg = role_color, .bold = true },
                 }};
                 _ = window.print(&segments, .{
                     .row_offset = row,
@@ -4162,6 +4168,45 @@ test "reasoning and response stay ordered before a queued prompt" {
         "queued response",
         transcript.messageAt(4).text.items,
     );
+}
+
+test "reasoning renders under a single Vivi heading" {
+    var transcript: Transcript = .{};
+    defer transcript.deinit(std.testing.allocator);
+
+    try transcript.append(std.testing.allocator, .user, "why?");
+    try transcript.appendReasoningDelta(std.testing.allocator, "thinking");
+    try transcript.appendDelta(std.testing.allocator, "because");
+
+    var screen = try vaxis.Screen.init(std.testing.allocator, .{
+        .rows = 1,
+        .cols = 40,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(std.testing.allocator);
+    const window: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = screen.width,
+        .height = screen.height,
+        .screen = &screen,
+    };
+    var projection = try Projection.build(
+        std.testing.allocator,
+        &transcript,
+        window,
+    );
+    defer projection.deinit(std.testing.allocator);
+
+    var role_entries = std.ArrayList(usize).init(std.testing.allocator);
+    defer role_entries.deinit();
+    for (projection.lines.items) |line| {
+        if (line.kind == .role) try role_entries.append(line.entry_index);
+    }
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1 }, role_entries.items);
 }
 
 test "ask-user exchange separates resumed output from active reasoning" {
