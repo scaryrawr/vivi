@@ -4,6 +4,11 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const use_llvm = b.option(bool, "llvm", "Override compiler backend selection");
+    const macos_sdk = b.option(
+        []const u8,
+        "macos-sdk",
+        "macOS SDK root used for explicit compatibility targets",
+    );
     // Zig 0.16's default x86_64 backend crashes compiling the image decoder.
     const cli_use_llvm = use_llvm orelse true;
     const backend_linkage = b.option(
@@ -80,7 +85,7 @@ pub fn build(b: *std.Build) void {
     });
     cli_module.addImport("vivi_backend", backend);
     cli_module.addImport("vaxis", vaxis.module("vaxis"));
-    addClipboard(b, cli_module, target);
+    addClipboard(b, cli_module, target, macos_sdk);
     addSyntaxHighlighting(
         b,
         cli_module,
@@ -126,7 +131,7 @@ pub fn build(b: *std.Build) void {
     });
     chat_tests_module.addImport("vivi_backend", backend);
     chat_tests_module.addImport("vaxis", vaxis.module("vaxis"));
-    addClipboard(b, chat_tests_module, target);
+    addClipboard(b, chat_tests_module, target, macos_sdk);
     addSyntaxHighlighting(
         b,
         chat_tests_module,
@@ -232,8 +237,21 @@ pub fn build(b: *std.Build) void {
     install_c_api.dependOn(&install_library.step);
 }
 
-fn addClipboard(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget) void {
+fn addClipboard(
+    b: *std.Build,
+    module: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    macos_sdk: ?[]const u8,
+) void {
     if (target.result.os.tag != .macos) return;
+    if (macos_sdk) |sdk| {
+        module.addSystemIncludePath(.{
+            .cwd_relative = b.pathJoin(&.{ sdk, "usr/include" }),
+        });
+        module.addSystemFrameworkPath(.{
+            .cwd_relative = b.pathJoin(&.{ sdk, "System/Library/Frameworks" }),
+        });
+    }
     module.addCSourceFile(.{
         .file = b.path("cli/src/clipboard_macos.m"),
         .flags = &.{"-fobjc-arc"},
