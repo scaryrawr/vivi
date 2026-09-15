@@ -110,8 +110,10 @@ Details wrap with the terminal width and scroll with the
 transcript, on a subtly contrasting background. Input arguments use readable
 labels with decoded strings and line breaks, including all additional fields;
 nested objects and arrays use indentation and indexed items. Invalid JSON is
-explicitly labeled and shown as unparsed input. Output stays literal, not
-JSON-decoded or rendered as Markdown. Terminal control characters are escaped.
+explicitly labeled and shown as unparsed input. Output is not JSON-decoded;
+successful Markdown file reads are rendered as Markdown, while other output
+stays literal. Complete terminal control sequences are stripped, while
+malformed or unterminated controls are visibly escaped.
 
 `vivi models` lists the authenticated Copilot model catalog alongside OMLX
 models discovered from `http://localhost:8000/v1/models/status`. Each row
