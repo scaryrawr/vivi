@@ -4,6 +4,7 @@ const vaxis = @import("vaxis");
 
 const summary_text_graphemes = 80;
 const summary_text_bytes = 240;
+const max_terminal_sequence_bytes = 4096;
 const ellipsis = "…";
 
 pub fn renderArguments(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
@@ -109,22 +110,33 @@ test "tool argument parsing and fallback release all allocations on failure" {
 }
 
 pub fn renderLiteral(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
-    return renderSafeText(allocator, text, false);
+    return renderSafeText(allocator, text, false, false);
+}
+
+pub fn renderOutput(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    return renderSafeText(allocator, text, false, true);
 }
 
 pub fn renderMarkdown(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
-    return renderSafeText(allocator, text, true);
+    return renderSafeText(allocator, text, true, true);
 }
 
 fn renderSafeText(
     allocator: std.mem.Allocator,
     text: []const u8,
     preserve_markdown_whitespace: bool,
+    strip_terminal_sequences: bool,
 ) ![]u8 {
     var result: std.ArrayList(u8) = .empty;
     defer result.deinit(allocator);
     var index: usize = 0;
     while (index < text.len) {
+        if (strip_terminal_sequences) {
+            if (terminalSequenceLength(text[index..])) |length| {
+                index += length;
+                continue;
+            }
+        }
         const byte = text[index];
         if (preserve_markdown_whitespace and byte == '\r') {
             try result.append(allocator, '\n');
@@ -157,6 +169,44 @@ fn renderSafeText(
     return result.toOwnedSlice(allocator);
 }
 
+fn terminalSequenceLength(text: []const u8) ?usize {
+    if (text.len < 2 or text[0] != 0x1b) return null;
+    return switch (text[1]) {
+        '[' => csiSequenceLength(text),
+        ']' => stringSequenceLength(text, true),
+        'P', 'X', '^', '_' => stringSequenceLength(text, false),
+        else => escapeSequenceLength(text),
+    };
+}
+
+fn csiSequenceLength(text: []const u8) ?usize {
+    var index: usize = 2;
+    const limit = @min(text.len, max_terminal_sequence_bytes);
+    while (index < limit and text[index] >= 0x30 and text[index] <= 0x3f) : (index += 1) {}
+    while (index < limit and text[index] >= 0x20 and text[index] <= 0x2f) : (index += 1) {}
+    if (index < limit and text[index] >= 0x40 and text[index] <= 0x7e) return index + 1;
+    return null;
+}
+
+fn stringSequenceLength(text: []const u8, bell_terminated: bool) ?usize {
+    var index: usize = 2;
+    const limit = @min(text.len, max_terminal_sequence_bytes);
+    while (index < limit) : (index += 1) {
+        if (bell_terminated and text[index] == 0x07) return index + 1;
+        if (text[index] == 0x1b and index + 1 < limit and text[index + 1] == '\\')
+            return index + 2;
+    }
+    return null;
+}
+
+fn escapeSequenceLength(text: []const u8) ?usize {
+    var index: usize = 1;
+    const limit = @min(text.len, max_terminal_sequence_bytes);
+    while (index < limit and text[index] >= 0x20 and text[index] <= 0x2f) : (index += 1) {}
+    if (index < limit and text[index] >= 0x30 and text[index] <= 0x7e) return index + 1;
+    return null;
+}
+
 test "Markdown display preserves structural whitespace and escapes controls" {
     const rendered = try renderMarkdown(
         std.testing.allocator,
@@ -164,7 +214,7 @@ test "Markdown display preserves structural whitespace and escapes controls" {
     );
     defer std.testing.allocator.free(rendered);
     try std.testing.expectEqualStrings(
-        "# Heading\n\n\tcode\n- item\tcontinued\\x1b[31m",
+        "# Heading\n\n\tcode\n- item\tcontinued",
         rendered,
     );
 }
@@ -178,9 +228,18 @@ test "tool literal display preserves multiline markdown and escapes unsafe bytes
     );
 }
 
+test "tool output strips terminal sequences without hiding malformed controls" {
+    const rendered = try renderOutput(
+        std.testing.allocator,
+        "\x1b[1;38mname\x1b[m \x1b[32mv8.0.1\x1b[0m \x1b]8;;https://example.test\x07link\x1b]8;;\x1b\\ \x1b[31 \x1bPbad\x07",
+    );
+    defer std.testing.allocator.free(rendered);
+    try std.testing.expectEqualStrings("name v8.0.1 link \\x1b[31 \\x1bPbad\\x07", rendered);
+}
+
 test "tool output keeps JSON literal rather than presenting arguments" {
     const output = "{\"path\":\"a\\nb\",\"ok\":true}";
-    const rendered = try renderLiteral(std.testing.allocator, output);
+    const rendered = try renderOutput(std.testing.allocator, output);
     defer std.testing.allocator.free(rendered);
     try std.testing.expectEqualStrings(output, rendered);
 }
