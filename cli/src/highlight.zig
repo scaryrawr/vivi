@@ -685,6 +685,8 @@ test "language detection covers supported file and fence names" {
 
     const fence_cases = [_]struct { []const u8, Language }{
         .{ "JSON", .json },
+        .{ "yaml", .yaml },
+        .{ "yml", .yaml },
         .{ "patch", .diff },
         .{ "javascript", .javascript },
         .{ "js", .javascript },
