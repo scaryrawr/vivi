@@ -4307,7 +4307,6 @@ const App = struct {
         var pending: ?AppEvent = null;
         var conversation_backlog = false;
         while (!self.closed) {
-            const backlog_before_event = conversation_backlog;
             const event = try nextAppEvent(
                 &self.loop,
                 pending,
@@ -4317,7 +4316,6 @@ const App = struct {
             conversation_backlog = false;
             var redraw = true;
             var composer_redraw = false;
-            var drain_conversation = backlog_before_event;
             switch (event) {
                 .key_press => |key| {
                     if (!self.ui.bracketed_paste and
@@ -4361,14 +4359,10 @@ const App = struct {
                         redraw = false;
                     }
                 },
-                .conversation_wake => drain_conversation = true,
+                .conversation_wake => redraw = false,
                 .input_error => |err| return err,
             }
-            const conversation_drain: ConversationDrain =
-                if (drain_conversation)
-                    try self.drainConversation()
-                else
-                    .{ .redraw = false, .continue_drain = false };
+            const conversation_drain = try self.drainConversation();
             if (conversation_drain.continue_drain) {
                 conversation_backlog = true;
             }
