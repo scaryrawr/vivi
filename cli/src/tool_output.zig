@@ -13,13 +13,17 @@ pub const OutputPlan = union(enum) {
     literal,
     markdown,
     syntax: highlight.Language,
+    syntax_fragment: highlight.Language,
 
     pub fn fromInvocation(
         allocator: std.mem.Allocator,
         summary: backend.ToolSummary,
     ) !OutputPlan {
         return switch (summary) {
-            .read => |read| planForPath(read.path),
+            .read => |read| planForPath(
+                read.path,
+                read.offset == null and read.limit == null,
+            ),
             .bash => |bash| switch (bash) {
                 .run => |run| fromCommand(allocator, run.command),
                 .start, .list, .read, .write, .stop => .literal,
@@ -61,7 +65,10 @@ pub const OutputPlan = union(enum) {
         }
         return switch (self) {
             .markdown => tool_renderer.renderMarkdown(allocator, raw),
-            .literal, .syntax => tool_renderer.renderOutput(allocator, raw),
+            .literal, .syntax, .syntax_fragment => tool_renderer.renderOutput(
+                allocator,
+                raw,
+            ),
         };
     }
 
@@ -76,6 +83,11 @@ pub const OutputPlan = union(enum) {
         }
         return switch (self) {
             .syntax => |language| highlight.completeSpans(
+                allocator,
+                language,
+                display,
+            ),
+            .syntax_fragment => |language| highlight.spans(
                 allocator,
                 language,
                 display,
@@ -214,7 +226,7 @@ fn inferCat(words: []const []const u8) ?OutputPlan {
     else
         return null;
     if (path.len == 0 or path[0] == '-') return null;
-    return planForPath(path);
+    return planForPath(path, true);
 }
 
 fn inferGit(words: []const []const u8) ?OutputPlan {
@@ -251,10 +263,13 @@ fn inferGit(words: []const []const u8) ?OutputPlan {
     return .{ .syntax = .diff };
 }
 
-fn planForPath(path: []const u8) OutputPlan {
+fn planForPath(path: []const u8, complete: bool) OutputPlan {
     if (isMarkdownPath(path)) return .markdown;
     if (highlight.Language.fromPath(path)) |language| {
-        return .{ .syntax = language };
+        return if (complete)
+            .{ .syntax = language }
+        else
+            .{ .syntax_fragment = language };
     }
     return .literal;
 }
@@ -332,4 +347,35 @@ test "output plans sanitize before strict syntax highlighting" {
         try std.testing.expect(span.start < span.end);
         try std.testing.expect(span.end <= display.len);
     }
+}
+
+test "partial reads use tolerant fragment highlighting" {
+    const plan = try OutputPlan.fromInvocation(
+        std.testing.allocator,
+        .{ .read = .{
+            .path = "example.py",
+            .offset = 2,
+            .limit = 1,
+        } },
+    );
+    try std.testing.expectEqual(
+        OutputPlan{ .syntax_fragment = .python },
+        plan,
+    );
+
+    const source = "    return 1\n";
+    const highlighted = try plan.spans(
+        std.testing.allocator,
+        .succeeded,
+        source,
+    );
+    defer std.testing.allocator.free(highlighted);
+    for (highlighted) |span| {
+        if (span.token == .keyword and
+            std.mem.eql(u8, source[span.start..span.end], "return"))
+        {
+            return;
+        }
+    }
+    return error.ExpectedReturnKeyword;
 }
