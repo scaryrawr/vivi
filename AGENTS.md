@@ -73,6 +73,10 @@ zig build -Dtarget=x86_64-windows-gnu --prefix zig-out/cli-windows
 Use the Windows GNU target when cross-building from macOS without MSVC headers.
 These checks establish compilation, not live desktop behavior.
 
+Release CLIs target glibc 2.17 on Linux and macOS 14.0 on Apple silicon. An
+explicit macOS target must pass both `--sysroot` and `-Dmacos-sdk` from
+`xcrun --sdk macosx --show-sdk-path` so Zig can find AppKit and SDK headers.
+
 ## Commit & Pull Request Guidelines
 
 No commit convention exists yet. Keep changes narrowly scoped and include the
