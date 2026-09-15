@@ -6,6 +6,146 @@ extern fn tree_sitter_bash() callconv(.c) *const ts.Language;
 extern fn tree_sitter_json() callconv(.c) *const ts.Language;
 extern fn tree_sitter_yaml() callconv(.c) *const ts.Language;
 extern fn tree_sitter_diff() callconv(.c) *const ts.Language;
+extern fn tree_sitter_javascript() callconv(.c) *const ts.Language;
+extern fn tree_sitter_typescript() callconv(.c) *const ts.Language;
+extern fn tree_sitter_tsx() callconv(.c) *const ts.Language;
+extern fn tree_sitter_rust() callconv(.c) *const ts.Language;
+extern fn tree_sitter_c() callconv(.c) *const ts.Language;
+extern fn tree_sitter_cpp() callconv(.c) *const ts.Language;
+extern fn tree_sitter_go() callconv(.c) *const ts.Language;
+extern fn tree_sitter_java() callconv(.c) *const ts.Language;
+extern fn tree_sitter_lua() callconv(.c) *const ts.Language;
+extern fn tree_sitter_python() callconv(.c) *const ts.Language;
+
+const javascript_query =
+    \\(property_identifier) @property
+    \\(function_declaration name: (identifier) @function)
+    \\(method_definition name: (property_identifier) @function)
+    \\(call_expression function: (identifier) @function)
+    \\[(true) (false) (null) (undefined)] @constant
+    \\[(string) (template_string) (regex)] @string
+    \\(number) @number
+    \\(comment) @comment
+    \\["as" "async" "await" "break" "case" "catch" "class" "const"
+    \\ "continue" "default" "delete" "do" "else" "export" "extends" "finally"
+    \\ "for" "from" "function" "if" "import" "in" "instanceof" "let" "new"
+    \\ "of" "return" "static" "switch" "throw" "try" "typeof" "var" "void"
+    \\ "while" "with" "yield"] @keyword
+    \\["-" "+" "*" "/" "%" "=" "==" "===" "!" "!=" "!==" "=>"
+    \\ "<" "<=" ">" ">=" "&&" "||" "??"] @operator
+;
+
+const typescript_query = javascript_query ++
+    \\["abstract" "declare" "enum" "implements" "interface" "keyof"
+    \\ "namespace" "private" "protected" "public" "type" "readonly"
+    \\ "override" "satisfies"] @keyword
+;
+
+const rust_query =
+    \\(field_identifier) @property
+    \\(function_item (identifier) @function)
+    \\(call_expression function: (identifier) @function)
+    \\[(line_comment) (block_comment)] @comment
+    \\[(char_literal) (string_literal) (raw_string_literal)] @string
+    \\[(integer_literal) (float_literal)] @number
+    \\(boolean_literal) @constant
+    \\["as" "async" "await" "break" "const" "continue" "default" "dyn"
+    \\ "else" "enum" "extern" "fn" "for" "if" "impl" "in" "let" "loop"
+    \\ "match" "mod" "move" "pub" "ref" "return" "static" "struct" "trait"
+    \\ "type" "union" "unsafe" "use" "where" "while"] @keyword
+    \\["*" "&" "!" "+" "-" "/" "%" "=" "==" "!=" "<" "<=" ">" ">="] @operator
+;
+
+const c_query =
+    \\(field_identifier) @property
+    \\(call_expression function: (identifier) @function)
+    \\(function_declarator declarator: (identifier) @function)
+    \\(comment) @comment
+    \\[(string_literal) (system_lib_string) (char_literal)] @string
+    \\(number_literal) @number
+    \\(null) @constant
+    \\["break" "case" "const" "continue" "default" "do" "else" "enum"
+    \\ "extern" "for" "if" "inline" "return" "sizeof" "static" "struct"
+    \\ "switch" "typedef" "union" "volatile" "while"
+    \\ "#define" "#elif" "#else" "#endif" "#if" "#ifdef" "#ifndef"
+    \\ "#include"] @keyword
+    \\["--" "-" "-=" "->" "=" "!=" "*" "&" "&&" "+" "++" "+="
+    \\ "<" "==" ">" "||"] @operator
+;
+
+const cpp_query = c_query ++
+    \\(raw_string_literal) @string
+    \\(this) @constant
+    \\["catch" "class" "co_await" "co_return" "co_yield" "constexpr"
+    \\ "constinit" "consteval" "delete" "explicit" "final" "friend" "mutable"
+    \\ "namespace" "noexcept" "new" "override" "private" "protected" "public"
+    \\ "template" "throw" "try" "typename" "using" "concept" "requires"
+    \\ "virtual" "import" "export" "module"] @keyword
+;
+
+const go_query =
+    \\(field_identifier) @property
+    \\(call_expression function: (identifier) @function)
+    \\(function_declaration name: (identifier) @function)
+    \\(method_declaration name: (field_identifier) @function)
+    \\[(interpreted_string_literal) (raw_string_literal) (rune_literal)] @string
+    \\[(int_literal) (float_literal) (imaginary_literal)] @number
+    \\[(true) (false) (nil) (iota)] @constant
+    \\(comment) @comment
+    \\["break" "case" "chan" "const" "continue" "default" "defer" "else"
+    \\ "fallthrough" "for" "func" "go" "goto" "if" "import" "interface"
+    \\ "map" "package" "range" "return" "select" "struct" "switch" "type"
+    \\ "var"] @keyword
+    \\["--" "-" ":=" "!" "!=" "*" "/" "&" "&&" "%" "^" "+" "++"
+    \\ "<-" "<" "<=" "=" "==" ">" ">=" "|" "||"] @operator
+;
+
+const java_query =
+    \\(method_declaration name: (identifier) @function)
+    \\(method_invocation name: (identifier) @function)
+    \\[(hex_integer_literal) (decimal_integer_literal) (octal_integer_literal)
+    \\ (decimal_floating_point_literal) (hex_floating_point_literal)] @number
+    \\[(character_literal) (string_literal)] @string
+    \\[(true) (false) (null_literal)] @constant
+    \\[(line_comment) (block_comment)] @comment
+    \\["abstract" "assert" "break" "case" "catch" "class" "continue"
+    \\ "default" "do" "else" "enum" "extends" "final" "finally" "for" "if"
+    \\ "implements" "import" "instanceof" "interface" "native" "new"
+    \\ "package" "private" "protected" "public" "record" "return" "static"
+    \\ "switch" "synchronized" "throw" "throws" "transient" "try" "volatile"
+    \\ "while" "yield"] @keyword
+    \\"@" @operator
+;
+
+const lua_query =
+    \\(field name: (identifier) @property)
+    \\(dot_index_expression field: (identifier) @property)
+    \\(function_declaration name: (identifier) @function)
+    \\(function_call name: (identifier) @function)
+    \\[(nil) (false) (true)] @constant
+    \\(string) @string
+    \\(number) @number
+    \\(comment) @comment
+    \\["return" "goto" "in" "local" "global" "do" "end" "while"
+    \\ "repeat" "until" "if" "elseif" "else" "then" "for" "function"] @keyword
+    \\["=" "and" "not" "or"] @operator
+;
+
+const python_query =
+    \\(attribute attribute: (identifier) @property)
+    \\(function_definition name: (identifier) @function)
+    \\(call function: (identifier) @function)
+    \\[(none) (true) (false)] @constant
+    \\[(integer) (float)] @number
+    \\(comment) @comment
+    \\(string) @string
+    \\["as" "assert" "async" "await" "break" "class" "continue" "def"
+    \\ "del" "elif" "else" "except" "finally" "for" "from" "global" "if"
+    \\ "import" "lambda" "nonlocal" "pass" "raise" "return" "try" "while"
+    \\ "with" "yield" "match" "case"] @keyword
+    \\["-" "!=" "*" "**" "/" "//" "&" "%" "^" "+" "->" "<" "<="
+    \\ "=" ":=" "==" ">" ">=" "|" "~" "and" "in" "is" "not" "or"] @operator
+;
 
 pub const Language = enum {
     zig,
@@ -13,6 +153,16 @@ pub const Language = enum {
     json,
     yaml,
     diff,
+    javascript,
+    typescript,
+    tsx,
+    rust,
+    c,
+    cpp,
+    go,
+    java,
+    lua,
+    python,
 
     pub fn fromPath(path: []const u8) ?Language {
         const extension = std.fs.path.extension(path);
@@ -41,6 +191,45 @@ pub const Language = enum {
             std.ascii.eqlIgnoreCase(extension, ".patch"))
         {
             return .diff;
+        }
+        if (std.ascii.eqlIgnoreCase(extension, ".js") or
+            std.ascii.eqlIgnoreCase(extension, ".jsx") or
+            std.ascii.eqlIgnoreCase(extension, ".mjs") or
+            std.ascii.eqlIgnoreCase(extension, ".cjs"))
+        {
+            return .javascript;
+        }
+        if (std.ascii.eqlIgnoreCase(extension, ".ts")) return .typescript;
+        if (std.ascii.eqlIgnoreCase(extension, ".tsx")) return .tsx;
+        if (std.ascii.eqlIgnoreCase(extension, ".rs")) return .rust;
+        if (std.ascii.eqlIgnoreCase(extension, ".c") or
+            std.ascii.eqlIgnoreCase(extension, ".h"))
+        {
+            return .c;
+        }
+        if (std.ascii.eqlIgnoreCase(extension, ".cc") or
+            std.ascii.eqlIgnoreCase(extension, ".cpp") or
+            std.ascii.eqlIgnoreCase(extension, ".cxx") or
+            std.ascii.eqlIgnoreCase(extension, ".c++") or
+            std.ascii.eqlIgnoreCase(extension, ".hh") or
+            std.ascii.eqlIgnoreCase(extension, ".hpp") or
+            std.ascii.eqlIgnoreCase(extension, ".hxx") or
+            std.ascii.eqlIgnoreCase(extension, ".h++") or
+            std.ascii.eqlIgnoreCase(extension, ".ipp") or
+            std.ascii.eqlIgnoreCase(extension, ".inl") or
+            std.ascii.eqlIgnoreCase(extension, ".ixx") or
+            std.ascii.eqlIgnoreCase(extension, ".tcc") or
+            std.ascii.eqlIgnoreCase(extension, ".tpp"))
+        {
+            return .cpp;
+        }
+        if (std.ascii.eqlIgnoreCase(extension, ".go")) return .go;
+        if (std.ascii.eqlIgnoreCase(extension, ".java")) return .java;
+        if (std.ascii.eqlIgnoreCase(extension, ".lua")) return .lua;
+        if (std.ascii.eqlIgnoreCase(extension, ".py") or
+            std.ascii.eqlIgnoreCase(extension, ".pyw"))
+        {
+            return .python;
         }
         return null;
     }
@@ -72,6 +261,47 @@ pub const Language = enum {
             std.ascii.eqlIgnoreCase(name, "patch"))
         {
             return .diff;
+        }
+        if (std.ascii.eqlIgnoreCase(name, "javascript") or
+            std.ascii.eqlIgnoreCase(name, "js") or
+            std.ascii.eqlIgnoreCase(name, "jsx") or
+            std.ascii.eqlIgnoreCase(name, "mjs") or
+            std.ascii.eqlIgnoreCase(name, "cjs"))
+        {
+            return .javascript;
+        }
+        if (std.ascii.eqlIgnoreCase(name, "typescript") or
+            std.ascii.eqlIgnoreCase(name, "ts"))
+        {
+            return .typescript;
+        }
+        if (std.ascii.eqlIgnoreCase(name, "tsx")) return .tsx;
+        if (std.ascii.eqlIgnoreCase(name, "rust") or
+            std.ascii.eqlIgnoreCase(name, "rs"))
+        {
+            return .rust;
+        }
+        if (std.ascii.eqlIgnoreCase(name, "c")) return .c;
+        if (std.ascii.eqlIgnoreCase(name, "c++") or
+            std.ascii.eqlIgnoreCase(name, "cpp") or
+            std.ascii.eqlIgnoreCase(name, "cxx") or
+            std.ascii.eqlIgnoreCase(name, "cc"))
+        {
+            return .cpp;
+        }
+        if (std.ascii.eqlIgnoreCase(name, "go") or
+            std.ascii.eqlIgnoreCase(name, "golang"))
+        {
+            return .go;
+        }
+        if (std.ascii.eqlIgnoreCase(name, "java")) return .java;
+        if (std.ascii.eqlIgnoreCase(name, "lua")) return .lua;
+        if (std.ascii.eqlIgnoreCase(name, "python") or
+            std.ascii.eqlIgnoreCase(name, "py") or
+            std.ascii.eqlIgnoreCase(name, "python3") or
+            std.ascii.eqlIgnoreCase(name, "py3"))
+        {
+            return .python;
         }
         return null;
     }
@@ -160,6 +390,46 @@ pub const Language = enum {
                 .invalid_query = "(unrecognized) @invalid",
                 .required_query = "(command (argument) @signature)",
                 .required_text = "--git",
+            },
+            .javascript => .{
+                .language = tree_sitter_javascript(),
+                .color_query = javascript_query,
+            },
+            .typescript => .{
+                .language = tree_sitter_typescript(),
+                .color_query = typescript_query,
+            },
+            .tsx => .{
+                .language = tree_sitter_tsx(),
+                .color_query = typescript_query,
+            },
+            .rust => .{
+                .language = tree_sitter_rust(),
+                .color_query = rust_query,
+            },
+            .c => .{
+                .language = tree_sitter_c(),
+                .color_query = c_query,
+            },
+            .cpp => .{
+                .language = tree_sitter_cpp(),
+                .color_query = cpp_query,
+            },
+            .go => .{
+                .language = tree_sitter_go(),
+                .color_query = go_query,
+            },
+            .java => .{
+                .language = tree_sitter_java(),
+                .color_query = java_query,
+            },
+            .lua => .{
+                .language = tree_sitter_lua(),
+                .color_query = lua_query,
+            },
+            .python => .{
+                .language = tree_sitter_python(),
+                .color_query = python_query,
             },
         };
     }
@@ -340,12 +610,150 @@ fn capturesAny(
 }
 
 test "language detection covers supported file and fence names" {
-    try std.testing.expectEqual(Language.zig, Language.fromPath("build.zig.zon").?);
-    try std.testing.expectEqual(Language.bash, Language.fromPath("script.sh").?);
-    try std.testing.expectEqual(Language.json, Language.fromMarkdownName("JSON").?);
-    try std.testing.expectEqual(Language.yaml, Language.fromPath("workflow.YML").?);
-    try std.testing.expectEqual(Language.diff, Language.fromMarkdownName("patch").?);
+    const path_cases = [_]struct { []const u8, Language }{
+        .{ "build.zig.zon", .zig },
+        .{ "script.sh", .bash },
+        .{ "data.json", .json },
+        .{ "workflow.YML", .yaml },
+        .{ "change.patch", .diff },
+        .{ "app.js", .javascript },
+        .{ "component.JSX", .javascript },
+        .{ "module.mjs", .javascript },
+        .{ "config.cjs", .javascript },
+        .{ "types.ts", .typescript },
+        .{ "component.tsx", .tsx },
+        .{ "main.rs", .rust },
+        .{ "main.c", .c },
+        .{ "header.h", .c },
+        .{ "main.cc", .cpp },
+        .{ "main.cpp", .cpp },
+        .{ "main.cxx", .cpp },
+        .{ "main.c++", .cpp },
+        .{ "header.hh", .cpp },
+        .{ "header.hpp", .cpp },
+        .{ "header.hxx", .cpp },
+        .{ "header.h++", .cpp },
+        .{ "template.ipp", .cpp },
+        .{ "template.inl", .cpp },
+        .{ "module.ixx", .cpp },
+        .{ "template.tcc", .cpp },
+        .{ "template.tpp", .cpp },
+        .{ "main.go", .go },
+        .{ "Main.java", .java },
+        .{ "init.lua", .lua },
+        .{ "script.py", .python },
+        .{ "window.pyw", .python },
+    };
+    for (path_cases) |case| {
+        try std.testing.expectEqual(case[1], Language.fromPath(case[0]).?);
+    }
+
+    const fence_cases = [_]struct { []const u8, Language }{
+        .{ "JSON", .json },
+        .{ "patch", .diff },
+        .{ "javascript", .javascript },
+        .{ "js", .javascript },
+        .{ "jsx", .javascript },
+        .{ "mjs", .javascript },
+        .{ "cjs", .javascript },
+        .{ "typescript", .typescript },
+        .{ "ts", .typescript },
+        .{ "tsx", .tsx },
+        .{ "rust", .rust },
+        .{ "rs", .rust },
+        .{ "c", .c },
+        .{ "c++", .cpp },
+        .{ "cpp", .cpp },
+        .{ "cxx", .cpp },
+        .{ "cc", .cpp },
+        .{ "go", .go },
+        .{ "golang", .go },
+        .{ "java", .java },
+        .{ "lua", .lua },
+        .{ "python", .python },
+        .{ "py", .python },
+        .{ "python3", .python },
+        .{ "py3", .python },
+    };
+    for (fence_cases) |case| {
+        try std.testing.expectEqual(
+            case[1],
+            Language.fromMarkdownName(case[0]).?,
+        );
+    }
+
     try std.testing.expect(Language.fromPath("README.md") == null);
+}
+
+fn expectTokenSlice(
+    language: Language,
+    source: []const u8,
+    expected_token: Token,
+    expected_text: []const u8,
+) !void {
+    const highlighted = try spans(std.testing.allocator, language, source);
+    defer std.testing.allocator.free(highlighted);
+    for (highlighted) |span| {
+        if (span.token == expected_token and
+            std.mem.eql(u8, source[span.start..span.end], expected_text))
+        {
+            return;
+        }
+    }
+    return error.ExpectedTokenSlice;
+}
+
+test "new languages produce semantic spans for literal source slices" {
+    try expectTokenSlice(
+        .javascript,
+        "function greet() { return 1; }",
+        .function,
+        "greet",
+    );
+    try expectTokenSlice(
+        .typescript,
+        "interface User { name: string }",
+        .keyword,
+        "interface",
+    );
+    try expectTokenSlice(
+        .tsx,
+        "const view = <Button title=\"Save\" />;",
+        .string,
+        "\"Save\"",
+    );
+    try expectTokenSlice(.rust, "fn greet() -> i32 { 1 }", .function, "greet");
+    try expectTokenSlice(.c, "int main(void) { return 0; }", .function, "main");
+    try expectTokenSlice(
+        .cpp,
+        "class Widget { public: int size() { return 1; } };",
+        .keyword,
+        "class",
+    );
+    try expectTokenSlice(
+        .go,
+        "func greet() string { return \"hi\" }",
+        .function,
+        "greet",
+    );
+    try expectTokenSlice(
+        .java,
+        "class App { void greet() {} }",
+        .function,
+        "greet",
+    );
+    try expectTokenSlice(
+        .lua,
+        "function greet() return \"hi\" end",
+        .function,
+        "greet",
+    );
+    try expectTokenSlice(
+        .python,
+        "def greet():\n    return \"hi\"\n",
+        .function,
+        "greet",
+    );
 }
 
 test "tree-sitter produces semantic spans" {

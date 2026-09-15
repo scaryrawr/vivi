@@ -20,11 +20,22 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    const tree_sitter_core = b.dependency("tree_sitter_core", .{});
-    const tree_sitter_bash = b.dependency("tree_sitter_bash", .{});
-    const tree_sitter_json = b.dependency("tree_sitter_json", .{});
-    const tree_sitter_yaml = b.dependency("tree_sitter_yaml", .{});
-    const tree_sitter_diff = b.dependency("tree_sitter_diff", .{});
+    const syntax_dependencies = SyntaxDependencies{
+        .core = b.dependency("tree_sitter_core", .{}),
+        .bash = b.dependency("tree_sitter_bash", .{}),
+        .json = b.dependency("tree_sitter_json", .{}),
+        .yaml = b.dependency("tree_sitter_yaml", .{}),
+        .diff = b.dependency("tree_sitter_diff", .{}),
+        .javascript = b.dependency("tree_sitter_javascript", .{}),
+        .typescript = b.dependency("tree_sitter_typescript", .{}),
+        .rust = b.dependency("tree_sitter_rust", .{}),
+        .c = b.dependency("tree_sitter_c", .{}),
+        .cpp = b.dependency("tree_sitter_cpp", .{}),
+        .go = b.dependency("tree_sitter_go", .{}),
+        .java = b.dependency("tree_sitter_java", .{}),
+        .lua = b.dependency("tree_sitter_lua", .{}),
+        .python = b.dependency("tree_sitter_python", .{}),
+    };
     const tree_sitter = b.createModule(.{
         .root_source_file = b.path("cli/src/tree_sitter.zig"),
         .target = target,
@@ -80,12 +91,8 @@ pub fn build(b: *std.Build) void {
     addSyntaxHighlighting(
         b,
         cli_module,
-        tree_sitter_core,
         tree_sitter,
-        tree_sitter_bash,
-        tree_sitter_json,
-        tree_sitter_yaml,
-        tree_sitter_diff,
+        syntax_dependencies,
     );
     cli_module.addIncludePath(b.path("third_party/md4c"));
     cli_module.addCSourceFile(.{
@@ -128,12 +135,8 @@ pub fn build(b: *std.Build) void {
     addSyntaxHighlighting(
         b,
         chat_tests_module,
-        tree_sitter_core,
         tree_sitter,
-        tree_sitter_bash,
-        tree_sitter_json,
-        tree_sitter_yaml,
-        tree_sitter_diff,
+        syntax_dependencies,
     );
     chat_tests_module.addIncludePath(b.path("third_party/md4c"));
     chat_tests_module.addCSourceFile(.{
@@ -160,12 +163,8 @@ pub fn build(b: *std.Build) void {
     addSyntaxHighlighting(
         b,
         tool_tests_module,
-        tree_sitter_core,
         tree_sitter,
-        tree_sitter_bash,
-        tree_sitter_json,
-        tree_sitter_yaml,
-        tree_sitter_diff,
+        syntax_dependencies,
     );
     const tool_tests = b.addTest(.{ .root_module = tool_tests_module, .use_llvm = use_llvm });
     const run_tool_tests = b.addRunArtifact(tool_tests);
@@ -180,12 +179,8 @@ pub fn build(b: *std.Build) void {
     addSyntaxHighlighting(
         b,
         markdown_tests_module,
-        tree_sitter_core,
         tree_sitter,
-        tree_sitter_bash,
-        tree_sitter_json,
-        tree_sitter_yaml,
-        tree_sitter_diff,
+        syntax_dependencies,
     );
     markdown_tests_module.addIncludePath(b.path("third_party/md4c"));
     markdown_tests_module.addCSourceFile(.{
@@ -267,15 +262,28 @@ fn addPty(
     }
 }
 
+const SyntaxDependencies = struct {
+    core: *std.Build.Dependency,
+    bash: *std.Build.Dependency,
+    json: *std.Build.Dependency,
+    yaml: *std.Build.Dependency,
+    diff: *std.Build.Dependency,
+    javascript: *std.Build.Dependency,
+    typescript: *std.Build.Dependency,
+    rust: *std.Build.Dependency,
+    c: *std.Build.Dependency,
+    cpp: *std.Build.Dependency,
+    go: *std.Build.Dependency,
+    java: *std.Build.Dependency,
+    lua: *std.Build.Dependency,
+    python: *std.Build.Dependency,
+};
+
 fn addSyntaxHighlighting(
     b: *std.Build,
     module: *std.Build.Module,
-    tree_sitter_core: *std.Build.Dependency,
     tree_sitter: *std.Build.Module,
-    tree_sitter_bash: *std.Build.Dependency,
-    tree_sitter_json: *std.Build.Dependency,
-    tree_sitter_yaml: *std.Build.Dependency,
-    tree_sitter_diff: *std.Build.Dependency,
+    dependencies: SyntaxDependencies,
 ) void {
     const c_flags = &.{"-std=c11"};
     const core_c_flags = &.{
@@ -285,11 +293,11 @@ fn addSyntaxHighlighting(
     };
     module.addImport("tree-sitter", tree_sitter);
     module.link_libc = true;
-    module.addIncludePath(tree_sitter_core.path("include"));
-    module.addIncludePath(tree_sitter_core.path("src"));
+    module.addIncludePath(dependencies.core.path("include"));
+    module.addIncludePath(dependencies.core.path("src"));
     module.addIncludePath(b.path("third_party/tree-sitter-zig"));
     module.addCSourceFile(.{
-        .file = tree_sitter_core.path("src/lib.c"),
+        .file = dependencies.core.path("src/lib.c"),
         .flags = core_c_flags,
     });
     module.addCSourceFile(.{
@@ -297,27 +305,95 @@ fn addSyntaxHighlighting(
         .flags = c_flags,
     });
     module.addCSourceFile(.{
-        .file = tree_sitter_bash.path("src/parser.c"),
+        .file = dependencies.bash.path("src/parser.c"),
         .flags = c_flags,
     });
     module.addCSourceFile(.{
-        .file = tree_sitter_bash.path("src/scanner.c"),
+        .file = dependencies.bash.path("src/scanner.c"),
         .flags = c_flags,
     });
     module.addCSourceFile(.{
-        .file = tree_sitter_json.path("src/parser.c"),
+        .file = dependencies.json.path("src/parser.c"),
         .flags = c_flags,
     });
     module.addCSourceFile(.{
-        .file = tree_sitter_yaml.path("src/parser.c"),
+        .file = dependencies.yaml.path("src/parser.c"),
         .flags = c_flags,
     });
     module.addCSourceFile(.{
-        .file = tree_sitter_yaml.path("src/scanner.c"),
+        .file = dependencies.yaml.path("src/scanner.c"),
         .flags = c_flags,
     });
     module.addCSourceFile(.{
-        .file = tree_sitter_diff.path("src/parser.c"),
+        .file = dependencies.diff.path("src/parser.c"),
+        .flags = c_flags,
+    });
+    module.addCSourceFile(.{
+        .file = dependencies.javascript.path("src/parser.c"),
+        .flags = c_flags,
+    });
+    module.addCSourceFile(.{
+        .file = dependencies.javascript.path("src/scanner.c"),
+        .flags = c_flags,
+    });
+    module.addCSourceFile(.{
+        .file = dependencies.typescript.path("typescript/src/parser.c"),
+        .flags = c_flags,
+    });
+    module.addCSourceFile(.{
+        .file = dependencies.typescript.path("typescript/src/scanner.c"),
+        .flags = c_flags,
+    });
+    module.addCSourceFile(.{
+        .file = dependencies.typescript.path("tsx/src/parser.c"),
+        .flags = c_flags,
+    });
+    module.addCSourceFile(.{
+        .file = dependencies.typescript.path("tsx/src/scanner.c"),
+        .flags = c_flags,
+    });
+    module.addCSourceFile(.{
+        .file = dependencies.rust.path("src/parser.c"),
+        .flags = c_flags,
+    });
+    module.addCSourceFile(.{
+        .file = dependencies.rust.path("src/scanner.c"),
+        .flags = c_flags,
+    });
+    module.addCSourceFile(.{
+        .file = dependencies.c.path("src/parser.c"),
+        .flags = c_flags,
+    });
+    module.addCSourceFile(.{
+        .file = dependencies.cpp.path("src/parser.c"),
+        .flags = c_flags,
+    });
+    module.addCSourceFile(.{
+        .file = dependencies.cpp.path("src/scanner.c"),
+        .flags = c_flags,
+    });
+    module.addCSourceFile(.{
+        .file = dependencies.go.path("src/parser.c"),
+        .flags = c_flags,
+    });
+    module.addCSourceFile(.{
+        .file = dependencies.java.path("src/parser.c"),
+        .flags = c_flags,
+    });
+    module.addCSourceFile(.{
+        .file = dependencies.lua.path("src/parser.c"),
+        .flags = c_flags,
+    });
+    module.addCSourceFile(.{
+        .file = dependencies.lua.path("src/scanner.c"),
+        .flags = c_flags,
+    });
+    module.addCSourceFile(.{
+        .file = dependencies.python.path("src/parser.c"),
+        .flags = c_flags,
+    });
+    module.addCSourceFile(.{
+        .file = dependencies.python.path("src/scanner.c"),
         .flags = c_flags,
     });
 }
