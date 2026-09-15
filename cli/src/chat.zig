@@ -1360,18 +1360,62 @@ const Projection = struct {
         defer if (unload_after_measure) {
             entry.message.unload(allocator);
         };
-        var projection: Projection = .{};
-        defer projection.deinit(allocator);
-        try projection.appendEntry(
-            allocator,
-            entry,
-            entry_index,
-            window,
-            false,
-            spool,
-            show_role,
-        );
-        const rows = projection.lines.items.len;
+        const rows = switch (entry.*) {
+            .message => |*message| rows: {
+                try message.ensureResident(allocator, spool);
+                var counter: Projection = .{};
+                defer counter.deinit(allocator);
+                break :rows switch (message.role) {
+                    .reasoning, .assistant => @intFromBool(show_role) +
+                        try counter.appendMarkdownRange(
+                            allocator,
+                            entry_index,
+                            message.text.items,
+                            window,
+                            @max(window.width -| 2, 1),
+                            &message.highlight_cache,
+                            .markdown,
+                            0,
+                            0,
+                        ),
+                    .user, .queued, .question => 1 +
+                        try counter.appendWrappedRange(
+                            allocator,
+                            entry_index,
+                            message.text.items,
+                            window,
+                            .body,
+                            2,
+                            0,
+                            0,
+                        ),
+                    .status => try counter.appendWrappedRange(
+                        allocator,
+                        entry_index,
+                        message.text.items,
+                        window,
+                        .status,
+                        2,
+                        0,
+                        0,
+                    ),
+                };
+            },
+            .tool => rows: {
+                var projection: Projection = .{};
+                defer projection.deinit(allocator);
+                try projection.appendEntry(
+                    allocator,
+                    entry,
+                    entry_index,
+                    window,
+                    false,
+                    spool,
+                    show_role,
+                );
+                break :rows projection.lines.items.len;
+            },
+        };
         switch (entry.*) {
             .message => |*message| {
                 message.layout_width = window.width;
@@ -1548,7 +1592,7 @@ const Projection = struct {
                     });
                 }
                 if (last > body_offset) {
-                    try self.appendMarkdownRange(
+                    _ = try self.appendMarkdownRange(
                         allocator,
                         entry_index,
                         message.text.items,
@@ -1569,7 +1613,7 @@ const Projection = struct {
                     });
                 }
                 if (last > 1) {
-                    try self.appendWrappedRange(
+                    _ = try self.appendWrappedRange(
                         allocator,
                         entry_index,
                         message.text.items,
@@ -1581,16 +1625,18 @@ const Projection = struct {
                     );
                 }
             },
-            .status => try self.appendWrappedRange(
-                allocator,
-                entry_index,
-                message.text.items,
-                window,
-                .status,
-                2,
-                first,
-                last,
-            ),
+            .status => {
+                _ = try self.appendWrappedRange(
+                    allocator,
+                    entry_index,
+                    message.text.items,
+                    window,
+                    .status,
+                    2,
+                    first,
+                    last,
+                );
+            },
         }
     }
 
@@ -1628,7 +1674,7 @@ const Projection = struct {
         cache: ?*markdown.HighlightCache,
         kind: LineKind,
     ) !void {
-        try self.appendMarkdownRange(
+        _ = try self.appendMarkdownRange(
             allocator,
             entry_index,
             text,
@@ -1652,7 +1698,7 @@ const Projection = struct {
         kind: LineKind,
         first: usize,
         last: usize,
-    ) !void {
+    ) !usize {
         var layout = try markdown.Layout.initCachedRange(
             allocator,
             text,
@@ -1674,6 +1720,7 @@ const Projection = struct {
             });
         }
         layout.lines.clearRetainingCapacity();
+        return layout.total_rows;
     }
 
     fn appendWrapped(
@@ -1685,7 +1732,7 @@ const Projection = struct {
         kind: LineKind,
         indent: u16,
     ) !void {
-        try self.appendWrappedRange(
+        _ = try self.appendWrappedRange(
             allocator,
             entry_index,
             text,
@@ -1707,7 +1754,7 @@ const Projection = struct {
         indent: u16,
         first: usize,
         last: usize,
-    ) !void {
+    ) !usize {
         const available_width = @max(window.width -| indent, 1);
         var iterator = vaxis.unicode.graphemeIterator(text);
         var line_start: usize = 0;
@@ -1756,6 +1803,7 @@ const Projection = struct {
                 .end = text.len,
             });
         }
+        return row + 1;
     }
 };
 

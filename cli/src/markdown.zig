@@ -66,6 +66,7 @@ pub const Line = struct {
 pub const Layout = struct {
     allocator: std.mem.Allocator,
     lines: std.ArrayList(Line) = .empty,
+    total_rows: usize = 0,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -137,7 +138,7 @@ pub const Layout = struct {
 
         var layout = Layout{ .allocator = allocator };
         errdefer layout.deinit();
-        try builder.wrapRangeInto(
+        layout.total_rows = try builder.wrapRangeInto(
             &layout.lines,
             first_row,
             last_row,
@@ -548,23 +549,12 @@ const Builder = struct {
         if (self.lines.items.len == 0) try self.lines.append(self.allocator, .{});
     }
 
-    fn wrapInto(
-        self: *Builder,
-        destination: *std.ArrayList(Line),
-    ) !void {
-        try self.wrapRangeInto(
-            destination,
-            0,
-            std.math.maxInt(usize),
-        );
-    }
-
     fn wrapRangeInto(
         self: *Builder,
         destination: *std.ArrayList(Line),
         first_row: usize,
         last_row: usize,
-    ) !void {
+    ) !usize {
         var sink = LineSink{
             .allocator = self.allocator,
             .destination = destination,
@@ -580,6 +570,7 @@ const Builder = struct {
                 &sink,
             );
         }
+        return sink.index;
     }
 
     fn beginListItem(self: *Builder, detail: ?*anyopaque) !void {
@@ -1942,6 +1933,7 @@ test "range layout retains only requested wrapped rows" {
     defer rendered.deinit(std.testing.allocator);
     try appendLayoutText(std.testing.allocator, &rendered, &layout);
 
+    try std.testing.expectEqual(@as(usize, 5), layout.total_rows);
     try std.testing.expectEqual(@as(usize, 2), layout.lines.items.len);
     try std.testing.expectEqualStrings("beta\ngamma", rendered.items);
 }
