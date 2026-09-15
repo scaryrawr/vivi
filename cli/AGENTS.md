@@ -16,3 +16,6 @@ line endings so syntax spans index `output_display`, not the raw payload.
 Treat `read` results with an `offset` or `limit` as fragments and use tolerant
 highlighting. Reserve complete parsing for full-file or homogeneous command
 output, and reject oversized complete sources before truncation.
+
+When adding a Tree-sitter grammar in `build.zig`, compile its generated
+`parser.c` and every generated external scanner source shipped by that grammar.
