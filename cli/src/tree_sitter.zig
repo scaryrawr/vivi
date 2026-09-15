@@ -55,6 +55,10 @@ pub const Node = extern struct {
     pub fn endByte(self: Node) u32 {
         return ts_node_end_byte(self);
     }
+
+    pub fn hasError(self: Node) bool {
+        return ts_node_has_error(self);
+    }
 };
 
 const QueryError = enum(c_uint) {
@@ -178,6 +182,7 @@ extern fn ts_tree_delete(tree: *Tree) void;
 extern fn ts_tree_root_node(tree: *const Tree) Node;
 extern fn ts_node_start_byte(node: Node) u32;
 extern fn ts_node_end_byte(node: Node) u32;
+extern fn ts_node_has_error(node: Node) bool;
 
 extern fn ts_query_new(
     language: *const Language,

@@ -4,11 +4,15 @@ const ts = @import("tree-sitter");
 extern fn tree_sitter_zig() callconv(.c) *const ts.Language;
 extern fn tree_sitter_bash() callconv(.c) *const ts.Language;
 extern fn tree_sitter_json() callconv(.c) *const ts.Language;
+extern fn tree_sitter_yaml() callconv(.c) *const ts.Language;
+extern fn tree_sitter_diff() callconv(.c) *const ts.Language;
 
 pub const Language = enum {
     zig,
     bash,
     json,
+    yaml,
+    diff,
 
     pub fn fromPath(path: []const u8) ?Language {
         const extension = std.fs.path.extension(path);
@@ -27,6 +31,16 @@ pub const Language = enum {
             std.ascii.eqlIgnoreCase(extension, ".jsonl"))
         {
             return .json;
+        }
+        if (std.ascii.eqlIgnoreCase(extension, ".yaml") or
+            std.ascii.eqlIgnoreCase(extension, ".yml"))
+        {
+            return .yaml;
+        }
+        if (std.ascii.eqlIgnoreCase(extension, ".diff") or
+            std.ascii.eqlIgnoreCase(extension, ".patch"))
+        {
+            return .diff;
         }
         return null;
     }
@@ -49,55 +63,114 @@ pub const Language = enum {
         {
             return .json;
         }
+        if (std.ascii.eqlIgnoreCase(name, "yaml") or
+            std.ascii.eqlIgnoreCase(name, "yml"))
+        {
+            return .yaml;
+        }
+        if (std.ascii.eqlIgnoreCase(name, "diff") or
+            std.ascii.eqlIgnoreCase(name, "patch"))
+        {
+            return .diff;
+        }
         return null;
     }
 
-    fn treeSitterLanguage(self: Language) *const ts.Language {
+    fn definition(self: Language) Definition {
         return switch (self) {
-            .zig => tree_sitter_zig(),
-            .bash => tree_sitter_bash(),
-            .json => tree_sitter_json(),
+            .zig => .{
+                .language = tree_sitter_zig(),
+                .color_query =
+                \\(comment) @comment
+                \\[(string) (multiline_string)] @string
+                \\[(integer) (float)] @number
+                \\["true" "false" "null" "unreachable" "undefined"] @constant
+                \\(builtin_identifier) @function
+                \\["asm" "defer" "errdefer" "test" "error" "const" "var"
+                \\ "struct" "union" "enum" "opaque" "async" "await" "suspend"
+                \\ "nosuspend" "resume" "fn"
+                \\ "and" "or" "orelse" "return" "if" "else" "switch" "for" "while"
+                \\ "break" "continue" "usingnamespace" "export" "try" "catch"
+                \\ "volatile" "allowzero" "noalias" "addrspace" "align" "callconv"
+                \\ "linksection" "pub" "inline" "noinline" "extern" "comptime"
+                \\ "packed" "threadlocal"] @keyword
+                ,
+            },
+            .bash => .{
+                .language = tree_sitter_bash(),
+                .color_query =
+                \\[(string) (raw_string) (heredoc_body) (heredoc_start)] @string
+                \\(command_name) @function
+                \\(function_definition name: (word) @function)
+                \\(variable_name) @property
+                \\["case" "do" "done" "elif" "else" "esac" "export" "fi" "for"
+                \\ "function" "if" "in" "select" "then" "unset" "until" "while"] @keyword
+                \\(comment) @comment
+                \\(file_descriptor) @number
+                \\["$" "&&" ">" ">>" "<" "|"] @operator
+                ,
+            },
+            .json => .{
+                .language = tree_sitter_json(),
+                .color_query =
+                \\(string) @string
+                \\(pair key: (_) @property)
+                \\(number) @number
+                \\[(null) (true) (false)] @constant
+                \\(escape_sequence) @operator
+                \\(comment) @comment
+                ,
+            },
+            .yaml => .{
+                .language = tree_sitter_yaml(),
+                .color_query =
+                \\(comment) @comment
+                \\[(double_quote_scalar) (single_quote_scalar)
+                \\ (block_scalar) (string_scalar)] @string
+                \\[(integer_scalar) (float_scalar)] @number
+                \\[(boolean_scalar) (null_scalar)] @constant
+                \\[(anchor_name) (alias_name) (tag)] @operator
+                \\(block_mapping_pair
+                \\  key: (flow_node
+                \\    [(double_quote_scalar) (single_quote_scalar)] @property))
+                \\(block_mapping_pair
+                \\  key: (flow_node
+                \\    (plain_scalar (string_scalar) @property)))
+                \\(flow_mapping
+                \\  (_ key: (flow_node
+                \\    [(double_quote_scalar) (single_quote_scalar)] @property)))
+                \\(flow_mapping
+                \\  (_ key: (flow_node
+                \\    (plain_scalar (string_scalar) @property))))
+                ,
+            },
+            .diff => .{
+                .language = tree_sitter_diff(),
+                .color_query =
+                \\(comment) @comment
+                \\[(addition) (new_file)] @inserted
+                \\[(deletion) (old_file)] @deleted
+                \\[(change) (location)] @meta
+                \\(commit) @constant
+                \\(filename) @string
+                \\(command "diff" @function)
+                \\(mode) @number
+                \\(index "index" @keyword)
+                ,
+                .invalid_query = "(unrecognized) @invalid",
+                .required_query = "(command (argument) @signature)",
+                .required_text = "--git",
+            },
         };
     }
+};
 
-    fn query(self: Language) []const u8 {
-        return switch (self) {
-            .zig =>
-            \\(comment) @comment
-            \\[(string) (multiline_string)] @string
-            \\[(integer) (float)] @number
-            \\["true" "false" "null" "unreachable" "undefined"] @constant
-            \\(builtin_identifier) @function
-            \\["asm" "defer" "errdefer" "test" "error" "const" "var"
-            \\ "struct" "union" "enum" "opaque" "async" "await" "suspend"
-            \\ "nosuspend" "resume" "fn"
-            \\ "and" "or" "orelse" "return" "if" "else" "switch" "for" "while"
-            \\ "break" "continue" "usingnamespace" "export" "try" "catch"
-            \\ "volatile" "allowzero" "noalias" "addrspace" "align" "callconv"
-            \\ "linksection" "pub" "inline" "noinline" "extern" "comptime"
-            \\ "packed" "threadlocal"] @keyword
-            ,
-            .bash =>
-            \\[(string) (raw_string) (heredoc_body) (heredoc_start)] @string
-            \\(command_name) @function
-            \\(function_definition name: (word) @function)
-            \\(variable_name) @property
-            \\["case" "do" "done" "elif" "else" "esac" "export" "fi" "for"
-            \\ "function" "if" "in" "select" "then" "unset" "until" "while"] @keyword
-            \\(comment) @comment
-            \\(file_descriptor) @number
-            \\["$" "&&" ">" ">>" "<" "|"] @operator
-            ,
-            .json =>
-            \\(string) @string
-            \\(pair key: (_) @property)
-            \\(number) @number
-            \\[(null) (true) (false)] @constant
-            \\(escape_sequence) @operator
-            \\(comment) @comment
-            ,
-        };
-    }
+const Definition = struct {
+    language: *const ts.Language,
+    color_query: []const u8,
+    invalid_query: ?[]const u8 = null,
+    required_query: ?[]const u8 = null,
+    required_text: ?[]const u8 = null,
 };
 
 pub const Token = enum {
@@ -109,6 +182,9 @@ pub const Token = enum {
     function,
     property,
     operator,
+    inserted,
+    deleted,
+    meta,
 };
 
 pub const Span = struct {
@@ -124,22 +200,54 @@ pub fn spans(
     language: Language,
     source: []const u8,
 ) ![]Span {
+    return parseSpans(allocator, language, source, false);
+}
+
+pub fn completeSpans(
+    allocator: std.mem.Allocator,
+    language: Language,
+    source: []const u8,
+) ![]Span {
+    return parseSpans(allocator, language, source, true);
+}
+
+fn parseSpans(
+    allocator: std.mem.Allocator,
+    language: Language,
+    source: []const u8,
+    require_complete: bool,
+) ![]Span {
     const bounded_source = source[0..@min(source.len, max_source_bytes)];
     if (bounded_source.len == 0) {
         return allocator.alloc(Span, 0);
     }
 
+    const definition = language.definition();
     const parser = ts.Parser.create();
     defer parser.destroy();
-    try parser.setLanguage(language.treeSitterLanguage());
+    try parser.setLanguage(definition.language);
     const tree = parser.parseString(bounded_source, null) orelse
         return allocator.alloc(Span, 0);
     defer tree.destroy();
+    const root = tree.rootNode();
+    if (require_complete and
+        (root.hasError() or
+            try capturesAny(
+                definition,
+                definition.invalid_query,
+                bounded_source,
+                root,
+                null,
+            ) or
+            !try satisfiesRequirement(definition, bounded_source, root)))
+    {
+        return allocator.alloc(Span, 0);
+    }
 
     var error_offset: u32 = 0;
     const query = try ts.Query.create(
-        language.treeSitterLanguage(),
-        language.query(),
+        definition.language,
+        definition.color_query,
         &error_offset,
     );
     defer query.destroy();
@@ -184,10 +292,59 @@ pub fn spans(
     return result.toOwnedSlice(allocator);
 }
 
+fn satisfiesRequirement(
+    definition: Definition,
+    source: []const u8,
+    root: ts.Node,
+) !bool {
+    const query_source = definition.required_query orelse return true;
+    return capturesAny(
+        definition,
+        query_source,
+        source,
+        root,
+        definition.required_text,
+    );
+}
+
+fn capturesAny(
+    definition: Definition,
+    query_source: ?[]const u8,
+    source: []const u8,
+    root: ts.Node,
+    required_text: ?[]const u8,
+) !bool {
+    const text = query_source orelse return false;
+    var error_offset: u32 = 0;
+    const query = try ts.Query.create(
+        definition.language,
+        text,
+        &error_offset,
+    );
+    defer query.destroy();
+    const cursor = ts.QueryCursor.create();
+    defer cursor.destroy();
+    cursor.exec(query, root);
+    while (cursor.nextCapture()) |result| {
+        if (required_text == null) return true;
+        const capture = result[1].captures[result[0]];
+        const start: usize = @intCast(capture.node.startByte());
+        const end: usize = @intCast(capture.node.endByte());
+        if (end <= source.len and
+            std.mem.eql(u8, source[start..end], required_text.?))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 test "language detection covers supported file and fence names" {
     try std.testing.expectEqual(Language.zig, Language.fromPath("build.zig.zon").?);
     try std.testing.expectEqual(Language.bash, Language.fromPath("script.sh").?);
     try std.testing.expectEqual(Language.json, Language.fromMarkdownName("JSON").?);
+    try std.testing.expectEqual(Language.yaml, Language.fromPath("workflow.YML").?);
+    try std.testing.expectEqual(Language.diff, Language.fromMarkdownName("patch").?);
     try std.testing.expect(Language.fromPath("README.md") == null);
 }
 
@@ -254,4 +411,87 @@ test "Bash function styling is limited to the function name" {
         }
     }
     try std.testing.expect(saw_function_name and saw_body_keyword);
+}
+
+test "complete parsing rejects syntax that tolerant snippets retain" {
+    const source = "const =";
+    const tolerant = try spans(std.testing.allocator, .zig, source);
+    defer std.testing.allocator.free(tolerant);
+    const complete = try completeSpans(std.testing.allocator, .zig, source);
+    defer std.testing.allocator.free(complete);
+
+    try std.testing.expect(tolerant.len > 0);
+    try std.testing.expectEqual(@as(usize, 0), complete.len);
+}
+
+test "YAML complete parsing produces semantic spans and rejects errors" {
+    const source =
+        \\name: vivi
+        \\ready: true
+        \\count: 2
+        \\# note
+    ;
+    const highlighted = try completeSpans(std.testing.allocator, .yaml, source);
+    defer std.testing.allocator.free(highlighted);
+    var saw_property = false;
+    var saw_constant = false;
+    var saw_comment = false;
+    for (highlighted) |span| {
+        const text = source[span.start..span.end];
+        saw_property = saw_property or
+            (span.token == .property and std.mem.eql(u8, text, "name"));
+        saw_constant = saw_constant or
+            (span.token == .constant and std.mem.eql(u8, text, "true"));
+        saw_comment = saw_comment or
+            (span.token == .comment and std.mem.eql(u8, text, "# note"));
+    }
+    try std.testing.expect(saw_property and saw_constant and saw_comment);
+
+    const rejected = try completeSpans(
+        std.testing.allocator,
+        .yaml,
+        "items: [one, two",
+    );
+    defer std.testing.allocator.free(rejected);
+    try std.testing.expectEqual(@as(usize, 0), rejected.len);
+}
+
+test "diff complete parsing requires a git signature and rejects unknown text" {
+    const source =
+        \\diff --git a/file.txt b/file.txt
+        \\index 3367afd..4a58007 100644
+        \\--- a/file.txt
+        \\+++ b/file.txt
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+    ++ "\n";
+    const highlighted = try completeSpans(std.testing.allocator, .diff, source);
+    defer std.testing.allocator.free(highlighted);
+    var saw_inserted = false;
+    var saw_deleted = false;
+    var saw_meta = false;
+    for (highlighted) |span| {
+        const text = source[span.start..span.end];
+        saw_inserted = saw_inserted or
+            (span.token == .inserted and std.mem.eql(u8, text, "+new"));
+        saw_deleted = saw_deleted or
+            (span.token == .deleted and std.mem.eql(u8, text, "-old"));
+        saw_meta = saw_meta or
+            (span.token == .meta and std.mem.startsWith(u8, text, "@@"));
+    }
+    try std.testing.expect(saw_inserted and saw_deleted and saw_meta);
+
+    for ([_][]const u8{
+        "--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-old\n+new\n",
+        "fatal: bad revision",
+    }) |invalid| {
+        const rejected = try completeSpans(
+            std.testing.allocator,
+            .diff,
+            invalid,
+        );
+        defer std.testing.allocator.free(rejected);
+        try std.testing.expectEqual(@as(usize, 0), rejected.len);
+    }
 }

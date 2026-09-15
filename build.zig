@@ -23,6 +23,8 @@ pub fn build(b: *std.Build) void {
     const tree_sitter_core = b.dependency("tree_sitter_core", .{});
     const tree_sitter_bash = b.dependency("tree_sitter_bash", .{});
     const tree_sitter_json = b.dependency("tree_sitter_json", .{});
+    const tree_sitter_yaml = b.dependency("tree_sitter_yaml", .{});
+    const tree_sitter_diff = b.dependency("tree_sitter_diff", .{});
     const tree_sitter = b.createModule(.{
         .root_source_file = b.path("cli/src/tree_sitter.zig"),
         .target = target,
@@ -82,6 +84,8 @@ pub fn build(b: *std.Build) void {
         tree_sitter,
         tree_sitter_bash,
         tree_sitter_json,
+        tree_sitter_yaml,
+        tree_sitter_diff,
     );
     cli_module.addIncludePath(b.path("third_party/md4c"));
     cli_module.addCSourceFile(.{
@@ -128,6 +132,8 @@ pub fn build(b: *std.Build) void {
         tree_sitter,
         tree_sitter_bash,
         tree_sitter_json,
+        tree_sitter_yaml,
+        tree_sitter_diff,
     );
     chat_tests_module.addIncludePath(b.path("third_party/md4c"));
     chat_tests_module.addCSourceFile(.{
@@ -158,6 +164,8 @@ pub fn build(b: *std.Build) void {
         tree_sitter,
         tree_sitter_bash,
         tree_sitter_json,
+        tree_sitter_yaml,
+        tree_sitter_diff,
     );
     const tool_tests = b.addTest(.{ .root_module = tool_tests_module, .use_llvm = use_llvm });
     const run_tool_tests = b.addRunArtifact(tool_tests);
@@ -176,6 +184,8 @@ pub fn build(b: *std.Build) void {
         tree_sitter,
         tree_sitter_bash,
         tree_sitter_json,
+        tree_sitter_yaml,
+        tree_sitter_diff,
     );
     markdown_tests_module.addIncludePath(b.path("third_party/md4c"));
     markdown_tests_module.addCSourceFile(.{
@@ -264,6 +274,8 @@ fn addSyntaxHighlighting(
     tree_sitter: *std.Build.Module,
     tree_sitter_bash: *std.Build.Dependency,
     tree_sitter_json: *std.Build.Dependency,
+    tree_sitter_yaml: *std.Build.Dependency,
+    tree_sitter_diff: *std.Build.Dependency,
 ) void {
     const c_flags = &.{"-std=c11"};
     const core_c_flags = &.{
@@ -294,6 +306,18 @@ fn addSyntaxHighlighting(
     });
     module.addCSourceFile(.{
         .file = tree_sitter_json.path("src/parser.c"),
+        .flags = c_flags,
+    });
+    module.addCSourceFile(.{
+        .file = tree_sitter_yaml.path("src/parser.c"),
+        .flags = c_flags,
+    });
+    module.addCSourceFile(.{
+        .file = tree_sitter_yaml.path("src/scanner.c"),
+        .flags = c_flags,
+    });
+    module.addCSourceFile(.{
+        .file = tree_sitter_diff.path("src/parser.c"),
         .flags = c_flags,
     });
 }

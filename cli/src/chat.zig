@@ -2,6 +2,7 @@ const std = @import("std");
 const backend = @import("vivi_backend");
 const highlight = @import("highlight.zig");
 const markdown = @import("markdown.zig");
+const tool_output = @import("tool_output.zig");
 const tool_renderer = @import("tool_renderer.zig");
 const clipboard = @import("clipboard.zig");
 const images = @import("images.zig");
@@ -25,6 +26,9 @@ const syntax_keyword = vaxis.Color{ .rgb = .{ 196, 181, 253 } };
 const syntax_function = vaxis.Color{ .rgb = .{ 125, 211, 252 } };
 const syntax_property = vaxis.Color{ .rgb = .{ 253, 224, 71 } };
 const syntax_operator = vaxis.Color{ .rgb = .{ 244, 114, 182 } };
+const syntax_inserted = vaxis.Color{ .rgb = .{ 134, 239, 172 } };
+const syntax_deleted = vaxis.Color{ .rgb = .{ 251, 113, 133 } };
+const syntax_meta = vaxis.Color{ .rgb = .{ 125, 211, 252 } };
 
 const AppEvent = union(enum) {
     key_press: vaxis.Key,
@@ -291,8 +295,7 @@ const ToolEntry = struct {
     preview: ?image_preview.Preview = null,
     input_highlights: []highlight.Span,
     output_highlights: ?[]highlight.Span = null,
-    output_language: ?highlight.Language,
-    output_markdown: bool,
+    output_plan: tool_output.OutputPlan,
     output_markdown_cache: markdown.HighlightCache = .{},
     expanded: bool = false,
     layout_width: u16 = 0,
@@ -359,14 +362,10 @@ const ToolEntry = struct {
             .input = input,
             .input_display = input_display,
             .input_highlights = input_highlights,
-            .output_language = switch (started.invocation.summary) {
-                .read => |summary| highlight.Language.fromPath(summary.path),
-                else => null,
-            },
-            .output_markdown = switch (started.invocation.summary) {
-                .read => |summary| isMarkdownPath(summary.path),
-                else => false,
-            },
+            .output_plan = try tool_output.OutputPlan.fromInvocation(
+                allocator,
+                started.invocation.summary,
+            ),
             .invocation_hash = hashToolInvocation(started),
             .compact = try tool_renderer.renderCompact(
                 allocator,
@@ -432,14 +431,11 @@ const ToolEntry = struct {
         };
         const output = try allocator.dupe(u8, text);
         errdefer allocator.free(output);
-        const succeeded = switch (completion) {
-            .succeeded, .image => true,
-            .failed => false,
-        };
-        const output_display = if (self.output_markdown and succeeded and completion != .image)
-            try tool_renderer.renderMarkdown(allocator, output)
-        else
-            try tool_renderer.renderLiteral(allocator, output);
+        const output_display = try self.output_plan.render(
+            allocator,
+            completionOutcome(completion),
+            output,
+        );
         errdefer allocator.free(output_display);
         const preview = if (finished.result == .image)
             try image_preview.Preview.init(allocator, finished.result.image.bytes)
@@ -448,10 +444,6 @@ const ToolEntry = struct {
         self.output = output;
         self.output_display = output_display;
         self.preview = preview;
-        if (completion == .image) {
-            self.output_language = null;
-            self.output_markdown = false;
-        }
         self.completion = completion;
         self.layout_valid = false;
         const marker = switch (completion) {
@@ -468,17 +460,12 @@ const ToolEntry = struct {
     ) !void {
         if (self.output_highlights != null) return;
         const output = self.output_display orelse return;
-        const succeeded = if (self.completion) |completion| switch (completion) {
-            .succeeded, .image => true,
-            .failed => false,
-        } else false;
-        self.output_highlights = if (succeeded)
-            if (self.output_language) |language|
-                try highlight.spans(allocator, language, output)
-            else
-                try allocator.alloc(highlight.Span, 0)
-        else
-            try allocator.alloc(highlight.Span, 0);
+        const completion = self.completion orelse return;
+        self.output_highlights = try self.output_plan.spans(
+            allocator,
+            completionOutcome(completion),
+            output,
+        );
     }
 
     fn deinit(self: *ToolEntry, allocator: std.mem.Allocator) void {
@@ -496,12 +483,12 @@ const ToolEntry = struct {
     }
 };
 
-fn isMarkdownPath(path: []const u8) bool {
-    const extension = std.fs.path.extension(path);
-    return std.ascii.eqlIgnoreCase(extension, ".md") or
-        std.ascii.eqlIgnoreCase(extension, ".markdown") or
-        std.ascii.eqlIgnoreCase(extension, ".mdown") or
-        std.ascii.eqlIgnoreCase(extension, ".mkdn");
+fn completionOutcome(completion: ToolEntry.Completion) tool_output.Outcome {
+    return switch (completion) {
+        .succeeded => .succeeded,
+        .failed => .failed,
+        .image => .image,
+    };
 }
 
 fn highlightBashInput(
@@ -607,6 +594,9 @@ fn syntaxStyle(base: vaxis.Style, token: highlight.Token) vaxis.Style {
         .function => syntax_function,
         .property => syntax_property,
         .operator => syntax_operator,
+        .inserted => syntax_inserted,
+        .deleted => syntax_deleted,
+        .meta => syntax_meta,
     };
     return style;
 }
@@ -1532,11 +1522,12 @@ const Projection = struct {
             last -| row,
         );
         if (!tool.expanded) return row;
-        const render_markdown = tool.output_markdown and
-            if (tool.completion) |completion| switch (completion) {
-                .succeeded, .image => true,
-                .failed => false,
-            } else false;
+        const render_markdown =
+            std.meta.activeTag(tool.output_plan) == .markdown and
+            if (tool.completion) |completion|
+                std.meta.activeTag(completion) == .succeeded
+            else
+                false;
         if (cache_highlights and !render_markdown) {
             try tool.ensureOutputHighlights(allocator);
         }
@@ -4743,6 +4734,166 @@ test "tool details highlight shell input and supported read output" {
     );
 }
 
+test "bash output plans highlight YAML and diff through the ToolEntry lifecycle" {
+    var yaml_started = try toolStarted(
+        "yaml-output",
+        "{\"command\":\"cat .github/workflows/ci.yml\"}",
+        .{ .bash = .{ .run = .{
+            .command = "cat .github/workflows/ci.yml",
+        } } },
+    );
+    defer yaml_started.deinit();
+    var yaml_entry = try ToolEntry.init(std.testing.allocator, &yaml_started);
+    defer yaml_entry.deinit(std.testing.allocator);
+    try std.testing.expectEqual(
+        tool_output.OutputPlan{ .syntax = .yaml },
+        yaml_entry.output_plan,
+    );
+    const yaml_raw = "name: CI\r\nready: true\nunsafe: \xff\u{202e}\n";
+    var yaml_finished = try toolFinished(
+        "yaml-output",
+        .{ .succeeded = yaml_raw },
+    );
+    defer yaml_finished.deinit();
+    try yaml_entry.finish(std.testing.allocator, &yaml_finished);
+    try std.testing.expectEqualStrings(
+        "name: CI\\x0d\nready: true\nunsafe: \\xff\\xe2\\x80\\xae\n",
+        yaml_entry.output_display.?,
+    );
+    try std.testing.expect(yaml_entry.output_highlights == null);
+    try yaml_entry.ensureOutputHighlights(std.testing.allocator);
+    const yaml_spans = yaml_entry.output_highlights.?;
+    var saw_name = false;
+    var saw_true = false;
+    for (yaml_spans) |span| {
+        const text = yaml_entry.output_display.?[span.start..span.end];
+        saw_name = saw_name or
+            (span.token == .property and std.mem.eql(u8, text, "name"));
+        saw_true = saw_true or
+            (span.token == .constant and std.mem.eql(u8, text, "true"));
+        try std.testing.expect(span.end <= yaml_entry.output_display.?.len);
+    }
+    try std.testing.expect(saw_name and saw_true);
+    const cached_spans = yaml_entry.output_highlights.?.ptr;
+    try yaml_entry.finish(std.testing.allocator, &yaml_finished);
+    try std.testing.expectEqual(cached_spans, yaml_entry.output_highlights.?.ptr);
+
+    var diff_started = try toolStarted(
+        "diff-output",
+        "{\"command\":\"git diff\"}",
+        .{ .bash = .{ .run = .{ .command = "git diff" } } },
+    );
+    defer diff_started.deinit();
+    var diff_entry = try ToolEntry.init(std.testing.allocator, &diff_started);
+    defer diff_entry.deinit(std.testing.allocator);
+    const diff_text =
+        \\diff --git a/file.txt b/file.txt
+        \\index 3367afd..4a58007 100644
+        \\--- a/file.txt
+        \\+++ b/file.txt
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+    ++ "\n";
+    var diff_finished = try toolFinished(
+        "diff-output",
+        .{ .succeeded = diff_text },
+    );
+    defer diff_finished.deinit();
+    try diff_entry.finish(std.testing.allocator, &diff_finished);
+    try std.testing.expect(diff_entry.output_highlights == null);
+    try diff_entry.ensureOutputHighlights(std.testing.allocator);
+    var saw_inserted = false;
+    var saw_deleted = false;
+    var saw_meta = false;
+    for (diff_entry.output_highlights.?) |span| {
+        const text = diff_entry.output_display.?[span.start..span.end];
+        saw_inserted = saw_inserted or
+            (span.token == .inserted and std.mem.eql(u8, text, "+new"));
+        saw_deleted = saw_deleted or
+            (span.token == .deleted and std.mem.eql(u8, text, "-old"));
+        saw_meta = saw_meta or
+            (span.token == .meta and std.mem.startsWith(u8, text, "@@"));
+    }
+    try std.testing.expect(saw_inserted and saw_deleted and saw_meta);
+}
+
+test "bash output plans fall back to literal for unsafe lifecycle cases" {
+    const diff_text =
+        \\diff --git a/file.txt b/file.txt
+        \\--- a/file.txt
+        \\+++ b/file.txt
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+    ;
+    const cases = [_]struct {
+        id: []const u8,
+        summary: backend.ToolSummary,
+        result: union(enum) {
+            succeeded: []const u8,
+            failed: []const u8,
+        },
+    }{
+        .{
+            .id = "failed-diff",
+            .summary = .{ .bash = .{ .run = .{ .command = "git diff" } } },
+            .result = .{ .failed = diff_text },
+        },
+        .{
+            .id = "pipeline-diff",
+            .summary = .{ .bash = .{ .run = .{
+                .command = "git diff | sed s/a/b/",
+            } } },
+            .result = .{ .succeeded = diff_text },
+        },
+        .{
+            .id = "started-yaml",
+            .summary = .{ .bash = .{ .start = .{
+                .command = "cat workflow.yml",
+            } } },
+            .result = .{ .succeeded = "name: CI\n" },
+        },
+        .{
+            .id = "unknown-command",
+            .summary = .{ .bash = .{ .run = .{
+                .command = "printf 'name: CI'",
+            } } },
+            .result = .{ .succeeded = "name: CI" },
+        },
+        .{
+            .id = "invalid-yaml",
+            .summary = .{ .bash = .{ .run = .{
+                .command = "cat workflow.yml",
+            } } },
+            .result = .{ .succeeded = "items: [one, two" },
+        },
+    };
+    for (cases) |case| {
+        var started = try toolStarted(case.id, "{}", case.summary);
+        defer started.deinit();
+        var entry = try ToolEntry.init(std.testing.allocator, &started);
+        defer entry.deinit(std.testing.allocator);
+        var finished = switch (case.result) {
+            .succeeded => |text| try toolFinished(
+                case.id,
+                .{ .succeeded = text },
+            ),
+            .failed => |text| try toolFinished(
+                case.id,
+                .{ .failed = text },
+            ),
+        };
+        defer finished.deinit();
+        try entry.finish(std.testing.allocator, &finished);
+        try entry.ensureOutputHighlights(std.testing.allocator);
+        try std.testing.expectEqual(
+            @as(usize, 0),
+            entry.output_highlights.?.len,
+        );
+    }
+}
+
 test "expanded tool rows draw syntax colors across wrapping" {
     var ui: ChatUi = .{
         .allocator = std.testing.allocator,
@@ -4798,6 +4949,28 @@ test "expanded tool rows draw syntax colors across wrapping" {
     read_finished.deinit();
     ui.transcript.entries.items[1].tool.expanded = true;
 
+    var diff_started = try toolStarted(
+        "diff-render",
+        "{\"command\":\"git diff\"}",
+        .{ .bash = .{ .run = .{ .command = "git diff" } } },
+    );
+    try ui.transcript.applyToolActivity(
+        std.testing.allocator,
+        &.{ .started = diff_started },
+    );
+    diff_started.deinit();
+    var diff_finished = try toolFinished(
+        "diff-render",
+        .{ .succeeded = "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n" ++
+            "@@ -1 +1 @@\n-old\n+new\n" },
+    );
+    try ui.transcript.applyToolActivity(
+        std.testing.allocator,
+        &.{ .finished = diff_finished },
+    );
+    diff_finished.deinit();
+    ui.transcript.entries.items[2].tool.expanded = true;
+
     var screen = try vaxis.Screen.init(std.testing.allocator, .{
         .rows = 1,
         .cols = 12,
@@ -4826,6 +4999,9 @@ test "expanded tool rows draw syntax colors across wrapping" {
     } else unreachable;
     var saw_wrapped_string = false;
     var saw_read_styles = false;
+    var saw_inserted_style = false;
+    var saw_deleted_style = false;
+    var saw_meta_style = false;
     for (projection.lines.items) |line| {
         if (line.entry_index == 0 and line.kind == .tool_input and
             line.start > bash_string.start and line.start < bash_string.end)
@@ -4851,8 +5027,40 @@ test "expanded tool rows draw syntax colors across wrapping" {
             );
             saw_read_styles = true;
         }
+        if (line.entry_index == 2 and line.kind == .tool_output) {
+            const output = ui.transcript.entries.items[2].tool.output_display.?;
+            const text = output[line.start..line.end];
+            if (std.mem.eql(u8, text, "+new")) {
+                ui.drawTranscriptLine(window, 0, &projection, line);
+                try std.testing.expectEqual(
+                    syntax_inserted,
+                    screen.readCell(4, 0).?.style.fg,
+                );
+                saw_inserted_style = true;
+            } else if (std.mem.eql(u8, text, "-old")) {
+                ui.drawTranscriptLine(window, 0, &projection, line);
+                try std.testing.expectEqual(
+                    syntax_deleted,
+                    screen.readCell(4, 0).?.style.fg,
+                );
+                saw_deleted_style = true;
+            } else if (std.mem.startsWith(u8, text, "@@")) {
+                ui.drawTranscriptLine(window, 0, &projection, line);
+                try std.testing.expectEqual(
+                    syntax_meta,
+                    screen.readCell(4, 0).?.style.fg,
+                );
+                saw_meta_style = true;
+            }
+        }
     }
-    try std.testing.expect(saw_wrapped_string and saw_read_styles);
+    try std.testing.expect(
+        saw_wrapped_string and
+            saw_read_styles and
+            saw_inserted_style and
+            saw_deleted_style and
+            saw_meta_style,
+    );
 }
 
 test "transcript replaces streamed draft with completed response" {
@@ -5748,14 +5956,16 @@ test "tool entries retain full owned payloads with bounded compact summaries" {
 }
 
 fn toolAllocationLifecycle(allocator: std.mem.Allocator) !void {
-    var started = try toolStarted("allocation", "{\"path\":\"file\"}", .{
-        .read = .{ .path = "file", .offset = null, .limit = null },
-    });
+    var started = try toolStarted(
+        "allocation",
+        "{\"command\":\"cat workflow.yml\"}",
+        .{ .bash = .{ .run = .{ .command = "cat workflow.yml" } } },
+    );
     defer started.deinit();
     var tool = try ToolEntry.init(allocator, &started);
     defer tool.deinit(allocator);
     var finished = try backend.ToolFinished.init(std.testing.allocator, "allocation", .{
-        .succeeded = "output\n\x1b[31m",
+        .succeeded = "name: vivi\nready: true\nunsafe: \x1b[31m\n",
     });
     defer finished.deinit();
     tool.expanded = true;
@@ -5766,6 +5976,7 @@ fn toolAllocationLifecycle(allocator: std.mem.Allocator) !void {
         return err;
     };
     try std.testing.expect(tool.expanded);
+    try tool.ensureOutputHighlights(allocator);
 }
 
 test "tool owned payload lifecycle is atomic under allocation failure" {
@@ -6490,11 +6701,25 @@ test "expanded tool viewport retains only visible Markdown rows" {
     );
 }
 
-test "Markdown read detection is extension based and case insensitive" {
-    try std.testing.expect(isMarkdownPath("README.md"));
-    try std.testing.expect(isMarkdownPath("docs/GUIDE.MARKDOWN"));
-    try std.testing.expect(!isMarkdownPath("src/main.zig"));
-    try std.testing.expect(!isMarkdownPath("notes.md.txt"));
+test "Markdown read plans are extension based and case insensitive" {
+    const markdown_plan = try tool_output.OutputPlan.fromInvocation(
+        std.testing.allocator,
+        .{ .read = .{
+            .path = "docs/GUIDE.MARKDOWN",
+            .offset = null,
+            .limit = null,
+        } },
+    );
+    try std.testing.expectEqual(tool_output.OutputPlan.markdown, markdown_plan);
+    const literal_plan = try tool_output.OutputPlan.fromInvocation(
+        std.testing.allocator,
+        .{ .read = .{
+            .path = "notes.md.txt",
+            .offset = null,
+            .limit = null,
+        } },
+    );
+    try std.testing.expectEqual(tool_output.OutputPlan.literal, literal_plan);
 }
 
 test "failed Markdown reads remain literal tool output" {
@@ -6812,11 +7037,12 @@ test "image paste boundaries survive terminal parser and event forwarding" {
 
 test "image tool previews retain read bytes and reserve rows only when expanded" {
     const allocator = std.testing.allocator;
-    var started = try backend.ToolStarted.init(allocator, "image-read", "{\"path\":\"image.png\"}", .{ .read = .{
-        .path = "image.png",
-        .offset = null,
-        .limit = null,
-    } });
+    var started = try backend.ToolStarted.init(
+        allocator,
+        "image-read",
+        "{\"command\":\"cat image.yml\"}",
+        .{ .bash = .{ .run = .{ .command = "cat image.yml" } } },
+    );
     defer started.deinit();
     var finished = try backend.ToolFinished.init(allocator, "image-read", .{ .image = .{
         .bytes = "snapshot",
@@ -6836,6 +7062,8 @@ test "image tool previews retain read bytes and reserve rows only when expanded"
     const tool = &ui.transcript.entries.items[0].tool;
     try std.testing.expectEqualStrings("snapshot", tool.preview.?.state.pending);
     try std.testing.expectEqualStrings("Image: image.png", tool.output_display.?);
+    try tool.ensureOutputHighlights(allocator);
+    try std.testing.expectEqual(@as(usize, 0), tool.output_highlights.?.len);
     tool.preview.?.deinit(allocator);
     tool.preview = .{ .state = .{ .ready = vaxis.Image.init(9, 320, 160) } };
     var screen: vaxis.Screen = .{ .width = 80, .height = 30, .width_pix = 640, .height_pix = 480 };
