@@ -296,6 +296,9 @@ const ToolEntry = struct {
     output_markdown_cache: markdown.HighlightCache = .{},
     expanded: bool = false,
     layout_width: u16 = 0,
+    layout_height: u16 = 0,
+    layout_width_pix: u16 = 0,
+    layout_height_pix: u16 = 0,
     layout_rows: usize = 0,
     layout_valid: bool = false,
 
@@ -1348,7 +1351,10 @@ const Projection = struct {
                 return message.layout_rows;
             },
             .tool => |*tool| if (tool.layout_valid and
-                tool.layout_width == window.width)
+                tool.layout_width == window.width and
+                tool.layout_height == window.height and
+                tool.layout_width_pix == window.screen.width_pix and
+                tool.layout_height_pix == window.screen.height_pix)
             {
                 return tool.layout_rows;
             },
@@ -1373,7 +1379,7 @@ const Projection = struct {
                             message.text.items,
                             window,
                             @max(window.width -| 2, 1),
-                            &message.highlight_cache,
+                            null,
                             .markdown,
                             0,
                             0,
@@ -1402,18 +1408,17 @@ const Projection = struct {
                 };
             },
             .tool => rows: {
-                var projection: Projection = .{};
-                defer projection.deinit(allocator);
-                try projection.appendEntry(
+                var counter: Projection = .{};
+                defer counter.deinit(allocator);
+                break :rows try counter.appendToolRange(
                     allocator,
-                    entry,
+                    &entry.tool,
                     entry_index,
                     window,
                     false,
-                    spool,
-                    show_role,
+                    0,
+                    0,
                 );
-                break :rows projection.lines.items.len;
             },
         };
         switch (entry.*) {
@@ -1425,6 +1430,9 @@ const Projection = struct {
             },
             .tool => |*tool| {
                 tool.layout_width = window.width;
+                tool.layout_height = window.height;
+                tool.layout_width_pix = window.screen.width_pix;
+                tool.layout_height_pix = window.screen.height_pix;
                 tool.layout_rows = rows;
                 tool.layout_valid = true;
             },
@@ -1490,63 +1498,115 @@ const Projection = struct {
                     2,
                 ),
             },
-            .tool => |*tool| {
-                try self.appendWrapped(
-                    allocator,
-                    entry_index,
-                    tool.compact,
-                    window,
-                    .tool,
-                    4,
-                );
-                if (tool.expanded) {
-                    if (cache_highlights) {
-                        try tool.ensureOutputHighlights(allocator);
-                    }
-                    try self.lines.append(allocator, .{
-                        .kind = .tool_input_label,
-                        .entry_index = entry_index,
-                    });
-                    try self.appendWrapped(allocator, entry_index, tool.input_display, window, .tool_input, 4);
-                    try self.lines.append(allocator, .{
-                        .kind = .tool_output_label,
-                        .entry_index = entry_index,
-                    });
-                    const render_markdown = tool.output_markdown and
-                        if (tool.completion) |completion| switch (completion) {
-                            .succeeded, .image => true,
-                            .failed => false,
-                        } else false;
-                    if (render_markdown) {
-                        try self.appendMarkdown(
-                            allocator,
-                            entry_index,
-                            tool.output_display.?,
-                            window,
-                            @max(window.width -| 4, 1),
-                            if (cache_highlights)
-                                &tool.output_markdown_cache
-                            else
-                                null,
-                            .tool_output_markdown,
-                        );
-                    } else {
-                        try self.appendWrapped(allocator, entry_index, tool.output_display orelse "Running…", window, .tool_output, 4);
-                    }
-                    if (tool.preview) |preview| {
-                        const size = preview.cellSize(window.child(.{ .width = window.width -| 4 }));
-                        for (0..size.rows) |row| {
-                            try self.lines.append(allocator, .{
-                                .kind = .tool_image,
-                                .entry_index = entry_index,
-                                .start = row,
-                                .end = size.rows,
-                            });
-                        }
-                    }
-                }
-            },
+            .tool => |*tool| _ = try self.appendToolRange(
+                allocator,
+                tool,
+                entry_index,
+                window,
+                cache_highlights,
+                0,
+                std.math.maxInt(usize),
+            ),
         }
+    }
+
+    fn appendToolRange(
+        self: *Projection,
+        allocator: std.mem.Allocator,
+        tool: *ToolEntry,
+        entry_index: usize,
+        window: vaxis.Window,
+        cache_highlights: bool,
+        first: usize,
+        last: usize,
+    ) !usize {
+        var row: usize = 0;
+        row += try self.appendWrappedRange(
+            allocator,
+            entry_index,
+            tool.compact,
+            window,
+            .tool,
+            4,
+            first -| row,
+            last -| row,
+        );
+        if (!tool.expanded) return row;
+        const render_markdown = tool.output_markdown and
+            if (tool.completion) |completion| switch (completion) {
+                .succeeded, .image => true,
+                .failed => false,
+            } else false;
+        if (cache_highlights and !render_markdown) {
+            try tool.ensureOutputHighlights(allocator);
+        }
+
+        if (row >= first and row < last) {
+            try self.lines.append(allocator, .{
+                .kind = .tool_input_label,
+                .entry_index = entry_index,
+            });
+        }
+        row += 1;
+        row += try self.appendWrappedRange(
+            allocator,
+            entry_index,
+            tool.input_display,
+            window,
+            .tool_input,
+            4,
+            first -| row,
+            last -| row,
+        );
+        if (row >= first and row < last) {
+            try self.lines.append(allocator, .{
+                .kind = .tool_output_label,
+                .entry_index = entry_index,
+            });
+        }
+        row += 1;
+
+        if (render_markdown) {
+            row += try self.appendMarkdownRange(
+                allocator,
+                entry_index,
+                tool.output_display.?,
+                window,
+                @max(window.width -| 4, 1),
+                null,
+                .tool_output_markdown,
+                first -| row,
+                last -| row,
+            );
+        } else {
+            row += try self.appendWrappedRange(
+                allocator,
+                entry_index,
+                tool.output_display orelse "Running…",
+                window,
+                .tool_output,
+                4,
+                first -| row,
+                last -| row,
+            );
+        }
+        if (tool.preview) |preview| {
+            const size = preview.cellSize(
+                window.child(.{ .width = window.width -| 4 }),
+            );
+            const image_first = first -| row;
+            const image_last = @min(last -| row, size.rows);
+            for (image_first..image_last) |image_row| {
+                try self.lines.append(allocator, .{
+                    .kind = .tool_image,
+                    .entry_index = entry_index,
+                    .start = image_row,
+                    .end = size.rows,
+                });
+            }
+            row += size.rows;
+        }
+        return row;
     }
 
     fn appendEntryRange(
@@ -1561,27 +1621,24 @@ const Projection = struct {
         last: usize,
     ) !void {
         if (entry.* == .tool) {
-            var full: Projection = .{};
-            defer full.deinit(allocator);
-            try full.appendEntry(
+            entry.tool.output_markdown_cache.deinit(allocator);
+            entry.tool.output_markdown_cache = .{};
+            _ = try self.appendToolRange(
                 allocator,
-                entry,
+                &entry.tool,
                 entry_index,
                 window,
                 true,
-                spool,
-                show_role,
-            );
-            return self.appendRange(
-                allocator,
-                &full,
                 first,
-                @min(last, full.lines.items.len),
+                last,
             );
+            return;
         }
 
         try entry.message.ensureResident(allocator, spool);
         const message = &entry.message;
+        message.highlight_cache.deinit(allocator);
+        message.highlight_cache = .{};
         switch (message.role) {
             .reasoning, .assistant => {
                 const body_offset: usize = @intFromBool(show_role);
@@ -1598,7 +1655,7 @@ const Projection = struct {
                         message.text.items,
                         window,
                         @max(window.width -| 2, 1),
-                        &message.highlight_cache,
+                        null,
                         .markdown,
                         first -| body_offset,
                         last - body_offset,
@@ -4951,8 +5008,9 @@ test "viewport projection retains only visible transcript rows" {
         @as(usize, 0),
         transcript.messageAt(0).highlight_cache.blocks.items.len,
     );
-    try std.testing.expect(
-        transcript.messageAt(39).highlight_cache.blocks.items.len > 0,
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        transcript.messageAt(39).highlight_cache.blocks.items.len,
     );
 
     try transcript.appendDelta(std.testing.allocator, "stream");
@@ -4974,10 +5032,10 @@ test "single long message materializes only its viewport range" {
     defer transcript.deinit(std.testing.allocator);
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(std.testing.allocator);
-    for (0..200) |index| {
-        try text.writer(std.testing.allocator).print(
-            "row-{d} contains enough words to wrap\n",
-            .{index},
+    for (0..200) |_| {
+        try text.appendSlice(
+            std.testing.allocator,
+            "row contains enough words to wrap\n",
         );
     }
     try transcript.append(std.testing.allocator, .assistant, text.items);
@@ -6349,6 +6407,89 @@ test "successful Markdown reads use the transcript Markdown renderer" {
     );
 }
 
+test "expanded tool viewport retains only visible Markdown rows" {
+    var transcript: Transcript = .{};
+    defer transcript.deinit(std.testing.allocator);
+    var started = try toolStarted(
+        "long-markdown-read",
+        "{\"path\":\"README.md\"}",
+        .{ .read = .{
+            .path = "README.md",
+            .offset = null,
+            .limit = null,
+        } },
+    );
+    defer started.deinit();
+    try transcript.applyToolActivity(
+        std.testing.allocator,
+        &.{ .started = started },
+    );
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(std.testing.allocator);
+    for (0..200) |_| {
+        try output.appendSlice(
+            std.testing.allocator,
+            "A Markdown paragraph with **bold text**.\n\n",
+        );
+    }
+    var finished = try toolFinished(
+        "long-markdown-read",
+        .{ .succeeded = output.items },
+    );
+    defer finished.deinit();
+    try transcript.applyToolActivity(
+        std.testing.allocator,
+        &.{ .finished = finished },
+    );
+    transcript.entries.items[0].tool.expanded = true;
+
+    var screen = try vaxis.Screen.init(std.testing.allocator, .{
+        .rows = 5,
+        .cols = 24,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(std.testing.allocator);
+    const window: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = screen.width,
+        .height = screen.height,
+        .screen = &screen,
+    };
+    var layout = try TranscriptLayout.measure(
+        std.testing.allocator,
+        &transcript,
+        window,
+        null,
+    );
+    defer layout.deinit(std.testing.allocator);
+    var projection = try Projection.buildViewport(
+        std.testing.allocator,
+        &transcript,
+        &layout,
+        window,
+        20,
+        null,
+    );
+    defer projection.deinit(std.testing.allocator);
+
+    try std.testing.expect(layout.total_rows > 200);
+    try std.testing.expectEqual(
+        @as(usize, window.height),
+        projection.lines.items.len,
+    );
+    try std.testing.expect(
+        projection.markdown_lines.items.len <= window.height,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        transcript.entries.items[0].tool.output_markdown_cache.blocks.items.len,
+    );
+}
+
 test "Markdown read detection is extension based and case insensitive" {
     try std.testing.expect(isMarkdownPath("README.md"));
     try std.testing.expect(isMarkdownPath("docs/GUIDE.MARKDOWN"));
@@ -6698,7 +6839,7 @@ test "image tool previews retain read bytes and reserve rows only when expanded"
     tool.preview.?.deinit(allocator);
     tool.preview = .{ .state = .{ .ready = vaxis.Image.init(9, 320, 160) } };
     var screen: vaxis.Screen = .{ .width = 80, .height = 30, .width_pix = 640, .height_pix = 480 };
-    const window: vaxis.Window = .{
+    var window: vaxis.Window = .{
         .x_off = 0,
         .y_off = 0,
         .parent_x_off = 0,
@@ -6718,6 +6859,28 @@ test "image tool previews retain read bytes and reserve rows only when expanded"
         if (line.kind == .tool_image) image_rows += 1;
     }
     try std.testing.expectEqual(@as(usize, 10), image_rows);
+
+    var tall_layout = try TranscriptLayout.measure(
+        allocator,
+        &ui.transcript,
+        window,
+        null,
+    );
+    defer tall_layout.deinit(allocator);
+    const tall_rows = tall_layout.total_rows;
+    window.height = 5;
+    var short_layout = try TranscriptLayout.measure(
+        allocator,
+        &ui.transcript,
+        window,
+        null,
+    );
+    defer short_layout.deinit(allocator);
+    try std.testing.expect(short_layout.total_rows < tall_rows);
+    try std.testing.expectEqual(
+        window.height,
+        ui.transcript.entries.items[0].tool.layout_height,
+    );
 }
 
 test "slash command parsing preserves argument suffixes" {
