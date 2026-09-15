@@ -1516,6 +1516,12 @@ const Projection = struct {
         spool: ?*TranscriptSpool,
         show_role: bool,
     ) !usize {
+        if (entry.* == .tool and
+            entry.tool.expanded and
+            std.meta.activeTag(entry.tool.output_plan) == .syntax)
+        {
+            try entry.tool.ensureOutputHighlights(allocators.persistent);
+        }
         switch (entry.*) {
             .message => |*message| if (message.layout_valid and
                 message.layout_width == window.width and
@@ -5125,26 +5131,58 @@ test "bash output plans highlight YAML and diff through the ToolEntry lifecycle"
 }
 
 test "strict syntax rejection restores literal output rendering" {
+    var transcript: Transcript = .{};
+    defer transcript.deinit(std.testing.allocator);
     var started = try toolStarted(
         "external-diff-output",
         "{\"command\":\"git diff\"}",
         .{ .bash = .{ .run = .{ .command = "git diff" } } },
     );
     defer started.deinit();
-    var entry = try ToolEntry.init(std.testing.allocator, &started);
-    defer entry.deinit(std.testing.allocator);
+    try transcript.applyToolActivity(
+        std.testing.allocator,
+        &.{ .started = started },
+    );
     var finished = try toolFinished(
         "external-diff-output",
         .{ .succeeded = "external diff:\tchanged\r\n" },
     );
     defer finished.deinit();
-
-    try entry.finish(std.testing.allocator, &finished);
+    try transcript.applyToolActivity(
+        std.testing.allocator,
+        &.{ .finished = finished },
+    );
+    const entry = &transcript.entries.items[0].tool;
+    entry.expanded = true;
     try std.testing.expectEqualStrings(
         "external diff:\tchanged\n",
         entry.output_display.?,
     );
-    try entry.ensureOutputHighlights(std.testing.allocator);
+
+    var screen = try vaxis.Screen.init(std.testing.allocator, .{
+        .rows = 8,
+        .cols = 16,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(std.testing.allocator);
+    const window: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = screen.width,
+        .height = screen.height,
+        .screen = &screen,
+    };
+    var layout = try TranscriptLayout.measure(
+        std.testing.allocator,
+        &transcript,
+        window,
+        null,
+    );
+    defer layout.deinit(std.testing.allocator);
+
     try std.testing.expectEqualStrings(
         "external diff:\\x09changed\\x0d\n",
         entry.output_display.?,
