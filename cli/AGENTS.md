@@ -17,7 +17,9 @@ Treat `read` results with an `offset` or `limit` as fragments and use tolerant
 highlighting. Reserve complete parsing for full-file or homogeneous command
 output, and reject oversized complete sources before truncation. If complete
 parsing rejects the source, re-render the raw payload with `renderOutput`;
-valid syntax with zero captures is not a rejection.
+valid syntax with zero captures is not a rejection. Complete strict validation
+and any fallback before measuring expanded tool output so layout ranges match
+the final display buffer in the current frame.
 
 When adding a Tree-sitter grammar in `build.zig`, compile its generated
 `parser.c` and every generated external scanner source shipped by that grammar.
