@@ -134,10 +134,96 @@ fn visibleSelectionRange(
     };
 }
 
+const TranscriptSpool = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    file: std.Io.File,
+    path: []u8,
+    length: u64 = 0,
+
+    const Page = struct {
+        offset: u64,
+        length: usize,
+    };
+
+    fn init(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        directory: []const u8,
+    ) !TranscriptSpool {
+        var random: [16]u8 = undefined;
+        try std.Io.randomSecure(io, &random);
+        const filename =
+            "vivi-transcript-" ++ std.fmt.bytesToHex(random, .lower) ++ ".bin";
+        const path = try std.fs.path.join(
+            allocator,
+            &.{ directory, filename },
+        );
+        errdefer allocator.free(path);
+        const file = try std.Io.Dir.cwd().createFile(io, path, .{
+            .exclusive = true,
+            .read = true,
+            .permissions = if (@import("builtin").os.tag == .windows)
+                .default_file
+            else
+                .fromMode(0o600),
+        });
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .file = file,
+            .path = path,
+        };
+    }
+
+    fn deinit(self: *TranscriptSpool) void {
+        self.file.close(self.io);
+        std.Io.Dir.cwd().deleteFile(self.io, self.path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => std.log.warn(
+                "Unable to remove transcript spool {s}: {s}",
+                .{ self.path, @errorName(err) },
+            ),
+        };
+        self.allocator.free(self.path);
+        self.* = undefined;
+    }
+
+    fn write(self: *TranscriptSpool, text: []const u8) !Page {
+        const page = Page{
+            .offset = self.length,
+            .length = text.len,
+        };
+        try self.file.writePositionalAll(self.io, text, page.offset);
+        self.length += text.len;
+        return page;
+    }
+
+    fn read(
+        self: *TranscriptSpool,
+        allocator: std.mem.Allocator,
+        page: Page,
+    ) ![]u8 {
+        const text = try allocator.alloc(u8, page.length);
+        errdefer allocator.free(text);
+        const read_length = try self.file.readPositionalAll(
+            self.io,
+            text,
+            page.offset,
+        );
+        if (read_length != text.len) return error.TruncatedTranscriptSpool;
+        return text;
+    }
+};
+
 const MessageEntry = struct {
     role: Role,
     text: std.ArrayList(u8) = .empty,
+    page: ?TranscriptSpool.Page = null,
     highlight_cache: markdown.HighlightCache = .{},
+    layout_width: u16 = 0,
+    layout_rows: usize = 0,
+    layout_valid: bool = false,
 
     fn init(
         allocator: std.mem.Allocator,
@@ -154,6 +240,41 @@ const MessageEntry = struct {
         self.highlight_cache.deinit(allocator);
         self.text.deinit(allocator);
         self.* = undefined;
+    }
+
+    fn invalidateLayout(self: *MessageEntry) void {
+        self.layout_valid = false;
+    }
+
+    fn ensureResident(
+        self: *MessageEntry,
+        allocator: std.mem.Allocator,
+        spool: ?*TranscriptSpool,
+    ) !void {
+        if (self.page == null or self.text.items.len > 0) return;
+        const store = spool orelse return error.MissingTranscriptSpool;
+        self.text = .fromOwnedSlice(try store.read(allocator, self.page.?));
+    }
+
+    fn pageOut(
+        self: *MessageEntry,
+        allocator: std.mem.Allocator,
+        spool: *TranscriptSpool,
+    ) !void {
+        if (self.text.items.len == 0) return;
+        if (self.page == null) self.page = try spool.write(self.text.items);
+        self.text.deinit(allocator);
+        self.text = .empty;
+        self.highlight_cache.deinit(allocator);
+        self.highlight_cache = .{};
+    }
+
+    fn unload(self: *MessageEntry, allocator: std.mem.Allocator) void {
+        if (self.page == null or self.text.items.len == 0) return;
+        self.text.deinit(allocator);
+        self.text = .empty;
+        self.highlight_cache.deinit(allocator);
+        self.highlight_cache = .{};
     }
 };
 
@@ -173,6 +294,9 @@ const ToolEntry = struct {
     output_markdown: bool,
     output_markdown_cache: markdown.HighlightCache = .{},
     expanded: bool = false,
+    layout_width: u16 = 0,
+    layout_rows: usize = 0,
+    layout_valid: bool = false,
 
     const Completion = union(enum) {
         succeeded: [std.crypto.hash.sha2.Sha256.digest_length]u8,
@@ -325,6 +449,7 @@ const ToolEntry = struct {
             self.output_markdown = false;
         }
         self.completion = completion;
+        self.layout_valid = false;
         const marker = switch (completion) {
             .succeeded, .image => "✓",
             .failed => "✗",
@@ -563,6 +688,26 @@ const Entry = union(enum) {
             .tool => null,
         };
     }
+
+    fn releaseRenderCaches(
+        self: *Entry,
+        allocator: std.mem.Allocator,
+    ) void {
+        switch (self.*) {
+            .message => |*message| {
+                message.highlight_cache.deinit(allocator);
+                message.highlight_cache = .{};
+            },
+            .tool => |*tool| {
+                tool.output_markdown_cache.deinit(allocator);
+                tool.output_markdown_cache = .{};
+                if (tool.output_highlights) |spans| {
+                    allocator.free(spans);
+                    tool.output_highlights = null;
+                }
+            },
+        }
+    }
 };
 
 const Transcript = struct {
@@ -642,6 +787,7 @@ const Transcript = struct {
             allocator,
             text,
         );
+        self.entries.items[index].messageValue().?.invalidateLayout();
     }
 
     fn appendReasoningDelta(
@@ -657,6 +803,7 @@ const Transcript = struct {
             allocator,
             text,
         );
+        self.entries.items[index].messageValue().?.invalidateLayout();
     }
 
     fn startEntry(
@@ -697,6 +844,7 @@ const Transcript = struct {
         const message = self.entries.items[index].messageValue().?;
         message.text.clearRetainingCapacity();
         try message.text.appendSlice(allocator, text);
+        message.invalidateLayout();
     }
 
     fn completeReasoning(
@@ -713,6 +861,7 @@ const Transcript = struct {
         const message = self.entries.items[index].messageValue().?;
         message.text.clearRetainingCapacity();
         try message.text.appendSlice(allocator, text);
+        message.invalidateLayout();
     }
 
     fn finishAssistant(self: *Transcript) void {
@@ -977,9 +1126,63 @@ const RenderLine = struct {
     end: usize = 0,
 };
 
+const TranscriptLayout = struct {
+    entry_starts: []usize,
+    entry_rows: []usize,
+    total_rows: usize,
+
+    fn deinit(self: *TranscriptLayout, allocator: std.mem.Allocator) void {
+        allocator.free(self.entry_starts);
+        allocator.free(self.entry_rows);
+        self.* = undefined;
+    }
+
+    fn measure(
+        allocator: std.mem.Allocator,
+        transcript: *Transcript,
+        window: vaxis.Window,
+        spool: ?*TranscriptSpool,
+    ) !TranscriptLayout {
+        const entry_starts = try allocator.alloc(
+            usize,
+            transcript.entries.items.len,
+        );
+        errdefer allocator.free(entry_starts);
+        const entry_rows = try allocator.alloc(
+            usize,
+            transcript.entries.items.len,
+        );
+        errdefer allocator.free(entry_rows);
+
+        var total_rows: usize = 0;
+        for (transcript.entries.items, 0..) |*entry, entry_index| {
+            if (entry_index > 0) total_rows += 1;
+            entry_starts[entry_index] = total_rows;
+            const rows = try Projection.measureEntry(
+                allocator,
+                entry,
+                entry_index,
+                window,
+                spool,
+            );
+            entry_rows[entry_index] = rows;
+            total_rows += rows;
+        }
+        return .{
+            .entry_starts = entry_starts,
+            .entry_rows = entry_rows,
+            .total_rows = total_rows,
+        };
+    }
+};
+
 const Projection = struct {
     lines: std.ArrayList(RenderLine) = .empty,
     markdown_lines: std.ArrayList(markdown.Line) = .empty,
+    total_rows: usize = 0,
+    viewport_materialized: bool = false,
+    first_visible_entry: ?usize = null,
+    last_visible_entry: ?usize = null,
 
     fn deinit(self: *Projection, allocator: std.mem.Allocator) void {
         for (self.markdown_lines.items) |*line| line.deinit(allocator);
@@ -1003,100 +1206,272 @@ const Projection = struct {
                     .entry_index = entry_index,
                 });
             }
-            switch (entry.*) {
-                .message => |*message| switch (message.role) {
-                    .reasoning, .assistant => {
-                        try projection.lines.append(allocator, .{
-                            .kind = .role,
-                            .entry_index = entry_index,
-                        });
-                        try projection.appendMarkdown(
-                            allocator,
-                            entry_index,
-                            message.text.items,
-                            window,
-                            @max(window.width -| 2, 1),
-                            &message.highlight_cache,
-                            .markdown,
-                        );
-                    },
-                    .user, .queued, .question => {
-                        try projection.lines.append(allocator, .{
-                            .kind = .role,
-                            .entry_index = entry_index,
-                        });
-                        try projection.appendWrapped(
-                            allocator,
-                            entry_index,
-                            message.text.items,
-                            window,
-                            .body,
-                            2,
-                        );
-                    },
-                    .status => try projection.appendWrapped(
+            try projection.appendEntry(
+                allocator,
+                entry,
+                entry_index,
+                window,
+                true,
+                null,
+            );
+        }
+        projection.total_rows = projection.lines.items.len;
+        return projection;
+    }
+
+    fn buildViewport(
+        allocator: std.mem.Allocator,
+        transcript: *Transcript,
+        layout: *const TranscriptLayout,
+        window: vaxis.Window,
+        rows_from_tail: usize,
+        spool: ?*TranscriptSpool,
+    ) !Projection {
+        var projection: Projection = .{
+            .total_rows = layout.total_rows,
+            .viewport_materialized = true,
+        };
+        errdefer projection.deinit(allocator);
+
+        const visible_rows = @min(layout.total_rows, window.height);
+        const first_row =
+            layout.total_rows - visible_rows - rows_from_tail;
+        const last_row = @min(first_row + window.height, layout.total_rows);
+        for (transcript.entries.items, 0..) |*entry, entry_index| {
+            const entry_start = layout.entry_starts[entry_index];
+            if (entry_index > 0 and
+                entry_start > 0 and
+                entry_start - 1 >= first_row and
+                entry_start - 1 < last_row)
+            {
+                try projection.lines.append(allocator, .{
+                    .kind = .blank,
+                    .entry_index = entry_index,
+                });
+            }
+            const entry_end = entry_start + layout.entry_rows[entry_index];
+            if (entry_end <= first_row or entry_start >= last_row) {
+                entry.releaseRenderCaches(allocator);
+                continue;
+            }
+            if (projection.first_visible_entry == null) {
+                projection.first_visible_entry = entry_index;
+            }
+            projection.last_visible_entry = entry_index;
+
+            var entry_projection: Projection = .{};
+            defer entry_projection.deinit(allocator);
+            try entry_projection.appendEntry(
+                allocator,
+                entry,
+                entry_index,
+                window,
+                true,
+                spool,
+            );
+            const local_first = first_row -| entry_start;
+            const local_last = @min(
+                last_row -| entry_start,
+                entry_projection.lines.items.len,
+            );
+            try projection.appendRange(
+                allocator,
+                &entry_projection,
+                local_first,
+                local_last,
+            );
+        }
+        return projection;
+    }
+
+    fn measureEntry(
+        allocator: std.mem.Allocator,
+        entry: *Entry,
+        entry_index: usize,
+        window: vaxis.Window,
+        spool: ?*TranscriptSpool,
+    ) !usize {
+        switch (entry.*) {
+            .message => |*message| if (message.layout_valid and
+                message.layout_width == window.width)
+            {
+                return message.layout_rows;
+            },
+            .tool => |*tool| if (tool.layout_valid and
+                tool.layout_width == window.width)
+            {
+                return tool.layout_rows;
+            },
+        }
+
+        const unload_after_measure = entry.* == .message and
+            entry.message.page != null and
+            entry.message.text.items.len == 0;
+        defer if (unload_after_measure) {
+            entry.message.unload(allocator);
+        };
+        var projection: Projection = .{};
+        defer projection.deinit(allocator);
+        try projection.appendEntry(
+            allocator,
+            entry,
+            entry_index,
+            window,
+            false,
+            spool,
+        );
+        const rows = projection.lines.items.len;
+        switch (entry.*) {
+            .message => |*message| {
+                message.layout_width = window.width;
+                message.layout_rows = rows;
+                message.layout_valid = true;
+            },
+            .tool => |*tool| {
+                tool.layout_width = window.width;
+                tool.layout_rows = rows;
+                tool.layout_valid = true;
+            },
+        }
+        return rows;
+    }
+
+    fn appendEntry(
+        self: *Projection,
+        allocator: std.mem.Allocator,
+        entry: *Entry,
+        entry_index: usize,
+        window: vaxis.Window,
+        cache_highlights: bool,
+        spool: ?*TranscriptSpool,
+    ) !void {
+        if (entry.* == .message) {
+            try entry.message.ensureResident(allocator, spool);
+        }
+        switch (entry.*) {
+            .message => |*message| switch (message.role) {
+                .reasoning, .assistant => {
+                    try self.lines.append(allocator, .{
+                        .kind = .role,
+                        .entry_index = entry_index,
+                    });
+                    try self.appendMarkdown(
                         allocator,
                         entry_index,
                         message.text.items,
                         window,
-                        .status,
-                        2,
-                    ),
+                        @max(window.width -| 2, 1),
+                        if (cache_highlights)
+                            &message.highlight_cache
+                        else
+                            null,
+                        .markdown,
+                    );
                 },
-                .tool => |*tool| {
-                    try projection.appendWrapped(
+                .user, .queued, .question => {
+                    try self.lines.append(allocator, .{
+                        .kind = .role,
+                        .entry_index = entry_index,
+                    });
+                    try self.appendWrapped(
                         allocator,
                         entry_index,
-                        tool.compact,
+                        message.text.items,
                         window,
-                        .tool,
-                        4,
+                        .body,
+                        2,
                     );
-                    if (tool.expanded) {
+                },
+                .status => try self.appendWrapped(
+                    allocator,
+                    entry_index,
+                    message.text.items,
+                    window,
+                    .status,
+                    2,
+                ),
+            },
+            .tool => |*tool| {
+                try self.appendWrapped(
+                    allocator,
+                    entry_index,
+                    tool.compact,
+                    window,
+                    .tool,
+                    4,
+                );
+                if (tool.expanded) {
+                    if (cache_highlights) {
                         try tool.ensureOutputHighlights(allocator);
-                        try projection.lines.append(allocator, .{
-                            .kind = .tool_input_label,
-                            .entry_index = entry_index,
-                        });
-                        try projection.appendWrapped(allocator, entry_index, tool.input_display, window, .tool_input, 4);
-                        try projection.lines.append(allocator, .{
-                            .kind = .tool_output_label,
-                            .entry_index = entry_index,
-                        });
-                        const render_markdown = tool.output_markdown and
-                            if (tool.completion) |completion| switch (completion) {
-                                .succeeded, .image => true,
-                                .failed => false,
-                            } else false;
-                        if (render_markdown) {
-                            try projection.appendMarkdown(
-                                allocator,
-                                entry_index,
-                                tool.output_display.?,
-                                window,
-                                @max(window.width -| 4, 1),
-                                &tool.output_markdown_cache,
-                                .tool_output_markdown,
-                            );
-                        } else {
-                            try projection.appendWrapped(allocator, entry_index, tool.output_display orelse "Running…", window, .tool_output, 4);
-                        }
-                        if (tool.preview) |preview| {
-                            const size = preview.cellSize(window.child(.{ .width = window.width -| 4 }));
-                            for (0..size.rows) |row| {
-                                try projection.lines.append(allocator, .{
-                                    .kind = .tool_image,
-                                    .entry_index = entry_index,
-                                    .start = row,
-                                    .end = size.rows,
-                                });
-                            }
+                    }
+                    try self.lines.append(allocator, .{
+                        .kind = .tool_input_label,
+                        .entry_index = entry_index,
+                    });
+                    try self.appendWrapped(allocator, entry_index, tool.input_display, window, .tool_input, 4);
+                    try self.lines.append(allocator, .{
+                        .kind = .tool_output_label,
+                        .entry_index = entry_index,
+                    });
+                    const render_markdown = tool.output_markdown and
+                        if (tool.completion) |completion| switch (completion) {
+                            .succeeded, .image => true,
+                            .failed => false,
+                        } else false;
+                    if (render_markdown) {
+                        try self.appendMarkdown(
+                            allocator,
+                            entry_index,
+                            tool.output_display.?,
+                            window,
+                            @max(window.width -| 4, 1),
+                            if (cache_highlights)
+                                &tool.output_markdown_cache
+                            else
+                                null,
+                            .tool_output_markdown,
+                        );
+                    } else {
+                        try self.appendWrapped(allocator, entry_index, tool.output_display orelse "Running…", window, .tool_output, 4);
+                    }
+                    if (tool.preview) |preview| {
+                        const size = preview.cellSize(window.child(.{ .width = window.width -| 4 }));
+                        for (0..size.rows) |row| {
+                            try self.lines.append(allocator, .{
+                                .kind = .tool_image,
+                                .entry_index = entry_index,
+                                .start = row,
+                                .end = size.rows,
+                            });
                         }
                     }
-                },
-            }
+                }
+            },
         }
-        return projection;
+    }
+
+    fn appendRange(
+        self: *Projection,
+        allocator: std.mem.Allocator,
+        source: *Projection,
+        first: usize,
+        last: usize,
+    ) !void {
+        for (source.lines.items[first..last]) |line| {
+            var moved = line;
+            if (line.kind == .markdown or
+                line.kind == .tool_output_markdown)
+            {
+                const markdown_index = self.markdown_lines.items.len;
+                try self.markdown_lines.append(
+                    allocator,
+                    source.markdown_lines.items[line.start],
+                );
+                source.markdown_lines.items[line.start] = .{};
+                moved.start = markdown_index;
+            }
+            try self.lines.append(allocator, moved);
+        }
     }
 
     fn appendMarkdown(
@@ -1106,7 +1481,7 @@ const Projection = struct {
         text: []const u8,
         window: vaxis.Window,
         width: u16,
-        cache: *markdown.HighlightCache,
+        cache: ?*markdown.HighlightCache,
         kind: LineKind,
     ) !void {
         var layout = try markdown.Layout.initCached(
@@ -1188,6 +1563,7 @@ const ConversationOutcome = enum {
 
 const KeyOutcome = enum {
     keep_running,
+    composer_redraw,
     force_exit,
 };
 
@@ -1458,6 +1834,7 @@ const ChatUi = struct {
     io: std.Io,
     input: TextInput,
     pasted_images: ?images.Store = null,
+    transcript_spool: ?TranscriptSpool = null,
     bracketed_paste: bool = false,
     transcript: Transcript = .{},
     cwd: []u8,
@@ -1510,6 +1887,7 @@ const ChatUi = struct {
     }
 
     fn deinit(self: *ChatUi) void {
+        if (self.transcript_spool) |*spool| spool.deinit();
         if (self.pasted_images) |*store| store.deinit();
         self.tool_hits.deinit(self.allocator);
         self.menu.deinit(self.allocator);
@@ -1545,7 +1923,11 @@ const ChatUi = struct {
                 }
                 self.input_revision +%= 1;
             }
-            return .keep_running;
+            return if ((self.phase == .ready or self.phase == .responding) and
+                self.menu_mode == .closed)
+                .composer_redraw
+            else
+                .keep_running;
         }
         if (key.matches('c', .{ .ctrl = true })) {
             if (self.phase == .stopping) return .force_exit;
@@ -1637,9 +2019,17 @@ const ChatUi = struct {
             try self.submitPrompt(conversation, .enqueue);
             return .keep_running;
         }
+        const previous_phase = self.phase;
+        const previous_menu_mode = self.menu_mode;
         try self.input.update(.{ .key_press = key });
         try self.inputChanged(conversation);
-        return .keep_running;
+        return if ((previous_phase == .ready or previous_phase == .responding) and
+            previous_phase == self.phase and
+            previous_menu_mode == .closed and
+            self.menu_mode == .closed)
+            .composer_redraw
+        else
+            .keep_running;
     }
 
     fn inputChanged(self: *ChatUi, conversation: *backend.Conversation) !void {
@@ -1772,6 +2162,7 @@ const ChatUi = struct {
         } else if (key.matches(vaxis.Key.enter, .{}) or key.matches(' ', .{})) {
             const tool = &self.transcript.entries.items[index].tool;
             tool.expanded = !tool.expanded;
+            tool.layout_valid = false;
             self.reveal_tool_focus = true;
         }
         return true;
@@ -1795,6 +2186,7 @@ const ChatUi = struct {
                 self.clearToolFocus();
                 while (row > 0 and self.tool_hits.items[row - 1] == entry_index) row -= 1;
                 entry.tool.expanded = !entry.tool.expanded;
+                entry.tool.layout_valid = false;
                 self.tool_anchor = .{ .entry_index = entry_index, .row = row };
                 break :blk true;
             },
@@ -2497,10 +2889,24 @@ const ChatUi = struct {
                 self.last_total_rows = 0;
                 self.last_viewport_rows = transcript_window.height;
             } else {
-                projection = try Projection.build(
+                var transcript_layout = try TranscriptLayout.measure(
                     self.allocator,
                     &self.transcript,
                     transcript_window,
+                    if (self.transcript_spool) |*spool| spool else null,
+                );
+                defer transcript_layout.deinit(self.allocator);
+                self.prepareTranscriptViewport(
+                    &transcript_layout,
+                    transcript_window.height,
+                );
+                projection = try Projection.buildViewport(
+                    self.allocator,
+                    &self.transcript,
+                    &transcript_layout,
+                    transcript_window,
+                    self.rows_from_tail,
+                    if (self.transcript_spool) |*spool| spool else null,
                 );
                 try self.drawTranscript(transcript_window, &projection.?);
             }
@@ -2522,6 +2928,42 @@ const ChatUi = struct {
         }
         if (layout.footer) |region| self.drawFooter(region.child(root));
         return projection;
+    }
+
+    fn prepareTranscriptViewport(
+        self: *ChatUi,
+        layout: *const TranscriptLayout,
+        viewport_rows: usize,
+    ) void {
+        const max_scroll =
+            layout.total_rows -| @min(layout.total_rows, viewport_rows);
+        if (self.tool_anchor) |anchor| {
+            if (anchor.entry_index < layout.entry_starts.len) {
+                const tool_row = layout.entry_starts[anchor.entry_index];
+                self.rows_from_tail =
+                    max_scroll -| (tool_row -| anchor.row);
+            }
+            self.tool_anchor = null;
+        } else if (self.rows_from_tail > 0 and
+            layout.total_rows > self.last_total_rows)
+        {
+            self.rows_from_tail +=
+                layout.total_rows - self.last_total_rows;
+        }
+        self.rows_from_tail = @min(self.rows_from_tail, max_scroll);
+        if (self.reveal_tool_focus) {
+            if (self.focusedToolIndex()) |focused| {
+                const tool_row = layout.entry_starts[focused];
+                const first = max_scroll - self.rows_from_tail;
+                if (tool_row < first) {
+                    self.rows_from_tail = max_scroll -| tool_row;
+                } else if (tool_row >= first + viewport_rows) {
+                    self.rows_from_tail =
+                        max_scroll -| (tool_row + 1 -| viewport_rows);
+                }
+            }
+            self.reveal_tool_focus = false;
+        }
     }
 
     fn drawMenu(self: *ChatUi, window: vaxis.Window) void {
@@ -2902,39 +3344,43 @@ const ChatUi = struct {
         window: vaxis.Window,
         projection: *const Projection,
     ) !void {
-        const total_rows = projection.lines.items.len;
+        const total_rows = projection.total_rows;
         const viewport_rows: usize = window.height;
-        if (self.tool_anchor) |anchor| {
-            for (projection.lines.items, 0..) |line, index| {
-                if (line.entry_index == anchor.entry_index and line.kind == .tool) {
-                    self.rows_from_tail = (total_rows -| viewport_rows) -| (index -| anchor.row);
-                    break;
-                }
-            }
-            self.tool_anchor = null;
-        } else if (self.rows_from_tail > 0 and total_rows > self.last_total_rows) {
-            self.rows_from_tail += total_rows - self.last_total_rows;
-        }
-        const max_scroll = total_rows -| @min(total_rows, viewport_rows);
-        self.rows_from_tail = @min(self.rows_from_tail, max_scroll);
-        if (self.reveal_tool_focus) {
-            if (self.focusedToolIndex()) |focused| {
+        var first_row: usize = 0;
+        var last_row = projection.lines.items.len;
+        if (!projection.viewport_materialized) {
+            if (self.tool_anchor) |anchor| {
                 for (projection.lines.items, 0..) |line, index| {
-                    if (line.entry_index != focused or line.kind != .tool) continue;
-                    const first = max_scroll - self.rows_from_tail;
-                    if (index < first) {
-                        self.rows_from_tail = max_scroll -| index;
-                    } else if (index >= first + viewport_rows) {
-                        self.rows_from_tail = max_scroll -| (index + 1 -| viewport_rows);
+                    if (line.entry_index == anchor.entry_index and line.kind == .tool) {
+                        self.rows_from_tail = (total_rows -| viewport_rows) -| (index -| anchor.row);
+                        break;
                     }
-                    break;
                 }
+                self.tool_anchor = null;
+            } else if (self.rows_from_tail > 0 and total_rows > self.last_total_rows) {
+                self.rows_from_tail += total_rows - self.last_total_rows;
             }
-            self.reveal_tool_focus = false;
+            const max_scroll = total_rows -| @min(total_rows, viewport_rows);
+            self.rows_from_tail = @min(self.rows_from_tail, max_scroll);
+            if (self.reveal_tool_focus) {
+                if (self.focusedToolIndex()) |focused| {
+                    for (projection.lines.items, 0..) |line, index| {
+                        if (line.entry_index != focused or line.kind != .tool) continue;
+                        const first = max_scroll - self.rows_from_tail;
+                        if (index < first) {
+                            self.rows_from_tail = max_scroll -| index;
+                        } else if (index >= first + viewport_rows) {
+                            self.rows_from_tail = max_scroll -| (index + 1 -| viewport_rows);
+                        }
+                        break;
+                    }
+                }
+                self.reveal_tool_focus = false;
+            }
+            const visible_rows = @min(total_rows, viewport_rows);
+            first_row = total_rows - visible_rows - self.rows_from_tail;
+            last_row = @min(first_row + viewport_rows, total_rows);
         }
-        const visible_rows = @min(total_rows, viewport_rows);
-        const first_row = total_rows - visible_rows - self.rows_from_tail;
-        const last_row = @min(first_row + viewport_rows, total_rows);
 
         for (projection.lines.items[first_row..last_row], 0..) |line, row| {
             try self.tool_hits.append(self.allocator, switch (line.kind) {
@@ -3459,6 +3905,31 @@ const ChatUi = struct {
         self.clearToolFocus();
         self.rows_from_tail = 0;
     }
+
+    fn evictOffscreenMessages(
+        self: *ChatUi,
+        projection: *const Projection,
+    ) !void {
+        const spool = if (self.transcript_spool) |*value| value else return;
+        for (self.transcript.entries.items, 0..) |*entry, entry_index| {
+            if (projection.first_visible_entry) |first| {
+                if (entry_index >= first and
+                    entry_index <= projection.last_visible_entry.?)
+                {
+                    continue;
+                }
+            }
+            if (entry_index == self.transcript.active_assistant or
+                entry_index == self.transcript.active_reasoning or
+                entry_index == self.transcript.last_reasoning)
+            {
+                continue;
+            }
+            if (entry.* == .message) {
+                try entry.message.pageOut(self.allocator, spool);
+            }
+        }
+    }
 };
 
 fn handleMouseBatch(
@@ -3479,6 +3950,32 @@ fn handleMouseBatch(
     return .{ .redraw = redraw };
 }
 
+fn handleResizeBatch(
+    loop: *vaxis.Loop(AppEvent),
+    first: vaxis.Winsize,
+) !struct { winsize: ?vaxis.Winsize, next: ?AppEvent = null } {
+    var latest: ?vaxis.Winsize =
+        if (first.cols > 0 and first.rows > 0) first else null;
+    for (1..512) |_| {
+        const event = try loop.tryEvent() orelse break;
+        if (event != .winsize) {
+            return .{ .winsize = latest, .next = event };
+        }
+        if (event.winsize.cols > 0 and event.winsize.rows > 0) {
+            latest = event.winsize;
+        }
+    }
+    return .{ .winsize = latest };
+}
+
+const max_conversation_events_per_batch = 32;
+const stream_updates_before_overflow_redraw = 8;
+
+const ConversationDrain = struct {
+    redraw: bool,
+    continue_drain: bool,
+};
+
 const App = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -3489,6 +3986,8 @@ const App = struct {
     loop: vaxis.Loop(AppEvent),
     conversation: backend.Conversation,
     ui: ChatUi,
+    rendered_projection: ?Projection = null,
+    stream_updates_since_render: usize = 0,
     closed: bool = false,
 
     fn init(
@@ -3521,6 +4020,19 @@ const App = struct {
             init_args.environ_map,
         );
         errdefer self.ui.deinit();
+        const temporary_directory = if (@import("builtin").os.tag == .windows)
+            init_args.environ_map.get("TEMP") orelse
+                init_args.environ_map.get("TMP") orelse
+                return error.MissingTemporaryDirectory
+        else
+            init_args.environ_map.get("TMPDIR") orelse "/tmp";
+        self.ui.transcript_spool = try TranscriptSpool.init(
+            init_args.gpa,
+            init_args.io,
+            temporary_directory,
+        );
+        self.rendered_projection = null;
+        self.stream_updates_since_render = 0;
         self.closed = false;
 
         self.conversation = try backend.openConversation(
@@ -3545,6 +4057,9 @@ const App = struct {
     fn deinit(self: *App) void {
         self.conversation.deinit();
         self.releaseImages();
+        if (self.rendered_projection) |*projection| {
+            projection.deinit(self.allocator);
+        }
         self.ui.deinit();
         self.loop.stop();
         self.vx.deinit(self.allocator, self.tty.writer());
@@ -3577,6 +4092,8 @@ const App = struct {
             const event = pending orelse try self.loop.nextEvent();
             pending = null;
             var redraw = true;
+            var composer_redraw = false;
+            var drain_conversation = false;
             switch (event) {
                 .key_press => |key| {
                     if (!self.ui.bracketed_paste and
@@ -3590,6 +4107,7 @@ const App = struct {
                         };
                     } else switch (try self.ui.handleKey(key, &self.conversation)) {
                         .keep_running => {},
+                        .composer_redraw => composer_redraw = true,
                         .force_exit => self.hardExit(),
                     }
                 },
@@ -3604,18 +4122,42 @@ const App = struct {
                     pending = batch.next;
                 },
                 .winsize => |winsize| {
-                    try self.vx.resize(
-                        self.allocator,
-                        self.tty.writer(),
+                    const batch = try handleResizeBatch(
+                        &self.loop,
                         winsize,
                     );
+                    pending = batch.next;
+                    if (batch.winsize) |valid| {
+                        try self.vx.resize(
+                            self.allocator,
+                            self.tty.writer(),
+                            valid,
+                        );
+                    } else {
+                        redraw = false;
+                    }
                 },
-                .conversation_wake => {},
+                .conversation_wake => drain_conversation = true,
                 .input_error => |err| return err,
             }
-            const conversation_changed = try self.drainConversation();
-            if (!self.closed and (redraw or conversation_changed))
-                try self.render();
+            const conversation_drain: ConversationDrain =
+                if (drain_conversation)
+                    try self.drainConversation()
+                else
+                    .{ .redraw = false, .continue_drain = false };
+            if (conversation_drain.continue_drain) {
+                std.debug.assert(pending == null);
+                pending = .conversation_wake;
+            }
+            if (!self.closed) {
+                if (conversation_drain.redraw or
+                    (redraw and !composer_redraw))
+                {
+                    try self.render();
+                } else if (composer_redraw) {
+                    try self.renderComposer();
+                }
+            }
         }
     }
 
@@ -3660,17 +4202,34 @@ const App = struct {
         try self.ui.insertImage(png, directory);
     }
 
-    fn drainConversation(self: *App) !bool {
-        var changed = false;
-        while (try self.conversation.tryTakeEvent()) |event_value| {
-            changed = true;
+    fn drainConversation(self: *App) !ConversationDrain {
+        var redraw = false;
+        for (0..max_conversation_events_per_batch) |_| {
+            const event_value = try self.conversation.tryTakeEvent() orelse
+                return .{ .redraw = redraw, .continue_drain = false };
             var event = event_value;
             defer event.deinit();
+            const stream_update = switch (event) {
+                .assistant_delta, .reasoning_delta => true,
+                else => false,
+            };
             if (try self.ui.applyConversationEvent(&event) == .close) {
                 self.closed = true;
+                return .{ .redraw = redraw, .continue_drain = false };
+            }
+            if (stream_update and
+                self.ui.rows_from_tail == 0 and
+                self.ui.last_total_rows > self.ui.last_viewport_rows)
+            {
+                self.stream_updates_since_render += 1;
+                redraw = redraw or
+                    self.stream_updates_since_render >=
+                        stream_updates_before_overflow_redraw;
+            } else {
+                redraw = true;
             }
         }
-        return changed;
+        return .{ .redraw = redraw, .continue_drain = true };
     }
 
     fn render(self: *App) !void {
@@ -3683,7 +4242,29 @@ const App = struct {
         const root = self.vx.window();
         root.clear();
         var projection = try self.ui.draw(root);
-        defer if (projection) |*value| value.deinit(self.allocator);
+        errdefer if (projection) |*value| value.deinit(self.allocator);
+        try self.vx.render(self.tty.writer());
+        if (projection) |*value| {
+            try self.ui.evictOffscreenMessages(value);
+        }
+        if (self.rendered_projection) |*previous| {
+            previous.deinit(self.allocator);
+        }
+        self.rendered_projection = projection;
+        projection = null;
+        self.stream_updates_since_render = 0;
+        try self.tty.writer().flush();
+    }
+
+    fn renderComposer(self: *App) !void {
+        const root = self.vx.window();
+        const layout = FrameLayout.compute(root.width, root.height, 0);
+        if (layout.composer.height > 0) {
+            self.ui.drawComposer(layout.composer.child(root));
+        }
+        if (layout.footer) |region| {
+            self.ui.drawFooter(region.child(root));
+        }
         try self.vx.render(self.tty.writer());
         try self.tty.writer().flush();
     }
@@ -3691,6 +4272,9 @@ const App = struct {
     fn hardExit(self: *App) noreturn {
         self.loop.stop();
         self.releaseImages();
+        if (self.rendered_projection) |*projection| {
+            projection.deinit(self.allocator);
+        }
         self.vx.deinit(self.allocator, self.tty.writer());
         self.tty.deinit();
         std.process.exit(130);
@@ -3960,6 +4544,212 @@ test "transcript replaces streamed draft with completed response" {
     try std.testing.expectEqualStrings(
         "hello",
         transcript.messageAt(0).text.items,
+    );
+}
+
+test "assistant completion stays responding until backend idle" {
+    var ui: ChatUi = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .input = TextInput.init(std.testing.allocator),
+        .cwd = try std.testing.allocator.dupe(u8, "."),
+        .phase = .responding,
+    };
+    defer ui.deinit();
+    var event: backend.ConversationEvent = .{
+        .assistant_complete = try backend.OwnedText.init(
+            std.testing.allocator,
+            "finished response",
+        ),
+    };
+    defer event.deinit();
+
+    _ = try ui.applyConversationEvent(&event);
+    try std.testing.expectEqual(UiPhase.responding, ui.phase);
+    var idle: backend.ConversationEvent = .idle;
+    _ = try ui.applyConversationEvent(&idle);
+    try std.testing.expectEqual(UiPhase.ready, ui.phase);
+}
+
+test "completed message text pages to disk and reloads" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try temporary.dir.realPath(
+        std.testing.io,
+        &path_buffer,
+    );
+    var spool = try TranscriptSpool.init(
+        std.testing.allocator,
+        std.testing.io,
+        path_buffer[0..path_len],
+    );
+    defer spool.deinit();
+
+    var message = try MessageEntry.init(
+        std.testing.allocator,
+        .assistant,
+        "paged transcript text",
+    );
+    defer message.deinit(std.testing.allocator);
+    try message.pageOut(std.testing.allocator, &spool);
+    try std.testing.expectEqual(@as(usize, 0), message.text.items.len);
+    try std.testing.expect(message.page != null);
+    const spool_length = spool.length;
+
+    try message.ensureResident(std.testing.allocator, &spool);
+    try std.testing.expectEqualStrings(
+        "paged transcript text",
+        message.text.items,
+    );
+    try message.pageOut(std.testing.allocator, &spool);
+    try std.testing.expectEqual(spool_length, spool.length);
+}
+
+test "viewport projection retains only visible transcript rows" {
+    var transcript: Transcript = .{};
+    defer transcript.deinit(std.testing.allocator);
+    for (0..40) |index| {
+        const text = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "## Answer {d}\n\nA paragraph with enough text to wrap.\n\n```zig\nconst value = {d};\n```",
+            .{ index, index },
+        );
+        defer std.testing.allocator.free(text);
+        try transcript.append(std.testing.allocator, .assistant, text);
+    }
+
+    var screen = try vaxis.Screen.init(std.testing.allocator, .{
+        .rows = 6,
+        .cols = 24,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(std.testing.allocator);
+    const window: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = screen.width,
+        .height = screen.height,
+        .screen = &screen,
+    };
+    var layout = try TranscriptLayout.measure(
+        std.testing.allocator,
+        &transcript,
+        window,
+        null,
+    );
+    defer layout.deinit(std.testing.allocator);
+    var projection = try Projection.buildViewport(
+        std.testing.allocator,
+        &transcript,
+        &layout,
+        window,
+        0,
+        null,
+    );
+    defer projection.deinit(std.testing.allocator);
+
+    try std.testing.expect(layout.total_rows > window.height);
+    try std.testing.expectEqual(layout.total_rows, projection.total_rows);
+    try std.testing.expect(projection.viewport_materialized);
+    try std.testing.expect(projection.lines.items.len <= window.height);
+    try std.testing.expect(projection.markdown_lines.items.len <= window.height);
+    try std.testing.expect(transcript.messageAt(0).layout_valid);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        transcript.messageAt(0).highlight_cache.blocks.items.len,
+    );
+    try std.testing.expect(
+        transcript.messageAt(39).highlight_cache.blocks.items.len > 0,
+    );
+
+    try transcript.appendDelta(std.testing.allocator, "stream");
+    var updated_layout = try TranscriptLayout.measure(
+        std.testing.allocator,
+        &transcript,
+        window,
+        null,
+    );
+    updated_layout.deinit(std.testing.allocator);
+    const active = transcript.active_assistant.?;
+    try std.testing.expect(transcript.messageAt(active).layout_valid);
+    try transcript.appendDelta(std.testing.allocator, " update");
+    try std.testing.expect(!transcript.messageAt(active).layout_valid);
+}
+
+test "offscreen messages page out and reload when scrolled into view" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try temporary.dir.realPath(
+        std.testing.io,
+        &path_buffer,
+    );
+    var ui: ChatUi = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .input = TextInput.init(std.testing.allocator),
+        .transcript_spool = try TranscriptSpool.init(
+            std.testing.allocator,
+            std.testing.io,
+            path_buffer[0..path_len],
+        ),
+        .cwd = try std.testing.allocator.dupe(u8, "."),
+        .phase = .ready,
+    };
+    defer ui.deinit();
+    for (0..20) |index| {
+        const text = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "message {d} with enough text to wrap across rows",
+            .{index},
+        );
+        defer std.testing.allocator.free(text);
+        try ui.transcript.append(std.testing.allocator, .user, text);
+    }
+
+    var screen = try vaxis.Screen.init(std.testing.allocator, .{
+        .rows = 12,
+        .cols = 30,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(std.testing.allocator);
+    const window: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = screen.width,
+        .height = screen.height,
+        .screen = &screen,
+    };
+
+    var tail_projection = (try ui.draw(window)).?;
+    defer tail_projection.deinit(std.testing.allocator);
+    try ui.evictOffscreenMessages(&tail_projection);
+    try std.testing.expect(ui.transcript.messageAt(0).page != null);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        ui.transcript.messageAt(0).text.items.len,
+    );
+    try std.testing.expect(
+        ui.transcript.messageAt(19).text.items.len > 0,
+    );
+
+    ui.rows_from_tail = ui.last_total_rows;
+    var head_projection = (try ui.draw(window)).?;
+    defer head_projection.deinit(std.testing.allocator);
+    try std.testing.expect(
+        ui.transcript.messageAt(0).text.items.len > 0,
+    );
+    try ui.evictOffscreenMessages(&head_projection);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        ui.transcript.messageAt(19).text.items.len,
     );
 }
 
@@ -4910,6 +5700,49 @@ test "mouse wheel batch is bounded and does not drain after clicks" {
     try std.testing.expectEqual(null, try loop.tryEvent());
 }
 
+test "resize batch keeps the latest dimensions and following event" {
+    var tty: vaxis.Tty = undefined;
+    var vx: vaxis.Vaxis = undefined;
+    var loop = vaxis.Loop(AppEvent).init(std.testing.io, &tty, &vx);
+    const first: vaxis.Winsize = .{
+        .cols = 80,
+        .rows = 24,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    };
+    const latest: vaxis.Winsize = .{
+        .cols = 120,
+        .rows = 36,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    };
+    try loop.postEvent(.{ .winsize = latest });
+    try loop.postEvent(.conversation_wake);
+
+    const batch = try handleResizeBatch(&loop, first);
+    try std.testing.expectEqualDeep(latest, batch.winsize.?);
+    try std.testing.expectEqualDeep(
+        AppEvent.conversation_wake,
+        batch.next.?,
+    );
+    try std.testing.expectEqual(null, try loop.tryEvent());
+}
+
+test "resize batch ignores transient zero dimensions" {
+    var tty: vaxis.Tty = undefined;
+    var vx: vaxis.Vaxis = undefined;
+    var loop = vaxis.Loop(AppEvent).init(std.testing.io, &tty, &vx);
+    const zero: vaxis.Winsize = .{
+        .cols = 0,
+        .rows = 0,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    };
+    try loop.postEvent(.{ .winsize = zero });
+    const batch = try handleResizeBatch(&loop, zero);
+    try std.testing.expectEqual(null, batch.winsize);
+}
+
 test "mouse wheel outside the transcript does not scroll" {
     var ui: ChatUi = .{
         .allocator = std.testing.allocator,
@@ -5416,7 +6249,7 @@ test "image paste boundaries survive terminal parser and event forwarding" {
             ui.bracketed_paste = false;
             boundaries += 1;
         },
-        .key_press => |key| try std.testing.expect((try ui.handleKey(key, &unused)) == .keep_running),
+        .key_press => |key| try std.testing.expect((try ui.handleKey(key, &unused)) == .composer_redraw),
         else => return error.UnexpectedEvent,
     };
     const text = try ui.input.toOwnedContents(std.testing.allocator);
