@@ -223,6 +223,7 @@ const MessageEntry = struct {
     highlight_cache: markdown.HighlightCache = .{},
     layout_width: u16 = 0,
     layout_rows: usize = 0,
+    layout_show_role: bool = true,
     layout_valid: bool = false,
 
     fn init(
@@ -1129,11 +1130,13 @@ const RenderLine = struct {
 const TranscriptLayout = struct {
     entry_starts: []usize,
     entry_rows: []usize,
+    entry_show_role: []bool,
     total_rows: usize,
 
     fn deinit(self: *TranscriptLayout, allocator: std.mem.Allocator) void {
         allocator.free(self.entry_starts);
         allocator.free(self.entry_rows);
+        allocator.free(self.entry_show_role);
         self.* = undefined;
     }
 
@@ -1153,17 +1156,45 @@ const TranscriptLayout = struct {
             transcript.entries.items.len,
         );
         errdefer allocator.free(entry_rows);
+        const entry_show_role = try allocator.alloc(
+            bool,
+            transcript.entries.items.len,
+        );
+        errdefer allocator.free(entry_show_role);
 
         var total_rows: usize = 0;
+        var in_vivi_block = false;
         for (transcript.entries.items, 0..) |*entry, entry_index| {
             if (entry_index > 0) total_rows += 1;
             entry_starts[entry_index] = total_rows;
+            const show_role = switch (entry.*) {
+                .message => |message| switch (message.role) {
+                    .reasoning, .assistant => show: {
+                        defer in_vivi_block = true;
+                        break :show !in_vivi_block;
+                    },
+                    .user, .queued, .question => show: {
+                        in_vivi_block = false;
+                        break :show true;
+                    },
+                    .status => show: {
+                        in_vivi_block = false;
+                        break :show false;
+                    },
+                },
+                .tool => show: {
+                    in_vivi_block = false;
+                    break :show false;
+                },
+            };
+            entry_show_role[entry_index] = show_role;
             const rows = try Projection.measureEntry(
                 allocator,
                 entry,
                 entry_index,
                 window,
                 spool,
+                show_role,
             );
             entry_rows[entry_index] = rows;
             total_rows += rows;
@@ -1171,6 +1202,7 @@ const TranscriptLayout = struct {
         return .{
             .entry_starts = entry_starts,
             .entry_rows = entry_rows,
+            .entry_show_role = entry_show_role,
             .total_rows = total_rows,
         };
     }
@@ -1199,6 +1231,7 @@ const Projection = struct {
         var projection: Projection = .{};
         errdefer projection.deinit(allocator);
 
+        var in_vivi_block = false;
         for (transcript.entries.items, 0..) |*entry, entry_index| {
             if (projection.lines.items.len > 0) {
                 try projection.lines.append(allocator, .{
@@ -1206,6 +1239,26 @@ const Projection = struct {
                     .entry_index = entry_index,
                 });
             }
+            const show_role = switch (entry.*) {
+                .message => |message| switch (message.role) {
+                    .reasoning, .assistant => show: {
+                        defer in_vivi_block = true;
+                        break :show !in_vivi_block;
+                    },
+                    .user, .queued, .question => show: {
+                        in_vivi_block = false;
+                        break :show true;
+                    },
+                    .status => show: {
+                        in_vivi_block = false;
+                        break :show false;
+                    },
+                },
+                .tool => show: {
+                    in_vivi_block = false;
+                    break :show false;
+                },
+            };
             try projection.appendEntry(
                 allocator,
                 entry,
@@ -1213,6 +1266,7 @@ const Projection = struct {
                 window,
                 true,
                 null,
+                show_role,
             );
         }
         projection.total_rows = projection.lines.items.len;
@@ -1268,6 +1322,7 @@ const Projection = struct {
                 window,
                 true,
                 spool,
+                layout.entry_show_role[entry_index],
             );
             const local_first = first_row -| entry_start;
             const local_last = @min(
@@ -1290,10 +1345,12 @@ const Projection = struct {
         entry_index: usize,
         window: vaxis.Window,
         spool: ?*TranscriptSpool,
+        show_role: bool,
     ) !usize {
         switch (entry.*) {
             .message => |*message| if (message.layout_valid and
-                message.layout_width == window.width)
+                message.layout_width == window.width and
+                message.layout_show_role == show_role)
             {
                 return message.layout_rows;
             },
@@ -1319,12 +1376,14 @@ const Projection = struct {
             window,
             false,
             spool,
+            show_role,
         );
         const rows = projection.lines.items.len;
         switch (entry.*) {
             .message => |*message| {
                 message.layout_width = window.width;
                 message.layout_rows = rows;
+                message.layout_show_role = show_role;
                 message.layout_valid = true;
             },
             .tool => |*tool| {
@@ -1344,6 +1403,7 @@ const Projection = struct {
         window: vaxis.Window,
         cache_highlights: bool,
         spool: ?*TranscriptSpool,
+        show_role: bool,
     ) !void {
         if (entry.* == .message) {
             try entry.message.ensureResident(allocator, spool);
@@ -1351,10 +1411,12 @@ const Projection = struct {
         switch (entry.*) {
             .message => |*message| switch (message.role) {
                 .reasoning, .assistant => {
-                    try self.lines.append(allocator, .{
-                        .kind = .role,
-                        .entry_index = entry_index,
-                    });
+                    if (show_role) {
+                        try self.lines.append(allocator, .{
+                            .kind = .role,
+                            .entry_index = entry_index,
+                        });
+                    }
                     try self.appendMarkdown(
                         allocator,
                         entry_index,
@@ -3428,25 +3490,20 @@ const ChatUi = struct {
                 const role_text = switch (message.role) {
                     .user => "You",
                     .queued => "Queued",
-                    .reasoning => "Thinking",
-                    .assistant => "Vivi",
+                    .reasoning, .assistant => "Vivi",
                     .question => "Question",
                     .status => unreachable,
                 };
                 const role_color = switch (message.role) {
                     .user => user_color,
                     .queued => accent,
-                    .reasoning => reasoning_color,
-                    .assistant => assistant_color,
+                    .reasoning, .assistant => assistant_color,
                     .question => accent,
                     .status => unreachable,
                 };
                 var segments = [_]vaxis.Segment{.{
                     .text = role_text,
-                    .style = if (message.role == .reasoning)
-                        .{ .fg = role_color, .dim = true, .italic = true }
-                    else
-                        .{ .fg = role_color, .bold = true },
+                    .style = .{ .fg = role_color, .bold = true },
                 }};
                 _ = window.print(&segments, .{
                     .row_offset = row,
@@ -4951,6 +5008,51 @@ test "reasoning and response stay ordered before a queued prompt" {
     try std.testing.expectEqualStrings(
         "queued response",
         transcript.messageAt(4).text.items,
+    );
+}
+
+test "reasoning renders under a single Vivi heading" {
+    var transcript: Transcript = .{};
+    defer transcript.deinit(std.testing.allocator);
+
+    try transcript.append(std.testing.allocator, .user, "why?");
+    try transcript.appendReasoningDelta(std.testing.allocator, "thinking");
+    try transcript.appendDelta(std.testing.allocator, "because");
+
+    var screen = try vaxis.Screen.init(std.testing.allocator, .{
+        .rows = 1,
+        .cols = 40,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(std.testing.allocator);
+    const window: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = screen.width,
+        .height = screen.height,
+        .screen = &screen,
+    };
+    var projection = try Projection.build(
+        std.testing.allocator,
+        &transcript,
+        window,
+    );
+    defer projection.deinit(std.testing.allocator);
+
+    var role_entries: std.ArrayList(usize) = .empty;
+    defer role_entries.deinit(std.testing.allocator);
+    for (projection.lines.items) |line| {
+        if (line.kind == .role) {
+            try role_entries.append(std.testing.allocator, line.entry_index);
+        }
+    }
+    try std.testing.expectEqualSlices(
+        usize,
+        &.{ 0, 1 },
+        role_entries.items,
     );
 }
 
