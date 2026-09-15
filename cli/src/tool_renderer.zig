@@ -245,8 +245,13 @@ fn stringSequence(
             return .{ .complete = index + 1 };
         if (text[index] == 0x9c)
             return .{ .complete = index + 1 };
-        if (text[index] == 0x1b and index + 1 < limit and text[index + 1] == '\\')
-            return .{ .complete = index + 2 };
+        if (text[index] == 0x18 or text[index] == 0x1a)
+            return .{ .incomplete = index + 1 };
+        if (text[index] == 0x1b) {
+            if (index + 1 < limit and text[index + 1] == '\\')
+                return .{ .complete = index + 2 };
+            return .{ .incomplete = index };
+        }
     }
     return .{ .incomplete = limit };
 }
@@ -298,6 +303,18 @@ test "malformed terminal strings are escaped without overlapping scans" {
     const rendered = try renderOutput(std.testing.allocator, input.items);
     defer std.testing.allocator.free(rendered);
     try std.testing.expectEqual(5 * 16 * 1024, rendered.len);
+}
+
+test "cancelled terminal strings do not hide subsequent output" {
+    const rendered = try renderOutput(
+        std.testing.allocator,
+        "\x1b]bad\x18visible\x07 \x90bad\x1anext\x9c \x1b]bad\x1b[31mred\x1b[0m",
+    );
+    defer std.testing.allocator.free(rendered);
+    try std.testing.expectEqualStrings(
+        "\\x1b]bad\\x18visible\\x07 \\x90bad\\x1anext \\x1b]badred",
+        rendered,
+    );
 }
 
 test "tool output keeps JSON literal rather than presenting arguments" {
