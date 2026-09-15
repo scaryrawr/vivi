@@ -487,6 +487,9 @@ fn parseSpans(
     source: []const u8,
     require_complete: bool,
 ) ![]Span {
+    if (require_complete and source.len > max_source_bytes) {
+        return allocator.alloc(Span, 0);
+    }
     const bounded_source = source[0..@min(source.len, max_source_bytes)];
     if (bounded_source.len == 0) {
         return allocator.alloc(Span, 0);
@@ -799,6 +802,10 @@ test "highlighting is bounded for large sources" {
     for (highlighted) |span| {
         try std.testing.expect(span.end <= max_source_bytes);
     }
+
+    const complete = try completeSpans(std.testing.allocator, .json, source);
+    defer std.testing.allocator.free(complete);
+    try std.testing.expectEqual(@as(usize, 0), complete.len);
 }
 
 test "Bash function styling is limited to the function name" {

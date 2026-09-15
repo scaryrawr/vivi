@@ -1120,6 +1120,53 @@ const RenderLine = struct {
     end: usize = 0,
 };
 
+const RenderMemory = struct {
+    borrowed: std.heap.ArenaAllocator,
+    frame: std.heap.ArenaAllocator,
+    measure: std.heap.ArenaAllocator,
+
+    fn init(backing: std.mem.Allocator) RenderMemory {
+        return .{
+            .borrowed = .init(backing),
+            .frame = .init(backing),
+            .measure = .init(backing),
+        };
+    }
+
+    fn beginFull(self: *RenderMemory, root: vaxis.Window) FullFrame {
+        root.clear();
+        _ = self.borrowed.reset(.retain_capacity);
+        _ = self.frame.reset(.retain_capacity);
+        _ = self.measure.reset(.retain_capacity);
+        return .{ .memory = self };
+    }
+
+    fn deinit(self: *RenderMemory, root: vaxis.Window) void {
+        root.clear();
+        self.measure.deinit();
+        self.frame.deinit();
+        self.borrowed.deinit();
+        self.* = undefined;
+    }
+};
+
+const FullFrame = struct {
+    memory: *RenderMemory,
+
+    fn borrowedAllocator(self: *FullFrame) std.mem.Allocator {
+        return self.memory.borrowed.allocator();
+    }
+
+    fn frameAllocator(self: *FullFrame) std.mem.Allocator {
+        return self.memory.frame.allocator();
+    }
+
+    fn beginMeasurement(self: *FullFrame) std.mem.Allocator {
+        _ = self.memory.measure.reset(.retain_capacity);
+        return self.memory.measure.allocator();
+    }
+};
+
 const TranscriptLayout = struct {
     entry_starts: []usize,
     entry_rows: []usize,
@@ -1139,21 +1186,57 @@ const TranscriptLayout = struct {
         window: vaxis.Window,
         spool: ?*TranscriptSpool,
     ) !TranscriptLayout {
-        const entry_starts = try allocator.alloc(
+        return measureAllocating(
+            allocator,
+            null,
+            transcript,
+            window,
+            spool,
+        );
+    }
+
+    fn measureFrame(
+        persistent_allocator: std.mem.Allocator,
+        frame: *FullFrame,
+        transcript: *Transcript,
+        window: vaxis.Window,
+        spool: ?*TranscriptSpool,
+    ) !TranscriptLayout {
+        return measureAllocating(
+            persistent_allocator,
+            frame,
+            transcript,
+            window,
+            spool,
+        );
+    }
+
+    fn measureAllocating(
+        persistent_allocator: std.mem.Allocator,
+        frame: ?*FullFrame,
+        transcript: *Transcript,
+        window: vaxis.Window,
+        spool: ?*TranscriptSpool,
+    ) !TranscriptLayout {
+        const layout_allocator = if (frame) |value|
+            value.frameAllocator()
+        else
+            persistent_allocator;
+        const entry_starts = try layout_allocator.alloc(
             usize,
             transcript.entries.items.len,
         );
-        errdefer allocator.free(entry_starts);
-        const entry_rows = try allocator.alloc(
+        errdefer layout_allocator.free(entry_starts);
+        const entry_rows = try layout_allocator.alloc(
             usize,
             transcript.entries.items.len,
         );
-        errdefer allocator.free(entry_rows);
-        const entry_show_role = try allocator.alloc(
+        errdefer layout_allocator.free(entry_rows);
+        const entry_show_role = try layout_allocator.alloc(
             bool,
             transcript.entries.items.len,
         );
-        errdefer allocator.free(entry_show_role);
+        errdefer layout_allocator.free(entry_show_role);
 
         var total_rows: usize = 0;
         var in_vivi_block = false;
@@ -1181,8 +1264,16 @@ const TranscriptLayout = struct {
                 },
             };
             entry_show_role[entry_index] = show_role;
-            const rows = try Projection.measureEntry(
-                allocator,
+            const work_allocator = if (frame) |value|
+                value.beginMeasurement()
+            else
+                persistent_allocator;
+            const rows = try Projection.measureEntryAllocating(
+                .{
+                    .result = work_allocator,
+                    .scratch = work_allocator,
+                    .persistent = persistent_allocator,
+                },
                 entry,
                 entry_index,
                 window,
@@ -1199,6 +1290,12 @@ const TranscriptLayout = struct {
             .total_rows = total_rows,
         };
     }
+};
+
+const ProjectionAllocators = struct {
+    result: std.mem.Allocator,
+    scratch: std.mem.Allocator,
+    persistent: std.mem.Allocator,
 };
 
 const Projection = struct {
@@ -1274,11 +1371,58 @@ const Projection = struct {
         rows_from_tail: usize,
         spool: ?*TranscriptSpool,
     ) !Projection {
+        return buildViewportAllocating(
+            .{
+                .result = allocator,
+                .scratch = allocator,
+                .persistent = allocator,
+            },
+            null,
+            transcript,
+            layout,
+            window,
+            rows_from_tail,
+            spool,
+        );
+    }
+
+    fn buildViewportFrame(
+        persistent_allocator: std.mem.Allocator,
+        frame: *FullFrame,
+        transcript: *Transcript,
+        layout: *const TranscriptLayout,
+        window: vaxis.Window,
+        rows_from_tail: usize,
+        spool: ?*TranscriptSpool,
+    ) !Projection {
+        return buildViewportAllocating(
+            .{
+                .result = frame.borrowedAllocator(),
+                .scratch = frame.beginMeasurement(),
+                .persistent = persistent_allocator,
+            },
+            frame,
+            transcript,
+            layout,
+            window,
+            rows_from_tail,
+            spool,
+        );
+    }
+    fn buildViewportAllocating(
+        initial_allocators: ProjectionAllocators,
+        frame: ?*FullFrame,
+        transcript: *Transcript,
+        layout: *const TranscriptLayout,
+        window: vaxis.Window,
+        rows_from_tail: usize,
+        spool: ?*TranscriptSpool,
+    ) !Projection {
         var projection: Projection = .{
             .total_rows = layout.total_rows,
             .viewport_materialized = true,
         };
-        errdefer projection.deinit(allocator);
+        errdefer projection.deinit(initial_allocators.result);
 
         const visible_rows = @min(layout.total_rows, window.height);
         const first_row =
@@ -1291,14 +1435,14 @@ const Projection = struct {
                 entry_start - 1 >= first_row and
                 entry_start - 1 < last_row)
             {
-                try projection.lines.append(allocator, .{
+                try projection.lines.append(initial_allocators.result, .{
                     .kind = .blank,
                     .entry_index = entry_index,
                 });
             }
             const entry_end = entry_start + layout.entry_rows[entry_index];
             if (entry_end <= first_row or entry_start >= last_row) {
-                entry.releaseRenderCaches(allocator);
+                entry.releaseRenderCaches(initial_allocators.persistent);
                 continue;
             }
             if (projection.first_visible_entry == null) {
@@ -1311,8 +1455,12 @@ const Projection = struct {
                 last_row -| entry_start,
                 layout.entry_rows[entry_index],
             );
-            try projection.appendEntryRange(
-                allocator,
+            var allocators = initial_allocators;
+            if (frame) |value| {
+                allocators.scratch = value.beginMeasurement();
+            }
+            try projection.appendEntryRangeAllocating(
+                allocators,
                 entry,
                 entry_index,
                 window,
@@ -1327,6 +1475,28 @@ const Projection = struct {
 
     fn measureEntry(
         allocator: std.mem.Allocator,
+        entry: *Entry,
+        entry_index: usize,
+        window: vaxis.Window,
+        spool: ?*TranscriptSpool,
+        show_role: bool,
+    ) !usize {
+        return measureEntryAllocating(
+            .{
+                .result = allocator,
+                .scratch = allocator,
+                .persistent = allocator,
+            },
+            entry,
+            entry_index,
+            window,
+            spool,
+            show_role,
+        );
+    }
+
+    fn measureEntryAllocating(
+        allocators: ProjectionAllocators,
         entry: *Entry,
         entry_index: usize,
         window: vaxis.Window,
@@ -1354,17 +1524,17 @@ const Projection = struct {
             entry.message.page != null and
             entry.message.text.items.len == 0;
         defer if (unload_after_measure) {
-            entry.message.unload(allocator);
+            entry.message.unload(allocators.persistent);
         };
         const rows = switch (entry.*) {
             .message => |*message| rows: {
-                try message.ensureResident(allocator, spool);
+                try message.ensureResident(allocators.persistent, spool);
                 var counter: Projection = .{};
-                defer counter.deinit(allocator);
+                defer counter.deinit(allocators.result);
                 break :rows switch (message.role) {
                     .reasoning, .assistant => @intFromBool(show_role) +
-                        try counter.appendMarkdownRange(
-                            allocator,
+                        try counter.appendMarkdownRangeAllocating(
+                            allocators,
                             entry_index,
                             message.text.items,
                             window,
@@ -1376,7 +1546,7 @@ const Projection = struct {
                         ),
                     .user, .queued, .question => 1 +
                         try counter.appendWrappedRange(
-                            allocator,
+                            allocators.result,
                             entry_index,
                             message.text.items,
                             window,
@@ -1386,7 +1556,7 @@ const Projection = struct {
                             0,
                         ),
                     .status => try counter.appendWrappedRange(
-                        allocator,
+                        allocators.result,
                         entry_index,
                         message.text.items,
                         window,
@@ -1399,9 +1569,9 @@ const Projection = struct {
             },
             .tool => rows: {
                 var counter: Projection = .{};
-                defer counter.deinit(allocator);
-                break :rows try counter.appendToolRange(
-                    allocator,
+                defer counter.deinit(allocators.result);
+                break :rows try counter.appendToolRangeAllocating(
+                    allocators,
                     &entry.tool,
                     entry_index,
                     window,
@@ -1510,9 +1680,34 @@ const Projection = struct {
         first: usize,
         last: usize,
     ) !usize {
+        return self.appendToolRangeAllocating(
+            .{
+                .result = allocator,
+                .scratch = allocator,
+                .persistent = allocator,
+            },
+            tool,
+            entry_index,
+            window,
+            cache_highlights,
+            first,
+            last,
+        );
+    }
+
+    fn appendToolRangeAllocating(
+        self: *Projection,
+        allocators: ProjectionAllocators,
+        tool: *ToolEntry,
+        entry_index: usize,
+        window: vaxis.Window,
+        cache_highlights: bool,
+        first: usize,
+        last: usize,
+    ) !usize {
         var row: usize = 0;
         row += try self.appendWrappedRange(
-            allocator,
+            allocators.result,
             entry_index,
             tool.compact,
             window,
@@ -1529,18 +1724,18 @@ const Projection = struct {
             else
                 false;
         if (cache_highlights and !render_markdown) {
-            try tool.ensureOutputHighlights(allocator);
+            try tool.ensureOutputHighlights(allocators.persistent);
         }
 
         if (row >= first and row < last) {
-            try self.lines.append(allocator, .{
+            try self.lines.append(allocators.result, .{
                 .kind = .tool_input_label,
                 .entry_index = entry_index,
             });
         }
         row += 1;
         row += try self.appendWrappedRange(
-            allocator,
+            allocators.result,
             entry_index,
             tool.input_display,
             window,
@@ -1550,7 +1745,7 @@ const Projection = struct {
             last -| row,
         );
         if (row >= first and row < last) {
-            try self.lines.append(allocator, .{
+            try self.lines.append(allocators.result, .{
                 .kind = .tool_output_label,
                 .entry_index = entry_index,
             });
@@ -1558,8 +1753,8 @@ const Projection = struct {
         row += 1;
 
         if (render_markdown) {
-            row += try self.appendMarkdownRange(
-                allocator,
+            row += try self.appendMarkdownRangeAllocating(
+                allocators,
                 entry_index,
                 tool.output_display.?,
                 window,
@@ -1571,7 +1766,7 @@ const Projection = struct {
             );
         } else {
             row += try self.appendWrappedRange(
-                allocator,
+                allocators.result,
                 entry_index,
                 tool.output_display orelse "Running…",
                 window,
@@ -1588,7 +1783,7 @@ const Projection = struct {
             const image_first = first -| row;
             const image_last = @min(last -| row, size.rows);
             for (image_first..image_last) |image_row| {
-                try self.lines.append(allocator, .{
+                try self.lines.append(allocators.result, .{
                     .kind = .tool_image,
                     .entry_index = entry_index,
                     .start = image_row,
@@ -1611,11 +1806,38 @@ const Projection = struct {
         first: usize,
         last: usize,
     ) !void {
+        return self.appendEntryRangeAllocating(
+            .{
+                .result = allocator,
+                .scratch = allocator,
+                .persistent = allocator,
+            },
+            entry,
+            entry_index,
+            window,
+            spool,
+            show_role,
+            first,
+            last,
+        );
+    }
+
+    fn appendEntryRangeAllocating(
+        self: *Projection,
+        allocators: ProjectionAllocators,
+        entry: *Entry,
+        entry_index: usize,
+        window: vaxis.Window,
+        spool: ?*TranscriptSpool,
+        show_role: bool,
+        first: usize,
+        last: usize,
+    ) !void {
         if (entry.* == .tool) {
-            entry.tool.output_markdown_cache.deinit(allocator);
+            entry.tool.output_markdown_cache.deinit(allocators.persistent);
             entry.tool.output_markdown_cache = .{};
-            _ = try self.appendToolRange(
-                allocator,
+            _ = try self.appendToolRangeAllocating(
+                allocators,
                 &entry.tool,
                 entry_index,
                 window,
@@ -1626,22 +1848,22 @@ const Projection = struct {
             return;
         }
 
-        try entry.message.ensureResident(allocator, spool);
+        try entry.message.ensureResident(allocators.persistent, spool);
         const message = &entry.message;
-        message.highlight_cache.deinit(allocator);
+        message.highlight_cache.deinit(allocators.persistent);
         message.highlight_cache = .{};
         switch (message.role) {
             .reasoning, .assistant => {
                 const body_offset: usize = @intFromBool(show_role);
                 if (show_role and first == 0 and last > 0) {
-                    try self.lines.append(allocator, .{
+                    try self.lines.append(allocators.result, .{
                         .kind = .role,
                         .entry_index = entry_index,
                     });
                 }
                 if (last > body_offset) {
-                    _ = try self.appendMarkdownRange(
-                        allocator,
+                    _ = try self.appendMarkdownRangeAllocating(
+                        allocators,
                         entry_index,
                         message.text.items,
                         window,
@@ -1655,14 +1877,14 @@ const Projection = struct {
             },
             .user, .queued, .question => {
                 if (first == 0 and last > 0) {
-                    try self.lines.append(allocator, .{
+                    try self.lines.append(allocators.result, .{
                         .kind = .role,
                         .entry_index = entry_index,
                     });
                 }
                 if (last > 1) {
                     _ = try self.appendWrappedRange(
-                        allocator,
+                        allocators.result,
                         entry_index,
                         message.text.items,
                         window,
@@ -1675,7 +1897,7 @@ const Projection = struct {
             },
             .status => {
                 _ = try self.appendWrappedRange(
-                    allocator,
+                    allocators.result,
                     entry_index,
                     message.text.items,
                     window,
@@ -1747,8 +1969,41 @@ const Projection = struct {
         first: usize,
         last: usize,
     ) !usize {
-        var layout = try markdown.Layout.initCachedRange(
-            allocator,
+        return self.appendMarkdownRangeAllocating(
+            .{
+                .result = allocator,
+                .scratch = allocator,
+                .persistent = allocator,
+            },
+            entry_index,
+            text,
+            window,
+            width,
+            cache,
+            kind,
+            first,
+            last,
+        );
+    }
+
+    fn appendMarkdownRangeAllocating(
+        self: *Projection,
+        allocators: ProjectionAllocators,
+        entry_index: usize,
+        text: []const u8,
+        window: vaxis.Window,
+        width: u16,
+        cache: ?*markdown.HighlightCache,
+        kind: LineKind,
+        first: usize,
+        last: usize,
+    ) !usize {
+        var layout = try markdown.Layout.initCachedRangeAllocating(
+            .{
+                .result = allocators.result,
+                .scratch = allocators.scratch,
+                .cache = allocators.persistent,
+            },
             text,
             window,
             width,
@@ -1759,9 +2014,9 @@ const Projection = struct {
         defer layout.deinit();
         for (layout.lines.items) |*line| {
             const markdown_index = self.markdown_lines.items.len;
-            try self.markdown_lines.append(allocator, line.*);
+            try self.markdown_lines.append(allocators.result, line.*);
             line.* = .{};
-            try self.lines.append(allocator, .{
+            try self.lines.append(allocators.result, .{
                 .kind = kind,
                 .entry_index = entry_index,
                 .start = markdown_index,
@@ -3169,8 +3424,29 @@ const ChatUi = struct {
     }
 
     fn draw(self: *ChatUi, root: vaxis.Window) !?Projection {
+        return self.drawAllocating(root, null);
+    }
+
+    fn drawFrame(
+        self: *ChatUi,
+        root: vaxis.Window,
+        frame: *FullFrame,
+    ) !?Projection {
+        return self.drawAllocating(root, frame);
+    }
+
+    fn drawAllocating(
+        self: *ChatUi,
+        root: vaxis.Window,
+        frame: ?*FullFrame,
+    ) !?Projection {
+        const projection_allocator = if (frame) |value|
+            value.borrowedAllocator()
+        else
+            self.allocator;
         var projection: ?Projection = null;
-        errdefer if (projection) |*value| value.deinit(self.allocator);
+        errdefer if (projection) |*value|
+            value.deinit(projection_allocator);
 
         const desired_menu_rows: u16 = if (self.phase == .awaiting_input)
             self.userInputPanelRows(root)
@@ -3195,25 +3471,50 @@ const ChatUi = struct {
                 self.last_total_rows = 0;
                 self.last_viewport_rows = transcript_window.height;
             } else {
-                var transcript_layout = try TranscriptLayout.measure(
-                    self.allocator,
-                    &self.transcript,
-                    transcript_window,
-                    if (self.transcript_spool) |*spool| spool else null,
+                var transcript_layout = if (frame) |value|
+                    try TranscriptLayout.measureFrame(
+                        self.allocator,
+                        value,
+                        &self.transcript,
+                        transcript_window,
+                        if (self.transcript_spool) |*spool| spool else null,
+                    )
+                else
+                    try TranscriptLayout.measure(
+                        self.allocator,
+                        &self.transcript,
+                        transcript_window,
+                        if (self.transcript_spool) |*spool| spool else null,
+                    );
+                defer transcript_layout.deinit(
+                    if (frame) |value|
+                        value.frameAllocator()
+                    else
+                        self.allocator,
                 );
-                defer transcript_layout.deinit(self.allocator);
                 self.prepareTranscriptViewport(
                     &transcript_layout,
                     transcript_window.height,
                 );
-                projection = try Projection.buildViewport(
-                    self.allocator,
-                    &self.transcript,
-                    &transcript_layout,
-                    transcript_window,
-                    self.rows_from_tail,
-                    if (self.transcript_spool) |*spool| spool else null,
-                );
+                projection = if (frame) |value|
+                    try Projection.buildViewportFrame(
+                        self.allocator,
+                        value,
+                        &self.transcript,
+                        &transcript_layout,
+                        transcript_window,
+                        self.rows_from_tail,
+                        if (self.transcript_spool) |*spool| spool else null,
+                    )
+                else
+                    try Projection.buildViewport(
+                        self.allocator,
+                        &self.transcript,
+                        &transcript_layout,
+                        transcript_window,
+                        self.rows_from_tail,
+                        if (self.transcript_spool) |*spool| spool else null,
+                    );
                 try self.drawTranscript(transcript_window, &projection.?);
             }
         }
@@ -4299,7 +4600,7 @@ const App = struct {
     loop: vaxis.Loop(AppEvent),
     conversation: backend.Conversation,
     ui: ChatUi,
-    rendered_projection: ?Projection = null,
+    render_memory: RenderMemory,
     stream_updates_since_render: usize = 0,
     closed: bool = false,
 
@@ -4326,6 +4627,9 @@ const App = struct {
         );
         errdefer self.vx.deinit(init_args.gpa, self.tty.writer());
 
+        self.render_memory = .init(init_args.gpa);
+        errdefer self.render_memory.deinit(self.vx.window());
+
         self.loop = .init(init_args.io, &self.tty, &self.vx);
         self.ui = try ChatUi.init(
             init_args.gpa,
@@ -4344,7 +4648,6 @@ const App = struct {
             init_args.io,
             temporary_directory,
         );
-        self.rendered_projection = null;
         self.stream_updates_since_render = 0;
         self.closed = false;
 
@@ -4370,9 +4673,7 @@ const App = struct {
     fn deinit(self: *App) void {
         self.conversation.deinit();
         self.releaseImages();
-        if (self.rendered_projection) |*projection| {
-            projection.deinit(self.allocator);
-        }
+        self.render_memory.deinit(self.vx.window());
         self.ui.deinit();
         self.loop.stop();
         self.vx.deinit(self.allocator, self.tty.writer());
@@ -4553,18 +4854,12 @@ const App = struct {
             }
         }
         const root = self.vx.window();
-        root.clear();
-        var projection = try self.ui.draw(root);
-        errdefer if (projection) |*value| value.deinit(self.allocator);
+        var frame = self.render_memory.beginFull(root);
+        const projection = try self.ui.drawFrame(root, &frame);
         try self.vx.render(self.tty.writer());
         if (projection) |*value| {
             try self.ui.evictOffscreenMessages(value);
         }
-        if (self.rendered_projection) |*previous| {
-            previous.deinit(self.allocator);
-        }
-        self.rendered_projection = projection;
-        projection = null;
         self.stream_updates_since_render = 0;
         try self.tty.writer().flush();
     }
@@ -4586,9 +4881,7 @@ const App = struct {
         self.loop.stop();
         self.releaseImages();
         self.ui.deinitTranscriptSpool();
-        if (self.rendered_projection) |*projection| {
-            projection.deinit(self.allocator);
-        }
+        self.render_memory.deinit(self.vx.window());
         self.vx.deinit(self.allocator, self.tty.writer());
         self.tty.deinit();
         std.process.exit(130);
@@ -6178,7 +6471,7 @@ test "tool disclosure hit mapping follows wrapping scrolling resizing and comple
     finished.deinit();
     try std.testing.expect(ui.transcript.entries.items[0].tool.expanded);
     try std.testing.expectEqualStrings("# literal failure\n\x1b[31mactual output", ui.transcript.entries.items[0].tool.output.?);
-    try std.testing.expectEqualStrings("# literal failure\n\\x1b[31mactual output", ui.transcript.entries.items[0].tool.output_display.?);
+    try std.testing.expectEqualStrings("# literal failure\nactual output", ui.transcript.entries.items[0].tool.output_display.?);
     window.width = 20;
     projection = (try ui.draw(window)).?;
     projection.deinit(std.testing.allocator);
@@ -6837,6 +7130,84 @@ test "Markdown draw storage remains valid while screen cells are consumed" {
         rendered.items,
         "Tables",
     ) != null);
+}
+
+test "renderer arenas preserve screen borrows and stabilize after warmup" {
+    var ui: ChatUi = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .input = TextInput.init(std.testing.allocator),
+        .cwd = try std.testing.allocator.dupe(u8, "."),
+    };
+    defer ui.deinit();
+    try ui.transcript.append(
+        std.testing.allocator,
+        .assistant,
+        "# Retained frame\n\n**Styled** [link](https://example.com)",
+    );
+
+    var screen = try vaxis.Screen.init(std.testing.allocator, .{
+        .rows = 12,
+        .cols = 40,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(std.testing.allocator);
+    const window: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = screen.width,
+        .height = screen.height,
+        .screen = &screen,
+    };
+    var memory = RenderMemory.init(std.testing.allocator);
+    defer memory.deinit(window);
+
+    var frame = memory.beginFull(window);
+    _ = try ui.drawFrame(window, &frame);
+    var rendered: std.ArrayList(u8) = .empty;
+    defer rendered.deinit(std.testing.allocator);
+    for (0..screen.height) |row| {
+        for (0..screen.width) |column| {
+            const cell = screen.readCell(
+                @intCast(column),
+                @intCast(row),
+            ).?;
+            try rendered.appendSlice(
+                std.testing.allocator,
+                cell.char.grapheme,
+            );
+        }
+    }
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        rendered.items,
+        "Retained frame",
+    ) != null);
+
+    frame = memory.beginFull(window);
+    _ = try ui.drawFrame(window, &frame);
+    const borrowed_capacity = memory.borrowed.queryCapacity();
+    const frame_capacity = memory.frame.queryCapacity();
+    const measure_capacity = memory.measure.queryCapacity();
+    for (0..32) |_| {
+        frame = memory.beginFull(window);
+        _ = try ui.drawFrame(window, &frame);
+    }
+    try std.testing.expectEqual(
+        borrowed_capacity,
+        memory.borrowed.queryCapacity(),
+    );
+    try std.testing.expectEqual(
+        frame_capacity,
+        memory.frame.queryCapacity(),
+    );
+    try std.testing.expectEqual(
+        measure_capacity,
+        memory.measure.queryCapacity(),
+    );
 }
 
 test "frame layout keeps chrome in bounds" {

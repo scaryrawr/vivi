@@ -57,11 +57,11 @@ pub const OutputPlan = union(enum) {
         raw: []const u8,
     ) ![]u8 {
         if (outcome != .succeeded) {
-            return tool_renderer.renderLiteral(allocator, raw);
+            return tool_renderer.renderOutput(allocator, raw);
         }
         return switch (self) {
             .markdown => tool_renderer.renderMarkdown(allocator, raw),
-            .literal, .syntax => tool_renderer.renderLiteral(allocator, raw),
+            .literal, .syntax => tool_renderer.renderOutput(allocator, raw),
         };
     }
 
@@ -153,6 +153,13 @@ fn parseSimpleCommand(
                             source[index] == 0x7f)
                         {
                             return error.UnsupportedCommand;
+                        }
+                        if (std.mem.indexOfScalar(
+                            u8,
+                            "$`\"\\",
+                            source[index],
+                        ) == null) {
+                            try word.append(allocator, '\\');
                         }
                     }
                     try word.append(allocator, source[index]);
@@ -286,6 +293,7 @@ test "output plans classify only static homogeneous commands" {
         "cat a.yml > copy.yml",
         "cat a.yml\nprintf done",
         "cat \"$FILE\"",
+        "cat \"workflow.\\yml\"",
         "cat `find . -name ci.yml`",
         "cat workflow.\xffyml",
         "git diff --stat",
@@ -310,7 +318,7 @@ test "output plans sanitize before strict syntax highlighting" {
     );
     defer std.testing.allocator.free(display);
     try std.testing.expectEqualStrings(
-        "name: vivi\nready: true\nnote: \\x1b[31mred\n",
+        "name: vivi\nready: true\nnote: red\n",
         display,
     );
     const highlighted = try plan.spans(

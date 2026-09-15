@@ -68,6 +68,12 @@ pub const Layout = struct {
     lines: std.ArrayList(Line) = .empty,
     total_rows: usize = 0,
 
+    pub const Allocators = struct {
+        result: std.mem.Allocator,
+        scratch: std.mem.Allocator,
+        cache: std.mem.Allocator,
+    };
+
     pub fn init(
         allocator: std.mem.Allocator,
         source: []const u8,
@@ -104,11 +110,36 @@ pub const Layout = struct {
         first_row: usize,
         last_row: usize,
     ) !Layout {
+        return initCachedRangeAllocating(
+            .{
+                .result = allocator,
+                .scratch = allocator,
+                .cache = allocator,
+            },
+            source,
+            window,
+            width,
+            highlight_cache,
+            first_row,
+            last_row,
+        );
+    }
+
+    pub fn initCachedRangeAllocating(
+        allocators: Allocators,
+        source: []const u8,
+        window: vaxis.Window,
+        width: u16,
+        highlight_cache: ?*HighlightCache,
+        first_row: usize,
+        last_row: usize,
+    ) !Layout {
         if (source.len > std.math.maxInt(c.MD_SIZE)) {
             return error.MarkdownInputTooLarge;
         }
         var builder = Builder{
-            .allocator = allocator,
+            .allocator = allocators.scratch,
+            .cache_allocator = allocators.cache,
             .window = window,
             .width = @max(width, 1),
             .highlight_cache = highlight_cache,
@@ -133,12 +164,13 @@ pub const Layout = struct {
         if (result != 0) return error.MarkdownParseFailed;
         try builder.finishDocument();
         if (highlight_cache) |cache| {
-            cache.truncate(allocator, builder.code_block_index);
+            cache.truncate(allocators.cache, builder.code_block_index);
         }
 
-        var layout = Layout{ .allocator = allocator };
+        var layout = Layout{ .allocator = allocators.result };
         errdefer layout.deinit();
         layout.total_rows = try builder.wrapRangeInto(
+            allocators.result,
             &layout.lines,
             first_row,
             last_row,
@@ -297,6 +329,7 @@ const Table = struct {
 
 const Builder = struct {
     allocator: std.mem.Allocator,
+    cache_allocator: std.mem.Allocator,
     window: vaxis.Window,
     width: u16,
     lines: std.ArrayList(Line) = .empty,
@@ -417,7 +450,7 @@ const Builder = struct {
             if (self.code_language) |language|
                 if (self.highlight_cache) |cache|
                     try cache.spansFor(
-                        self.allocator,
+                        self.cache_allocator,
                         self.current_code_block_index,
                         language,
                         source,
@@ -554,19 +587,20 @@ const Builder = struct {
 
     fn wrapRangeInto(
         self: *Builder,
+        allocator: std.mem.Allocator,
         destination: *std.ArrayList(Line),
         first_row: usize,
         last_row: usize,
     ) !usize {
         var sink = LineSink{
-            .allocator = self.allocator,
+            .allocator = allocator,
             .destination = destination,
             .first = first_row,
             .last = last_row,
         };
         for (self.lines.items) |*line| {
             try wrapLine(
-                self.allocator,
+                allocator,
                 self.window,
                 self.width,
                 line,
@@ -1939,6 +1973,45 @@ test "range layout retains only requested wrapped rows" {
     try std.testing.expectEqual(@as(usize, 5), layout.total_rows);
     try std.testing.expectEqual(@as(usize, 2), layout.lines.items.len);
     try std.testing.expectEqualStrings("beta\ngamma", rendered.items);
+}
+
+test "layout result does not borrow parser scratch" {
+    var screen: vaxis.Screen = undefined;
+    const window = testWindow(&screen, 20);
+    var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var layout = try Layout.initCachedRangeAllocating(
+        .{
+            .result = std.testing.allocator,
+            .scratch = scratch.allocator(),
+            .cache = std.testing.allocator,
+        },
+        "**retained** [link](https://example.com)",
+        window,
+        20,
+        null,
+        0,
+        std.math.maxInt(usize),
+    );
+    scratch.deinit();
+    defer layout.deinit();
+
+    var rendered: std.ArrayList(u8) = .empty;
+    defer rendered.deinit(std.testing.allocator);
+    try appendLayoutText(std.testing.allocator, &rendered, &layout);
+    try std.testing.expectEqualStrings("retained link", rendered.items);
+    var found_uri = false;
+    for (layout.lines.items) |line| {
+        for (line.segments.items) |segment| {
+            if (segment.uri) |uri| {
+                try std.testing.expectEqualStrings(
+                    "https://example.com",
+                    uri,
+                );
+                found_uri = true;
+            }
+        }
+    }
+    try std.testing.expect(found_uri);
 }
 
 test "lists blockquotes tasks and code have readable structure" {
