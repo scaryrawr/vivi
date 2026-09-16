@@ -2140,6 +2140,14 @@ fn streamSessionResponse(
                 )) return .failed;
             },
             .session_title_changed => |title| {
+                if (!session_store.validTitle(title.data.title)) {
+                    if (!reportStreamStatus(
+                        worker,
+                        "Session title updated.",
+                        "Unable to display session title.",
+                    )) return .failed;
+                    continue;
+                }
                 if (session_tracking_enabled.*) {
                     if (store) |value| {
                         value.updateTitle(

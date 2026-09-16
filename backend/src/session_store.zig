@@ -278,7 +278,7 @@ pub const Store = struct {
         id: []const u8,
         title: []const u8,
     ) !void {
-        try validateText(title, 512);
+        if (!validTitle(title)) return error.InvalidSessionText;
         const lock = try self.acquireLock();
         defer lock.close(self.io);
 
@@ -991,6 +991,10 @@ test "session store persists generated titles" {
 
     try store.recordCreated("session-a", "/work/a", "copilot/default", .off, 10);
     try store.updateTitle("session-a", "Fix resume picker");
+    try std.testing.expectError(
+        error.InvalidSessionText,
+        store.updateTitle("session-a", "unsafe\x1b[2J"),
+    );
     try store.recordCreated("session-a", "/work/a", "copilot/default", .off, 20);
 
     var index = try store.list();
