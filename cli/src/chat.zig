@@ -2468,6 +2468,23 @@ fn uniqueWorkspaceLabel(
     }
 }
 
+fn sessionMenuEntry(
+    sessions: []const backend.SessionSummary,
+    index: usize,
+) MenuEntry {
+    const session = sessions[index];
+    return .{
+        .identity = .{ .resume_key = session.key },
+        .key = session.working_directory,
+        .primary = session.title orelse uniqueWorkspaceLabel(sessions, index),
+        .detail = .{ .session = .{
+            .working_directory = session.working_directory,
+        } },
+        .current = session.current,
+        .source_index = index,
+    };
+}
+
 fn pathEndsWithComponent(path: []const u8, suffix: []const u8) bool {
     if (!std.mem.endsWith(u8, path, suffix)) return false;
     if (path.len == suffix.len) return true;
@@ -3134,18 +3151,8 @@ const ChatUi = struct {
             catalog.sessions.len,
         );
         defer self.allocator.free(entries);
-        for (catalog.sessions, 0..) |session, index| {
-            entries[index] = .{
-                .identity = .{ .resume_key = session.key },
-                .key = session.working_directory,
-                .primary = session.title orelse
-                    uniqueWorkspaceLabel(catalog.sessions, index),
-                .detail = .{ .session = .{
-                    .working_directory = session.working_directory,
-                } },
-                .current = session.current,
-                .source_index = index,
-            };
+        for (catalog.sessions, 0..) |_, index| {
+            entries[index] = sessionMenuEntry(catalog.sessions, index);
         }
         try self.menu.rebuild(self.allocator, entries, query);
         for (self.menu.matches.items, 0..) |entry_index, match_index| {
@@ -7989,6 +7996,49 @@ test "session menu preserves duplicate workspace selection by session key" {
     try std.testing.expectEqual(@as(usize, 1), menu.selected().?.source_index);
     try menu.rebuild(std.testing.allocator, &entries, "project");
     try std.testing.expectEqual(@as(usize, 1), menu.selected().?.source_index);
+}
+
+test "session menu filters by title and directory without exposing model" {
+    var titled_path = "/work/titled".*;
+    var fallback_path = "/work/untitled".*;
+    var titled_model = "copilot/hidden-model".*;
+    var fallback_model = "copilot/other-model".*;
+    var title = "Fix resume picker".*;
+    const sessions = [_]backend.SessionSummary{
+        .{
+            .allocator = undefined,
+            .key = .{ .generation = 1, .slot = 0, .scope = .local },
+            .working_directory = &titled_path,
+            .model_id = &titled_model,
+            .reasoning = .off,
+            .title = &title,
+            .last_used_unix_ms = 20,
+            .current = false,
+        },
+        .{
+            .allocator = undefined,
+            .key = .{ .generation = 1, .slot = 1, .scope = .local },
+            .working_directory = &fallback_path,
+            .model_id = &fallback_model,
+            .reasoning = .off,
+            .last_used_unix_ms = 10,
+            .current = false,
+        },
+    };
+    const entries = [_]MenuEntry{
+        sessionMenuEntry(&sessions, 0),
+        sessionMenuEntry(&sessions, 1),
+    };
+    var menu: MenuState = .{};
+    defer menu.deinit(std.testing.allocator);
+
+    try menu.rebuild(std.testing.allocator, &entries, "resume picker");
+    try std.testing.expectEqual(@as(usize, 0), menu.selected().?.source_index);
+    try menu.rebuild(std.testing.allocator, &entries, "hidden-model");
+    try std.testing.expectEqual(@as(usize, 0), menu.matches.items.len);
+    try menu.rebuild(std.testing.allocator, &entries, "untitled");
+    try std.testing.expectEqual(@as(usize, 1), menu.selected().?.source_index);
+    try std.testing.expectEqualStrings("untitled", menu.selected().?.primary);
 }
 
 test "session menu labels colliding workspaces with unique path suffixes" {
