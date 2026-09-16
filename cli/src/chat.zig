@@ -2718,7 +2718,10 @@ const ChatUi = struct {
                 return .keep_running;
             }
             if (key.matches(vaxis.Key.enter, .{})) {
-                if (self.phase != .ready or
+                const can_activate =
+                    self.phase == .ready or
+                    (self.phase == .responding and self.menu_mode == .files);
+                if (!can_activate or
                     self.menu_mode == .loading_models or
                     self.menu_mode == .loading_sessions)
                 {
@@ -8142,7 +8145,7 @@ test "file menu selection replaces the active reference and preserves suffix" {
         .io = std.testing.io,
         .input = TextInput.init(std.testing.allocator),
         .cwd = try std.testing.allocator.dupe(u8, "."),
-        .phase = .ready,
+        .phase = .responding,
         .menu_mode = .files,
     };
     defer ui.deinit();
@@ -8151,7 +8154,7 @@ test "file menu selection replaces the active reference and preserves suffix" {
     for (0..14) |_| ui.input.cursorLeft();
 
     var unused: backend.Conversation = undefined;
-    try ui.activateMenu(&unused);
+    _ = try ui.handleKey(.{ .codepoint = vaxis.Key.enter }, &unused);
 
     const contents = try ui.input.toOwnedContents(std.testing.allocator);
     defer std.testing.allocator.free(contents);

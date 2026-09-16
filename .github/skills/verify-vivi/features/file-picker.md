@@ -12,6 +12,8 @@ control metadata.
   available.
 - Git-ignored paths and metadata under `.git`, `.hg`, `.svn`, `.bzr`,
   `_darcs`, and `CVS` are excluded.
+- Paths containing invalid UTF-8 or terminal control bytes are excluded rather
+  than passed into the menu or composer.
 - Enter replaces the active `@` token with the selected relative path.
 - Escape dismisses the picker without changing the draft.
 - Enumeration and matching run outside the terminal event loop.

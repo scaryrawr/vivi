@@ -163,7 +163,12 @@ const CatalogBuilder = struct {
     fn finishPath(self: *CatalogBuilder) !void {
         defer self.partial.clearRetainingCapacity();
         const path = self.partial.items;
-        if (path.len == 0 or isVcsMetadataPath(path)) return;
+        if (path.len == 0 or
+            isVcsMetadataPath(path) or
+            !isSafeComposerPath(path))
+        {
+            return;
+        }
         const projected_bytes = self.bytes.items.len + path.len;
         const projected_path_count = self.paths.items.len + 1;
         if (path.len > self.limits.max_single_path_bytes or
@@ -1028,6 +1033,14 @@ fn isVcsMetadataPath(path: []const u8) bool {
     return false;
 }
 
+fn isSafeComposerPath(path: []const u8) bool {
+    if (!std.unicode.utf8ValidateSlice(path)) return false;
+    for (path) |byte| {
+        if (std.ascii.isControl(byte)) return false;
+    }
+    return true;
+}
+
 test "catalog builder streams hidden files and filters VCS metadata" {
     var builder: CatalogBuilder = .{
         .allocator = std.testing.allocator,
@@ -1042,6 +1055,21 @@ test "catalog builder streams hidden files and filters VCS metadata" {
     try std.testing.expectEqualStrings(".env", catalog.path(0));
     try std.testing.expectEqualStrings(".gitignore", catalog.path(1));
     try std.testing.expectEqualStrings("src/main.zig", catalog.path(2));
+}
+
+test "catalog builder filters paths unsafe for composer text" {
+    var builder: CatalogBuilder = .{
+        .allocator = std.testing.allocator,
+        .limits = .{},
+    };
+    defer builder.deinit();
+    try builder.feed(
+        "line\nbreak\x00bell-\x07\x00bad-\xff\x00caf\xc3\xa9.zig\x00",
+    );
+    var catalog = try builder.finish();
+    defer catalog.deinit();
+    try std.testing.expectEqual(@as(usize, 1), catalog.paths.len);
+    try std.testing.expectEqualStrings("caf\xc3\xa9.zig", catalog.path(0));
 }
 
 test "catalog builder enforces single path limit across chunks" {
