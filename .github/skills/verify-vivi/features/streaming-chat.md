@@ -7,7 +7,8 @@ the session returns to the ready state.
 ## Sub-features
 
 - `chat-launch` opens the alternate-screen TUI and accented composer.
-- `prompt-entry` accepts typed text through the libvaxis text input.
+- `prompt-entry` accepts typed text through the libvaxis text input, wraps at
+  word boundaries, and grows the composer vertically for longer drafts.
 - `prompt-submit` adds the submitted text under `You:`.
 - `response-stream` shows the responding state and Vivi output.
 - `reasoning-stream` shows model reasoning as a dim, italic `Thinking` entry
