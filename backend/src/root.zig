@@ -1623,6 +1623,9 @@ test "broader resume ignores invalid SDK session titles" {
     try std.testing.expectEqual(null, resumableSessionTitle(null));
     try std.testing.expectEqual(null, resumableSessionTitle(""));
     try std.testing.expectEqual(null, resumableSessionTitle(" padded "));
+    try std.testing.expectEqual(null, resumableSessionTitle("line\nbreak"));
+    try std.testing.expectEqual(null, resumableSessionTitle("escape\x1b[2J"));
+    try std.testing.expectEqual(null, resumableSessionTitle("delete\x7fbyte"));
     const oversized = [_]u8{'x'} ** 513;
     try std.testing.expectEqual(null, resumableSessionTitle(&oversized));
 }

@@ -672,6 +672,9 @@ fn validateWorkingDirectory(value: []const u8) !void {
 
 pub fn validTitle(value: []const u8) bool {
     validateText(value, 512) catch return false;
+    for (value) |byte| {
+        if (byte < 0x20 or byte == 0x7f) return false;
+    }
     return true;
 }
 
