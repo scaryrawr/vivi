@@ -65,7 +65,9 @@ pub const Record = struct {
         try validateText(id, 512);
         try validateWorkingDirectory(working_directory);
         try validateText(model_id, 512);
-        if (title) |value| try validateText(value, 512);
+        if (title) |value| {
+            if (!validTitle(value)) return error.InvalidSessionText;
+        }
         if (last_used_unix_ms < 0) return error.InvalidSessionTimestamp;
 
         const owned_id = try allocator.dupe(u8, id);
@@ -668,6 +670,11 @@ fn validateWorkingDirectory(value: []const u8) !void {
     }
 }
 
+pub fn validTitle(value: []const u8) bool {
+    validateText(value, 512) catch return false;
+    return true;
+}
+
 fn validDocument(filename: []const u8, document: anytype) bool {
     if (document.writer_id.len != writer_id_hex_len or
         document.sessions.len > max_records_per_shard)
@@ -990,6 +997,23 @@ test "session store persists generated titles" {
         index.records[0].title.?,
     );
     try std.testing.expectEqual(@as(i64, 20), index.records[0].last_used_unix_ms);
+    const content = try temporary.dir.readFileAlloc(
+        std.testing.io,
+        "sessions/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json",
+        std.testing.allocator,
+        .limited(max_shard_bytes),
+    );
+    defer std.testing.allocator.free(content);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        content,
+        "\"version\": 3",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        content,
+        "\"title\": \"Fix resume picker\"",
+    ) != null);
 }
 
 test "session store promotes a titled remote record" {

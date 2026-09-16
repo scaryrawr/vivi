@@ -1344,6 +1344,11 @@ const RemoteResumeTarget = struct {
     }
 };
 
+fn resumableSessionTitle(summary: ?[]const u8) ?[]const u8 {
+    const title = summary orelse return null;
+    return if (session_store.validTitle(title)) title else null;
+}
+
 const ResumeTargets = union(enum) {
     local: session_store.Index,
     broader: []RemoteResumeTarget,
@@ -1402,8 +1407,8 @@ fn buildBroaderSessionCatalog(
                 .modified_time = modified_time,
             };
             errdefer value.deinit(allocator);
-            if (metadata.summary) |summary| {
-                value.title = try allocator.dupe(u8, summary);
+            if (resumableSessionTitle(metadata.summary)) |title| {
+                value.title = try allocator.dupe(u8, title);
             }
             break :blk value;
         };
@@ -1608,6 +1613,18 @@ test "raw history projection ignores malformed events" {
     try std.testing.expectEqualStrings("question", snapshot.items[0].text);
     try std.testing.expectEqual(.assistant, snapshot.items[1].role);
     try std.testing.expectEqualStrings("answer", snapshot.items[1].text);
+}
+
+test "broader resume ignores invalid SDK session titles" {
+    try std.testing.expectEqualStrings(
+        "Remote session",
+        resumableSessionTitle("Remote session").?,
+    );
+    try std.testing.expectEqual(null, resumableSessionTitle(null));
+    try std.testing.expectEqual(null, resumableSessionTitle(""));
+    try std.testing.expectEqual(null, resumableSessionTitle(" padded "));
+    const oversized = [_]u8{'x'} ** 513;
+    try std.testing.expectEqual(null, resumableSessionTitle(&oversized));
 }
 
 fn sessionSummaryFromRecord(
