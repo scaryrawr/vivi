@@ -1117,6 +1117,10 @@ chat_session_resume() {
         's/\e\[[0-?]*[ -\/]*[@-~]//g; s/\e\][^\a]*(?:\a|\e\\)//g' \
         "$run_dir/chat-session-resume-second.terminal.log" |
         tr -d '\r\b' >"$run_dir/chat-session-resume-second.normalized.txt"
+    perl -0ne \
+        'if (/Showing Saved Vivi sessions\.(.*?)(?:Resuming session\.\.\.)/s) { print $1 }' \
+        "$run_dir/chat-session-resume-second.normalized.txt" \
+        >"$run_dir/chat-session-resume-picker.normalized.txt"
 
     {
         printf 'exit=%s\n' "$status"
@@ -1137,12 +1141,36 @@ chat_session_resume() {
             printf 'no\n'
         fi
         printf 'hydrated_transcript_seen='
-        if grep -Eq 'You[[:space:]]*Transform vivi_resume_memory' \
+        if grep -Eq 'You[[:space:]]*Transform[[:space:]]*vivi_resume_memory' \
             "$run_dir/chat-session-resume-second.normalized.txt"
         then
             printf 'yes\n'
         else
             printf 'no\n'
+        fi
+        printf 'picker_title_seen='
+        if grep -q 'Transform vivi_resume_memory' \
+            "$run_dir/chat-session-resume-picker.normalized.txt"
+        then
+            printf 'yes\n'
+        else
+            printf 'no\n'
+        fi
+        printf 'picker_directory_seen='
+        if grep -Fq "$repo_root" \
+            "$run_dir/chat-session-resume-picker.normalized.txt"
+        then
+            printf 'yes\n'
+        else
+            printf 'no\n'
+        fi
+        printf 'picker_model_hidden='
+        if grep -Fq 'copilot/default' \
+            "$run_dir/chat-session-resume-picker.normalized.txt"
+        then
+            printf 'no\n'
+        else
+            printf 'yes\n'
         fi
     } >"$run_dir/chat-session-resume.assertions.txt"
 
@@ -1150,8 +1178,14 @@ chat_session_resume() {
     grep -q 'Resumed ' "$run_dir/chat-session-resume-second.normalized.txt"
     grep -Eq 'Vivi[[:space:]]*VIVI_RESUME_MEMORY' \
         "$run_dir/chat-session-resume-second.normalized.txt"
-    grep -Eq 'You[[:space:]]*Transform vivi_resume_memory' \
+    grep -Eq 'You[[:space:]]*Transform[[:space:]]*vivi_resume_memory' \
         "$run_dir/chat-session-resume-second.normalized.txt"
+    grep -q 'Transform vivi_resume_memory' \
+        "$run_dir/chat-session-resume-picker.normalized.txt"
+    grep -Fq "$repo_root" \
+        "$run_dir/chat-session-resume-picker.normalized.txt"
+    ! grep -Fq 'copilot/default' \
+        "$run_dir/chat-session-resume-picker.normalized.txt"
 
     (
         cd "$repo_root" &&

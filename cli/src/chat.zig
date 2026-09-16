@@ -2263,9 +2263,7 @@ const MenuDetail = union(enum) {
         reasoning: backend.ReasoningEffort,
     },
     session: struct {
-        model_id: []const u8,
-        summary: ?[]const u8,
-        last_used_unix_ms: i64,
+        working_directory: []const u8,
     },
 };
 
@@ -2408,11 +2406,10 @@ fn matchRank(entry: MenuEntry, query: []const u8) ?u2 {
                 @tagName(model.reasoning),
                 query,
             ),
-            .session => |session| asciiContainsIgnoreCase(session.model_id, query) or
-                if (session.summary) |summary|
-                    asciiContainsIgnoreCase(summary, query)
-                else
-                    false,
+            .session => |session| asciiContainsIgnoreCase(
+                session.working_directory,
+                query,
+            ),
         })
     {
         return 2;
@@ -2469,6 +2466,27 @@ fn uniqueWorkspaceLabel(
         if (!collision or start == 0) return candidate;
         start = previousPathComponentStart(path, start);
     }
+}
+
+fn sessionMenuEntry(
+    sessions: []const backend.SessionSummary,
+    index: usize,
+) MenuEntry {
+    const session = sessions[index];
+    return .{
+        .identity = .{ .resume_key = session.key },
+        .key = session.working_directory,
+        .primary = session.title orelse uniqueWorkspaceLabel(sessions, index),
+        .detail = .{ .session = .{
+            .working_directory = session.working_directory,
+        } },
+        .current = session.current,
+        .source_index = index,
+    };
+}
+
+fn menuDetailColumn(width: u16) u16 {
+    return if (width >= 28) @min(width / 2, 44) else width;
 }
 
 fn pathEndsWithComponent(path: []const u8, suffix: []const u8) bool {
@@ -3137,20 +3155,8 @@ const ChatUi = struct {
             catalog.sessions.len,
         );
         defer self.allocator.free(entries);
-        for (catalog.sessions, 0..) |session, index| {
-            entries[index] = .{
-                .identity = .{ .resume_key = session.key },
-                .key = session.working_directory,
-                .primary = session.title orelse
-                    uniqueWorkspaceLabel(catalog.sessions, index),
-                .detail = .{ .session = .{
-                    .model_id = session.model_id,
-                    .summary = session.summary,
-                    .last_used_unix_ms = session.last_used_unix_ms,
-                } },
-                .current = session.current,
-                .source_index = index,
-            };
+        for (catalog.sessions, 0..) |_, index| {
+            entries[index] = sessionMenuEntry(catalog.sessions, index);
         }
         try self.menu.rebuild(self.allocator, entries, query);
         for (self.menu.matches.items, 0..) |entry_index, match_index| {
@@ -3764,10 +3770,7 @@ const ChatUi = struct {
                     },
                 },
             };
-            const detail_col: u16 = if (window.width >= 28)
-                @min(window.width / 2, 44)
-            else
-                window.width;
+            const detail_col = menuDetailColumn(window.width);
             const label_window = window.child(.{ .width = detail_col -| 1 });
             _ = label_window.print(&segments, .{
                 .row_offset = @intCast(row),
@@ -3941,7 +3944,7 @@ const ChatUi = struct {
                 }};
                 _ = window.print(&segments, .{
                     .row_offset = row,
-                    .col_offset = @intCast(@min(window.width / 2, 36)),
+                    .col_offset = menuDetailColumn(window.width),
                     .wrap = .none,
                 });
             },
@@ -3981,81 +3984,18 @@ const ChatUi = struct {
                 }};
                 _ = window.print(&segments, .{
                     .row_offset = row,
-                    .col_offset = @intCast(@min(window.width / 2, 36)),
+                    .col_offset = menuDetailColumn(window.width),
                     .wrap = .none,
                 });
             },
             .session => |session| {
-                if (session.summary) |summary| {
-                    var segments = [_]vaxis.Segment{.{
-                        .text = summary,
-                        .style = .{ .bg = style.bg, .dim = true },
-                    }};
-                    _ = window.print(&segments, .{
-                        .row_offset = row,
-                        .col_offset = @intCast(@min(window.width / 2, 36)),
-                        .wrap = .none,
-                    });
-                    return;
-                }
-                var age_buffer: [24]u8 = undefined;
-                const age_ms = @max(
-                    @as(i64, 0),
-                    std.Io.Timestamp.now(self.io, .real).toMilliseconds() -
-                        session.last_used_unix_ms,
-                );
-                const age = if (age_ms < 60 * 1000)
-                    "now"
-                else if (age_ms < 60 * 60 * 1000)
-                    std.fmt.bufPrint(
-                        &age_buffer,
-                        "{d}m ago",
-                        .{@divTrunc(age_ms, 60 * 1000)},
-                    ) catch "recently"
-                else if (age_ms < 24 * 60 * 60 * 1000)
-                    std.fmt.bufPrint(
-                        &age_buffer,
-                        "{d}h ago",
-                        .{@divTrunc(age_ms, 60 * 60 * 1000)},
-                    ) catch "earlier"
-                else
-                    std.fmt.bufPrint(
-                        &age_buffer,
-                        "{d}d ago",
-                        .{@divTrunc(age_ms, 24 * 60 * 60 * 1000)},
-                    ) catch "earlier";
-                const detail_col = @min(window.width / 2, 36);
-                const age_width = window.gwidth(age);
-                const separator = " · ";
-                const separator_width = window.gwidth(separator);
-                const model_width = window.width -| detail_col -|
-                    age_width -| separator_width;
-                if (model_width > 0) {
-                    const model_window = window.child(.{
-                        .x_off = @intCast(detail_col),
-                        .y_off = @intCast(row),
-                        .width = model_width,
-                        .height = 1,
-                    });
-                    var model_segments = [_]vaxis.Segment{.{
-                        .text = session.model_id,
-                        .style = .{ .bg = style.bg, .dim = true },
-                    }};
-                    _ = model_window.print(&model_segments, .{ .wrap = .none });
-                }
-                var trailing_segments = [_]vaxis.Segment{
-                    .{
-                        .text = separator,
-                        .style = .{ .bg = style.bg, .dim = true },
-                    },
-                    .{
-                        .text = age,
-                        .style = .{ .bg = style.bg, .dim = true },
-                    },
-                };
-                _ = window.print(&trailing_segments, .{
+                var segments = [_]vaxis.Segment{.{
+                    .text = session.working_directory,
+                    .style = .{ .bg = style.bg, .dim = true },
+                }};
+                _ = window.print(&segments, .{
                     .row_offset = row,
-                    .col_offset = detail_col + model_width,
+                    .col_offset = menuDetailColumn(window.width),
                     .wrap = .none,
                 });
             },
@@ -8031,9 +7971,7 @@ test "session menu preserves duplicate workspace selection by session key" {
             .key = "/work/project",
             .primary = "project",
             .detail = .{ .session = .{
-                .model_id = "copilot/first",
-                .summary = null,
-                .last_used_unix_ms = 20,
+                .working_directory = "/work/project",
             } },
             .source_index = 0,
         },
@@ -8046,9 +7984,7 @@ test "session menu preserves duplicate workspace selection by session key" {
             .key = "/work/project",
             .primary = "project",
             .detail = .{ .session = .{
-                .model_id = "copilot/second",
-                .summary = null,
-                .last_used_unix_ms = 10,
+                .working_directory = "/work/project",
             } },
             .source_index = 1,
         },
@@ -8061,6 +7997,55 @@ test "session menu preserves duplicate workspace selection by session key" {
     try std.testing.expectEqual(@as(usize, 1), menu.selected().?.source_index);
     try menu.rebuild(std.testing.allocator, &entries, "project");
     try std.testing.expectEqual(@as(usize, 1), menu.selected().?.source_index);
+}
+
+test "session menu filters by title and directory without exposing model" {
+    var titled_path = "/work/titled".*;
+    var fallback_path = "/work/untitled".*;
+    var titled_model = "copilot/hidden-model".*;
+    var fallback_model = "copilot/other-model".*;
+    var title = "Fix resume picker".*;
+    const sessions = [_]backend.SessionSummary{
+        .{
+            .allocator = undefined,
+            .key = .{ .generation = 1, .slot = 0, .scope = .local },
+            .working_directory = &titled_path,
+            .model_id = &titled_model,
+            .reasoning = .off,
+            .title = &title,
+            .last_used_unix_ms = 20,
+            .current = false,
+        },
+        .{
+            .allocator = undefined,
+            .key = .{ .generation = 1, .slot = 1, .scope = .local },
+            .working_directory = &fallback_path,
+            .model_id = &fallback_model,
+            .reasoning = .off,
+            .last_used_unix_ms = 10,
+            .current = false,
+        },
+    };
+    const entries = [_]MenuEntry{
+        sessionMenuEntry(&sessions, 0),
+        sessionMenuEntry(&sessions, 1),
+    };
+    var menu: MenuState = .{};
+    defer menu.deinit(std.testing.allocator);
+
+    try menu.rebuild(std.testing.allocator, &entries, "resume picker");
+    try std.testing.expectEqual(@as(usize, 0), menu.selected().?.source_index);
+    try menu.rebuild(std.testing.allocator, &entries, "hidden-model");
+    try std.testing.expectEqual(@as(usize, 0), menu.matches.items.len);
+    try menu.rebuild(std.testing.allocator, &entries, "untitled");
+    try std.testing.expectEqual(@as(usize, 1), menu.selected().?.source_index);
+    try std.testing.expectEqualStrings("untitled", menu.selected().?.primary);
+}
+
+test "menu details start after the label column" {
+    try std.testing.expectEqual(@as(u16, 27), menuDetailColumn(27));
+    try std.testing.expectEqual(@as(u16, 38), menuDetailColumn(76));
+    try std.testing.expectEqual(@as(u16, 44), menuDetailColumn(100));
 }
 
 test "session menu labels colliding workspaces with unique path suffixes" {

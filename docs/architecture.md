@@ -230,9 +230,9 @@ an oversized shard aborts the operation before compaction so an older Vivi
 binary cannot delete a newer catalog it cannot safely inspect. On POSIX
 systems, the directory, lock, and shards use owner-only permissions; Windows
 creation inherits the user profile's access-controlled directory permissions.
-The store records only the session ID, working directory, model identity, and
-recency, refreshing recency after each completed response; Copilot CLI remains
-the sole transcript/history store.
+The store records only the session ID, generated title, working directory,
+model identity, and recency, refreshing recency after each completed response;
+Copilot CLI remains the sole transcript/history store.
 
 `/resume` is a first-class broker control operation rather than an SDK slash
 command. Bare `/resume` lists only Vivi's private local index. `/resume all`

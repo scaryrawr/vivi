@@ -2,10 +2,10 @@ const std = @import("std");
 const builtin = @import("builtin");
 const conversation = @import("conversation.zig");
 
-pub const version: u32 = 2;
+pub const version: u32 = 3;
 pub const max_records_per_shard: usize = 200;
 const max_record_text_bytes =
-    512 + std.Io.Dir.max_path_bytes + 512;
+    512 + std.Io.Dir.max_path_bytes + 512 + 512;
 const max_json_expansion = 6;
 const max_serialized_record_bytes =
     max_record_text_bytes * max_json_expansion + 256;
@@ -30,6 +30,7 @@ pub const Record = struct {
     id: []u8,
     working_directory: []u8,
     model_id: []u8,
+    title: ?[]u8,
     reasoning: conversation.ReasoningEffort,
     last_used_unix_ms: i64,
 
@@ -41,9 +42,32 @@ pub const Record = struct {
         reasoning: conversation.ReasoningEffort,
         last_used_unix_ms: i64,
     ) !Record {
+        return initWithTitle(
+            allocator,
+            id,
+            working_directory,
+            model_id,
+            null,
+            reasoning,
+            last_used_unix_ms,
+        );
+    }
+
+    pub fn initWithTitle(
+        allocator: std.mem.Allocator,
+        id: []const u8,
+        working_directory: []const u8,
+        model_id: []const u8,
+        title: ?[]const u8,
+        reasoning: conversation.ReasoningEffort,
+        last_used_unix_ms: i64,
+    ) !Record {
         try validateText(id, 512);
         try validateWorkingDirectory(working_directory);
         try validateText(model_id, 512);
+        if (title) |value| {
+            if (!validTitle(value)) return error.InvalidSessionText;
+        }
         if (last_used_unix_ms < 0) return error.InvalidSessionTimestamp;
 
         const owned_id = try allocator.dupe(u8, id);
@@ -53,11 +77,17 @@ pub const Record = struct {
             working_directory,
         );
         errdefer allocator.free(owned_working_directory);
+        const owned_model_id = try allocator.dupe(u8, model_id);
+        errdefer allocator.free(owned_model_id);
         return .{
             .allocator = allocator,
             .id = owned_id,
             .working_directory = owned_working_directory,
-            .model_id = try allocator.dupe(u8, model_id),
+            .model_id = owned_model_id,
+            .title = if (title) |value|
+                try allocator.dupe(u8, value)
+            else
+                null,
             .reasoning = reasoning,
             .last_used_unix_ms = last_used_unix_ms,
         };
@@ -67,11 +97,12 @@ pub const Record = struct {
         self: *const Record,
         allocator: std.mem.Allocator,
     ) !Record {
-        return init(
+        return initWithTitle(
             allocator,
             self.id,
             self.working_directory,
             self.model_id,
+            self.title,
             self.reasoning,
             self.last_used_unix_ms,
         );
@@ -81,6 +112,7 @@ pub const Record = struct {
         self.allocator.free(self.id);
         self.allocator.free(self.working_directory);
         self.allocator.free(self.model_id);
+        if (self.title) |value| self.allocator.free(value);
         self.* = undefined;
     }
 };
@@ -122,6 +154,21 @@ const DocumentV2 = struct {
     version: u32,
     writer_id: []const u8,
     sessions: []const DocumentRecordV2,
+};
+
+const DocumentRecordV3 = struct {
+    id: []const u8,
+    working_directory: []const u8,
+    model_id: []const u8,
+    title: ?[]const u8 = null,
+    reasoning: conversation.ReasoningEffort,
+    last_used_unix_ms: i64,
+};
+
+const DocumentV3 = struct {
+    version: u32,
+    writer_id: []const u8,
+    sessions: []const DocumentRecordV3,
 };
 
 const VersionHeader = struct {
@@ -213,16 +260,39 @@ pub const Store = struct {
     }
 
     pub fn touch(self: *Store, record: *const Record, now_unix_ms: i64) !void {
-        var touched = try Record.init(
+        var touched = try Record.initWithTitle(
             self.allocator,
             record.id,
             record.working_directory,
             record.model_id,
+            record.title,
             record.reasoning,
             now_unix_ms,
         );
         defer touched.deinit();
         try self.upsert(&touched);
+    }
+
+    pub fn updateTitle(
+        self: *Store,
+        id: []const u8,
+        title: []const u8,
+    ) !void {
+        if (!validTitle(title)) return error.InvalidSessionText;
+        const lock = try self.acquireLock();
+        defer lock.close(self.io);
+
+        var index = try self.loadMerged();
+        defer index.deinit();
+        for (index.records) |*record| {
+            if (!std.mem.eql(u8, record.id, id)) continue;
+            const owned_title = try self.allocator.dupe(u8, title);
+            if (record.title) |value| self.allocator.free(value);
+            record.title = owned_title;
+            try self.compact(index.records);
+            return;
+        }
+        return error.SessionNotFound;
     }
 
     pub fn list(self: *Store) !Index {
@@ -332,7 +402,7 @@ pub const Store = struct {
                         trimRecords(&merged);
                     }
                 },
-                version => {
+                2 => {
                     var parsed = std.json.parseFromSlice(
                         DocumentV2,
                         self.allocator,
@@ -356,6 +426,47 @@ pub const Store = struct {
                             stored.id,
                             stored.working_directory,
                             stored.model_id,
+                            stored.reasoning,
+                            stored.last_used_unix_ms,
+                        ) catch |err| switch (err) {
+                            error.InvalidSessionText,
+                            error.InvalidSessionTimestamp,
+                            => {
+                                skipped_invalid = true;
+                                continue;
+                            },
+                            else => return err,
+                        };
+                        errdefer record.deinit();
+                        try mergeRecord(self.allocator, &merged, record);
+                        trimRecords(&merged);
+                    }
+                },
+                3 => {
+                    var parsed = std.json.parseFromSlice(
+                        DocumentV3,
+                        self.allocator,
+                        content,
+                        .{},
+                    ) catch |err| switch (err) {
+                        error.OutOfMemory => return err,
+                        else => {
+                            skipped_invalid = true;
+                            continue;
+                        },
+                    };
+                    defer parsed.deinit();
+                    if (!validDocument(entry.name, parsed.value)) {
+                        skipped_invalid = true;
+                        continue;
+                    }
+                    for (parsed.value.sessions) |stored| {
+                        var record = Record.initWithTitle(
+                            self.allocator,
+                            stored.id,
+                            stored.working_directory,
+                            stored.model_id,
+                            stored.title,
                             stored.reasoning,
                             stored.last_used_unix_ms,
                         ) catch |err| switch (err) {
@@ -478,7 +589,7 @@ pub const Store = struct {
 
     fn save(self: *Store, records: []const Record) !void {
         var document_records = try self.allocator.alloc(
-            DocumentRecordV2,
+            DocumentRecordV3,
             records.len,
         );
         defer self.allocator.free(document_records);
@@ -487,13 +598,14 @@ pub const Store = struct {
                 .id = record.id,
                 .working_directory = record.working_directory,
                 .model_id = record.model_id,
+                .title = record.title,
                 .reasoning = record.reasoning,
                 .last_used_unix_ms = record.last_used_unix_ms,
             };
         }
         const encoded = try std.json.Stringify.valueAlloc(
             self.allocator,
-            DocumentV2{
+            DocumentV3{
                 .version = version,
                 .writer_id = &self.writer_id,
                 .sessions = document_records,
@@ -558,6 +670,14 @@ fn validateWorkingDirectory(value: []const u8) !void {
     }
 }
 
+pub fn validTitle(value: []const u8) bool {
+    validateText(value, 512) catch return false;
+    for (value) |byte| {
+        if (byte < 0x20 or byte == 0x7f) return false;
+    }
+    return true;
+}
+
 fn validDocument(filename: []const u8, document: anytype) bool {
     if (document.writer_id.len != writer_id_hex_len or
         document.sessions.len > max_records_per_shard)
@@ -582,11 +702,25 @@ fn mergeRecord(
 ) !void {
     for (records.items) |*record| {
         if (!std.mem.eql(u8, record.id, candidate.id)) continue;
-        if (candidate.last_used_unix_ms > record.last_used_unix_ms) {
+        if (candidate.last_used_unix_ms > record.last_used_unix_ms or
+            (candidate.last_used_unix_ms == record.last_used_unix_ms and
+                record.title == null and candidate.title != null))
+        {
+            var replacement = candidate;
+            if (replacement.title == null) {
+                replacement.title = if (record.title) |title|
+                    try allocator.dupe(u8, title)
+                else
+                    null;
+            }
             record.deinit();
-            record.* = candidate;
+            record.* = replacement;
         } else {
             var discarded = candidate;
+            if (record.title == null and discarded.title != null) {
+                record.title = discarded.title;
+                discarded.title = null;
+            }
             discarded.deinit();
         }
         return;
@@ -776,7 +910,7 @@ test "session store migrates version one shards with reasoning off" {
     try std.testing.expect(std.mem.indexOf(
         u8,
         content,
-        "\"version\": 2",
+        "\"version\": 3",
     ) != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
@@ -793,8 +927,204 @@ test "session store migrates version one shards with reasoning off" {
     );
 }
 
+test "session store migrates version two shards without titles" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.createDirPath(std.testing.io, "sessions");
+    const directory = try temporary.dir.realPathFileAlloc(
+        std.testing.io,
+        "sessions",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(directory);
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = "sessions/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json",
+        .data =
+        \\{
+        \\  "version": 2,
+        \\  "writer_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        \\  "sessions": [{
+        \\    "id": "session-a",
+        \\    "working_directory": "/work/a",
+        \\    "model_id": "copilot/model-a",
+        \\    "reasoning": "medium",
+        \\    "last_used_unix_ms": 10
+        \\  }]
+        \\}
+        ,
+    });
+    var store = try Store.initWithWriterId(
+        std.testing.allocator,
+        std.testing.io,
+        directory,
+        [_]u8{'b'} ** writer_id_hex_len,
+    );
+    defer store.deinit();
+
+    var migrated = try store.list();
+    defer migrated.deinit();
+    try std.testing.expectEqual(@as(usize, 1), migrated.records.len);
+    try std.testing.expectEqual(
+        conversation.ReasoningEffort.medium,
+        migrated.records[0].reasoning,
+    );
+    try std.testing.expectEqual(null, migrated.records[0].title);
+}
+
+test "session store persists generated titles" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.createDirPath(std.testing.io, "sessions");
+    const directory = try temporary.dir.realPathFileAlloc(
+        std.testing.io,
+        "sessions",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(directory);
+    var store = try Store.initWithWriterId(
+        std.testing.allocator,
+        std.testing.io,
+        directory,
+        [_]u8{'a'} ** writer_id_hex_len,
+    );
+    defer store.deinit();
+
+    try store.recordCreated("session-a", "/work/a", "copilot/default", .off, 10);
+    try store.updateTitle("session-a", "Fix resume picker");
+    try std.testing.expectError(
+        error.InvalidSessionText,
+        store.updateTitle("session-a", "unsafe\x1b[2J"),
+    );
+    try store.recordCreated("session-a", "/work/a", "copilot/default", .off, 20);
+
+    var index = try store.list();
+    defer index.deinit();
+    try std.testing.expectEqualStrings(
+        "Fix resume picker",
+        index.records[0].title.?,
+    );
+    try std.testing.expectEqual(@as(i64, 20), index.records[0].last_used_unix_ms);
+    const content = try temporary.dir.readFileAlloc(
+        std.testing.io,
+        "sessions/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json",
+        std.testing.allocator,
+        .limited(max_shard_bytes),
+    );
+    defer std.testing.allocator.free(content);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        content,
+        "\"version\": 3",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        content,
+        "\"title\": \"Fix resume picker\"",
+    ) != null);
+}
+
+test "session store promotes a titled remote record" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.createDirPath(std.testing.io, "sessions");
+    const directory = try temporary.dir.realPathFileAlloc(
+        std.testing.io,
+        "sessions",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(directory);
+    var store = try Store.initWithWriterId(
+        std.testing.allocator,
+        std.testing.io,
+        directory,
+        [_]u8{'a'} ** writer_id_hex_len,
+    );
+    defer store.deinit();
+    var remote = try Record.initWithTitle(
+        std.testing.allocator,
+        "session-a",
+        "/work/a",
+        "copilot/default",
+        "Remote session",
+        .off,
+        10,
+    );
+    defer remote.deinit();
+
+    try store.touch(&remote, 20);
+
+    var index = try store.list();
+    defer index.deinit();
+    try std.testing.expectEqualStrings("Remote session", index.records[0].title.?);
+}
+
+test "session store keeps a title from an equal-timestamp shard" {
+    var records: std.ArrayList(Record) = .empty;
+    defer {
+        for (records.items) |*record| record.deinit();
+        records.deinit(std.testing.allocator);
+    }
+    try records.append(
+        std.testing.allocator,
+        try Record.init(
+            std.testing.allocator,
+            "session-a",
+            "/work/a",
+            "copilot/default",
+            .off,
+            10,
+        ),
+    );
+    const titled = try Record.initWithTitle(
+        std.testing.allocator,
+        "session-a",
+        "/work/a",
+        "copilot/default",
+        "Remote session",
+        .off,
+        10,
+    );
+
+    try mergeRecord(std.testing.allocator, &records, titled);
+
+    try std.testing.expectEqualStrings("Remote session", records.items[0].title.?);
+}
+
+test "session store keeps a title from an older mixed-version shard" {
+    var records: std.ArrayList(Record) = .empty;
+    defer {
+        for (records.items) |*record| record.deinit();
+        records.deinit(std.testing.allocator);
+    }
+    try records.append(
+        std.testing.allocator,
+        try Record.init(
+            std.testing.allocator,
+            "session-a",
+            "/work/a",
+            "copilot/default",
+            .off,
+            20,
+        ),
+    );
+    const older_titled = try Record.initWithTitle(
+        std.testing.allocator,
+        "session-a",
+        "/work/a",
+        "copilot/default",
+        "Remote session",
+        .off,
+        10,
+    );
+
+    try mergeRecord(std.testing.allocator, &records, older_titled);
+
+    try std.testing.expectEqual(@as(i64, 20), records.items[0].last_used_unix_ms);
+    try std.testing.expectEqualStrings("Remote session", records.items[0].title.?);
+}
+
 test "session store rejects mismatched writer identity" {
-    const document = DocumentV2{
+    const document = DocumentV3{
         .version = version,
         .writer_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         .sessions = &.{},
@@ -827,7 +1157,7 @@ test "session store preserves unsupported version shards" {
         .sub_path = "sessions/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.json",
         .data =
         \\{
-        \\  "version": 3
+        \\  "version": 4
         \\}
         ,
     });
@@ -926,8 +1256,9 @@ test "session store read cap accepts maximum serialized shard" {
     const working_directory =
         [_]u8{1} ** std.Io.Dir.max_path_bytes;
     const model_id = [_]u8{1} ** 512;
+    const title = [_]u8{1} ** 512;
     const records = try std.testing.allocator.alloc(
-        DocumentRecordV2,
+        DocumentRecordV3,
         max_records_per_shard,
     );
     defer std.testing.allocator.free(records);
@@ -936,13 +1267,14 @@ test "session store read cap accepts maximum serialized shard" {
             .id = &id,
             .working_directory = &working_directory,
             .model_id = &model_id,
+            .title = &title,
             .reasoning = .medium,
             .last_used_unix_ms = std.math.maxInt(i64),
         };
     }
     const encoded = try std.json.Stringify.valueAlloc(
         std.testing.allocator,
-        DocumentV2{
+        DocumentV3{
             .version = version,
             .writer_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             .sessions = records,
