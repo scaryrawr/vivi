@@ -1305,24 +1305,16 @@ fn buildSessionCatalog(
     var initialized: usize = 0;
     errdefer for (sessions[0..initialized]) |*session| session.deinit();
     for (index.records, 0..) |record, record_index| {
-        const working_directory = try allocator.dupe(
-            u8,
-            record.working_directory,
-        );
-        errdefer allocator.free(working_directory);
-        sessions[record_index] = .{
-            .allocator = allocator,
-            .key = .{
+        sessions[record_index] = try sessionSummaryFromRecord(
+            allocator,
+            .{
                 .generation = generation,
                 .slot = @intCast(record_index),
                 .scope = .local,
             },
-            .working_directory = working_directory,
-            .model_id = try allocator.dupe(u8, record.model_id),
-            .reasoning = record.reasoning,
-            .last_used_unix_ms = record.last_used_unix_ms,
-            .current = std.mem.eql(u8, active_session_id, record.id),
-        };
+            &record,
+            std.mem.eql(u8, active_session_id, record.id),
+        );
         initialized += 1;
     }
     return .{
@@ -1626,12 +1618,18 @@ fn sessionSummaryFromRecord(
 ) !conversation.SessionSummary {
     const working_directory = try allocator.dupe(u8, record.working_directory);
     errdefer allocator.free(working_directory);
+    const model_id = try allocator.dupe(u8, record.model_id);
+    errdefer allocator.free(model_id);
     return .{
         .allocator = allocator,
         .key = key,
         .working_directory = working_directory,
-        .model_id = try allocator.dupe(u8, record.model_id),
+        .model_id = model_id,
         .reasoning = record.reasoning,
+        .title = if (record.title) |title|
+            try allocator.dupe(u8, title)
+        else
+            null,
         .last_used_unix_ms = record.last_used_unix_ms,
         .current = current,
     };
@@ -1836,6 +1834,8 @@ fn streamSessionResponse(
     client: *copilot.Client,
     session: copilot.Session,
     tool_service: *tools.Service,
+    store: ?*session_store.Store,
+    session_tracking_enabled: *bool,
 ) StreamResult {
     var typed_tool_calls = std.ArrayList([]u8).empty;
     defer {
@@ -2120,6 +2120,23 @@ fn streamSessionResponse(
                 )) return .failed;
             },
             .session_title_changed => |title| {
+                if (session_tracking_enabled.*) {
+                    if (store) |value| {
+                        value.updateTitle(
+                            session.id,
+                            title.data.title,
+                        ) catch |err| {
+                            session_tracking_enabled.* = false;
+                            var buffer: [256]u8 = undefined;
+                            const tracking_message = std.fmt.bufPrint(
+                                &buffer,
+                                "Session tracking disabled: {s}",
+                                .{@errorName(err)},
+                            ) catch "Session tracking disabled.";
+                            worker.sessionTrackingFailed(tracking_message) catch {};
+                        };
+                    }
+                }
                 const message = std.fmt.allocPrint(
                     worker.allocator(),
                     "Session title: {s}",
@@ -2895,6 +2912,8 @@ fn runSdkConversation(
                                 &client,
                                 session,
                                 &tool_service,
+                                if (store) |*value| value else null,
+                                &session_tracking_enabled,
                             )) {
                                 .idle => {},
                                 .stopped => {
@@ -3368,6 +3387,8 @@ fn runSdkConversation(
                     &client,
                     session,
                     &tool_service,
+                    if (store) |*value| value else null,
+                    &session_tracking_enabled,
                 )) {
                     .idle => {},
                     .stopped => {

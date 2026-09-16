@@ -2155,9 +2155,7 @@ const MenuDetail = union(enum) {
         reasoning: backend.ReasoningEffort,
     },
     session: struct {
-        model_id: []const u8,
-        summary: ?[]const u8,
-        last_used_unix_ms: i64,
+        working_directory: []const u8,
     },
 };
 
@@ -2300,11 +2298,10 @@ fn matchRank(entry: MenuEntry, query: []const u8) ?u2 {
                 @tagName(model.reasoning),
                 query,
             ),
-            .session => |session| asciiContainsIgnoreCase(session.model_id, query) or
-                if (session.summary) |summary|
-                    asciiContainsIgnoreCase(summary, query)
-                else
-                    false,
+            .session => |session| asciiContainsIgnoreCase(
+                session.working_directory,
+                query,
+            ),
         })
     {
         return 2;
@@ -3032,9 +3029,7 @@ const ChatUi = struct {
                 .primary = session.title orelse
                     uniqueWorkspaceLabel(catalog.sessions, index),
                 .detail = .{ .session = .{
-                    .model_id = session.model_id,
-                    .summary = session.summary,
-                    .last_used_unix_ms = session.last_used_unix_ms,
+                    .working_directory = session.working_directory,
                 } },
                 .current = session.current,
                 .source_index = index,
@@ -3871,76 +3866,13 @@ const ChatUi = struct {
                 });
             },
             .session => |session| {
-                if (session.summary) |summary| {
-                    var segments = [_]vaxis.Segment{.{
-                        .text = summary,
-                        .style = .{ .bg = style.bg, .dim = true },
-                    }};
-                    _ = window.print(&segments, .{
-                        .row_offset = row,
-                        .col_offset = @intCast(@min(window.width / 2, 36)),
-                        .wrap = .none,
-                    });
-                    return;
-                }
-                var age_buffer: [24]u8 = undefined;
-                const age_ms = @max(
-                    @as(i64, 0),
-                    std.Io.Timestamp.now(self.io, .real).toMilliseconds() -
-                        session.last_used_unix_ms,
-                );
-                const age = if (age_ms < 60 * 1000)
-                    "now"
-                else if (age_ms < 60 * 60 * 1000)
-                    std.fmt.bufPrint(
-                        &age_buffer,
-                        "{d}m ago",
-                        .{@divTrunc(age_ms, 60 * 1000)},
-                    ) catch "recently"
-                else if (age_ms < 24 * 60 * 60 * 1000)
-                    std.fmt.bufPrint(
-                        &age_buffer,
-                        "{d}h ago",
-                        .{@divTrunc(age_ms, 60 * 60 * 1000)},
-                    ) catch "earlier"
-                else
-                    std.fmt.bufPrint(
-                        &age_buffer,
-                        "{d}d ago",
-                        .{@divTrunc(age_ms, 24 * 60 * 60 * 1000)},
-                    ) catch "earlier";
-                const detail_col = @min(window.width / 2, 36);
-                const age_width = window.gwidth(age);
-                const separator = " · ";
-                const separator_width = window.gwidth(separator);
-                const model_width = window.width -| detail_col -|
-                    age_width -| separator_width;
-                if (model_width > 0) {
-                    const model_window = window.child(.{
-                        .x_off = @intCast(detail_col),
-                        .y_off = @intCast(row),
-                        .width = model_width,
-                        .height = 1,
-                    });
-                    var model_segments = [_]vaxis.Segment{.{
-                        .text = session.model_id,
-                        .style = .{ .bg = style.bg, .dim = true },
-                    }};
-                    _ = model_window.print(&model_segments, .{ .wrap = .none });
-                }
-                var trailing_segments = [_]vaxis.Segment{
-                    .{
-                        .text = separator,
-                        .style = .{ .bg = style.bg, .dim = true },
-                    },
-                    .{
-                        .text = age,
-                        .style = .{ .bg = style.bg, .dim = true },
-                    },
-                };
-                _ = window.print(&trailing_segments, .{
+                var segments = [_]vaxis.Segment{.{
+                    .text = session.working_directory,
+                    .style = .{ .bg = style.bg, .dim = true },
+                }};
+                _ = window.print(&segments, .{
                     .row_offset = row,
-                    .col_offset = detail_col + model_width,
+                    .col_offset = @intCast(@min(window.width / 2, 36)),
                     .wrap = .none,
                 });
             },
@@ -7777,9 +7709,7 @@ test "session menu preserves duplicate workspace selection by session key" {
             .key = "/work/project",
             .primary = "project",
             .detail = .{ .session = .{
-                .model_id = "copilot/first",
-                .summary = null,
-                .last_used_unix_ms = 20,
+                .working_directory = "/work/project",
             } },
             .source_index = 0,
         },
@@ -7792,9 +7722,7 @@ test "session menu preserves duplicate workspace selection by session key" {
             .key = "/work/project",
             .primary = "project",
             .detail = .{ .session = .{
-                .model_id = "copilot/second",
-                .summary = null,
-                .last_used_unix_ms = 10,
+                .working_directory = "/work/project",
             } },
             .source_index = 1,
         },

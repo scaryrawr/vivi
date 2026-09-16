@@ -1113,7 +1113,7 @@ chat_session_resume() {
             printf 'no\n'
         fi
         printf 'hydrated_transcript_seen='
-        if grep -Eq 'You[[:space:]]*Transform vivi_resume_memory' \
+        if grep -Eq 'You[[:space:]]*Transform[[:space:]]*vivi_resume_memory' \
             "$run_dir/chat-session-resume-second.normalized.txt"
         then
             printf 'yes\n'
@@ -1126,7 +1126,7 @@ chat_session_resume() {
     grep -q 'Resumed ' "$run_dir/chat-session-resume-second.normalized.txt"
     grep -Eq 'Vivi[[:space:]]*VIVI_RESUME_MEMORY' \
         "$run_dir/chat-session-resume-second.normalized.txt"
-    grep -Eq 'You[[:space:]]*Transform vivi_resume_memory' \
+    grep -Eq 'You[[:space:]]*Transform[[:space:]]*vivi_resume_memory' \
         "$run_dir/chat-session-resume-second.normalized.txt"
 
     (

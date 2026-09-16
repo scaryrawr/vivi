@@ -9,6 +9,8 @@ history later through a filterable `/resume` finder.
   `~/.vivi/sessions/`.
 - `/resume` opens a private Vivi-session finder without exposing Copilot
   session IDs; `/resume all` searches Copilot sessions for the active workspace.
+- Resume rows show the session title and working directory without model
+  metadata.
 - The finder explains when no earlier session is available or a filter has no
   matches.
 - Selecting a row joins the saved Copilot session and replaces the visible Vivi
