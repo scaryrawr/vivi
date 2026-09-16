@@ -109,6 +109,7 @@ fn commandArgumentSuffix(input: []const u8) []const u8 {
 
 const FileReferenceQuery = struct {
     start: usize,
+    end: usize,
     query: []const u8,
 };
 
@@ -117,8 +118,11 @@ fn fileReferenceQuery(input: []const u8, cursor: usize) ?FileReferenceQuery {
     var start = cursor;
     while (start > 0 and !isComposerWhitespace(input[start - 1])) start -= 1;
     if (start == cursor or input[start] != '@') return null;
+    var end = cursor;
+    while (end < input.len and !isComposerWhitespace(input[end])) end += 1;
     return .{
         .start = start,
+        .end = end,
         .query = input[start + 1 .. cursor],
     };
 }
@@ -2786,7 +2790,10 @@ const ChatUi = struct {
             return;
         }
         const previous_menu_mode = self.menu_mode;
-        if (self.phase == .ready or self.phase == .loading_commands) {
+        if (self.phase == .ready or
+            self.phase == .responding or
+            self.phase == .loading_commands)
+        {
             try self.syncComposerMenu();
         } else {
             self.menu_mode = .closed;
@@ -3128,13 +3135,26 @@ const ChatUi = struct {
                 self.file_failure = null;
             }
             self.menu_mode = .files;
-            if (self.file_picker) |picker| try picker.setDesired(.{
-                .workspace = self.cwd,
-                .query = reference.query,
-            });
+            if (self.file_picker) |picker| {
+                picker.setDesired(.{
+                    .workspace = self.cwd,
+                    .query = reference.query,
+                }) catch |err| switch (err) {
+                    error.InvalidDesired => {
+                        try self.closeFilePicker();
+                        self.menu_mode = .closed;
+                        return;
+                    },
+                    else => return err,
+                };
+            }
             return;
         }
         try self.closeFilePicker();
+        if (self.phase == .responding) {
+            self.menu_mode = .closed;
+            return;
+        }
         const query = slashCommandQuery(contents) orelse {
             self.menu_mode = .closed;
             return;
@@ -3382,16 +3402,16 @@ const ChatUi = struct {
                     return;
                 };
                 const path = self.file_paths.items[selected.source_index];
-                const suffix_needs_separator =
-                    reference.start + 1 + reference.query.len == contents.len or
-                    !isComposerWhitespace(contents[
-                        reference.start + 1 + reference.query.len
-                    ]);
+                var replaced_suffix = vaxis.unicode.graphemeIterator(
+                    contents[self.input.byteOffsetToCursor()..reference.end],
+                );
+                while (replaced_suffix.next() != null)
+                    self.input.deleteAfterCursor();
                 self.input.deleteToStart();
                 try self.input.insertSliceAtCursor(contents[0..reference.start]);
                 try self.input.insertSliceAtCursor("@");
                 try self.input.insertSliceAtCursor(path);
-                if (suffix_needs_separator)
+                if (reference.end == contents.len)
                     try self.input.insertSliceAtCursor(" ");
                 self.input_revision +%= 1;
                 try self.closeFilePicker();
@@ -8014,14 +8034,65 @@ test "slash command parsing preserves argument suffixes" {
 test "file reference query follows the active composer token" {
     const start = fileReferenceQuery("@cli", 4).?;
     try std.testing.expectEqual(@as(usize, 0), start.start);
+    try std.testing.expectEqual(@as(usize, 4), start.end);
     try std.testing.expectEqualStrings("cli", start.query);
 
-    const middle = fileReferenceQuery("check @cli/src next", 14).?;
+    const middle = fileReferenceQuery("check @cli/src next", 10).?;
     try std.testing.expectEqual(@as(usize, 6), middle.start);
-    try std.testing.expectEqualStrings("cli/src", middle.query);
+    try std.testing.expectEqual(@as(usize, 14), middle.end);
+    try std.testing.expectEqualStrings("cli", middle.query);
 
     try std.testing.expect(fileReferenceQuery("email@example.com", 17) == null);
     try std.testing.expect(fileReferenceQuery("check @cli/src", 5) == null);
+}
+
+test "responding composer keeps file completion but suppresses commands" {
+    var ui: ChatUi = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .input = TextInput.init(std.testing.allocator),
+        .cwd = try std.testing.allocator.dupe(u8, "."),
+        .phase = .responding,
+    };
+    defer ui.deinit();
+
+    try ui.input.insertSliceAtCursor("@cli");
+    try ui.syncComposerMenu();
+    try std.testing.expectEqual(MenuMode.files, ui.menu_mode);
+
+    ui.input.clearRetainingCapacity();
+    try ui.input.insertSliceAtCursor("/model");
+    try ui.syncComposerMenu();
+    try std.testing.expectEqual(MenuMode.closed, ui.menu_mode);
+}
+
+test "oversized file query closes the picker without changing the draft" {
+    const Fixture = struct {
+        fn wake(_: *anyopaque) void {}
+    };
+    var picker = try backend.FilePicker.open(
+        std.testing.allocator,
+        std.testing.io,
+        .{ .context = undefined, .notify = Fixture.wake },
+        .{ .max_query_bytes = 3 },
+    );
+    defer picker.deinit();
+    var ui: ChatUi = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .input = TextInput.init(std.testing.allocator),
+        .cwd = try std.testing.allocator.dupe(u8, "."),
+        .phase = .ready,
+        .file_picker = &picker,
+    };
+    defer ui.deinit();
+
+    try ui.input.insertSliceAtCursor("@long");
+    try ui.syncComposerMenu();
+    const contents = try ui.input.toOwnedContents(std.testing.allocator);
+    defer std.testing.allocator.free(contents);
+    try std.testing.expectEqualStrings("@long", contents);
+    try std.testing.expectEqual(MenuMode.closed, ui.menu_mode);
 }
 
 test "file picker update projects ranked paths into the menu" {
@@ -8076,8 +8147,8 @@ test "file menu selection replaces the active reference and preserves suffix" {
     };
     defer ui.deinit();
     try ui.replaceFilePaths(&.{"cli/src/chat.zig"});
-    try ui.input.insertSliceAtCursor("see @cli later");
-    for (0..6) |_| ui.input.cursorLeft();
+    try ui.input.insertSliceAtCursor("see @cli/old.zig later");
+    for (0..14) |_| ui.input.cursorLeft();
 
     var unused: backend.Conversation = undefined;
     try ui.activateMenu(&unused);

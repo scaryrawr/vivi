@@ -42,6 +42,7 @@ must not contain `.ignored-hidden` or `.svn/entries`.
 - The picker refreshes Git's tracked-plus-unignored view when it opens. A
   previous catalog remains searchable until the refresh completes.
 - File references are relative to the active session working directory.
-- Catalogs and result pages have explicit memory and path-count limits; an
+- Catalogs and result pages have explicit memory and path-count limits. The
+  catalog byte limit includes both path text and path-span storage, so an
   oversized workspace reports the picker as unavailable instead of consuming
   unbounded memory.

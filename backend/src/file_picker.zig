@@ -164,10 +164,15 @@ const CatalogBuilder = struct {
         defer self.partial.clearRetainingCapacity();
         const path = self.partial.items;
         if (path.len == 0 or isVcsMetadataPath(path)) return;
+        const projected_bytes = self.bytes.items.len + path.len;
+        const projected_path_count = self.paths.items.len + 1;
         if (path.len > self.limits.max_single_path_bytes or
             self.paths.items.len >= self.limits.max_catalog_paths or
-            self.bytes.items.len + path.len > self.limits.max_catalog_bytes or
-            self.bytes.items.len + path.len > std.math.maxInt(u32))
+            projected_bytes > self.limits.max_catalog_bytes or
+            projected_bytes > std.math.maxInt(u32) or
+            projected_path_count >
+                (self.limits.max_catalog_bytes - projected_bytes) /
+                    @sizeOf(PathSpan))
         {
             return error.CatalogTooLarge;
         }
@@ -729,10 +734,7 @@ fn runCoordinator(core: *Core) void {
 }
 
 fn runEnumerator(context: *EnumerationContext) void {
-    defer {
-        context.core.allocator.free(context.workspace);
-        context.core.allocator.destroy(context);
-    }
+    defer context.core.allocator.destroy(context);
     var builder: CatalogBuilder = .{
         .allocator = context.core.allocator,
         .limits = context.core.limits,
@@ -748,10 +750,7 @@ fn runEnumerator(context: *EnumerationContext) void {
         };
         break :blk null;
     };
-    const workspace = context.core.allocator.dupe(
-        u8,
-        context.workspace,
-    ) catch return;
+    const workspace = context.workspace;
     var result: Enumeration = if (failure) |value|
         .{ .failed = .{
             .allocator = context.core.allocator,
@@ -1057,6 +1056,18 @@ test "catalog builder enforces single path limit across chunks" {
     defer builder.deinit();
     try builder.feed("123");
     try std.testing.expectError(error.CatalogTooLarge, builder.feed("45"));
+}
+
+test "catalog builder counts path spans against the byte limit" {
+    var builder: CatalogBuilder = .{
+        .allocator = std.testing.allocator,
+        .limits = .{
+            .max_catalog_bytes = @sizeOf(PathSpan),
+            .max_cached_bytes = @sizeOf(PathSpan),
+        },
+    };
+    defer builder.deinit();
+    try std.testing.expectError(error.CatalogTooLarge, builder.feed("a\x00"));
 }
 
 test "match ranking favors full and component prefixes" {
