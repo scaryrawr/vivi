@@ -2485,6 +2485,10 @@ fn sessionMenuEntry(
     };
 }
 
+fn menuDetailColumn(width: u16) u16 {
+    return if (width >= 28) @min(width / 2, 44) else width;
+}
+
 fn pathEndsWithComponent(path: []const u8, suffix: []const u8) bool {
     if (!std.mem.endsWith(u8, path, suffix)) return false;
     if (path.len == suffix.len) return true;
@@ -3766,10 +3770,7 @@ const ChatUi = struct {
                     },
                 },
             };
-            const detail_col: u16 = if (window.width >= 28)
-                @min(window.width / 2, 44)
-            else
-                window.width;
+            const detail_col = menuDetailColumn(window.width);
             const label_window = window.child(.{ .width = detail_col -| 1 });
             _ = label_window.print(&segments, .{
                 .row_offset = @intCast(row),
@@ -3943,7 +3944,7 @@ const ChatUi = struct {
                 }};
                 _ = window.print(&segments, .{
                     .row_offset = row,
-                    .col_offset = @intCast(@min(window.width / 2, 36)),
+                    .col_offset = menuDetailColumn(window.width),
                     .wrap = .none,
                 });
             },
@@ -3983,7 +3984,7 @@ const ChatUi = struct {
                 }};
                 _ = window.print(&segments, .{
                     .row_offset = row,
-                    .col_offset = @intCast(@min(window.width / 2, 36)),
+                    .col_offset = menuDetailColumn(window.width),
                     .wrap = .none,
                 });
             },
@@ -3994,7 +3995,7 @@ const ChatUi = struct {
                 }};
                 _ = window.print(&segments, .{
                     .row_offset = row,
-                    .col_offset = @intCast(@min(window.width / 2, 36)),
+                    .col_offset = menuDetailColumn(window.width),
                     .wrap = .none,
                 });
             },
@@ -8039,6 +8040,12 @@ test "session menu filters by title and directory without exposing model" {
     try menu.rebuild(std.testing.allocator, &entries, "untitled");
     try std.testing.expectEqual(@as(usize, 1), menu.selected().?.source_index);
     try std.testing.expectEqualStrings("untitled", menu.selected().?.primary);
+}
+
+test "menu details start after the label column" {
+    try std.testing.expectEqual(@as(u16, 27), menuDetailColumn(27));
+    try std.testing.expectEqual(@as(u16, 38), menuDetailColumn(76));
+    try std.testing.expectEqual(@as(u16, 44), menuDetailColumn(100));
 }
 
 test "session menu labels colliding workspaces with unique path suffixes" {
