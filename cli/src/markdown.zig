@@ -274,6 +274,9 @@ fn syntaxColor(token: highlight.Token) vaxis.Color {
         .function => .{ .rgb = .{ 125, 211, 252 } },
         .property => .{ .rgb = .{ 253, 224, 71 } },
         .operator => .{ .rgb = .{ 244, 114, 182 } },
+        .inserted => .{ .rgb = .{ 134, 239, 172 } },
+        .deleted => .{ .rgb = .{ 251, 113, 133 } },
+        .meta => .{ .rgb = .{ 125, 211, 252 } },
     };
 }
 
