@@ -7,7 +7,9 @@ then use the matching feature file as the recipe.
 ## Baseline preconditions
 
 - Build from the repository root with `zig build`.
-- Put Zig 0.16.x, VHS, `script`, and GitHub Copilot CLI on `PATH`.
+- Put Zig 0.16.x, a VHS release that writes recordings, `script`, and GitHub
+  Copilot CLI on `PATH`. VHS 0.12.0 is known to exit without writing output;
+  pass a working binary with `VIVI_VHS=/path/to/vhs`.
 - Authenticate GitHub Copilot CLI before driving `vivi chat`.
 - Run `.github/skills/verify-vivi/bin/verify-vivi doctor`.
 - Give every verification attempt a unique run ID. Evidence belongs in

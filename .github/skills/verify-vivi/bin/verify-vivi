@@ -4,6 +4,7 @@ set -eu
 repo_root=$(git rev-parse --show-toplevel)
 artifact_root="$repo_root/.verify/vivi"
 binary="$repo_root/zig-out/bin/vivi"
+vhs_command=${VIVI_VHS:-vhs}
 
 usage() {
     cat <<'EOF'
@@ -56,7 +57,7 @@ build_vivi() {
 
 doctor() {
     require_command zig
-    require_command vhs
+    require_command "$vhs_command"
     require_command script
     require_command expect
     require_command copilot
@@ -66,9 +67,32 @@ doctor() {
 
     "$binary" --version
     zig version
-    vhs --version
+    "$vhs_command" --version
     copilot --version
     ffmpeg -version | sed -n '1p'
+
+    vhs_smoke_dir=$(mktemp -d "${TMPDIR:-/tmp}/vivi-vhs-smoke.XXXXXX")
+    cleanup_vhs_smoke() {
+        rm -f "$vhs_smoke_dir/smoke.tape" "$vhs_smoke_dir/smoke.gif"
+        rmdir "$vhs_smoke_dir" 2>/dev/null || true
+    }
+    trap cleanup_vhs_smoke EXIT INT TERM
+    cat >"$vhs_smoke_dir/smoke.tape" <<EOF
+Output "$vhs_smoke_dir/smoke.gif"
+Set Shell "bash"
+Set Width 600
+Set Height 400
+Type "printf VIVI_VHS_OK"
+Enter
+Sleep 1s
+EOF
+    "$vhs_command" "$vhs_smoke_dir/smoke.tape"
+    if ! test -s "$vhs_smoke_dir/smoke.gif"; then
+        printf 'VHS exited without writing its recording; use a working release such as 0.11.0 via VIVI_VHS=/path/to/vhs\n' >&2
+        exit 1
+    fi
+    cleanup_vhs_smoke
+    trap - EXIT INT TERM
 
     auth_output=$(
         copilot \
@@ -267,7 +291,7 @@ chat_streaming() {
     build_vivi
     write_streaming_tape "$run_dir"
 
-    (cd "$repo_root" && vhs "$run_dir/chat-streaming.tape")
+    (cd "$repo_root" && "$vhs_command" "$run_dir/chat-streaming.tape")
     extract_frames "$1" chat-streaming
 
     (
@@ -360,7 +384,7 @@ chat_markdown() {
     build_vivi
     write_markdown_tape "$run_dir"
 
-    (cd "$repo_root" && VIVI_KEEP_GIF=1 vhs "$run_dir/chat-markdown.tape")
+    (cd "$repo_root" && VIVI_KEEP_GIF=1 "$vhs_command" "$run_dir/chat-markdown.tape")
     VIVI_KEEP_GIF=1 extract_frames "$1" chat-markdown
 
     (
@@ -469,7 +493,7 @@ chat_markdown_read() {
     build_vivi
     write_markdown_read_tape "$run_dir"
 
-    (cd "$repo_root" && VIVI_KEEP_GIF=1 vhs "$run_dir/chat-markdown-read.tape")
+    (cd "$repo_root" && VIVI_KEEP_GIF=1 "$vhs_command" "$run_dir/chat-markdown-read.tape")
     VIVI_KEEP_GIF=1 extract_frames "$1" chat-markdown-read
 
     (
@@ -569,7 +593,7 @@ chat_streaming_input() {
     build_vivi
     write_streaming_input_tape "$run_dir"
 
-    (cd "$repo_root" && VIVI_KEEP_GIF=1 vhs "$run_dir/chat-streaming-input.tape")
+    (cd "$repo_root" && VIVI_KEEP_GIF=1 "$vhs_command" "$run_dir/chat-streaming-input.tape")
     VIVI_KEEP_GIF=1 extract_frames "$1" chat-streaming-input
 
     (
@@ -667,7 +691,7 @@ chat_ask_user() {
     build_vivi
     write_ask_user_tape "$run_dir"
 
-    (cd "$repo_root" && VIVI_KEEP_GIF=1 vhs "$run_dir/chat-ask-user.tape")
+    (cd "$repo_root" && VIVI_KEEP_GIF=1 "$vhs_command" "$run_dir/chat-ask-user.tape")
     VIVI_KEEP_GIF=1 extract_frames "$1" chat-ask-user
 
     (
@@ -792,7 +816,7 @@ chat_model_menu() {
     (
         cd "$repo_root" &&
             HOME="$settings_home" VIVI_KEEP_GIF=1 \
-                vhs "$run_dir/chat-model-menu.tape"
+                "$vhs_command" "$run_dir/chat-model-menu.tape"
     )
     VIVI_KEEP_GIF=1 extract_frames "$1" chat-model-menu
 
@@ -922,7 +946,7 @@ chat_customization() {
     fi
 
     HOME="$customization_home" VIVI_KEEP_GIF=1 \
-        vhs "$run_dir/chat-customization.tape"
+        "$vhs_command" "$run_dir/chat-customization.tape"
     VIVI_KEEP_GIF=1 extract_frames "$1" chat-customization
 
     (
@@ -1132,7 +1156,7 @@ chat_session_resume() {
     (
         cd "$repo_root" &&
             HOME="$vhs_home" VIVI_KEEP_GIF=1 \
-                vhs "$run_dir/chat-session-resume.tape"
+                "$vhs_command" "$run_dir/chat-session-resume.tape"
     ) &
     vhs_pid=$!
     rm -f "$run_dir/chat-session-resume.vhs-timeout"
@@ -1190,7 +1214,7 @@ chat_shutdown() {
     run_dir=$(prepare_run "$1")
     build_vivi
     write_shutdown_tape "$run_dir"
-    (cd "$repo_root" && vhs "$run_dir/chat-shutdown.tape")
+    (cd "$repo_root" && "$vhs_command" "$run_dir/chat-shutdown.tape")
     extract_frames "$1" chat-shutdown
     test -s "$run_dir/chat-shutdown.frames.txt"
     test -s "$run_dir/chat-shutdown.contact-sheet.png"
@@ -1251,7 +1275,7 @@ EOF
             'VHS was skipped; terminal PTY evidence is available.' \
             >"$run_dir/chat-async-bash.visual-blocker.txt"
     else
-        (cd "$repo_root" && VIVI_KEEP_GIF=1 vhs "$run_dir/chat-async-bash.tape")
+        (cd "$repo_root" && VIVI_KEEP_GIF=1 "$vhs_command" "$run_dir/chat-async-bash.tape")
     fi
 
     VIVI_EXPECT_BINARY=$binary \

@@ -36,19 +36,21 @@ time only when the UI is still showing `Stopping...`.
 
 ## Doctor
 
-Run this read-only health check before any drive when the environment or
-authentication looks questionable:
+Run this health check before any drive when the environment or authentication
+looks questionable:
 
 ```sh
 .github/skills/verify-vivi/bin/verify-vivi doctor
 ```
 
 It requires Zig, VHS, `script`, Expect, FFmpeg/FFprobe, and GitHub Copilot CLI;
-builds Vivi; checks the installed Vivi and Copilot versions; and sends a
-no-tools Copilot prompt that must return `VIVI_DOCTOR_OK`. A failure means the
-instance is not worth driving. Copilot CLI does not expose a standalone
-authenticated-status command, so the minimal prompt is the authentication
-check.
+builds Vivi; checks the installed Vivi and Copilot versions; records a
+temporary VHS smoke GIF; and sends a no-tools Copilot prompt that must return
+`VIVI_DOCTOR_OK`. A failure means the instance is not worth driving. VHS
+0.12.0 can exit successfully without writing its recording; use a working
+release such as 0.11.0 with `VIVI_VHS=/path/to/vhs` when the smoke check
+reports that failure. Copilot CLI does not expose a standalone authenticated
+status command, so the minimal prompt is the authentication check.
 
 ## Drive
 

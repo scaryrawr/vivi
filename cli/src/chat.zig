@@ -1011,7 +1011,103 @@ const UiPhase = enum {
             .stopping => "Stopping...",
         };
     }
+
+    fn acceptsComposerInput(self: UiPhase) bool {
+        return switch (self) {
+            .ready, .loading_commands, .responding, .awaiting_input => true,
+            else => false,
+        };
+    }
 };
+
+const ComposerMeasure = struct {
+    rows: u16,
+    cursor_row: u16,
+    cursor_col: u16,
+};
+
+fn composerContentX(width: u16) u16 {
+    return if (width >= 4) 3 else 0;
+}
+
+fn composerContentWidth(width: u16) u16 {
+    return width -| composerContentX(width);
+}
+
+fn isComposerWhitespace(byte: u8) bool {
+    return byte == ' ' or byte == '\t' or byte == '\n' or byte == '\r';
+}
+
+fn measureWrappedComposer(
+    window: vaxis.Window,
+    text: []const u8,
+    cursor_offset: usize,
+) ComposerMeasure {
+    if (window.width == 0) return .{
+        .rows = 1,
+        .cursor_row = 0,
+        .cursor_col = 0,
+    };
+
+    var segment = [_]vaxis.Segment{.{ .text = text }};
+    const full = window.print(&segment, .{ .wrap = .word, .commit = false });
+    const cursor = @min(cursor_offset, text.len);
+    var cursor_result = full;
+
+    if (cursor < text.len) {
+        var word_start = cursor;
+        while (word_start > 0 and !isComposerWhitespace(text[word_start - 1])) {
+            word_start -= 1;
+        }
+        var word_end = cursor;
+        while (word_end < text.len and !isComposerWhitespace(text[word_end])) {
+            word_end += 1;
+        }
+
+        if (word_start < word_end) {
+            var before_segment = [_]vaxis.Segment{.{
+                .text = text[0..word_start],
+            }};
+            cursor_result = window.print(
+                &before_segment,
+                .{ .wrap = .word, .commit = false },
+            );
+            const word_width = window.gwidth(text[word_start..word_end]);
+            if (cursor_result.col + word_width > window.width and
+                word_width < window.width)
+            {
+                cursor_result.row += 1;
+                cursor_result.col = 0;
+            }
+            var word_segment = [_]vaxis.Segment{.{
+                .text = text[word_start..cursor],
+            }};
+            cursor_result = window.print(
+                &word_segment,
+                .{
+                    .row_offset = cursor_result.row,
+                    .col_offset = cursor_result.col,
+                    .wrap = .grapheme,
+                    .commit = false,
+                },
+            );
+        } else {
+            var prefix_segment = [_]vaxis.Segment{.{
+                .text = text[0..cursor],
+            }};
+            cursor_result = window.print(
+                &prefix_segment,
+                .{ .wrap = .word, .commit = false },
+            );
+        }
+    }
+
+    return .{
+        .rows = @max(full.row +| 1, 1),
+        .cursor_row = cursor_result.row,
+        .cursor_col = cursor_result.col,
+    };
+}
 
 const Region = struct {
     x: u16 = 0,
@@ -1046,7 +1142,12 @@ const FrameLayout = struct {
     composer: Region,
     footer: ?Region,
 
-    fn compute(width: u16, height: u16, desired_menu_rows: u16) FrameLayout {
+    fn compute(
+        width: u16,
+        height: u16,
+        desired_menu_rows: u16,
+        desired_composer_rows: u16,
+    ) FrameLayout {
         if (width == 0 or height == 0) return .{
             .transcript = .{},
             .context = null,
@@ -1055,9 +1156,16 @@ const FrameLayout = struct {
             .footer = null,
         };
 
-        const composer_height: u16 = if (height >= 8 and width >= 24) 3 else 1;
+        const minimum_composer_height: u16 =
+            if (height >= 8 and width >= 24) 3 else 1;
         const footer_height: u16 = if (height >= 3 and width >= 12) 1 else 0;
         const context_height: u16 = if (height >= 5 and width >= 24) 1 else 0;
+        const maximum_composer_height =
+            height -| footer_height -| context_height -| 1;
+        const composer_height = @min(
+            @max(minimum_composer_height, desired_composer_rows),
+            @max(maximum_composer_height, minimum_composer_height),
+        );
         const fixed_chrome_height =
             composer_height + footer_height + context_height;
         const menu_height = @min(
@@ -2407,6 +2515,8 @@ const ChatUi = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     input: TextInput,
+    composer_display: [2]std.ArrayList(u8) = .{ .empty, .empty },
+    composer_display_index: usize = 0,
     pasted_images: ?images.Store = null,
     transcript_spool: ?TranscriptSpool = null,
     bracketed_paste: bool = false,
@@ -2429,6 +2539,7 @@ const ChatUi = struct {
     last_total_rows: usize = 0,
     last_viewport_rows: usize = 0,
     last_transcript_region: Region = .{},
+    last_composer_height: u16 = 0,
     tool_hits: std.ArrayList(?usize) = .empty,
     tool_anchor: ?struct { entry_index: usize, row: usize } = null,
     // Borrowed from the transcript; call IDs survive entry insertion and growth.
@@ -2462,6 +2573,7 @@ const ChatUi = struct {
 
     fn deinit(self: *ChatUi) void {
         self.deinitTranscriptSpool();
+        for (&self.composer_display) |*display| display.deinit(self.allocator);
         if (self.pasted_images) |*store| store.deinit();
         self.tool_hits.deinit(self.allocator);
         self.menu.deinit(self.allocator);
@@ -3466,6 +3578,7 @@ const ChatUi = struct {
         errdefer if (projection) |*value|
             value.deinit(projection_allocator);
 
+        try self.syncComposerDisplay();
         const desired_menu_rows: u16 = if (self.phase == .awaiting_input)
             self.userInputPanelRows(root)
         else switch (self.menu_mode) {
@@ -3479,7 +3592,9 @@ const ChatUi = struct {
             root.width,
             root.height,
             desired_menu_rows,
+            self.desiredComposerRows(root),
         );
+        self.last_composer_height = layout.composer.height;
         self.last_transcript_region = layout.transcript;
         self.tool_hits.clearRetainingCapacity();
         if (layout.transcript.height > 0) {
@@ -4245,6 +4360,38 @@ const ChatUi = struct {
         });
     }
 
+    fn syncComposerDisplay(self: *ChatUi) !void {
+        const contents = try self.input.toOwnedContents(self.allocator);
+        defer self.allocator.free(contents);
+        if (std.mem.eql(
+            u8,
+            self.composer_display[self.composer_display_index].items,
+            contents,
+        )) return;
+
+        const next_index = (self.composer_display_index + 1) % 2;
+        self.composer_display[next_index].clearRetainingCapacity();
+        try self.composer_display[next_index].appendSlice(
+            self.allocator,
+            contents,
+        );
+        self.composer_display_index = next_index;
+    }
+
+    fn desiredComposerRows(self: *ChatUi, window: vaxis.Window) u16 {
+        const content_width = composerContentWidth(window.width);
+        if (content_width == 0 or !self.phase.acceptsComposerInput()) return 1;
+        var measure_window = window;
+        measure_window.width = content_width;
+        measure_window.height = std.math.maxInt(u16);
+        const measure = measureWrappedComposer(
+            measure_window,
+            self.composer_display[self.composer_display_index].items,
+            self.input.byteOffsetToCursor(),
+        );
+        return measure.rows +| 2;
+    }
+
     fn drawComposer(self: *ChatUi, window: vaxis.Window) void {
         window.fill(.{
             .char = .{ .grapheme = " ", .width = 1 },
@@ -4258,23 +4405,38 @@ const ChatUi = struct {
                 .style = .{ .bg = accent },
             });
         }
-        const content_x: u16 = if (use_accent) 3 else 0;
+        const content_x = composerContentX(window.width);
         const content_width = window.width -| content_x;
         if (content_width == 0) return;
+        const content_y: u16 = if (window.height >= 3) 1 else 0;
         const content = window.child(.{
             .x_off = @intCast(content_x),
-            .y_off = @intCast((window.height - 1) / 2),
+            .y_off = @intCast(content_y),
             .width = content_width,
-            .height = 1,
+            .height = window.height -| content_y -| @intFromBool(window.height >= 3),
         });
         const text_style = vaxis.Style{ .bg = composer_background };
-        if (self.phase == .ready or
-            self.phase == .loading_commands or
-            self.phase == .responding or
-            self.phase == .awaiting_input)
-        {
-            self.input.drawWithStyle(content, text_style);
-            if (self.focused_tool != null) content.hideCursor();
+        if (self.phase.acceptsComposerInput()) {
+            const measure = measureWrappedComposer(
+                content,
+                self.composer_display[self.composer_display_index].items,
+                self.input.byteOffsetToCursor(),
+            );
+            const scroll_rows = if (measure.cursor_row >= content.height)
+                measure.cursor_row - content.height + 1
+            else
+                0;
+            const drawing = content.child(.{
+                .y_off = -@as(i17, @intCast(scroll_rows)),
+                .height = measure.rows,
+            });
+            var segments = [_]vaxis.Segment{.{
+                .text = self.composer_display[self.composer_display_index].items,
+                .style = text_style,
+            }};
+            _ = drawing.print(&segments, .{ .wrap = .word });
+            drawing.showCursor(measure.cursor_col, measure.cursor_row);
+            if (self.focused_tool != null) drawing.hideCursor();
         } else {
             content.hideCursor();
             var segments = [_]vaxis.Segment{.{
@@ -4821,7 +4983,17 @@ const App = struct {
 
     fn renderComposer(self: *App) !void {
         const root = self.vx.window();
-        const layout = FrameLayout.compute(root.width, root.height, 0);
+        try self.ui.syncComposerDisplay();
+        const layout = FrameLayout.compute(
+            root.width,
+            root.height,
+            0,
+            self.ui.desiredComposerRows(root),
+        );
+        if (layout.composer.height != self.ui.last_composer_height) {
+            try self.render();
+            return;
+        }
         if (layout.composer.height > 0) {
             self.ui.drawComposer(layout.composer.child(root));
         }
@@ -7248,7 +7420,7 @@ test "frame layout keeps chrome in bounds" {
         .{ .width = 120, .height = 30 },
     };
     for (sizes) |size| {
-        const layout = FrameLayout.compute(size.width, size.height, 8);
+        const layout = FrameLayout.compute(size.width, size.height, 8, 3);
         try std.testing.expect(
             layout.composer.y + layout.composer.height <= size.height,
         );
@@ -7277,6 +7449,88 @@ test "frame layout keeps chrome in bounds" {
             );
         }
     }
+}
+
+test "wrapped composer measures cursor within a word moved to the next row" {
+    var screen: vaxis.Screen = .{ .width_method = .unicode };
+    const window: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 8,
+        .height = 8,
+        .screen = &screen,
+    };
+
+    const measure = measureWrappedComposer(window, "hi abcdef", 6);
+    try std.testing.expectEqual(@as(u16, 2), measure.rows);
+    try std.testing.expectEqual(@as(u16, 1), measure.cursor_row);
+    try std.testing.expectEqual(@as(u16, 3), measure.cursor_col);
+}
+
+test "composer word wraps and grows instead of scrolling horizontally" {
+    var ui: ChatUi = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .input = TextInput.init(std.testing.allocator),
+        .cwd = try std.testing.allocator.dupe(u8, "."),
+        .phase = .ready,
+    };
+    defer ui.deinit();
+    try ui.input.insertSliceAtCursor(
+        "alpha beta gamma delta epsilon zeta eta theta",
+    );
+
+    var screen = try vaxis.Screen.init(std.testing.allocator, .{
+        .rows = 12,
+        .cols = 24,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(std.testing.allocator);
+    const window: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = screen.width,
+        .height = screen.height,
+        .screen = &screen,
+    };
+
+    var projection = try ui.draw(window);
+    defer if (projection) |*value| value.deinit(std.testing.allocator);
+
+    try std.testing.expect(ui.last_composer_height > 3);
+    try std.testing.expectEqual(@as(u16, 0), ui.input.draw_offset);
+
+    var rendered: std.ArrayList(u8) = .empty;
+    defer rendered.deinit(std.testing.allocator);
+    const composer_start = screen.height - 1 - ui.last_composer_height;
+    for (composer_start..screen.height - 1) |row| {
+        for (0..screen.width) |column| {
+            const cell = screen.readCell(
+                @intCast(column),
+                @intCast(row),
+            ).?;
+            try rendered.appendSlice(
+                std.testing.allocator,
+                cell.char.grapheme,
+            );
+        }
+        try rendered.append(std.testing.allocator, '\n');
+    }
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        rendered.items,
+        "alpha beta gamma",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        rendered.items,
+        "eta theta",
+    ) != null);
 }
 
 test "ask-user input preserves the existing composer draft" {
