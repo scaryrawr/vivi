@@ -67,6 +67,8 @@ user-visible behavior. It then uses exactly four H2 sections in this order:
   emphasis and code, and readable table layout in assistant responses.
 - [Ask-user prompt](./ask-user.md) covers interactive questions, numbered
   choices, answer entry, and resumed streaming.
+- [File picker](./file-picker.md) covers `@` completion, hidden files,
+  ignore rules, and VCS metadata exclusion.
 - [Chat shutdown](./chat-shutdown.md) covers cooperative Ctrl-C shutdown and
   the explicit second-Ctrl-C escape path.
 - [OMLX models](./omlx-models.md) covers live model discovery, token-limit

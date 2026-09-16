@@ -17,12 +17,13 @@ Usage:
   verify-vivi chat-markdown <run-id>
   verify-vivi chat-markdown-read <run-id>
   verify-vivi chat-ask-user <run-id>
+  verify-vivi chat-file-picker <run-id>
   verify-vivi chat-model-menu <run-id>
   verify-vivi chat-customization <run-id>
   verify-vivi chat-session-resume <run-id>
   verify-vivi chat-shutdown <run-id>
-  verify-vivi extract-frames <run-id> <chat-streaming|chat-streaming-input|chat-async-bash|chat-markdown|chat-markdown-read|chat-ask-user|chat-model-menu|chat-customization|chat-session-resume|chat-shutdown>
-  verify-vivi frame-check <run-id> <chat-streaming|chat-streaming-input|chat-async-bash|chat-markdown|chat-markdown-read|chat-ask-user|chat-model-menu|chat-customization|chat-session-resume|chat-shutdown>
+  verify-vivi extract-frames <run-id> <chat-streaming|chat-streaming-input|chat-async-bash|chat-markdown|chat-markdown-read|chat-ask-user|chat-file-picker|chat-model-menu|chat-customization|chat-session-resume|chat-shutdown>
+  verify-vivi frame-check <run-id> <chat-streaming|chat-streaming-input|chat-async-bash|chat-markdown|chat-markdown-read|chat-ask-user|chat-file-picker|chat-model-menu|chat-customization|chat-session-resume|chat-shutdown>
   verify-vivi cleanup <run-id>
 EOF
 }
@@ -161,9 +162,9 @@ cli_discovery() {
 
 validate_capture_name() {
     case "$1" in
-        chat-streaming|chat-streaming-input|chat-async-bash|chat-markdown|chat-markdown-read|chat-ask-user|chat-model-menu|chat-customization|chat-session-resume|chat-shutdown) ;;
+        chat-streaming|chat-streaming-input|chat-async-bash|chat-markdown|chat-markdown-read|chat-ask-user|chat-file-picker|chat-model-menu|chat-customization|chat-session-resume|chat-shutdown) ;;
         *)
-            printf 'capture must be chat-streaming, chat-streaming-input, chat-async-bash, chat-markdown, chat-markdown-read, chat-ask-user, chat-model-menu, chat-customization, chat-session-resume, or chat-shutdown\n' >&2
+            printf 'capture must be chat-streaming, chat-streaming-input, chat-async-bash, chat-markdown, chat-markdown-read, chat-ask-user, chat-file-picker, chat-model-menu, chat-customization, chat-session-resume, or chat-shutdown\n' >&2
             exit 1
             ;;
     esac
@@ -1400,6 +1401,109 @@ EOF
     grep -q 'VIVI_ASYNC_BASH_OK' "$run_dir/chat-async-bash.normalized.txt"
 }
 
+chat_file_picker() {
+    run_dir=$(prepare_run "$1")
+    build_vivi
+    fixture="$run_dir/file-picker-workspace"
+    mkdir -p "$fixture/.svn"
+    git -C "$fixture" init -q
+    printf '%s\n' '.ignored-hidden' >"$fixture/.gitignore"
+    printf '%s\n' visible >"$fixture/.visible-hidden"
+    printf '%s\n' ignored >"$fixture/.ignored-hidden"
+    printf '%s\n' metadata >"$fixture/.svn/entries"
+    printf '%s\n' regular >"$fixture/regular.txt"
+
+    cat >"$run_dir/chat-file-picker.tape" <<EOF
+Output "$run_dir/chat-file-picker.gif"
+Require copilot
+Set Shell "bash"
+Set Width 1200
+Set Height 720
+Set FontSize 22
+Set TypingSpeed 20ms
+
+Type "cd '$fixture' && '$binary' chat"
+Enter
+Sleep 3s
+Type "@."
+Sleep 3s
+Down
+Enter
+Sleep 2s
+Ctrl+C
+Sleep 3s
+Ctrl+C
+Sleep 1s
+EOF
+    (cd "$repo_root" && VIVI_KEEP_GIF=1 "$vhs_command" "$run_dir/chat-file-picker.tape")
+    VIVI_KEEP_GIF=1 extract_frames "$1" chat-file-picker
+
+    VIVI_EXPECT_BINARY=$binary \
+        VIVI_EXPECT_FIXTURE=$fixture \
+        VIVI_EXPECT_LOG="$run_dir/chat-file-picker.terminal.log" \
+        expect <<'EOF' &
+set timeout 30
+spawn -noecho script -q $env(VIVI_EXPECT_LOG) sh -c \
+    "cd '$env(VIVI_EXPECT_FIXTURE)' && stty cols 100 rows 30; exec '$env(VIVI_EXPECT_BINARY)' chat"
+expect {
+    -re {Ready} {}
+    timeout { exit 124 }
+    eof { exit 125 }
+}
+send -- "@."
+sleep 2
+send -- "\033\[B"
+send -- "\r"
+sleep 1
+send -- "\003"
+set timeout 10
+expect {
+    eof {}
+    timeout {
+        send -- "\003"
+        expect eof
+    }
+}
+catch wait result
+exit [lindex $result 3]
+EOF
+    pty_pid=$!
+    printf '%s\n' "$pty_pid" >"$run_dir/pty.pid"
+    trap 'kill "$pty_pid" 2>/dev/null || true; wait "$pty_pid" 2>/dev/null || true' EXIT INT TERM
+
+    if wait "$pty_pid"; then
+        status=0
+    else
+        status=$?
+    fi
+    rm -f "$run_dir/pty.pid"
+    trap - EXIT INT TERM
+
+    perl -0pe \
+        's/\e\[[0-?]*[ -\/]*[@-~]//g; s/\e\][^\a]*(?:\a|\e\\)//g' \
+        "$run_dir/chat-file-picker.terminal.log" |
+        tr -d '\r\b' >"$run_dir/chat-file-picker.normalized.txt"
+
+    {
+        printf 'exit=%s\n' "$status"
+        printf 'hidden_file_seen='
+        grep -F -q '.visible-hidden' "$run_dir/chat-file-picker.normalized.txt" &&
+            printf 'yes\n' || printf 'no\n'
+        printf 'ignored_file_seen='
+        grep -F -q '.ignored-hidden' "$run_dir/chat-file-picker.normalized.txt" &&
+            printf 'yes\n' || printf 'no\n'
+        printf 'vcs_metadata_seen='
+        grep -F -q '.svn/entries' "$run_dir/chat-file-picker.normalized.txt" &&
+            printf 'yes\n' || printf 'no\n'
+    } >"$run_dir/chat-file-picker.assertions.txt"
+
+    test "$status" -eq 0
+    grep -F -q '.visible-hidden' "$run_dir/chat-file-picker.normalized.txt"
+    ! grep -F -q '.ignored-hidden' "$run_dir/chat-file-picker.normalized.txt"
+    ! grep -F -q '.svn/entries' "$run_dir/chat-file-picker.normalized.txt"
+    test -s "$run_dir/chat-file-picker.contact-sheet.png"
+}
+
 case "${1:-}" in
     doctor)
         test "$#" -eq 1 || {
@@ -1456,6 +1560,13 @@ case "${1:-}" in
             exit 2
         }
         chat_ask_user "$2"
+        ;;
+    chat-file-picker)
+        test "$#" -eq 2 || {
+            usage >&2
+            exit 2
+        }
+        chat_file_picker "$2"
         ;;
     chat-model-menu)
         test "$#" -eq 2 || {

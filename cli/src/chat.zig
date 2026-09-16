@@ -38,6 +38,7 @@ const AppEvent = union(enum) {
     paste_end,
     input_error: anyerror,
     conversation_wake,
+    file_picker_wake,
 };
 
 fn isMouseWheel(mouse: vaxis.Mouse) bool {
@@ -104,6 +105,22 @@ fn slashCommandQuery(input: []const u8) ?[]const u8 {
 fn commandArgumentSuffix(input: []const u8) []const u8 {
     const separator = std.mem.indexOfAny(u8, input, " \t\r\n");
     return if (separator) |index| input[index..] else "";
+}
+
+const FileReferenceQuery = struct {
+    start: usize,
+    query: []const u8,
+};
+
+fn fileReferenceQuery(input: []const u8, cursor: usize) ?FileReferenceQuery {
+    if (cursor > input.len) return null;
+    var start = cursor;
+    while (start > 0 and !isComposerWhitespace(input[start - 1])) start -= 1;
+    if (start == cursor or input[start] != '@') return null;
+    return .{
+        .start = start,
+        .query = input[start + 1 .. cursor],
+    };
 }
 
 fn buildCommandInput(
@@ -2526,6 +2543,7 @@ fn stableRank(indices: []usize, ranks: []u2) void {
 const MenuMode = enum {
     closed,
     commands,
+    files,
     loading_models,
     models,
     loading_sessions,
@@ -2553,6 +2571,13 @@ const ChatUi = struct {
     invalid_user_input: bool = false,
     menu_mode: MenuMode = .closed,
     menu: MenuState = .{},
+    file_picker: ?*backend.FilePicker = null,
+    file_paths: std.ArrayList([]u8) = .empty,
+    file_query: std.ArrayList(u8) = .empty,
+    file_loading: bool = false,
+    file_failure: ?backend.FilePickerFailure = null,
+    file_refreshing: bool = false,
+    file_truncated: bool = false,
     input_revision: u64 = 0,
     dismissed_revision: ?u64 = null,
     menu_detail_storage: [8][96]u8 = undefined,
@@ -2598,6 +2623,9 @@ const ChatUi = struct {
         if (self.pasted_images) |*store| store.deinit();
         self.tool_hits.deinit(self.allocator);
         self.menu.deinit(self.allocator);
+        self.clearFilePaths();
+        self.file_paths.deinit(self.allocator);
+        self.file_query.deinit(self.allocator);
         if (self.saved_input) |*input| input.deinit();
         if (self.pending_user_input) |*request| request.deinit();
         if (self.models) |*catalog| catalog.deinit();
@@ -2666,6 +2694,7 @@ const ChatUi = struct {
         if (self.menu_mode != .closed) {
             self.clearToolFocus();
             if (key.matches(vaxis.Key.escape, .{})) {
+                if (self.menu_mode == .files) try self.closeFilePicker();
                 self.menu_mode = .closed;
                 self.dismissed_revision = self.input_revision;
                 return .keep_running;
@@ -2758,7 +2787,7 @@ const ChatUi = struct {
         }
         const previous_menu_mode = self.menu_mode;
         if (self.phase == .ready or self.phase == .loading_commands) {
-            try self.syncSlashMenu();
+            try self.syncComposerMenu();
         } else {
             self.menu_mode = .closed;
         }
@@ -3060,7 +3089,7 @@ const ChatUi = struct {
         }
     }
 
-    fn syncSlashMenu(self: *ChatUi) !void {
+    fn syncComposerMenu(self: *ChatUi) !void {
         if (self.menu_mode == .loading_models or
             self.menu_mode == .loading_sessions)
         {
@@ -3074,6 +3103,38 @@ const ChatUi = struct {
         }
         const contents = try self.input.toOwnedContents(self.allocator);
         defer self.allocator.free(contents);
+        if (fileReferenceQuery(contents, self.input.byteOffsetToCursor())) |reference| {
+            if (self.dismissed_revision == self.input_revision) {
+                try self.closeFilePicker();
+                self.menu_mode = .closed;
+                return;
+            }
+            const request_changed = self.menu_mode != .files or
+                !std.mem.eql(
+                    u8,
+                    self.file_query.items,
+                    reference.query,
+                );
+            if (request_changed) {
+                self.menu.entries.clearRetainingCapacity();
+                self.menu.matches.clearRetainingCapacity();
+                self.clearFilePaths();
+                self.file_query.clearRetainingCapacity();
+                try self.file_query.appendSlice(
+                    self.allocator,
+                    reference.query,
+                );
+                self.file_loading = true;
+                self.file_failure = null;
+            }
+            self.menu_mode = .files;
+            if (self.file_picker) |picker| try picker.setDesired(.{
+                .workspace = self.cwd,
+                .query = reference.query,
+            });
+            return;
+        }
+        try self.closeFilePicker();
         const query = slashCommandQuery(contents) orelse {
             self.menu_mode = .closed;
             return;
@@ -3084,6 +3145,90 @@ const ChatUi = struct {
         }
         self.menu_mode = .commands;
         try self.rebuildCommandMenu(query);
+    }
+
+    fn clearFilePaths(self: *ChatUi) void {
+        for (self.file_paths.items) |path| self.allocator.free(path);
+        self.file_paths.clearRetainingCapacity();
+    }
+
+    fn closeFilePicker(self: *ChatUi) !void {
+        if (self.file_picker) |picker| try picker.setDesired(null);
+        self.menu.entries.clearRetainingCapacity();
+        self.menu.matches.clearRetainingCapacity();
+        self.clearFilePaths();
+        self.file_query.clearRetainingCapacity();
+        self.file_loading = false;
+        self.file_failure = null;
+        self.file_refreshing = false;
+        self.file_truncated = false;
+    }
+
+    fn applyFilePickerUpdate(
+        self: *ChatUi,
+        update: *const backend.FilePickerUpdate,
+    ) !void {
+        if (self.menu_mode != .files) return;
+        switch (update.*) {
+            .loading => {
+                self.file_loading = true;
+                self.file_failure = null;
+            },
+            .unavailable => |failure| {
+                self.menu.entries.clearRetainingCapacity();
+                self.menu.matches.clearRetainingCapacity();
+                self.clearFilePaths();
+                self.file_loading = false;
+                self.file_failure = failure;
+                self.file_refreshing = false;
+                self.file_truncated = false;
+            },
+            .results => |results| {
+                self.file_loading = false;
+                self.file_failure = null;
+                self.file_refreshing = results.refreshing;
+                self.file_truncated = results.truncated;
+                try self.replaceFilePaths(results.paths);
+            },
+        }
+    }
+
+    fn replaceFilePaths(self: *ChatUi, paths: []const []const u8) !void {
+        var replacement: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (replacement.items) |path| self.allocator.free(path);
+            replacement.deinit(self.allocator);
+        }
+        for (paths) |path| {
+            const owned = try self.allocator.dupe(u8, path);
+            errdefer self.allocator.free(owned);
+            try replacement.append(self.allocator, owned);
+        }
+        const entries = try self.allocator.alloc(
+            MenuEntry,
+            replacement.items.len,
+        );
+        defer self.allocator.free(entries);
+        for (replacement.items, 0..) |path, index| {
+            entries[index] = .{
+                .identity = .{ .text = path },
+                .key = path,
+                .primary = path,
+                .detail = .{ .text = if (index == 0 and self.file_truncated)
+                    "file · more matches"
+                else if (index == 0 and self.file_refreshing)
+                    "file · refreshing"
+                else
+                    "file" },
+                .source_index = index,
+            };
+        }
+        try self.menu.rebuild(self.allocator, entries, "");
+        const previous = self.file_paths;
+        self.file_paths = replacement;
+        replacement = previous;
+        for (replacement.items) |path| self.allocator.free(path);
+        replacement.deinit(self.allocator);
     }
 
     fn rebuildCommandMenu(self: *ChatUi, query: []const u8) !void {
@@ -3226,6 +3371,32 @@ const ChatUi = struct {
                     else => return err,
                 };
             },
+            .files => {
+                const contents = try self.input.toOwnedContents(self.allocator);
+                defer self.allocator.free(contents);
+                const reference = fileReferenceQuery(
+                    contents,
+                    self.input.byteOffsetToCursor(),
+                ) orelse {
+                    self.menu_mode = .closed;
+                    return;
+                };
+                const path = self.file_paths.items[selected.source_index];
+                const suffix_needs_separator =
+                    reference.start + 1 + reference.query.len == contents.len or
+                    !isComposerWhitespace(contents[
+                        reference.start + 1 + reference.query.len
+                    ]);
+                self.input.deleteToStart();
+                try self.input.insertSliceAtCursor(contents[0..reference.start]);
+                try self.input.insertSliceAtCursor("@");
+                try self.input.insertSliceAtCursor(path);
+                if (suffix_needs_separator)
+                    try self.input.insertSliceAtCursor(" ");
+                self.input_revision +%= 1;
+                try self.closeFilePicker();
+                self.menu_mode = .closed;
+            },
             .models => {
                 const catalog = self.models orelse return;
                 const model = catalog.models[selected.source_index];
@@ -3270,7 +3441,7 @@ const ChatUi = struct {
                 if (self.commands) |*current| current.deinit();
                 self.commands = replacement;
                 if (self.phase == .loading_commands) self.phase = .ready;
-                if (self.menu_mode == .commands) try self.syncSlashMenu();
+                if (self.menu_mode == .commands) try self.syncComposerMenu();
             },
             .model_catalog => |catalog| {
                 const replacement = try catalog.clone(self.allocator);
@@ -3461,6 +3632,7 @@ const ChatUi = struct {
                         });
                         self.clearToolFocus();
                         self.tool_anchor = null;
+                        try self.closeFilePicker();
                         self.allocator.free(self.cwd);
                         self.cwd = resumed_cwd;
                         var previous = self.transcript;
@@ -3593,7 +3765,7 @@ const ChatUi = struct {
         const desired_menu_rows: u16 = if (self.phase == .awaiting_input)
             self.userInputPanelRows(root)
         else switch (self.menu_mode) {
-            .commands, .models, .sessions => @intCast(@min(
+            .commands, .files, .models, .sessions => @intCast(@min(
                 @max(self.menu.matches.items.len, 1),
                 8,
             )),
@@ -3723,7 +3895,14 @@ const ChatUi = struct {
             .style = .{ .bg = menu_background },
         });
         if (self.menu.matches.items.len == 0) {
-            const text = if (self.menu_mode == .sessions)
+            const text = if (self.menu_mode == .files)
+                if (self.file_loading)
+                    "Loading files..."
+                else if (self.file_failure != null)
+                    "File picker unavailable."
+                else
+                    "No matching files."
+            else if (self.menu_mode == .sessions)
                 sessionMenuEmptyMessage(blk: {
                     const catalog = self.sessions orelse break :blk false;
                     for (catalog.sessions) |session| {
@@ -4724,6 +4903,7 @@ const App = struct {
     vx: vaxis.Vaxis,
     loop: vaxis.Loop(AppEvent),
     conversation: backend.Conversation,
+    file_picker: backend.FilePicker,
     ui: ChatUi,
     render_memory: RenderMemory,
     stream_updates_since_render: usize = 0,
@@ -4773,6 +4953,14 @@ const App = struct {
             init_args.io,
             temporary_directory,
         );
+        self.file_picker = try backend.FilePicker.open(
+            init_args.gpa,
+            init_args.io,
+            .{ .context = self, .notify = wakeFilePicker },
+            .{},
+        );
+        errdefer self.file_picker.deinit();
+        self.ui.file_picker = &self.file_picker;
         self.stream_updates_since_render = 0;
         self.closed = false;
 
@@ -4796,6 +4984,7 @@ const App = struct {
     }
 
     fn deinit(self: *App) void {
+        self.file_picker.deinit();
         self.conversation.deinit();
         self.releaseImages();
         self.render_memory.deinit(self.vx.window());
@@ -4809,6 +4998,11 @@ const App = struct {
     fn wake(context: *anyopaque) void {
         const self: *App = @ptrCast(@alignCast(context));
         _ = self.loop.tryPostEvent(.conversation_wake) catch false;
+    }
+
+    fn wakeFilePicker(context: *anyopaque) void {
+        const self: *App = @ptrCast(@alignCast(context));
+        _ = self.loop.tryPostEvent(.file_picker_wake) catch false;
     }
 
     fn run(self: *App) !void {
@@ -4882,14 +5076,16 @@ const App = struct {
                     }
                 },
                 .conversation_wake => redraw = false,
+                .file_picker_wake => redraw = false,
                 .input_error => |err| return err,
             }
             const conversation_drain = try self.drainConversation();
+            const file_picker_redraw = try self.drainFilePicker();
             if (conversation_drain.continue_drain) {
                 conversation_backlog = true;
             }
             if (!self.closed) {
-                if (conversation_drain.redraw or
+                if (conversation_drain.redraw or file_picker_redraw or
                     (redraw and !composer_redraw))
                 {
                     try self.render();
@@ -4969,6 +5165,17 @@ const App = struct {
             }
         }
         return .{ .redraw = redraw, .continue_drain = true };
+    }
+
+    fn drainFilePicker(self: *App) !bool {
+        var redraw = false;
+        while (try self.file_picker.tryTakeUpdate()) |value| {
+            var update = value;
+            defer update.deinit();
+            try self.ui.applyFilePickerUpdate(&update);
+            redraw = true;
+        }
+        return redraw;
     }
 
     fn render(self: *App) !void {
@@ -7802,6 +8009,86 @@ test "slash command parsing preserves argument suffixes" {
         backend.SessionCatalogRequest.local,
         resumeCatalogRequest("/resume"),
     );
+}
+
+test "file reference query follows the active composer token" {
+    const start = fileReferenceQuery("@cli", 4).?;
+    try std.testing.expectEqual(@as(usize, 0), start.start);
+    try std.testing.expectEqualStrings("cli", start.query);
+
+    const middle = fileReferenceQuery("check @cli/src next", 14).?;
+    try std.testing.expectEqual(@as(usize, 6), middle.start);
+    try std.testing.expectEqualStrings("cli/src", middle.query);
+
+    try std.testing.expect(fileReferenceQuery("email@example.com", 17) == null);
+    try std.testing.expect(fileReferenceQuery("check @cli/src", 5) == null);
+}
+
+test "file picker update projects ranked paths into the menu" {
+    var ui: ChatUi = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .input = TextInput.init(std.testing.allocator),
+        .cwd = try std.testing.allocator.dupe(u8, "."),
+        .menu_mode = .files,
+    };
+    defer ui.deinit();
+    var first = ".visible-hidden".*;
+    var second = "src/main.zig".*;
+    var paths = [_][]u8{ &first, &second };
+    var update: backend.FilePickerUpdate = .{ .results = .{
+        .allocator = undefined,
+        .paths = &paths,
+        .refreshing = false,
+        .truncated = false,
+    } };
+    try ui.applyFilePickerUpdate(&update);
+
+    try std.testing.expectEqual(@as(usize, 2), ui.file_paths.items.len);
+    try std.testing.expectEqualStrings(".visible-hidden", ui.menu.selected().?.key);
+}
+
+test "file picker refresh preserves selection without borrowing freed paths" {
+    var ui: ChatUi = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .input = TextInput.init(std.testing.allocator),
+        .cwd = try std.testing.allocator.dupe(u8, "."),
+        .menu_mode = .files,
+    };
+    defer ui.deinit();
+    try ui.replaceFilePaths(&.{ "a.zig", "b.zig" });
+    ui.menu.move(.next);
+    try std.testing.expectEqualStrings("b.zig", ui.menu.selected().?.key);
+
+    try ui.replaceFilePaths(&.{ "a.zig", "b.zig", "c.zig" });
+    try std.testing.expectEqualStrings("b.zig", ui.menu.selected().?.key);
+}
+
+test "file menu selection replaces the active reference and preserves suffix" {
+    var ui: ChatUi = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .input = TextInput.init(std.testing.allocator),
+        .cwd = try std.testing.allocator.dupe(u8, "."),
+        .phase = .ready,
+        .menu_mode = .files,
+    };
+    defer ui.deinit();
+    try ui.replaceFilePaths(&.{"cli/src/chat.zig"});
+    try ui.input.insertSliceAtCursor("see @cli later");
+    for (0..6) |_| ui.input.cursorLeft();
+
+    var unused: backend.Conversation = undefined;
+    try ui.activateMenu(&unused);
+
+    const contents = try ui.input.toOwnedContents(std.testing.allocator);
+    defer std.testing.allocator.free(contents);
+    try std.testing.expectEqualStrings(
+        "see @cli/src/chat.zig later",
+        contents,
+    );
+    try std.testing.expectEqual(MenuMode.closed, ui.menu_mode);
 }
 
 test "arrow selection replaces typed ask-user input" {
