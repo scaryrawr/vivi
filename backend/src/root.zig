@@ -10,7 +10,7 @@ const tool_activity = @import("tool_activity.zig");
 const tools = @import("tools.zig");
 
 pub const version = build_options.version;
-pub const abi_version: u32 = 1;
+pub const abi_version: u32 = 2;
 pub const Conversation = conversation.Conversation;
 pub const ConversationEvent = conversation.Event;
 pub const ConversationWake = conversation.Wake;
@@ -61,20 +61,8 @@ pub const Settings = settings.Settings;
 pub const loadSettings = settings.load;
 pub const saveDefaultSelection = settings.saveDefaultSelection;
 
-pub const Lifecycle = enum(u32) {
-    scaffold = 0,
-};
-
-pub const Status = struct {
-    abi_version: u32 = abi_version,
-    lifecycle: Lifecycle = .scaffold,
-};
-
-pub fn scaffoldStatus() Status {
-    return .{};
-}
-
 pub const ConversationOptions = struct {
+    working_directory: []const u8,
     model: ?[]const u8 = null,
     reasoning: ?ReasoningEffort = null,
     settings_path: ?[]const u8 = null,
@@ -83,6 +71,7 @@ pub const ConversationOptions = struct {
 };
 
 const ConversationContext = struct {
+    working_directory: []u8,
     model: ?[]u8,
     reasoning: ?ReasoningEffort,
     settings_path: ?[]u8,
@@ -97,6 +86,11 @@ const ConversationContext = struct {
         const context = try allocator.create(ConversationContext);
         errdefer allocator.destroy(context);
 
+        const working_directory = try allocator.dupe(
+            u8,
+            options.working_directory,
+        );
+        errdefer allocator.free(working_directory);
         const model = if (options.model) |value|
             try allocator.dupe(u8, value)
         else
@@ -114,6 +108,7 @@ const ConversationContext = struct {
         errdefer if (sessions_directory) |value| allocator.free(value);
 
         context.* = .{
+            .working_directory = working_directory,
             .model = model,
             .reasoning = options.reasoning,
             .settings_path = settings_path,
@@ -138,6 +133,7 @@ const ConversationContext = struct {
         pointer: *anyopaque,
     ) void {
         const self: *ConversationContext = @ptrCast(@alignCast(pointer));
+        allocator.free(self.working_directory);
         if (self.model) |model| allocator.free(model);
         if (self.settings_path) |path| allocator.free(path);
         if (self.sessions_directory) |path| allocator.free(path);
@@ -192,6 +188,22 @@ pub fn openConversation(
         runSdkConversation,
         ConversationContext.destroy,
     );
+}
+
+test "conversation contexts retain their explicit working directories" {
+    const allocator = std.testing.allocator;
+    const first = try ConversationContext.init(
+        allocator,
+        .{ .working_directory = "/tmp/first" },
+    );
+    defer ConversationContext.destroy(allocator, first);
+    const second = try ConversationContext.init(
+        allocator,
+        .{ .working_directory = "/tmp/second" },
+    );
+    defer ConversationContext.destroy(allocator, second);
+    try std.testing.expectEqualStrings("/tmp/first", first.working_directory);
+    try std.testing.expectEqualStrings("/tmp/second", second.working_directory);
 }
 
 const MinimalCodingAgent = struct {
@@ -2254,17 +2266,9 @@ fn runSdkConversation(
     const context: *ConversationContext = @ptrCast(
         @alignCast(opaque_context),
     );
-    var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const cwd_len = std.process.currentPath(
-        worker.io(),
-        &cwd_buffer,
-    ) catch |err| {
-        worker.closeFailure(.startup, @errorName(err));
-        return;
-    };
     var active_working_directory = worker.allocator().dupe(
         u8,
-        cwd_buffer[0..cwd_len],
+        context.working_directory,
     ) catch |err| {
         worker.closeFailure(.startup, @errorName(err));
         return;
@@ -3426,13 +3430,6 @@ fn runSdkConversation(
             },
         }
     }
-}
-
-test "scaffold status is stable" {
-    const status = scaffoldStatus();
-
-    try std.testing.expectEqual(abi_version, status.abi_version);
-    try std.testing.expectEqual(Lifecycle.scaffold, status.lifecycle);
 }
 
 test "image tool result serializes binary content for Copilot, not the transcript" {

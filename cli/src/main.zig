@@ -3,6 +3,7 @@ const backend = @import("vivi_backend");
 const chat = @import("chat.zig");
 
 const ChatOptions = struct {
+    native: bool = false,
     model: ?[]const u8 = null,
     reasoning: ?backend.ReasoningEffort = null,
 };
@@ -34,17 +35,28 @@ const Command = union(enum) {
         if (std.mem.eql(u8, args[1], "chat")) {
             var options: ChatOptions = .{};
             var index: usize = 2;
-            while (index < args.len) : (index += 2) {
-                if (index + 1 >= args.len) return error.InvalidArguments;
-                if (std.mem.eql(u8, args[index], "--model")) {
+            while (index < args.len) {
+                if (std.mem.eql(u8, args[index], "--native")) {
+                    options.native = true;
+                    index += 1;
+                } else if (std.mem.eql(u8, args[index], "--model")) {
+                    if (index + 1 >= args.len) return error.InvalidArguments;
                     options.model = args[index + 1];
+                    index += 2;
                 } else if (std.mem.eql(u8, args[index], "--reasoning")) {
+                    if (index + 1 >= args.len) return error.InvalidArguments;
                     options.reasoning = backend.ReasoningEffort.parse(
                         args[index + 1],
                     ) catch return error.InvalidArguments;
+                    index += 2;
                 } else {
                     return error.InvalidArguments;
                 }
+            }
+            if (options.native and
+                (options.model != null or options.reasoning != null))
+            {
+                return error.InvalidArguments;
             }
             return .{ .chat = options };
         }
@@ -72,6 +84,12 @@ pub fn main(init: std.process.Init) !void {
         .models => try listModels(init, stdout),
         .chat => |options| {
             try stdout.flush();
+            const working_directory = try currentDirectory(init);
+            defer init.gpa.free(working_directory);
+            if (options.native) return launchNativeChat(
+                init,
+                working_directory,
+            );
             const settings_path = try defaultSettingsPath(
                 init.gpa,
                 init.environ_map,
@@ -86,12 +104,64 @@ pub fn main(init: std.process.Init) !void {
                 init,
                 options.model,
                 options.reasoning,
+                working_directory,
                 settings_path,
                 sessions_directory,
             );
         },
     }
+
     try stdout.flush();
+}
+
+fn currentDirectory(init: std.process.Init) ![]u8 {
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const length = try std.process.currentPath(init.io, &buffer);
+    return init.gpa.dupe(u8, buffer[0..length]);
+}
+
+fn launchNativeChat(init: std.process.Init, workspace: []const u8) !void {
+    if (@import("builtin").os.tag != .macos) {
+        return error.NativeChatUnsupported;
+    }
+    const escaped = try percentEncode(init.gpa, workspace);
+    defer init.gpa.free(escaped);
+    const url = try std.fmt.allocPrint(
+        init.gpa,
+        "vivi://chat?workspace={s}",
+        .{escaped},
+    );
+    defer init.gpa.free(url);
+    var child = try std.process.spawn(init.io, .{
+        .argv = &.{ "open", "-b", "com.scaryrawr.vivi", url },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .inherit,
+    });
+    const term = try child.wait(init.io);
+    switch (term) {
+        .exited => |code| if (code != 0) return error.NativeChatLaunchFailed,
+        else => return error.NativeChatLaunchFailed,
+    }
+}
+
+fn percentEncode(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(allocator);
+    for (input) |byte| {
+        if (std.ascii.isAlphanumeric(byte) or
+            std.mem.indexOfScalar(u8, "-._~/", byte) != null)
+        {
+            try output.append(allocator, byte);
+        } else {
+            const hex = "0123456789ABCDEF";
+            try output.appendSlice(
+                allocator,
+                &.{ '%', hex[byte >> 4], hex[byte & 0x0f] },
+            );
+        }
+    }
+    return output.toOwnedSlice(allocator);
 }
 
 fn defaultSessionsDirectory(
@@ -131,13 +201,13 @@ fn usableHome(value: ?[]const u8) ?[]const u8 {
 
 fn writeHelp(writer: *std.Io.Writer) !void {
     try writer.writeAll(
-        \\Usage: vivi [--help] [--version] [models] [chat [--model MODEL] [--reasoning LEVEL]]
+        \\Usage: vivi [--help] [--version] [models] [chat [--native] [--model MODEL] [--reasoning LEVEL]]
         \\
         \\Vivi command-line interface.
         \\
         \\Commands:
         \\  models     List available Copilot and OMLX models.
-        \\  chat       Start an interactive streaming Vivi chat.
+        \\  chat       Start an interactive streaming Vivi chat. --native opens macOS Vivi.
         \\
     );
 }
@@ -201,6 +271,16 @@ test "command parser accepts scaffold commands" {
         try Command.parse(&.{ "vivi", "chat" }),
     );
     try std.testing.expectEqual(
+        Command{ .chat = .{ .native = true } },
+        try Command.parse(&.{ "vivi", "chat", "--native" }),
+    );
+    try std.testing.expectError(
+        error.InvalidArguments,
+        Command.parse(
+            &.{ "vivi", "chat", "--native", "--model", "copilot/model" },
+        ),
+    );
+    try std.testing.expectEqual(
         Command.models,
         try Command.parse(&.{ "vivi", "models" }),
     );
@@ -228,6 +308,18 @@ test "command parser accepts scaffold commands" {
     try std.testing.expectEqualStrings(
         "copilot/model",
         chat_reasoning.chat.model.?,
+    );
+}
+
+test "native chat URL percent-encodes literal workspace bytes" {
+    const value = try percentEncode(
+        std.testing.allocator,
+        "/tmp/Vivi chat/日本語",
+    );
+    defer std.testing.allocator.free(value);
+    try std.testing.expectEqualStrings(
+        "/tmp/Vivi%20chat/%E6%97%A5%E6%9C%AC%E8%AA%9E",
+        value,
     );
 }
 

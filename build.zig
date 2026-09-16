@@ -69,6 +69,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("backend/src/c_api.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
     c_api.addImport("vivi_backend", backend);
     c_api.addIncludePath(b.path("backend/include"));

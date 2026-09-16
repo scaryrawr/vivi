@@ -3,11 +3,22 @@
 #include <assert.h>
 
 int main(void) {
-    vivi_backend_status_t status = {0};
+    vivi_backend_conversation_t *conversation = 0;
+    vivi_backend_conversation_options_t options = {
+        .working_directory = (const uint8_t *)"/tmp",
+        .working_directory_length = 4,
+        .wake = 0,
+        .wake_context = 0,
+    };
+    vivi_backend_event_t event = {0};
 
-    assert(vivi_backend_status(&status) == VIVI_BACKEND_OK);
-    assert(status.abi_version == VIVI_BACKEND_ABI_VERSION);
-    assert(status.lifecycle == VIVI_BACKEND_LIFECYCLE_SCAFFOLD);
-    assert(vivi_backend_status(0) == VIVI_BACKEND_INVALID_ARGUMENT);
+    assert(vivi_backend_open(0, &conversation) == VIVI_BACKEND_INVALID_ARGUMENT);
+    assert(vivi_backend_open(&options, &conversation) == VIVI_BACKEND_OK);
+    assert(conversation != 0);
+    assert(vivi_backend_submit(conversation, (const uint8_t *)"", 0) == VIVI_BACKEND_INVALID_ARGUMENT);
+    assert(vivi_backend_next_event(conversation, &event, 0, 0) != VIVI_BACKEND_INVALID_ARGUMENT);
+    assert(vivi_backend_close(conversation) == VIVI_BACKEND_OK);
+    assert(vivi_backend_close(conversation) == VIVI_BACKEND_OK);
+    vivi_backend_destroy(conversation);
     return 0;
 }
