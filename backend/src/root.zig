@@ -2537,7 +2537,6 @@ fn runSdkConversation(
                     };
                     continue;
                 }
-                const broader = key.scope == .broader;
                 var target: session_store.Record = switch (targets.*) {
                     .local => |index| blk: {
                         if (key.scope != .local or key.slot >= index.records.len) {
@@ -2577,11 +2576,12 @@ fn runSdkConversation(
                             continue;
                         }
                         const record = records[key.slot];
-                        break :blk session_store.Record.init(
+                        break :blk session_store.Record.initWithTitle(
                             worker.allocator(),
                             record.id,
                             record.working_directory,
                             active_plan.id(),
+                            record.title,
                             active_plan.selection().reasoning,
                             0,
                         ) catch |err| {
@@ -2613,16 +2613,7 @@ fn runSdkConversation(
                     };
                     const now = unixMilliseconds(worker.io());
                     target.last_used_unix_ms = now;
-                    if (store) |*value| (if (broader)
-                        value.recordCreated(
-                            target.id,
-                            target.working_directory,
-                            target.model_id,
-                            target.reasoning,
-                            now,
-                        )
-                    else
-                        value.touch(&target, now)) catch |err| {
+                    if (store) |*value| value.touch(&target, now) catch |err| {
                         var mutable = snapshot;
                         mutable.deinit();
                         worker.completeSessionResume(.{
@@ -2792,16 +2783,7 @@ fn runSdkConversation(
                     worker.closeFailure(.stream, @errorName(err));
                     return;
                 };
-                if (store) |*value| (if (broader)
-                    value.recordCreated(
-                        target.id,
-                        target.working_directory,
-                        target.model_id,
-                        target.reasoning,
-                        now,
-                    )
-                else
-                    value.touch(&target, now)) catch |err| {
+                if (store) |*value| value.touch(&target, now) catch |err| {
                     var mutable_summary = summary;
                     mutable_summary.deinit();
                     var mutable_snapshot = snapshot;

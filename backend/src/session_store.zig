@@ -53,7 +53,7 @@ pub const Record = struct {
         );
     }
 
-    fn initWithTitle(
+    pub fn initWithTitle(
         allocator: std.mem.Allocator,
         id: []const u8,
         working_directory: []const u8,
@@ -692,7 +692,10 @@ fn mergeRecord(
 ) !void {
     for (records.items) |*record| {
         if (!std.mem.eql(u8, record.id, candidate.id)) continue;
-        if (candidate.last_used_unix_ms > record.last_used_unix_ms) {
+        if (candidate.last_used_unix_ms > record.last_used_unix_ms or
+            (candidate.last_used_unix_ms == record.last_used_unix_ms and
+                record.title == null and candidate.title != null))
+        {
             var replacement = candidate;
             if (replacement.title == null) {
                 replacement.title = if (record.title) |title|
@@ -983,6 +986,73 @@ test "session store persists generated titles" {
         index.records[0].title.?,
     );
     try std.testing.expectEqual(@as(i64, 20), index.records[0].last_used_unix_ms);
+}
+
+test "session store promotes a titled remote record" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.createDirPath(std.testing.io, "sessions");
+    const directory = try temporary.dir.realPathFileAlloc(
+        std.testing.io,
+        "sessions",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(directory);
+    var store = try Store.initWithWriterId(
+        std.testing.allocator,
+        std.testing.io,
+        directory,
+        [_]u8{'a'} ** writer_id_hex_len,
+    );
+    defer store.deinit();
+    var remote = try Record.initWithTitle(
+        std.testing.allocator,
+        "session-a",
+        "/work/a",
+        "copilot/default",
+        "Remote session",
+        .off,
+        10,
+    );
+    defer remote.deinit();
+
+    try store.touch(&remote, 20);
+
+    var index = try store.list();
+    defer index.deinit();
+    try std.testing.expectEqualStrings("Remote session", index.records[0].title.?);
+}
+
+test "session store keeps a title from an equal-timestamp shard" {
+    var records: std.ArrayList(Record) = .empty;
+    defer {
+        for (records.items) |*record| record.deinit();
+        records.deinit(std.testing.allocator);
+    }
+    try records.append(
+        std.testing.allocator,
+        try Record.init(
+            std.testing.allocator,
+            "session-a",
+            "/work/a",
+            "copilot/default",
+            .off,
+            10,
+        ),
+    );
+    const titled = try Record.initWithTitle(
+        std.testing.allocator,
+        "session-a",
+        "/work/a",
+        "copilot/default",
+        "Remote session",
+        .off,
+        10,
+    );
+
+    try mergeRecord(std.testing.allocator, &records, titled);
+
+    try std.testing.expectEqualStrings("Remote session", records.items[0].title.?);
 }
 
 test "session store rejects mismatched writer identity" {
