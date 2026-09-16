@@ -707,6 +707,10 @@ fn mergeRecord(
             record.* = replacement;
         } else {
             var discarded = candidate;
+            if (record.title == null and discarded.title != null) {
+                record.title = discarded.title;
+                discarded.title = null;
+            }
             discarded.deinit();
         }
         return;
@@ -1052,6 +1056,39 @@ test "session store keeps a title from an equal-timestamp shard" {
 
     try mergeRecord(std.testing.allocator, &records, titled);
 
+    try std.testing.expectEqualStrings("Remote session", records.items[0].title.?);
+}
+
+test "session store keeps a title from an older mixed-version shard" {
+    var records: std.ArrayList(Record) = .empty;
+    defer {
+        for (records.items) |*record| record.deinit();
+        records.deinit(std.testing.allocator);
+    }
+    try records.append(
+        std.testing.allocator,
+        try Record.init(
+            std.testing.allocator,
+            "session-a",
+            "/work/a",
+            "copilot/default",
+            .off,
+            20,
+        ),
+    );
+    const older_titled = try Record.initWithTitle(
+        std.testing.allocator,
+        "session-a",
+        "/work/a",
+        "copilot/default",
+        "Remote session",
+        .off,
+        10,
+    );
+
+    try mergeRecord(std.testing.allocator, &records, older_titled);
+
+    try std.testing.expectEqual(@as(i64, 20), records.items[0].last_used_unix_ms);
     try std.testing.expectEqualStrings("Remote session", records.items[0].title.?);
 }
 
