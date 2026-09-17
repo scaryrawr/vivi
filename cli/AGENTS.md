@@ -22,3 +22,5 @@ presentation bytes.
 
 Markdown fenced code uses `vivi_backend.presentCodeFragment`; the backend owns
 language aliases and Tree-sitter tokens while the CLI owns its highlight cache.
+Cache identity must cover the complete rendered fence, even when backend syntax
+parsing is intentionally bounded to a prefix.
