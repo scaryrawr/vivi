@@ -19,26 +19,14 @@ struct ContentView: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
       }
-      HStack {
-        TextField("Ask Vivi", text: $store.draft)
-          .textFieldStyle(.roundedBorder)
-          .onSubmit(store.submit)
-        Button("Send", action: store.submit)
-          .keyboardShortcut(.return, modifiers: .command)
-          .disabled(
-            store.isBusy || store.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-      }
-      Text(status)
-        .font(.caption)
-        .foregroundStyle(.secondary)
-        .frame(maxWidth: .infinity, alignment: .leading)
+      composer
     }
     .padding(20)
     .frame(minWidth: 620, minHeight: 420)
   }
 
   private var header: some View {
-    VStack(alignment: .leading, spacing: 8) {
+    VStack(alignment: .leading, spacing: 4) {
       Text(store.sessionTitle)
         .font(.title2.weight(.semibold))
       Text(store.workspace)
@@ -46,67 +34,115 @@ struct ContentView: View {
         .foregroundStyle(.secondary)
         .lineLimit(1)
         .truncationMode(.middle)
-      HStack(spacing: 10) {
-        Picker(
-          "Model",
-          selection: Binding(
-            get: { store.selectedModelID ?? "" },
-            set: store.selectModel)
-        ) {
-          if store.catalog != nil {
-            ForEach(store.modelChoices) { model in
-              Text(
-                model.detail.isEmpty
-                  ? model.displayName : "\(model.displayName) · \(model.detail)"
-              )
-              .tag(model.id)
-            }
-          } else {
-            Text(store.modelState == .loading ? "Loading models…" : "Models unavailable").tag("")
-          }
-        }
-        .pickerStyle(.menu)
-        .frame(maxWidth: 310)
-        .disabled(store.modelState != .ready || store.catalog == nil || store.isBusy)
-
-        Picker(
-          "Reasoning",
-          selection: Binding(
-            get: { store.selectedReasoning ?? .off },
-            set: store.selectReasoning)
-        ) {
-          ForEach(store.reasoningChoices) { effort in
-            Text(
-              effort == selectedModel?.advertisedDefaultReasoning
-                ? "\(effort.label) (default)" : effort.label
-            )
-            .tag(effort)
-          }
-        }
-        .pickerStyle(.menu)
-        .frame(maxWidth: 190)
-        .disabled(
-          store.modelState != .ready || store.reasoningChoices.isEmpty || store.isBusy)
-
-        Button(action: store.refreshModels) {
-          Image(systemName: "arrow.clockwise")
-        }
-        .help("Refresh models")
-        .disabled(store.modelState != .ready || store.isBusy)
-
-        if store.modelState == .loading || store.modelState == .refreshing
-          || store.modelState == .switching
-        {
-          ProgressView()
-            .controlSize(.small)
-        }
-      }
     }
     .frame(maxWidth: .infinity, alignment: .leading)
   }
 
+  private var composer: some View {
+    VStack(alignment: .leading, spacing: 12) {
+      TextField(
+        "Ask anything. Use / for commands…",
+        text: $store.draft,
+        axis: .vertical
+      )
+      .textFieldStyle(.plain)
+      .lineLimit(2...6)
+      .onSubmit(store.submit)
+
+      HStack(spacing: 10) {
+        modelMenu
+
+        if store.modelState == .loading || store.modelState == .refreshing
+          || store.modelState == .switching || store.lifecycle == .responding
+        {
+          ProgressView()
+            .controlSize(.small)
+            .help(status)
+        }
+
+        Spacer()
+
+        Button(action: store.submit) {
+          Image(systemName: "arrow.up")
+            .font(.system(size: 14, weight: .semibold))
+            .foregroundStyle(canSubmit ? Color.white : Color.secondary)
+            .frame(width: 30, height: 30)
+            .background(
+              canSubmit ? Color.accentColor : Color.secondary.opacity(0.14),
+              in: Circle())
+        }
+        .buttonStyle(.plain)
+        .keyboardShortcut(.return, modifiers: .command)
+        .help("Send")
+        .disabled(!canSubmit)
+      }
+    }
+    .padding(.horizontal, 14)
+    .padding(.vertical, 12)
+    .background(.background, in: RoundedRectangle(cornerRadius: 16))
+    .overlay {
+      RoundedRectangle(cornerRadius: 16)
+        .stroke(.secondary.opacity(0.45), lineWidth: 1)
+    }
+  }
+
+  private var modelMenu: some View {
+    Menu {
+      ForEach(store.modelChoices) { model in
+        Menu(model.displayName) {
+          if !model.detail.isEmpty {
+            Text(model.detail)
+          }
+          ForEach(model.reasoning) { effort in
+            Button {
+              store.select(modelID: model.id, reasoning: effort)
+            } label: {
+              HStack {
+                Text(
+                  effort == model.advertisedDefaultReasoning
+                    ? "\(effort.label) (default)" : effort.label)
+                if store.selectedModelID == model.id && store.selectedReasoning == effort {
+                  Image(systemName: "checkmark")
+                }
+              }
+            }
+          }
+        }
+      }
+      Divider()
+      Button("Refresh Models", systemImage: "arrow.clockwise", action: store.refreshModels)
+    } label: {
+      HStack(spacing: 5) {
+        Text(modelLabel)
+          .lineLimit(1)
+        Image(systemName: "chevron.down")
+          .font(.caption2.weight(.semibold))
+      }
+      .font(.callout)
+      .foregroundStyle(.secondary)
+      .padding(.horizontal, 8)
+      .frame(height: 28)
+      .contentShape(Rectangle())
+    }
+    .menuStyle(.borderlessButton)
+    .fixedSize()
+    .help(selectedModel?.detail ?? "Choose a model and reasoning level")
+    .disabled(store.modelState != .ready || store.catalog == nil || store.isBusy)
+  }
+
   private var selectedModel: ModelInfo? {
     store.modelChoices.first(where: { $0.id == store.selectedModelID })
+  }
+
+  private var modelLabel: String {
+    guard let model = selectedModel, let reasoning = store.selectedReasoning else {
+      return store.modelState == .loading ? "Loading models…" : "Models unavailable"
+    }
+    return "\(model.displayName) · \(reasoning.label)"
+  }
+
+  private var canSubmit: Bool {
+    !store.isBusy && !store.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
   }
 
   private var status: String {

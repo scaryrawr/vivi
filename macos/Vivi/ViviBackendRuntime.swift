@@ -253,7 +253,15 @@ final class NativeChatStore: ObservableObject {
 
   func selectReasoning(_ reasoning: ReasoningEffort) {
     guard let selection = confirmedSelection, reasoningChoices.contains(reasoning) else { return }
-    switchModel(ModelSelection(modelID: selection.modelID, reasoning: reasoning))
+    select(modelID: selection.modelID, reasoning: reasoning)
+  }
+
+  func select(modelID: String, reasoning: ReasoningEffort) {
+    guard
+      let model = modelChoices.first(where: { $0.id == modelID }),
+      model.reasoning.contains(reasoning)
+    else { return }
+    switchModel(ModelSelection(modelID: modelID, reasoning: reasoning))
   }
 
   func reduce(_ event: ChatEvent) {

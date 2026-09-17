@@ -100,6 +100,19 @@ final class ViviBackendRuntimeTests: XCTestCase {
     XCTAssertEqual(store.modelState, .ready)
   }
 
+  func testCombinedModelChoiceSubmitsOneValidSelection() {
+    let driver = FakeConversationDriver()
+    let store = NativeChatStore(workspace: "/tmp/work", driver: driver)
+    store.reduce(.modelCatalog(testCatalog()))
+
+    store.select(modelID: "copilot/gpt-5", reasoning: .high)
+
+    XCTAssertEqual(
+      driver.selections,
+      [ModelSelection(modelID: "copilot/gpt-5", reasoning: .high)])
+    XCTAssertEqual(store.modelState, .switching)
+  }
+
   func testCatalogRepresentsActiveSelectionMissingFromDiscovery() {
     let store = NativeChatStore(workspace: "/tmp/work", driver: FakeConversationDriver())
     let catalog = ModelCatalog(
@@ -236,6 +249,7 @@ private final class FakeConversationDriver: ViviConversationDriving {
   var submitResult = ConversationOperationResult.accepted
   var refreshResult = ConversationOperationResult.accepted
   var switchResult = ConversationOperationResult.accepted
+  var selections: [ModelSelection] = []
   private var receive: (@MainActor (ChatEvent) -> Void)?
 
   func start(
@@ -253,8 +267,9 @@ private final class FakeConversationDriver: ViviConversationDriving {
     refreshResult
   }
 
-  func switchModel(_: ModelSelection) -> ConversationOperationResult {
-    switchResult
+  func switchModel(_ selection: ModelSelection) -> ConversationOperationResult {
+    selections.append(selection)
+    return switchResult
   }
 
   func close(completion: @escaping @MainActor () -> Void) {
