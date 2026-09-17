@@ -23,9 +23,12 @@ int main(void) {
     assert(vivi_backend_open(&options, &conversation) == VIVI_BACKEND_OK);
     assert(conversation != 0);
     assert(vivi_backend_submit(conversation, (const uint8_t *)"", 0) == VIVI_BACKEND_INVALID_ARGUMENT);
-    assert(VIVI_BACKEND_ABI_VERSION == 4);
+    assert(VIVI_BACKEND_ABI_VERSION == 5);
     assert(VIVI_BACKEND_EVENT_CLOSED == 8);
     assert(VIVI_BACKEND_EVENT_MODEL_SWITCH == 14);
+    assert(VIVI_BACKEND_EVENT_TOOL_STARTED == 15);
+    assert(VIVI_BACKEND_EVENT_TOOL_FINISHED == 16);
+    assert(VIVI_BACKEND_TOOL_RESULT_IMAGE == 4);
     assert(vivi_backend_refresh_models(0) == VIVI_BACKEND_INVALID_ARGUMENT);
     assert(vivi_backend_switch_model(
                conversation,

@@ -205,6 +205,11 @@ const Projected = struct {
     content_kind: c.vivi_backend_content_kind_t = c.VIVI_BACKEND_CONTENT_NONE,
     text: []const u8 = "",
     selected_model_id: []const u8 = "",
+    tool_call_id: []const u8 = "",
+    tool_title: []const u8 = "",
+    tool_detail: []const u8 = "",
+    tool_input: []const u8 = "",
+    tool_result: c.vivi_backend_tool_result_t = c.VIVI_BACKEND_TOOL_RESULT_NONE,
     selected_reasoning: c.vivi_backend_reasoning_effort_t = c.VIVI_BACKEND_REASONING_NONE,
     models: []const backend.ModelInfo = &.{},
     model: ?*const backend.ModelInfo = null,
@@ -213,6 +218,28 @@ const Projected = struct {
     default_saved: bool = false,
     cleanup_failed: bool = false,
 };
+
+const ToolDisplay = struct {
+    title: []const u8,
+    detail: []const u8 = "",
+};
+
+fn toolDisplay(summary: backend.ToolSummary) ToolDisplay {
+    return switch (summary) {
+        .read => |value| .{ .title = "Read file", .detail = value.path },
+        .bash => |value| switch (value) {
+            .run => |run| .{ .title = "Run command", .detail = run.command },
+            .start => |start| .{ .title = "Start command", .detail = start.command },
+            .list => .{ .title = "List Bash sessions" },
+            .read => |read| .{ .title = "Read Bash", .detail = read.shell_id },
+            .write => |write| .{ .title = "Write Bash", .detail = write.shell_id },
+            .stop => |stop| .{ .title = "Stop Bash", .detail = stop.shell_id },
+        },
+        .edit => |value| .{ .title = "Edit file", .detail = value.path },
+        .write => |value| .{ .title = "Write file", .detail = value.path },
+        .other => |value| .{ .title = value.name },
+    };
+}
 
 fn project(event: *const backend.ConversationEvent) ?Projected {
     return switch (event.*) {
@@ -247,6 +274,34 @@ fn project(event: *const backend.ConversationEvent) ?Projected {
             .kind = c.VIVI_BACKEND_EVENT_ASSISTANT_COMPLETE,
             .content_kind = c.VIVI_BACKEND_CONTENT_TEXT,
             .text = text.bytes,
+        },
+        .tool_activity => |*update| switch (update.*) {
+            .started => |*started| blk: {
+                const display = toolDisplay(started.invocation.summary);
+                break :blk .{
+                    .kind = c.VIVI_BACKEND_EVENT_TOOL_STARTED,
+                    .content_kind = c.VIVI_BACKEND_CONTENT_TOOL,
+                    .tool_call_id = started.call_id.bytes,
+                    .tool_title = display.title,
+                    .tool_detail = display.detail,
+                    .tool_input = started.invocation.arguments_json,
+                    .tool_result = c.VIVI_BACKEND_TOOL_RESULT_RUNNING,
+                };
+            },
+            .finished => |*finished| .{
+                .kind = c.VIVI_BACKEND_EVENT_TOOL_FINISHED,
+                .content_kind = c.VIVI_BACKEND_CONTENT_TOOL,
+                .text = switch (finished.result) {
+                    .succeeded, .failed => |text| text,
+                    .image => |value| value.description,
+                },
+                .tool_call_id = finished.call_id.bytes,
+                .tool_result = switch (finished.result) {
+                    .succeeded => c.VIVI_BACKEND_TOOL_RESULT_SUCCEEDED,
+                    .failed => c.VIVI_BACKEND_TOOL_RESULT_FAILED,
+                    .image => c.VIVI_BACKEND_TOOL_RESULT_IMAGE,
+                },
+            },
         },
         .model_catalog => |*catalog| .{
             .kind = c.VIVI_BACKEND_EVENT_MODEL_CATALOG,
@@ -320,14 +375,15 @@ fn project(event: *const backend.ConversationEvent) ?Projected {
         .session_catalog_failed,
         .session_tracking_failed,
         .session_resume,
-        .tool_activity,
         .command_completed,
         => null,
     };
 }
 
 fn byteCount(projected: Projected) !u32 {
-    var total: u64 = projected.text.len + projected.selected_model_id.len;
+    var total: u64 = projected.text.len + projected.selected_model_id.len +
+        projected.tool_call_id.len + projected.tool_title.len +
+        projected.tool_detail.len + projected.tool_input.len;
     for (projected.models) |model| {
         total += model.id.len + model.display_name.len;
     }
@@ -393,6 +449,11 @@ fn copyProjected(
             .offset = @intCast(projected.text.len),
             .length = @intCast(projected.selected_model_id.len),
         },
+        .tool_call_id = .{ .offset = 0, .length = 0 },
+        .tool_title = .{ .offset = 0, .length = 0 },
+        .tool_detail = .{ .offset = 0, .length = 0 },
+        .tool_input = .{ .offset = 0, .length = 0 },
+        .tool_result = projected.tool_result,
         .selected_reasoning = projected.selected_reasoning,
         .switch_outcome = projected.switch_outcome,
         .history_effect = projected.history_effect,
@@ -419,6 +480,26 @@ fn copyProjected(
         byte_destination,
         &offset,
         projected.selected_model_id,
+    );
+    output.tool_call_id = appendBytes(
+        byte_destination,
+        &offset,
+        projected.tool_call_id,
+    );
+    output.tool_title = appendBytes(
+        byte_destination,
+        &offset,
+        projected.tool_title,
+    );
+    output.tool_detail = appendBytes(
+        byte_destination,
+        &offset,
+        projected.tool_detail,
+    );
+    output.tool_input = appendBytes(
+        byte_destination,
+        &offset,
+        projected.tool_input,
     );
     var model_index: usize = 0;
     for (projected.models) |*model| {
@@ -450,6 +531,11 @@ export fn vivi_backend_next_event(
             .model_count = 0,
             .content = .{ .offset = 0, .length = 0 },
             .selected_model_id = .{ .offset = 0, .length = 0 },
+            .tool_call_id = .{ .offset = 0, .length = 0 },
+            .tool_title = .{ .offset = 0, .length = 0 },
+            .tool_detail = .{ .offset = 0, .length = 0 },
+            .tool_input = .{ .offset = 0, .length = 0 },
+            .tool_result = c.VIVI_BACKEND_TOOL_RESULT_NONE,
             .selected_reasoning = c.VIVI_BACKEND_REASONING_NONE,
             .switch_outcome = c.VIVI_BACKEND_MODEL_SWITCH_NONE,
             .history_effect = c.VIVI_BACKEND_HISTORY_NONE,
@@ -685,4 +771,159 @@ test "C session title is a distinct typed text event" {
     const projected = project(&event).?;
     try std.testing.expect(projected.kind == c.VIVI_BACKEND_EVENT_SESSION_TITLE);
     try std.testing.expectEqualStrings("Native title", projected.text);
+}
+
+test "C tool start copy-out is atomic and includes display fields" {
+    const allocator = std.testing.allocator;
+    var started = try backend.ToolStarted.init(
+        allocator,
+        "call-read",
+        "{\"path\":\"README.md\"}",
+        .{ .read = .{ .path = "README.md", .offset = null, .limit = null } },
+    );
+    var event: backend.ConversationEvent = .{
+        .tool_activity = .{ .started = started },
+    };
+    started = undefined;
+    defer event.deinit();
+
+    const projected = project(&event).?;
+    var metadata: c.vivi_backend_event_t = undefined;
+    var untouched = [_]u8{0xaa} ** 8;
+    try std.testing.expect(
+        c.VIVI_BACKEND_BUFFER_TOO_SMALL ==
+            copyProjected(projected, &metadata, &untouched, 1, null, 0),
+    );
+    try std.testing.expectEqual(@as(u8, 0xaa), untouched[0]);
+    try std.testing.expect(metadata.kind == c.VIVI_BACKEND_EVENT_TOOL_STARTED);
+    try std.testing.expect(
+        metadata.tool_result == c.VIVI_BACKEND_TOOL_RESULT_RUNNING,
+    );
+
+    const bytes = try allocator.alloc(u8, metadata.byte_count);
+    defer allocator.free(bytes);
+    try std.testing.expect(
+        c.VIVI_BACKEND_OK ==
+            copyProjected(
+                projected,
+                &metadata,
+                bytes.ptr,
+                @intCast(bytes.len),
+                null,
+                0,
+            ),
+    );
+    try std.testing.expectEqualStrings(
+        "call-read",
+        bytes[metadata.tool_call_id.offset..][0..metadata.tool_call_id.length],
+    );
+    try std.testing.expectEqualStrings(
+        "Read file",
+        bytes[metadata.tool_title.offset..][0..metadata.tool_title.length],
+    );
+    try std.testing.expectEqualStrings(
+        "README.md",
+        bytes[metadata.tool_detail.offset..][0..metadata.tool_detail.length],
+    );
+    try std.testing.expectEqualStrings(
+        "{\"path\":\"README.md\"}",
+        bytes[metadata.tool_input.offset..][0..metadata.tool_input.length],
+    );
+}
+
+fn expectToolCompletionCopyOut(
+    allocator: std.mem.Allocator,
+    event: *const backend.ConversationEvent,
+    expected: c.vivi_backend_tool_result_t,
+    expected_output: []const u8,
+) !void {
+    const projected = project(event).?;
+    var metadata: c.vivi_backend_event_t = undefined;
+    const bytes = try allocator.alloc(u8, try byteCount(projected));
+    defer allocator.free(bytes);
+    try std.testing.expect(
+        c.VIVI_BACKEND_OK ==
+            copyProjected(
+                projected,
+                &metadata,
+                bytes.ptr,
+                @intCast(bytes.len),
+                null,
+                0,
+            ),
+    );
+    try std.testing.expect(
+        metadata.kind == c.VIVI_BACKEND_EVENT_TOOL_FINISHED,
+    );
+    try std.testing.expect(metadata.tool_result == expected);
+    try std.testing.expectEqualStrings(
+        expected_output,
+        bytes[metadata.content.offset..][0..metadata.content.length],
+    );
+    try std.testing.expectEqualStrings(
+        "call-1",
+        bytes[metadata.tool_call_id.offset..][0..metadata.tool_call_id.length],
+    );
+}
+
+test "C tool completion copy-out distinguishes text failure and image" {
+    const allocator = std.testing.allocator;
+    {
+        var finished = try backend.ToolFinished.init(
+            allocator,
+            "call-1",
+            .{ .succeeded = "**done**" },
+        );
+        var event: backend.ConversationEvent = .{
+            .tool_activity = .{ .finished = finished },
+        };
+        finished = undefined;
+        defer event.deinit();
+        try expectToolCompletionCopyOut(
+            allocator,
+            &event,
+            c.VIVI_BACKEND_TOOL_RESULT_SUCCEEDED,
+            "**done**",
+        );
+    }
+    {
+        var finished = try backend.ToolFinished.init(
+            allocator,
+            "call-1",
+            .{ .failed = "permission denied" },
+        );
+        var event: backend.ConversationEvent = .{
+            .tool_activity = .{ .finished = finished },
+        };
+        finished = undefined;
+        defer event.deinit();
+        try expectToolCompletionCopyOut(
+            allocator,
+            &event,
+            c.VIVI_BACKEND_TOOL_RESULT_FAILED,
+            "permission denied",
+        );
+    }
+    {
+        var finished = try backend.ToolFinished.init(
+            allocator,
+            "call-1",
+            .{ .image = .{
+                .bytes = "png",
+                .format = .png,
+                .description = "chart.png",
+            } },
+        );
+        var event: backend.ConversationEvent = .{
+            .tool_activity = .{ .finished = finished },
+        };
+        finished = undefined;
+        defer event.deinit();
+        try expectToolCompletionCopyOut(
+            allocator,
+            &event,
+            c.VIVI_BACKEND_TOOL_RESULT_IMAGE,
+            "chart.png",
+        );
+    }
 }

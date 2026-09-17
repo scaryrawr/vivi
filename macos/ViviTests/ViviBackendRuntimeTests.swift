@@ -5,7 +5,7 @@ import XCTest
 
 @MainActor
 final class ViviBackendRuntimeTests: XCTestCase {
-  func testReducerStreamsLiteralAssistantTextIntoOneRow() {
+  func testReducerCreatesAssistantLazilyAfterReasoning() {
     let driver = FakeConversationDriver()
     let store = NativeChatStore(workspace: "/tmp/Vivi chat", driver: driver)
 
@@ -13,6 +13,8 @@ final class ViviBackendRuntimeTests: XCTestCase {
     store.draft = "Write a haiku"
     store.submit()
     store.reduce(.assistantStarted)
+    XCTAssertEqual(store.transcript.count, 1)
+    store.reduce(.reasoningComplete("finished thought"))
     store.reduce(.assistantDelta("old "))
     store.reduce(.assistantComplete("new answer"))
     store.reduce(.idle)
@@ -22,7 +24,8 @@ final class ViviBackendRuntimeTests: XCTestCase {
       store.transcript,
       [
         .user(id: store.transcript[0].id, text: "Write a haiku"),
-        .assistant(id: store.transcript[1].id, text: "new answer"),
+        .reasoning(id: store.transcript[1].id, text: "finished thought"),
+        .assistant(id: store.transcript[2].id, text: "new answer"),
       ])
   }
 
@@ -59,25 +62,113 @@ final class ViviBackendRuntimeTests: XCTestCase {
     XCTAssertEqual(store.lifecycle, .closed)
   }
 
-  func testReasoningAndSessionTitleStayDistinctFromAssistant() {
+  func testConsecutiveReasoningCompletionsCoalesce() {
     let store = NativeChatStore(
       workspace: "/tmp/work",
       driver: FakeConversationDriver()
     )
 
-    store.reduce(.sessionTitle("A useful title"))
     store.reduce(.assistantStarted)
-    store.reduce(.reasoningDelta("thinking"))
-    store.reduce(.reasoningComplete("finished thought"))
-    store.reduce(.assistantComplete("answer"))
+    store.reduce(.reasoningComplete("first"))
+    store.reduce(.reasoningComplete("second"))
 
-    XCTAssertEqual(store.sessionTitle, "A useful title")
     XCTAssertEqual(
       store.transcript,
-      [
-        .assistant(id: store.transcript[0].id, text: "answer"),
-        .reasoning(id: store.transcript[1].id, text: "finished thought"),
-      ])
+      [.reasoning(id: store.transcript[0].id, text: "first\n\nsecond")])
+  }
+
+  func testConsecutiveReasoningDeltaBlocksKeepParagraphBreak() {
+    let store = NativeChatStore(workspace: "/tmp/work", driver: FakeConversationDriver())
+
+    store.reduce(.assistantStarted)
+    store.reduce(.reasoningComplete("first"))
+    store.reduce(.reasoningDelta("sec"))
+    store.reduce(.reasoningDelta("ond"))
+    store.reduce(.reasoningComplete("second"))
+
+    XCTAssertEqual(
+      store.transcript,
+      [.reasoning(id: store.transcript[0].id, text: "first\n\nsecond")])
+  }
+
+  func testToolBetweenReasoningBlocksPreservesChronology() {
+    let store = NativeChatStore(workspace: "/tmp/work", driver: FakeConversationDriver())
+    let tool = ToolActivity(
+      callID: "call-1",
+      title: "Read file",
+      detail: "README.md",
+      input: #"{"path":"README.md"}"#,
+      result: .running,
+      output: "")
+
+    store.reduce(.assistantStarted)
+    store.reduce(.reasoningComplete("before"))
+    store.reduce(.toolStarted(tool))
+    store.reduce(.reasoningComplete("after"))
+    store.reduce(.assistantComplete("answer"))
+
+    XCTAssertEqual(store.transcript.count, 4)
+    guard case .reasoning(_, "before") = store.transcript[0],
+      case .tool(_, let inserted) = store.transcript[1],
+      case .reasoning(_, "after") = store.transcript[2],
+      case .assistant(_, "answer") = store.transcript[3]
+    else { return XCTFail("Expected reasoning, tool, reasoning, assistant order") }
+    XCTAssertEqual(inserted, tool)
+  }
+
+  func testEmptyToolRequestCompletionDoesNotCreateAssistantRow() {
+    let store = NativeChatStore(workspace: "/tmp/work", driver: FakeConversationDriver())
+    let tool = ToolActivity(
+      callID: "call-1",
+      title: "Read file",
+      detail: "README.md",
+      input: #"{"path":"README.md"}"#,
+      result: .running,
+      output: "")
+
+    store.reduce(.assistantStarted)
+    store.reduce(.assistantComplete(""))
+    store.reduce(.toolStarted(tool))
+    store.reduce(.toolFinished(callID: "call-1", result: .succeeded, output: "contents"))
+    store.reduce(.assistantDelta("done"))
+    store.reduce(.assistantComplete("done"))
+
+    XCTAssertEqual(store.transcript.count, 2)
+    guard case .tool(_, let finished) = store.transcript[0],
+      case .assistant(_, "done") = store.transcript[1]
+    else { return XCTFail("Expected tool followed by assistant without an empty row") }
+    XCTAssertEqual(finished.output, "contents")
+    XCTAssertEqual(finished.result, .succeeded)
+  }
+
+  func testToolFinishUpdatesOriginalRowByCallID() {
+    let store = NativeChatStore(workspace: "/tmp/work", driver: FakeConversationDriver())
+    let tool = ToolActivity(
+      callID: "call-1",
+      title: "Run command",
+      detail: "zig build test",
+      input: #"{"command":"zig build test"}"#,
+      result: .running,
+      output: "")
+    store.reduce(.toolStarted(tool))
+    let originalID = store.transcript[0].id
+
+    store.reduce(.toolFinished(callID: "call-1", result: .succeeded, output: "**passed**"))
+
+    XCTAssertEqual(store.transcript.count, 1)
+    XCTAssertEqual(store.transcript[0].id, originalID)
+    guard case .tool(_, let finished) = store.transcript[0] else {
+      return XCTFail("Expected tool row")
+    }
+    XCTAssertEqual(finished.result, .succeeded)
+    XCTAssertEqual(finished.output, "**passed**")
+  }
+
+  func testMarkdownRendererInterpretsBoldMarkup() {
+    let rendered = markdownAttributedString("**bold**")
+
+    XCTAssertEqual(String(rendered.characters), "bold")
+    XCTAssertFalse(String(rendered.characters).contains("**"))
   }
 
   func testRefreshFailureRetainsCatalogAndFailedSwitchRetainsSelection() {
@@ -217,6 +308,30 @@ final class ViviBackendRuntimeTests: XCTestCase {
 
     XCTAssertThrowsError(
       try NativeEventDecoder.decode(event, bytes: bytes, models: [model]))
+  }
+
+  func testDecoderCopiesToolStartFields() throws {
+    let bytes = Array(#"call-1Read fileREADME.md{"path":"README.md"}"#.utf8)
+    var event = vivi_backend_event_t()
+    event.kind = VIVI_BACKEND_EVENT_TOOL_STARTED
+    event.content_kind = VIVI_BACKEND_CONTENT_TOOL
+    event.byte_count = UInt32(bytes.count)
+    event.tool_call_id = vivi_backend_span_t(offset: 0, length: 6)
+    event.tool_title = vivi_backend_span_t(offset: 6, length: 9)
+    event.tool_detail = vivi_backend_span_t(offset: 15, length: 9)
+    event.tool_input = vivi_backend_span_t(offset: 24, length: 20)
+    event.tool_result = VIVI_BACKEND_TOOL_RESULT_RUNNING
+
+    XCTAssertEqual(
+      try NativeEventDecoder.decode(event, bytes: bytes, models: []),
+      .toolStarted(
+        ToolActivity(
+          callID: "call-1",
+          title: "Read file",
+          detail: "README.md",
+          input: #"{"path":"README.md"}"#,
+          result: .running,
+          output: "")))
   }
 
   func testNativeChatURLProducesWorkspaceOnlyRequest() {

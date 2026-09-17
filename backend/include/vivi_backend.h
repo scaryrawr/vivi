@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define VIVI_BACKEND_ABI_VERSION 4
+#define VIVI_BACKEND_ABI_VERSION 5
 
 typedef enum vivi_backend_result {
     VIVI_BACKEND_OK = 0,
@@ -55,6 +55,8 @@ typedef enum vivi_backend_event_kind {
     VIVI_BACKEND_EVENT_MODEL_CATALOG = 12,
     VIVI_BACKEND_EVENT_MODEL_CATALOG_FAILURE = 13,
     VIVI_BACKEND_EVENT_MODEL_SWITCH = 14,
+    VIVI_BACKEND_EVENT_TOOL_STARTED = 15,
+    VIVI_BACKEND_EVENT_TOOL_FINISHED = 16,
 } vivi_backend_event_kind_t;
 
 typedef enum vivi_backend_content_kind {
@@ -62,7 +64,16 @@ typedef enum vivi_backend_content_kind {
     VIVI_BACKEND_CONTENT_TEXT = 1,
     VIVI_BACKEND_CONTENT_MODEL_CATALOG = 2,
     VIVI_BACKEND_CONTENT_MODEL_SWITCH = 3,
+    VIVI_BACKEND_CONTENT_TOOL = 4,
 } vivi_backend_content_kind_t;
+
+typedef enum vivi_backend_tool_result {
+    VIVI_BACKEND_TOOL_RESULT_NONE = 0,
+    VIVI_BACKEND_TOOL_RESULT_RUNNING = 1,
+    VIVI_BACKEND_TOOL_RESULT_SUCCEEDED = 2,
+    VIVI_BACKEND_TOOL_RESULT_FAILED = 3,
+    VIVI_BACKEND_TOOL_RESULT_IMAGE = 4,
+} vivi_backend_tool_result_t;
 
 typedef enum vivi_backend_reasoning_effort {
     VIVI_BACKEND_REASONING_NONE = -1,
@@ -111,6 +122,11 @@ typedef struct vivi_backend_event {
     uint32_t model_count;
     vivi_backend_span_t content;
     vivi_backend_span_t selected_model_id;
+    vivi_backend_span_t tool_call_id;
+    vivi_backend_span_t tool_title;
+    vivi_backend_span_t tool_detail;
+    vivi_backend_span_t tool_input;
+    vivi_backend_tool_result_t tool_result;
     vivi_backend_reasoning_effort_t selected_reasoning;
     vivi_backend_model_switch_outcome_t switch_outcome;
     vivi_backend_history_effect_t history_effect;

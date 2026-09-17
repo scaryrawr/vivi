@@ -95,17 +95,34 @@ enum ModelControlState: Equatable {
   case switching
 }
 
+enum ToolResultState: Equatable {
+  case running
+  case succeeded
+  case failed
+  case image
+}
+
+struct ToolActivity: Equatable {
+  let callID: String
+  let title: String
+  let detail: String
+  let input: String
+  var result: ToolResultState
+  var output: String
+}
+
 enum ChatItem: Identifiable, Equatable {
   case user(id: UUID, text: String)
   case assistant(id: UUID, text: String)
   case reasoning(id: UUID, text: String)
+  case tool(id: UUID, activity: ToolActivity)
   case status(id: UUID, text: String)
   case failure(id: UUID, text: String)
 
   var id: UUID {
     switch self {
     case .user(let id, _), .assistant(let id, _), .reasoning(let id, _),
-      .status(let id, _), .failure(let id, _):
+      .tool(let id, _), .status(let id, _), .failure(let id, _):
       id
     }
   }
@@ -115,6 +132,8 @@ enum ChatItem: Identifiable, Equatable {
     case .user(_, let text), .assistant(_, let text), .reasoning(_, let text),
       .status(_, let text), .failure(_, let text):
       text
+    case .tool(_, let activity):
+      activity.output
     }
   }
 }
@@ -128,6 +147,8 @@ enum ChatEvent: Equatable {
   case reasoningComplete(String)
   case assistantDelta(String)
   case assistantComplete(String)
+  case toolStarted(ToolActivity)
+  case toolFinished(callID: String, result: ToolResultState, output: String)
   case modelCatalog(ModelCatalog)
   case modelCatalogFailure(String)
   case modelSwitch(ModelSwitchOutcome)
@@ -165,6 +186,7 @@ final class NativeChatStore: ObservableObject {
   let workspace: String
   private var activeAssistant: UUID?
   private var activeReasoning: UUID?
+  private var activeReasoningPrefix = ""
   private let driver: ViviConversationDriving
   private var closeCompletions: [@MainActor () -> Void] = []
 
@@ -222,9 +244,11 @@ final class NativeChatStore: ObservableObject {
     guard !prompt.isEmpty, lifecycle == .idle else { return }
     let result = driver.submit(prompt)
     guard result == .accepted else {
+      finishStreamingRows()
       transcript.append(.status(id: UUID(), text: message(for: result, action: "send message")))
       return
     }
+    finishStreamingRows()
     transcript.append(.user(id: UUID(), text: prompt))
     draft = ""
     lifecycle = .responding
@@ -278,29 +302,57 @@ final class NativeChatStore: ObservableObject {
     case .ready:
       lifecycle = .idle
     case .status(let text):
+      finishStreamingRows()
       transcript.append(.status(id: UUID(), text: text))
     case .sessionTitle(let title):
       sessionTitle = title
     case .assistantStarted:
-      let id = UUID()
-      activeAssistant = id
+      activeAssistant = nil
       activeReasoning = nil
-      transcript.append(.assistant(id: id, text: ""))
+      activeReasoningPrefix = ""
       lifecycle = .responding
     case .reasoningDelta(let text):
       updateReasoning(text, append: true)
     case .reasoningComplete(let text):
       updateReasoning(text, append: false)
       activeReasoning = nil
+      activeReasoningPrefix = ""
     case .assistantDelta(let text):
       replaceActiveAssistant(text, append: true)
     case .assistantComplete(let text):
-      replaceActiveAssistant(text, append: false)
+      if !text.isEmpty {
+        replaceActiveAssistant(text, append: false)
+      }
+      activeAssistant = nil
+    case .toolStarted(let activity):
+      activeReasoning = nil
+      activeReasoningPrefix = ""
+      activeAssistant = nil
+      if let index = transcript.firstIndex(where: { item in
+        guard case .tool(_, let existing) = item else { return false }
+        return existing.callID == activity.callID
+      }) {
+        let id = transcript[index].id
+        transcript[index] = .tool(id: id, activity: activity)
+      } else {
+        transcript.append(.tool(id: UUID(), activity: activity))
+      }
+    case .toolFinished(let callID, let result, let output):
+      guard
+        let index = transcript.firstIndex(where: { item in
+          guard case .tool(_, let activity) = item else { return false }
+          return activity.callID == callID
+        }), case .tool(let id, var activity) = transcript[index]
+      else { break }
+      activity.result = result
+      activity.output = output
+      transcript[index] = .tool(id: id, activity: activity)
     case .modelCatalog(let catalog):
       self.catalog = catalog
       confirmedSelection = catalog.selected
       modelState = .ready
     case .modelCatalogFailure(let message):
+      finishStreamingRows()
       transcript.append(.failure(id: UUID(), text: message))
       modelState = .ready
     case .modelSwitch(let outcome):
@@ -309,12 +361,15 @@ final class NativeChatStore: ObservableObject {
     case .idle:
       activeAssistant = nil
       activeReasoning = nil
+      activeReasoningPrefix = ""
       lifecycle = .idle
     case .failure(let message):
+      finishStreamingRows()
       transcript.append(.failure(id: UUID(), text: message))
     case .closed:
       activeAssistant = nil
       activeReasoning = nil
+      activeReasoningPrefix = ""
       finishClose()
     }
   }
@@ -343,6 +398,7 @@ final class NativeChatStore: ObservableObject {
   }
 
   private func apply(_ outcome: ModelSwitchOutcome) {
+    finishStreamingRows()
     switch outcome {
     case .unchanged(let model, let selection):
       confirm(model: model, selection: selection)
@@ -382,16 +438,31 @@ final class NativeChatStore: ObservableObject {
   }
 
   private func updateReasoning(_ text: String, append: Bool) {
+    var startsNewSegment = false
     if activeReasoning == nil {
-      let id = UUID()
-      activeReasoning = id
-      transcript.append(.reasoning(id: id, text: ""))
+      activeAssistant = nil
+      if case .reasoning(let id, let existing) = transcript.last {
+        activeReasoning = id
+        activeReasoningPrefix = existing.isEmpty ? "" : existing + "\n\n"
+        startsNewSegment = true
+      } else {
+        let id = UUID()
+        activeReasoning = id
+        activeReasoningPrefix = ""
+        transcript.append(.reasoning(id: id, text: ""))
+      }
     }
     guard let id = activeReasoning,
       let index = transcript.firstIndex(where: { $0.id == id }),
       case .reasoning(_, let existing) = transcript[index]
     else { return }
-    transcript[index] = .reasoning(id: id, text: append ? existing + text : text)
+    let replacement =
+      if append {
+        startsNewSegment ? activeReasoningPrefix + text : existing + text
+      } else {
+        activeReasoningPrefix + text
+      }
+    transcript[index] = .reasoning(id: id, text: replacement)
   }
 
   private func finishClose() {
@@ -403,7 +474,19 @@ final class NativeChatStore: ObservableObject {
     }
   }
 
+  private func finishStreamingRows() {
+    activeAssistant = nil
+    activeReasoning = nil
+    activeReasoningPrefix = ""
+  }
+
   private func replaceActiveAssistant(_ text: String, append: Bool) {
+    if activeAssistant == nil {
+      let id = UUID()
+      activeAssistant = id
+      activeReasoning = nil
+      transcript.append(.assistant(id: id, text: ""))
+    }
     guard let id = activeAssistant,
       let index = transcript.firstIndex(where: { $0.id == id }),
       case .assistant(_, let existing) = transcript[index]
@@ -420,6 +503,13 @@ final class NativeChatStore: ObservableObject {
     case .failed: "Could not \(action)."
     }
   }
+}
+
+func markdownAttributedString(_ text: String) -> AttributedString {
+  (try? AttributedString(
+    markdown: text,
+    options: .init(interpretedSyntax: .full)
+  )) ?? AttributedString(text)
 }
 
 enum NativeEventDecodingError: Error {
@@ -492,6 +582,37 @@ enum NativeEventDecoder {
     case VIVI_BACKEND_EVENT_REASONING_COMPLETE: return .reasoningComplete(content)
     case VIVI_BACKEND_EVENT_ASSISTANT_DELTA: return .assistantDelta(content)
     case VIVI_BACKEND_EVENT_ASSISTANT_COMPLETE: return .assistantComplete(content)
+    case VIVI_BACKEND_EVENT_TOOL_STARTED:
+      guard event.content_kind == VIVI_BACKEND_CONTENT_TOOL,
+        event.tool_result == VIVI_BACKEND_TOOL_RESULT_RUNNING
+      else { throw NativeEventDecodingError.malformed }
+      let callID = try text(event.tool_call_id)
+      let title = try text(event.tool_title)
+      guard !callID.isEmpty, !title.isEmpty else {
+        throw NativeEventDecodingError.malformed
+      }
+      return .toolStarted(
+        ToolActivity(
+          callID: callID,
+          title: title,
+          detail: try text(event.tool_detail),
+          input: try text(event.tool_input),
+          result: .running,
+          output: ""))
+    case VIVI_BACKEND_EVENT_TOOL_FINISHED:
+      guard event.content_kind == VIVI_BACKEND_CONTENT_TOOL else {
+        throw NativeEventDecodingError.malformed
+      }
+      let callID = try text(event.tool_call_id)
+      guard !callID.isEmpty else { throw NativeEventDecodingError.malformed }
+      let result: ToolResultState
+      switch event.tool_result {
+      case VIVI_BACKEND_TOOL_RESULT_SUCCEEDED: result = .succeeded
+      case VIVI_BACKEND_TOOL_RESULT_FAILED: result = .failed
+      case VIVI_BACKEND_TOOL_RESULT_IMAGE: result = .image
+      default: throw NativeEventDecodingError.malformed
+      }
+      return .toolFinished(callID: callID, result: result, output: content)
     case VIVI_BACKEND_EVENT_MODEL_CATALOG:
       guard event.content_kind == VIVI_BACKEND_CONTENT_MODEL_CATALOG else {
         throw NativeEventDecodingError.malformed

@@ -171,13 +171,13 @@ private struct ChatItemView: View {
         Text("Vivi")
           .font(.caption.weight(.semibold))
           .foregroundStyle(.secondary)
-        Text(text.isEmpty ? "…" : text)
+        Text(markdownAttributedString(text.isEmpty ? "…" : text))
           .textSelection(.enabled)
       }
       .frame(maxWidth: .infinity, alignment: .leading)
     case .reasoning(_, let text):
       DisclosureGroup("Reasoning") {
-        Text(text)
+        Text(markdownAttributedString(text))
           .font(.callout)
           .foregroundStyle(.secondary)
           .textSelection(.enabled)
@@ -186,6 +186,8 @@ private struct ChatItemView: View {
       }
       .padding(10)
       .background(.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+    case .tool(_, let activity):
+      ToolActivityView(activity: activity)
     case .status(_, let text):
       Label(text, systemImage: "info.circle")
         .font(.caption)
@@ -197,6 +199,85 @@ private struct ChatItemView: View {
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(.red.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+    }
+  }
+
+  private struct ToolActivityView: View {
+    let activity: ToolActivity
+
+    var body: some View {
+      DisclosureGroup {
+        VStack(alignment: .leading, spacing: 8) {
+          if !activity.detail.isEmpty {
+            detail("Detail", activity.detail, markdown: false)
+          }
+          if !activity.input.isEmpty {
+            detail("Input", activity.input, markdown: false)
+          }
+          if !activity.output.isEmpty {
+            detail("Output", activity.output, markdown: true)
+          }
+        }
+        .padding(.top, 6)
+      } label: {
+        Label {
+          HStack(spacing: 6) {
+            Text(activity.title)
+            Text(status)
+              .font(.caption)
+              .foregroundStyle(statusColor)
+          }
+        } icon: {
+          Image(systemName: icon)
+            .foregroundStyle(statusColor)
+        }
+      }
+      .padding(10)
+      .background(.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    @ViewBuilder
+    private func detail(_ label: String, _ value: String, markdown: Bool) -> some View {
+      VStack(alignment: .leading, spacing: 2) {
+        Text(label)
+          .font(.caption.weight(.semibold))
+          .foregroundStyle(.secondary)
+        if markdown {
+          Text(markdownAttributedString(value))
+            .textSelection(.enabled)
+        } else {
+          Text(value)
+            .textSelection(.enabled)
+        }
+      }
+      .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var status: String {
+      switch activity.result {
+      case .running: "Running"
+      case .succeeded: "Succeeded"
+      case .failed: "Failed"
+      case .image: "Image"
+      }
+    }
+
+    private var icon: String {
+      switch activity.result {
+      case .running: "circle.dotted"
+      case .succeeded: "checkmark.circle.fill"
+      case .failed: "xmark.circle.fill"
+      case .image: "photo"
+      }
+    }
+
+    private var statusColor: Color {
+      switch activity.result {
+      case .running: .secondary
+      case .succeeded: .green
+      case .failed: .red
+      case .image: .blue
+      }
     }
   }
 }
