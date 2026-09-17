@@ -488,14 +488,6 @@ const ToolEntry = struct {
         @memcpy(self.compact[0..marker.len], marker);
     }
 
-    fn ensureOutputHighlights(
-        self: *ToolEntry,
-        allocator: std.mem.Allocator,
-    ) !void {
-        if (self.output_highlights != null) return;
-        _ = allocator;
-    }
-
     fn deinit(self: *ToolEntry, allocator: std.mem.Allocator) void {
         if (self.preview) |*preview| preview.deinit(allocator);
         self.output_markdown_cache.deinit(allocator);
@@ -1698,7 +1690,6 @@ const Projection = struct {
                     &entry.tool,
                     entry_index,
                     window,
-                    false,
                     0,
                     0,
                 );
@@ -1786,7 +1777,6 @@ const Projection = struct {
                 tool,
                 entry_index,
                 window,
-                cache_highlights,
                 0,
                 std.math.maxInt(usize),
             ),
@@ -1799,7 +1789,6 @@ const Projection = struct {
         tool: *ToolEntry,
         entry_index: usize,
         window: vaxis.Window,
-        cache_highlights: bool,
         first: usize,
         last: usize,
     ) !usize {
@@ -1812,7 +1801,6 @@ const Projection = struct {
             tool,
             entry_index,
             window,
-            cache_highlights,
             first,
             last,
         );
@@ -1824,7 +1812,6 @@ const Projection = struct {
         tool: *ToolEntry,
         entry_index: usize,
         window: vaxis.Window,
-        cache_highlights: bool,
         first: usize,
         last: usize,
     ) !usize {
@@ -1846,10 +1833,6 @@ const Projection = struct {
                 std.meta.activeTag(completion) == .succeeded
             else
                 false;
-        if (cache_highlights and !render_markdown) {
-            try tool.ensureOutputHighlights(allocators.persistent);
-        }
-
         if (row >= first and row < last) {
             try self.lines.append(allocators.result, .{
                 .kind = .tool_input_label,
@@ -1964,7 +1947,6 @@ const Projection = struct {
                 &entry.tool,
                 entry_index,
                 window,
-                true,
                 first,
                 last,
             );
@@ -5368,7 +5350,6 @@ test "tool details highlight shell input and supported read output" {
     );
     defer finished.deinit();
     try read_entry.finish(std.testing.allocator, &finished);
-    try read_entry.ensureOutputHighlights(std.testing.allocator);
     try std.testing.expect(read_entry.output_highlights.?.len > 0);
 
     var failed_started = try toolStarted(
@@ -5393,7 +5374,6 @@ test "tool details highlight shell input and supported read output" {
     );
     defer failed.deinit();
     try failed_entry.finish(std.testing.allocator, &failed);
-    try failed_entry.ensureOutputHighlights(std.testing.allocator);
     try std.testing.expectEqual(
         @as(usize, 0),
         failed_entry.output_highlights.?.len,
@@ -5423,7 +5403,6 @@ test "bash output plans highlight YAML and diff through the ToolEntry lifecycle"
         "name: CI\nready: true\nunsafe: \\xff\\xe2\\x80\\xae\n",
         yaml_entry.output_display.?,
     );
-    try yaml_entry.ensureOutputHighlights(std.testing.allocator);
     const yaml_spans = yaml_entry.output_highlights.?;
     var saw_name = false;
     var saw_true = false;
@@ -5464,7 +5443,6 @@ test "bash output plans highlight YAML and diff through the ToolEntry lifecycle"
     );
     defer diff_finished.deinit();
     try diff_entry.finish(std.testing.allocator, &diff_finished);
-    try diff_entry.ensureOutputHighlights(std.testing.allocator);
     var saw_inserted = false;
     var saw_deleted = false;
     var saw_meta = false;
@@ -5544,7 +5522,6 @@ test "strict syntax rejection restores literal output rendering" {
     );
     try std.testing.expect(!entry.output_markdown);
     transcript.entries.items[0].releaseRenderCaches(std.testing.allocator);
-    try entry.ensureOutputHighlights(std.testing.allocator);
     try std.testing.expectEqualStrings(
         "external diff:\\x09changed\\x0d\n",
         entry.output_display.?,
@@ -5621,7 +5598,6 @@ test "bash output plans fall back to literal for unsafe lifecycle cases" {
         };
         defer finished.deinit();
         try entry.finish(std.testing.allocator, &finished);
-        try entry.ensureOutputHighlights(std.testing.allocator);
         try std.testing.expectEqual(
             @as(usize, 0),
             entry.output_highlights.?.len,
@@ -6717,7 +6693,6 @@ fn toolAllocationLifecycle(allocator: std.mem.Allocator) !void {
         return err;
     };
     try std.testing.expect(tool.expanded);
-    try tool.ensureOutputHighlights(allocator);
 }
 
 test "tool owned payload lifecycle is atomic under allocation failure" {
@@ -7978,7 +7953,6 @@ test "image tool previews retain read bytes and reserve rows only when expanded"
     const tool = &ui.transcript.entries.items[0].tool;
     try std.testing.expectEqualStrings("snapshot", tool.preview.?.state.pending);
     try std.testing.expectEqualStrings("Image: image.png", tool.output_display.?);
-    try tool.ensureOutputHighlights(allocator);
     try std.testing.expectEqual(@as(usize, 0), tool.output_highlights.?.len);
     tool.preview.?.deinit(allocator);
     tool.preview = .{ .state = .{ .ready = vaxis.Image.init(9, 320, 160) } };

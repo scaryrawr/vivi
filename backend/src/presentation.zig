@@ -593,6 +593,25 @@ const TestSummary = union(enum) {
     other,
 };
 
+test "strict source rejection rerenders the raw payload as literal" {
+    var value = try presentToolResult(
+        std.testing.allocator,
+        TestSummary{ .read = .{
+            .path = "broken.yaml",
+            .offset = null,
+            .limit = null,
+        } },
+        .succeeded,
+        "items: [one,\t two\r\n",
+    );
+    defer value.deinit();
+    try std.testing.expect(std.meta.activeTag(value.content) == .literal);
+    try std.testing.expectEqualStrings(
+        "items: [one,\\x09 two\\x0d\n",
+        value.text,
+    );
+}
+
 test "tool result presentation classifies paths and command producers" {
     const cases = [_]struct {
         summary: TestSummary,
@@ -617,54 +636,6 @@ test "tool result presentation classifies paths and command producers" {
             .raw = "const answer = 42;",
             .kind = .source,
         },
-        .{
-            .summary = .{ .bash = .{ .run = .{ .command = "git diff" } } },
-            .raw = "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-old\n+new\n",
-            .kind = .source,
-        },
-        .{
-            .summary = .{ .bash = .{ .run = .{ .command = "git diff --stat" } } },
-            .raw = "a | 1 +",
-            .kind = .literal,
-        },
-    };
-    for (cases) |case| {
-        var value = try presentToolResult(
-            std.testing.allocator,
-            case.summary,
-            .succeeded,
-            case.raw,
-        );
-        defer value.deinit();
-        try std.testing.expectEqual(case.kind, value.kind());
-    }
-}
-
-test "strict source rejection rerenders the raw payload as literal" {
-    var value = try presentToolResult(
-        std.testing.allocator,
-        TestSummary{ .read = .{
-            .path = "broken.yaml",
-            .offset = null,
-            .limit = null,
-        } },
-        .succeeded,
-        "items: [one,\t two\r\n",
-    );
-    defer value.deinit();
-    try std.testing.expect(std.meta.activeTag(value.content) == .literal);
-    try std.testing.expectEqualStrings(
-        "items: [one,\\x09 two\\x0d\n",
-        value.text,
-    );
-}
-
-test "tool result presentation preserves classification edge coverage" {
-    const cases = [_]struct {
-        summary: TestSummary,
-        raw: []const u8,
-        kind: PresentationKind,
-    }{
         .{
             .summary = .{ .read = .{
                 .path = "example.py",
@@ -721,6 +692,11 @@ test "tool result presentation preserves classification edge coverage" {
             } } },
             .raw = "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-old\n+new\n",
             .kind = .source,
+        },
+        .{
+            .summary = .{ .bash = .{ .run = .{ .command = "git diff --stat" } } },
+            .raw = "a | 1 +",
+            .kind = .literal,
         },
     };
     for (cases) |case| {
