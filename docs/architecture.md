@@ -23,6 +23,30 @@ C-compatible library. `backend/src/root.zig` is the only production module
 allowed to import `copilot_sdk`. `backend/src/c_api.zig` adapts domain values
 to the versioned C header; it does not own product behavior.
 
+`backend/src/canvas.zig` is the renderer-neutral, SDK-free canvas domain.
+Bounded UTF-8 identity types preserve the evidenced extension, canvas, and
+instance key; role-specific JSON types prevent schemas, open inputs, action
+inputs, and action results from being exchanged accidentally. Registry
+knowledge, runtime state (`opened`, `closed`, or `unavailable`, with local
+opening/closing work), and durable state (`recorded` or `removed`) remain
+orthogonal in each conversation.
+
+The canvas reducer accepts registry replacement and incremental updates as
+different tagged inputs because the SDK contract does not establish whether a
+registry event is a snapshot or delta. A future adapter must label that
+meaning from additional evidence rather than infer it. Provider lifecycle
+signals contain no operation correlation; Vivi's monotonic operation IDs and
+renderer generations are local ordering tools only. Reopening the same key is
+represented as another evidenced open request with a new local generation,
+not as an invented provider reopen method.
+
+Canvas limits are checked before valid registry, input, renderer, or recording
+state is replaced. Backpressure and protocol degradation are scoped, shutdown
+cancels pending local work, and resume projection contains only evidenced
+recorded open-canvas identity, title, and input fields. Transient URL, status,
+and renderer generation never enter resume state. Production SDK adaptation,
+C ABI exposure, and native or CLI rendering remain a separate PR 3 gate.
+
 Native applications are intentionally asymmetric:
 
 | Host | Native UX and build ownership | Core artifact |
