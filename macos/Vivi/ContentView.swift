@@ -14,6 +14,10 @@ func toolInputLayout(input: String, presentation: ToolPresentation) -> ToolInput
   return .presentationWithCanonicalJSON(presentation, input)
 }
 
+func toolInputIsVisible(input: String) -> Bool {
+  !input.isEmpty
+}
+
 struct ContentView: View {
   @StateObject private var store: NativeChatStore
 
@@ -238,7 +242,7 @@ private struct ChatItemView: View {
           if !activity.detail.isEmpty {
             detail("Detail", .literal(activity.detail))
           }
-          if !activity.inputPresentation.text.isEmpty {
+          if toolInputIsVisible(input: activity.input) {
             inputDetail
           }
           if let output = activity.outputPresentation, !output.text.isEmpty {

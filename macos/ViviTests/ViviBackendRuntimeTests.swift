@@ -362,6 +362,11 @@ final class ViviBackendRuntimeTests: XCTestCase {
       .presentation(.literal(input)))
   }
 
+  func testToolInputVisibilityUsesCanonicalInput() {
+    XCTAssertTrue(toolInputIsVisible(input: #"{"command":"\u001b"}"#))
+    XCTAssertFalse(toolInputIsVisible(input: ""))
+  }
+
   func testNonBashSourceInputKeepsExistingPresentation() {
     let presentation = ToolPresentation.source(
       text: "const value = 1;",

@@ -14,9 +14,11 @@ Consume the final `ToolStarted.input_presentation` and
 `ToolFinished.output_presentation` values produced by the backend. Do not
 reclassify tool output, infer languages, parse source, or perform strict
 fallback in the CLI. Terminal argument labels, wrapping, Vaxis styles, and
-Markdown layout remain CLI-owned. Map backend Bash input spans into the
-terminal-formatted argument display, and measure only the final presentation
-bytes.
+Markdown layout remain CLI-owned. Semantic spans always index the accompanying
+presentation text: map Bash spans into the terminal-formatted argument display
+only when that text exactly matches the canonical command, and render fenced
+code from the same presented text cached with its spans. Measure only the final
+presentation bytes.
 
 Markdown fenced code uses `vivi_backend.presentCodeFragment`; the backend owns
 language aliases and Tree-sitter tokens while the CLI owns its highlight cache.

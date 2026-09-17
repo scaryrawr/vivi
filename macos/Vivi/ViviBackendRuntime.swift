@@ -875,8 +875,8 @@ enum NativeEventDecoder {
           let end = start + length
           guard length > 0, start >= contentStart, start >= previousEnd,
             end <= contentEnd,
-            String(bytes: bytes[contentStart..<start], encoding: .utf8) != nil,
-            String(bytes: bytes[start..<end], encoding: .utf8) != nil
+            isUTF8Boundary(bytes, at: start),
+            isUTF8Boundary(bytes, at: end)
           else { throw NativeEventDecodingError.malformed }
           decoded.append(
             SemanticSpan(
@@ -1123,13 +1123,17 @@ func nativeCodePresentation(language: String, source: String) throws -> ToolPres
     let length = Int(span.bytes.length)
     let end = start + length
     guard length > 0, start >= previousEnd, end <= output.count,
-      String(bytes: output[0..<start], encoding: .utf8) != nil,
-      String(bytes: output[start..<end], encoding: .utf8) != nil
+      isUTF8Boundary(output, at: start),
+      isUTF8Boundary(output, at: end)
     else { throw NativeEventDecodingError.malformed }
     decodedSpans.append(.init(byteRange: start..<end, token: token))
     previousEnd = end
   }
   return .source(text: text, language: decodedLanguage, spans: decodedSpans)
+}
+
+private func isUTF8Boundary(_ bytes: [UInt8], at index: Int) -> Bool {
+  index == bytes.count || bytes[index] & 0xC0 != 0x80
 }
 
 func nativeCopilotExecutableCandidates(home: URL, path: String?) -> [String] {

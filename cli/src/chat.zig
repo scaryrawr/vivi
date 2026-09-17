@@ -372,12 +372,19 @@ const ToolEntry = struct {
         const input_highlights = switch (started.input_presentation.content) {
             .source => |source| switch (started.invocation.summary) {
                 .bash => |summary| if (bashSummaryCommand(summary)) |command|
-                    try mapBashInputHighlights(
-                        allocator,
-                        input_display,
+                    if (std.mem.eql(
+                        u8,
+                        started.input_presentation.text,
                         command,
-                        source.tokens,
-                    )
+                    ))
+                        try mapBashInputHighlights(
+                            allocator,
+                            input_display,
+                            command,
+                            source.tokens,
+                        )
+                    else
+                        try allocator.alloc(highlight.Span, 0)
                 else
                     try allocator.alloc(highlight.Span, 0),
                 else => try allocator.alloc(highlight.Span, 0),
@@ -5329,6 +5336,22 @@ test "tool details highlight shell input and supported read output" {
     try std.testing.expectEqualStrings(
         "printf",
         reordered_entry.input_display[reordered_command.start..reordered_command.end],
+    );
+
+    var sanitized_started = try toolStarted(
+        "bash-highlight-sanitized",
+        "{\"command\":\"printf \\u001b\"}",
+        .{ .bash = .{ .run = .{ .command = "printf \x1b" } } },
+    );
+    defer sanitized_started.deinit();
+    var sanitized_entry = try ToolEntry.init(
+        std.testing.allocator,
+        &sanitized_started,
+    );
+    defer sanitized_entry.deinit(std.testing.allocator);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        sanitized_entry.input_highlights.len,
     );
 
     var read_started = try toolStarted(
