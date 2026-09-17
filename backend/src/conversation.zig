@@ -1233,51 +1233,34 @@ pub const Conversation = struct {
         try self.enqueueControl(.{ .resume_session = key });
     }
 
-    pub fn openCanvas(
+    pub fn performCanvas(
         self: *Conversation,
-        input: canvas.OpenCommandInput,
+        input: canvas.CommandInput,
     ) !canvas.RequestId {
         const request_id = try self.takeCanvasRequestId();
-        try self.enqueueControl(.{ .canvas = .{
-            .open = try canvas.OpenCommand.init(
+        const command: canvas.Command = switch (input) {
+            .open => |value| .{ .open = try canvas.OpenCommand.init(
                 self.core.allocator,
                 request_id,
-                input,
+                value,
                 .{},
-            ),
-        } });
-        return request_id;
-    }
-
-    pub fn closeCanvas(
-        self: *Conversation,
-        key: canvas.KeyView,
-    ) !canvas.RequestId {
-        const request_id = try self.takeCanvasRequestId();
-        try self.enqueueControl(.{ .canvas = .{
-            .close = try canvas.CloseCommand.init(
+            ) },
+            .close => |key| .{ .close = try canvas.CloseCommand.init(
                 self.core.allocator,
                 request_id,
                 key,
                 .{},
-            ),
-        } });
-        return request_id;
-    }
-
-    pub fn invokeCanvasAction(
-        self: *Conversation,
-        input: canvas.ActionCommandInput,
-    ) !canvas.RequestId {
-        const request_id = try self.takeCanvasRequestId();
-        try self.enqueueControl(.{ .canvas = .{
-            .invoke_action = try canvas.ActionCommand.init(
-                self.core.allocator,
-                request_id,
-                input,
-                .{},
-            ),
-        } });
+            ) },
+            .invoke_action => |value| .{
+                .invoke_action = try canvas.ActionCommand.init(
+                    self.core.allocator,
+                    request_id,
+                    value,
+                    .{},
+                ),
+            },
+        };
+        try self.enqueueControl(.{ .canvas = command });
         return request_id;
     }
 
@@ -1599,14 +1582,14 @@ test "conversation serializes owned canvas commands and completions" {
         's', 'i', 'o', 'n',
     };
     var input_json = "{\"owned\":true}".*;
-    const request_id = try conversation.openCanvas(.{
+    const request_id = try conversation.performCanvas(.{ .open = .{
         .key = .{
             .extension_id = &extension_id,
             .canvas_id = "review",
             .instance_id = "review:main",
         },
         .input_json = &input_json,
-    });
+    } });
     extension_id[0] = 'x';
     input_json[2] = 'x';
 

@@ -63,8 +63,19 @@ establish replacement-versus-delta meaning. Its root-private adapter mode
 keeps replacement behavior available only to credential-free fixtures until
 runtime evidence resolves that gate. Join/resume `open_canvases` is likewise
 omitted; the adapter uses the public snapshot only as positive observations and
-never treats absence as closure. C ABI exposure and native or CLI rendering
-remain later host work.
+never treats absence as closure. Native or CLI rendering remains later host
+work.
+
+ABI v9 exposes the existing canvas domain through one disabled-by-default
+`canvas_mode`, one typed `vivi_backend_perform_canvas` operation, and the
+existing transactional event drain. Snapshot events flatten declarations,
+actions, and instances into caller-owned typed arrays with spans into the
+event byte buffer; completion events carry the local operation ID and typed
+outcome. The C boundary validates and copies operation input before return,
+and any undersized event destination leaves every payload buffer untouched
+while retaining the event for an identical retry. Current native call sites
+select `VIVI_BACKEND_CANVAS_DISABLED` and perform no canvas decoding or
+rendering. PR 5 remains the gate for host opt-in and user-visible behavior.
 
 Native applications are intentionally asymmetric:
 

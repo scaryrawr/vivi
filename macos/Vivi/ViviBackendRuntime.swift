@@ -1573,7 +1573,9 @@ final class ViviConversationDriver: ViviConversationDriving, @unchecked Sendable
         copilot_cli_path_length: UInt32(copilotBytes.count),
         copilot_cli_launch: VIVI_BACKEND_COPILOT_CLI_EXPLICIT_PATH,
         wake: Self.wake,
-        wake_context: Unmanaged.passUnretained(self).toOpaque()
+        wake_context: Unmanaged.passUnretained(self).toOpaque(),
+        canvas_mode: VIVI_BACKEND_CANVAS_DISABLED,
+        canvas_options_reserved: 0
       )
       let result = bytes.withUnsafeBufferPointer { buffer in
         settingsBytes.withUnsafeBufferPointer { settingsBuffer in
@@ -1687,7 +1689,8 @@ final class ViviConversationDriver: ViviConversationDriving, @unchecked Sendable
     while true {
       var event = vivi_backend_event_t()
       let result = vivi_backend_next_event(
-        handle, &event, nil, 0, nil, 0, nil, 0, nil, 0, nil, 0)
+        handle, &event, nil, 0, nil, 0, nil, 0, nil, 0, nil, 0,
+        nil, 0, nil, 0, nil, 0)
       if result == VIVI_BACKEND_NO_EVENT {
         deliver(events)
         return
@@ -1725,7 +1728,13 @@ final class ViviConversationDriver: ViviConversationDriving, @unchecked Sendable
                     sessionBuffer.baseAddress,
                     UInt32(sessionBuffer.count),
                     transcriptBuffer.baseAddress,
-                    UInt32(transcriptBuffer.count))
+                    UInt32(transcriptBuffer.count),
+                    nil,
+                    0,
+                    nil,
+                    0,
+                    nil,
+                    0)
                 }
               }
             }

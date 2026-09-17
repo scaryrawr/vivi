@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define VIVI_BACKEND_ABI_VERSION 8
+#define VIVI_BACKEND_ABI_VERSION 9
 
 typedef enum vivi_backend_result {
     VIVI_BACKEND_OK = 0,
@@ -30,6 +30,11 @@ typedef enum vivi_backend_copilot_cli_launch {
     VIVI_BACKEND_COPILOT_CLI_EXPLICIT_PATH = 1,
 } vivi_backend_copilot_cli_launch_t;
 
+typedef enum vivi_backend_canvas_mode {
+    VIVI_BACKEND_CANVAS_DISABLED = 0,
+    VIVI_BACKEND_CANVAS_ENABLED = 1,
+} vivi_backend_canvas_mode_t;
+
 typedef struct vivi_backend_conversation_options {
     uint32_t abi_version;
     uint32_t struct_size;
@@ -44,6 +49,8 @@ typedef struct vivi_backend_conversation_options {
     vivi_backend_copilot_cli_launch_t copilot_cli_launch;
     vivi_backend_wake_fn wake;
     void *wake_context;
+    vivi_backend_canvas_mode_t canvas_mode;
+    uint32_t canvas_options_reserved;
 } vivi_backend_conversation_options_t;
 
 typedef enum vivi_backend_event_kind {
@@ -67,6 +74,8 @@ typedef enum vivi_backend_event_kind {
     VIVI_BACKEND_EVENT_SESSION_CATALOG_FAILURE = 18,
     VIVI_BACKEND_EVENT_SESSION_TRACKING_FAILURE = 19,
     VIVI_BACKEND_EVENT_SESSION_RESUME = 20,
+    VIVI_BACKEND_EVENT_CANVAS_SNAPSHOT = 21,
+    VIVI_BACKEND_EVENT_CANVAS_OPERATION = 22,
 } vivi_backend_event_kind_t;
 
 typedef enum vivi_backend_content_kind {
@@ -77,6 +86,8 @@ typedef enum vivi_backend_content_kind {
     VIVI_BACKEND_CONTENT_TOOL = 4,
     VIVI_BACKEND_CONTENT_SESSION_CATALOG = 5,
     VIVI_BACKEND_CONTENT_SESSION_RESUME = 6,
+    VIVI_BACKEND_CONTENT_CANVAS_SNAPSHOT = 7,
+    VIVI_BACKEND_CONTENT_CANVAS_OPERATION = 8,
 } vivi_backend_content_kind_t;
 
 typedef enum vivi_backend_tool_result {
@@ -235,6 +246,170 @@ typedef struct vivi_backend_transcript_item {
     uint32_t reserved;
 } vivi_backend_transcript_item_t;
 
+typedef struct vivi_backend_canvas_key {
+    vivi_backend_span_t extension_id;
+    vivi_backend_span_t canvas_id;
+    vivi_backend_span_t instance_id;
+} vivi_backend_canvas_key_t;
+
+typedef enum vivi_backend_canvas_capability {
+    VIVI_BACKEND_CANVAS_CAPABILITY_NONE = 0,
+    VIVI_BACKEND_CANVAS_CAPABILITY_UNKNOWN = 1,
+    VIVI_BACKEND_CANVAS_CAPABILITY_UNSUPPORTED = 2,
+    VIVI_BACKEND_CANVAS_CAPABILITY_SUPPORTED = 3,
+} vivi_backend_canvas_capability_t;
+
+typedef enum vivi_backend_canvas_runtime {
+    VIVI_BACKEND_CANVAS_RUNTIME_NONE = 0,
+    VIVI_BACKEND_CANVAS_RUNTIME_CLOSED = 1,
+    VIVI_BACKEND_CANVAS_RUNTIME_OPENING = 2,
+    VIVI_BACKEND_CANVAS_RUNTIME_OPENED = 3,
+    VIVI_BACKEND_CANVAS_RUNTIME_CLOSING = 4,
+    VIVI_BACKEND_CANVAS_RUNTIME_UNAVAILABLE = 5,
+} vivi_backend_canvas_runtime_t;
+
+typedef enum vivi_backend_canvas_record {
+    VIVI_BACKEND_CANVAS_RECORD_NONE = 0,
+    VIVI_BACKEND_CANVAS_RECORD_RECORDED = 1,
+    VIVI_BACKEND_CANVAS_RECORD_REMOVED = 2,
+} vivi_backend_canvas_record_t;
+
+typedef enum vivi_backend_canvas_degradation {
+    VIVI_BACKEND_CANVAS_DEGRADATION_NONE = 0,
+    VIVI_BACKEND_CANVAS_DEGRADATION_INVALID_SIGNAL = 1,
+    VIVI_BACKEND_CANVAS_DEGRADATION_LIMIT_EXCEEDED = 2,
+    VIVI_BACKEND_CANVAS_DEGRADATION_BACKPRESSURE = 3,
+    VIVI_BACKEND_CANVAS_DEGRADATION_HOST_FAILURE = 4,
+} vivi_backend_canvas_degradation_t;
+
+typedef enum vivi_backend_canvas_operation_kind {
+    VIVI_BACKEND_CANVAS_OPERATION_NONE = 0,
+    VIVI_BACKEND_CANVAS_OPERATION_OPEN = 1,
+    VIVI_BACKEND_CANVAS_OPERATION_CLOSE = 2,
+    VIVI_BACKEND_CANVAS_OPERATION_INVOKE_ACTION = 3,
+} vivi_backend_canvas_operation_kind_t;
+
+typedef enum vivi_backend_canvas_operation_outcome {
+    VIVI_BACKEND_CANVAS_OPERATION_OUTCOME_NONE = 0,
+    VIVI_BACKEND_CANVAS_OPERATION_SUCCEEDED = 1,
+    VIVI_BACKEND_CANVAS_OPERATION_FAILED = 2,
+} vivi_backend_canvas_operation_outcome_t;
+
+typedef enum vivi_backend_canvas_operation_failure {
+    VIVI_BACKEND_CANVAS_FAILURE_NONE = 0,
+    VIVI_BACKEND_CANVAS_FAILURE_DISABLED = 1,
+    VIVI_BACKEND_CANVAS_FAILURE_UNSUPPORTED = 2,
+    VIVI_BACKEND_CANVAS_FAILURE_UNAVAILABLE = 3,
+    VIVI_BACKEND_CANVAS_FAILURE_INVALID_REQUEST = 4,
+    VIVI_BACKEND_CANVAS_FAILURE_BACKPRESSURE = 5,
+    VIVI_BACKEND_CANVAS_FAILURE_HOST_FAILURE = 6,
+    VIVI_BACKEND_CANVAS_FAILURE_INVALID_SDK_RESULT = 7,
+    VIVI_BACKEND_CANVAS_FAILURE_STALE = 8,
+    VIVI_BACKEND_CANVAS_FAILURE_SHUTDOWN = 9,
+} vivi_backend_canvas_operation_failure_t;
+
+enum vivi_backend_canvas_declaration_flags {
+    VIVI_BACKEND_CANVAS_DECLARATION_INPUT_SCHEMA_PRESENT = 1u << 0,
+};
+
+enum vivi_backend_canvas_action_flags {
+    VIVI_BACKEND_CANVAS_ACTION_INPUT_SCHEMA_PRESENT = 1u << 0,
+};
+
+enum vivi_backend_canvas_instance_flags {
+    VIVI_BACKEND_CANVAS_INSTANCE_OPEN_INPUT_PRESENT = 1u << 0,
+    VIVI_BACKEND_CANVAS_INSTANCE_RENDERER_GENERATION_PRESENT = 1u << 1,
+    VIVI_BACKEND_CANVAS_INSTANCE_TITLE_PRESENT = 1u << 2,
+    VIVI_BACKEND_CANVAS_INSTANCE_URL_PRESENT = 1u << 3,
+    VIVI_BACKEND_CANVAS_INSTANCE_STATUS_PRESENT = 1u << 4,
+    VIVI_BACKEND_CANVAS_INSTANCE_RECORDED_TITLE_PRESENT = 1u << 5,
+    VIVI_BACKEND_CANVAS_INSTANCE_RECORDED_INPUT_PRESENT = 1u << 6,
+};
+
+enum vivi_backend_canvas_snapshot_flags {
+    VIVI_BACKEND_CANVAS_SNAPSHOT_SHUTDOWN_REQUESTED = 1u << 0,
+};
+
+enum vivi_backend_canvas_completion_flags {
+    VIVI_BACKEND_CANVAS_COMPLETION_TITLE_PRESENT = 1u << 0,
+    VIVI_BACKEND_CANVAS_COMPLETION_URL_PRESENT = 1u << 1,
+    VIVI_BACKEND_CANVAS_COMPLETION_STATUS_PRESENT = 1u << 2,
+    VIVI_BACKEND_CANVAS_COMPLETION_ACTION_RESULT_PRESENT = 1u << 3,
+};
+
+typedef struct vivi_backend_canvas_action {
+    vivi_backend_span_t name;
+    vivi_backend_span_t description;
+    vivi_backend_span_t input_schema_json;
+    uint32_t flags;
+    uint32_t reserved;
+} vivi_backend_canvas_action_t;
+
+typedef struct vivi_backend_canvas_declaration {
+    vivi_backend_span_t extension_id;
+    vivi_backend_span_t extension_name;
+    vivi_backend_span_t canvas_id;
+    vivi_backend_span_t display_name;
+    vivi_backend_span_t description;
+    vivi_backend_span_t input_schema_json;
+    uint32_t action_offset;
+    uint32_t action_count;
+    uint32_t flags;
+    uint32_t reserved;
+} vivi_backend_canvas_declaration_t;
+
+typedef struct vivi_backend_canvas_instance {
+    vivi_backend_canvas_key_t key;
+    vivi_backend_span_t open_input_json;
+    vivi_backend_span_t title;
+    vivi_backend_span_t url;
+    vivi_backend_span_t status;
+    vivi_backend_span_t recorded_title;
+    vivi_backend_span_t recorded_input_json;
+    uint64_t renderer_generation;
+    vivi_backend_canvas_runtime_t runtime;
+    vivi_backend_canvas_record_t record;
+    vivi_backend_canvas_degradation_t degradation;
+    uint32_t flags;
+    uint32_t reserved[2];
+} vivi_backend_canvas_instance_t;
+
+typedef struct vivi_backend_canvas_snapshot {
+    vivi_backend_canvas_capability_t capability;
+    vivi_backend_canvas_degradation_t registry_degradation;
+    vivi_backend_canvas_degradation_t operation_degradation;
+    uint32_t flags;
+    uint32_t declaration_count;
+    uint32_t action_count;
+    uint32_t instance_count;
+    uint32_t reserved;
+} vivi_backend_canvas_snapshot_t;
+
+typedef struct vivi_backend_canvas_completion {
+    uint64_t operation_id;
+    vivi_backend_canvas_operation_kind_t kind;
+    vivi_backend_canvas_operation_outcome_t outcome;
+    vivi_backend_canvas_operation_failure_t failure;
+    uint32_t flags;
+    vivi_backend_span_t title;
+    vivi_backend_span_t url;
+    vivi_backend_span_t status;
+    vivi_backend_span_t action_result_json;
+    uint32_t reserved[2];
+} vivi_backend_canvas_completion_t;
+
+typedef struct vivi_backend_canvas_operation {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    vivi_backend_canvas_operation_kind_t kind;
+    uint32_t reserved0;
+    vivi_backend_canvas_key_t key;
+    vivi_backend_span_t action_name;
+    vivi_backend_span_t open_input_json;
+    vivi_backend_span_t action_input_json;
+    uint32_t reserved[2];
+} vivi_backend_canvas_operation_t;
+
 typedef struct vivi_backend_event {
     vivi_backend_event_kind_t kind;
     vivi_backend_content_kind_t content_kind;
@@ -262,6 +437,8 @@ typedef struct vivi_backend_event {
     uint8_t skipped_invalid_shards;
     uint8_t session_reserved;
     uint16_t reserved;
+    vivi_backend_canvas_snapshot_t canvas_snapshot;
+    vivi_backend_canvas_completion_t canvas_completion;
 } vivi_backend_event_t;
 
 /* Open and submit copy their input bytes before returning. */
@@ -285,6 +462,18 @@ vivi_backend_result_t vivi_backend_refresh_sessions(
 vivi_backend_result_t vivi_backend_resume_session(
     vivi_backend_conversation_t *conversation,
     vivi_backend_resume_key_t key);
+/*
+ * Every span is relative to input_bytes. Inputs are immutable, spans may
+ * overlap, and unreferenced bytes are ignored. {0, 0} is the only absent span.
+ * On success all referenced bytes have been copied and out_operation_id is
+ * nonzero. On failure out_operation_id is zero.
+ */
+vivi_backend_result_t vivi_backend_perform_canvas(
+    vivi_backend_conversation_t *conversation,
+    const vivi_backend_canvas_operation_t *operation,
+    const uint8_t *input_bytes,
+    uint32_t input_byte_count,
+    uint64_t *out_operation_id);
 /*
  * Sanitizes untrusted tool text for Markdown display. out_length always receives
  * the required byte count. A short or null output buffer does not write output.
@@ -327,7 +516,13 @@ vivi_backend_result_t vivi_backend_next_event(
     vivi_backend_session_summary_t *sessions,
     uint32_t session_capacity,
     vivi_backend_transcript_item_t *transcript_items,
-    uint32_t transcript_item_capacity);
+    uint32_t transcript_item_capacity,
+    vivi_backend_canvas_declaration_t *canvas_declarations,
+    uint32_t canvas_declaration_capacity,
+    vivi_backend_canvas_action_t *canvas_actions,
+    uint32_t canvas_action_capacity,
+    vivi_backend_canvas_instance_t *canvas_instances,
+    uint32_t canvas_instance_capacity);
 vivi_backend_result_t vivi_backend_close(
     vivi_backend_conversation_t *conversation);
 /*

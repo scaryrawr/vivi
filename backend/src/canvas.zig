@@ -599,6 +599,12 @@ pub const ActionCommandInput = struct {
     input_json: ?[]const u8 = null,
 };
 
+pub const CommandInput = union(enum) {
+    open: OpenCommandInput,
+    close: KeyView,
+    invoke_action: ActionCommandInput,
+};
+
 pub const OpenCommand = struct {
     allocator: std.mem.Allocator,
     request_id: RequestId,

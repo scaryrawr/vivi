@@ -12,7 +12,7 @@ const tool_activity = @import("tool_activity.zig");
 const tools = @import("tools.zig");
 
 pub const version = build_options.version;
-pub const abi_version: u32 = 8;
+pub const abi_version: u32 = 9;
 pub const canvas_domain = canvas;
 pub const Conversation = conversation.Conversation;
 pub const ConversationEvent = conversation.Event;
@@ -4688,6 +4688,12 @@ test "registry adapter validates typed declarations and gates unknown meaning" {
         .description = "Review changes",
         .actions = &actions,
     }};
+    const invalid = [_]copilot.SessionEventTypes.CanvasRegistryChangedCanvas{.{
+        .extension_id = "",
+        .canvas_id = "broken",
+        .display_name = "Broken",
+        .description = "Broken",
+    }};
     var adapter = CanvasSdkAdapter.init(
         std.testing.allocator,
         true,
@@ -4695,25 +4701,19 @@ test "registry adapter validates typed declarations and gates unknown meaning" {
         .unresolved,
     );
     defer adapter.deinit();
+    try std.testing.expect(try adapter.observeRegistry(&invalid));
+    try std.testing.expectEqual(@as(usize, 0), adapter.state.registryCount());
+    try std.testing.expectEqual(
+        canvas.Degradation.invalid_signal,
+        adapter.state.registry_degradation.?,
+    );
+
     try std.testing.expect(!try adapter.observeRegistry(&entries));
     try std.testing.expectEqual(@as(usize, 0), adapter.state.registryCount());
 
     adapter.registry_mode = .replacement;
     try std.testing.expect(try adapter.observeRegistry(&entries));
     try std.testing.expectEqual(@as(usize, 1), adapter.state.registryCount());
-
-    const invalid = [_]copilot.SessionEventTypes.CanvasRegistryChangedCanvas{.{
-        .extension_id = "",
-        .canvas_id = "broken",
-        .display_name = "Broken",
-        .description = "Broken",
-    }};
-    try std.testing.expect(try adapter.observeRegistry(&invalid));
-    try std.testing.expectEqual(@as(usize, 1), adapter.state.registryCount());
-    try std.testing.expectEqual(
-        canvas.Degradation.invalid_signal,
-        adapter.state.registry_degradation.?,
-    );
 }
 
 test "typed canvas lifecycle variants preserve runtime record orthogonality" {

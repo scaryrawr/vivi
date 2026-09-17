@@ -1,5 +1,6 @@
 const std = @import("std");
 const backend = @import("vivi_backend");
+const canvas = backend.canvas_domain;
 const c = @cImport({
     @cInclude("vivi_backend.h");
 });
@@ -17,6 +18,7 @@ const Handle = struct {
         switch_model,
         refresh_sessions,
         resume_session,
+        canvas,
     };
 
     io_threaded: std.Io.Threaded,
@@ -27,6 +29,7 @@ const Handle = struct {
     pending_wake: std.atomic.Value(bool) = .init(false),
     accepting_prompt: std.atomic.Value(bool) = .init(false),
     control_operation: ControlOperation = .none,
+    active_canvas_request_id: ?canvas.RequestId = null,
     pending: ?backend.ConversationEvent = null,
     emit_closed_after_failure: bool = false,
 
@@ -58,6 +61,14 @@ fn result(error_value: anyerror) c.vivi_backend_result_t {
         error.EmptyModel,
         error.InvalidReasoningEffort,
         error.InvalidSessionKey,
+        error.EmptyIdentifier,
+        error.IdentifierTooLong,
+        error.InvalidIdentifierUtf8,
+        error.KeyTooLong,
+        error.EmptyJsonDocument,
+        error.JsonDocumentTooLong,
+        error.InvalidJsonUtf8,
+        error.InvalidJson,
         => c.VIVI_BACKEND_INVALID_ARGUMENT,
         else => c.VIVI_BACKEND_FAILED,
     };
@@ -74,6 +85,14 @@ fn copilotCliLaunch(
     return switch (raw) {
         c.VIVI_BACKEND_COPILOT_CLI_SDK_DEFAULT => .sdk_default,
         c.VIVI_BACKEND_COPILOT_CLI_EXPLICIT_PATH => .explicit_path,
+        else => null,
+    };
+}
+
+fn canvasMode(raw: c.vivi_backend_canvas_mode_t) ?bool {
+    return switch (raw) {
+        c.VIVI_BACKEND_CANVAS_DISABLED => false,
+        c.VIVI_BACKEND_CANVAS_ENABLED => true,
         else => null,
     };
 }
@@ -124,6 +143,11 @@ export fn vivi_backend_open(
     ) catch return c.VIVI_BACKEND_INVALID_ARGUMENT;
     const launch = copilotCliLaunch(input.copilot_cli_launch) orelse
         return c.VIVI_BACKEND_INVALID_ARGUMENT;
+    const canvas_enabled = canvasMode(input.canvas_mode) orelse
+        return c.VIVI_BACKEND_INVALID_ARGUMENT;
+    if (input.canvas_options_reserved != 0) {
+        return c.VIVI_BACKEND_INVALID_ARGUMENT;
+    }
     if ((launch == .explicit_path) != (copilot_cli_path != null)) {
         return c.VIVI_BACKEND_INVALID_ARGUMENT;
     }
@@ -138,6 +162,7 @@ export fn vivi_backend_open(
     self.pending_wake = .init(false);
     self.accepting_prompt = .init(false);
     self.control_operation = .none;
+    self.active_canvas_request_id = null;
     self.pending = null;
     self.emit_closed_after_failure = false;
     self.conversation = backend.openConversation(
@@ -150,6 +175,8 @@ export fn vivi_backend_open(
             .sessions_directory = sessions_directory,
             .copilot_cli_path = copilot_cli_path,
             .copilot_cli_launch = launch,
+            .request_extensions = canvas_enabled,
+            .request_canvas_renderer = canvas_enabled,
         },
     ) catch {
         self.io_threaded.deinit();
@@ -310,6 +337,150 @@ export fn vivi_backend_resume_session(
         self.control_operation = .none;
         return result(err);
     };
+    return c.VIVI_BACKEND_OK;
+}
+
+fn requiredInputSpan(
+    bytes: []const u8,
+    span: c.vivi_backend_span_t,
+) ![]const u8 {
+    if (span.length == 0) return error.InvalidCanvasOperation;
+    const end = std.math.add(u32, span.offset, span.length) catch
+        return error.InvalidCanvasOperation;
+    if (end > bytes.len) return error.InvalidCanvasOperation;
+    return bytes[span.offset..end];
+}
+
+fn optionalInputSpan(
+    bytes: []const u8,
+    span: c.vivi_backend_span_t,
+) !?[]const u8 {
+    if (span.length == 0) {
+        if (span.offset != 0) return error.InvalidCanvasOperation;
+        return null;
+    }
+    const end = std.math.add(u32, span.offset, span.length) catch
+        return error.InvalidCanvasOperation;
+    if (end > bytes.len) return error.InvalidCanvasOperation;
+    return bytes[span.offset..end];
+}
+
+fn requireAbsentSpan(span: c.vivi_backend_span_t) !void {
+    if (span.offset != 0 or span.length != 0) {
+        return error.InvalidCanvasOperation;
+    }
+}
+
+fn validateCanvasKey(key: canvas.KeyView) !void {
+    var owned = canvas.InstanceKey.init(
+        std.heap.c_allocator,
+        key,
+        .{},
+    ) catch return error.InvalidCanvasOperation;
+    owned.deinit(std.heap.c_allocator);
+}
+
+fn validateOpenInput(value: ?[]const u8) !void {
+    const bytes = value orelse return;
+    var document = canvas.OpenInputDocument.init(
+        std.heap.c_allocator,
+        bytes,
+        .{},
+    ) catch return error.InvalidCanvasOperation;
+    document.deinit(std.heap.c_allocator);
+}
+
+fn validateActionInput(value: ?[]const u8) !void {
+    const bytes = value orelse return;
+    var document = canvas.ActionInputDocument.init(
+        std.heap.c_allocator,
+        bytes,
+        .{},
+    ) catch return error.InvalidCanvasOperation;
+    document.deinit(std.heap.c_allocator);
+}
+
+fn decodeCanvasOperation(
+    raw: *const c.vivi_backend_canvas_operation_t,
+    bytes: []const u8,
+) !canvas.CommandInput {
+    if (raw.abi_version != c.VIVI_BACKEND_ABI_VERSION or
+        raw.struct_size != @sizeOf(c.vivi_backend_canvas_operation_t) or
+        raw.reserved0 != 0 or raw.reserved[0] != 0 or raw.reserved[1] != 0)
+    {
+        return error.InvalidCanvasOperation;
+    }
+    const key: canvas.KeyView = .{
+        .extension_id = try requiredInputSpan(bytes, raw.key.extension_id),
+        .canvas_id = try requiredInputSpan(bytes, raw.key.canvas_id),
+        .instance_id = try requiredInputSpan(bytes, raw.key.instance_id),
+    };
+    try validateCanvasKey(key);
+    return switch (raw.kind) {
+        c.VIVI_BACKEND_CANVAS_OPERATION_OPEN => blk: {
+            try requireAbsentSpan(raw.action_name);
+            try requireAbsentSpan(raw.action_input_json);
+            const input = try optionalInputSpan(bytes, raw.open_input_json);
+            try validateOpenInput(input);
+            break :blk .{ .open = .{
+                .key = key,
+                .input_json = input,
+            } };
+        },
+        c.VIVI_BACKEND_CANVAS_OPERATION_CLOSE => blk: {
+            try requireAbsentSpan(raw.action_name);
+            try requireAbsentSpan(raw.open_input_json);
+            try requireAbsentSpan(raw.action_input_json);
+            break :blk .{ .close = key };
+        },
+        c.VIVI_BACKEND_CANVAS_OPERATION_INVOKE_ACTION => blk: {
+            try requireAbsentSpan(raw.open_input_json);
+            const action_name = try requiredInputSpan(bytes, raw.action_name);
+            var owned_name = canvas.ActionName.init(
+                std.heap.c_allocator,
+                action_name,
+                .{},
+            ) catch return error.InvalidCanvasOperation;
+            owned_name.deinit(std.heap.c_allocator);
+            const input = try optionalInputSpan(bytes, raw.action_input_json);
+            try validateActionInput(input);
+            break :blk .{ .invoke_action = .{
+                .key = key,
+                .action_name = action_name,
+                .input_json = input,
+            } };
+        },
+        else => error.InvalidCanvasOperation,
+    };
+}
+
+export fn vivi_backend_perform_canvas(
+    conversation: ?*c.vivi_backend_conversation_t,
+    operation: ?*const c.vivi_backend_canvas_operation_t,
+    input_bytes: ?[*]const u8,
+    input_byte_count: u32,
+    out_operation_id: ?*u64,
+) callconv(.c) c.vivi_backend_result_t {
+    const output = out_operation_id orelse
+        return c.VIVI_BACKEND_INVALID_ARGUMENT;
+    output.* = 0;
+    const self = handle(conversation) orelse
+        return c.VIVI_BACKEND_INVALID_ARGUMENT;
+    const raw = operation orelse return c.VIVI_BACKEND_INVALID_ARGUMENT;
+    const bytes: []const u8 = if (input_byte_count == 0)
+        ""
+    else
+        (input_bytes orelse
+            return c.VIVI_BACKEND_INVALID_ARGUMENT)[0..input_byte_count];
+    const input = decodeCanvasOperation(raw, bytes) catch
+        return c.VIVI_BACKEND_INVALID_ARGUMENT;
+    if (self.control_operation != .none) return c.VIVI_BACKEND_BUSY;
+    const request_id = self.conversation.performCanvas(input) catch |err| {
+        return result(err);
+    };
+    self.control_operation = .canvas;
+    self.active_canvas_request_id = request_id;
+    output.* = request_id.value();
     return c.VIVI_BACKEND_OK;
 }
 
@@ -505,6 +676,8 @@ const Projected = struct {
     resumed_session: ?*const backend.SessionSummary = null,
     transcript: []const backend.TranscriptItem = &.{},
     skipped_invalid_shards: bool = false,
+    canvas_snapshot: ?*const canvas.Snapshot = null,
+    canvas_completion: ?*const canvas.CommandCompletion = null,
 };
 
 const ToolDisplay = struct {
@@ -694,12 +867,213 @@ fn project(event: *const backend.ConversationEvent) ?Projected {
             .content_kind = c.VIVI_BACKEND_CONTENT_TEXT,
             .text = "Native chat cannot answer agent questions yet.",
         },
+        .canvas_snapshot => |*snapshot| .{
+            .kind = c.VIVI_BACKEND_EVENT_CANVAS_SNAPSHOT,
+            .content_kind = c.VIVI_BACKEND_CONTENT_CANVAS_SNAPSHOT,
+            .canvas_snapshot = snapshot,
+        },
+        .canvas_operation => |*completion| .{
+            .kind = c.VIVI_BACKEND_EVENT_CANVAS_OPERATION,
+            .content_kind = c.VIVI_BACKEND_CONTENT_CANVAS_OPERATION,
+            .canvas_completion = completion,
+        },
         .command_catalog,
         .command_completed,
-        .canvas_snapshot,
-        .canvas_operation,
         => null,
     };
+}
+
+fn addProjectedBytes(
+    total_value: u64,
+    value: []const u8,
+    maximum: usize,
+    allow_empty: bool,
+) !u64 {
+    if ((!allow_empty and value.len == 0) or value.len > maximum or
+        !std.unicode.utf8ValidateSlice(value))
+    {
+        return error.InvalidCanvasProjection;
+    }
+    return std.math.add(u64, total_value, value.len) catch
+        error.EventTooLarge;
+}
+
+fn addProjectedJson(total_value: u64, value: []const u8) !u64 {
+    const limits = canvas.Limits{};
+    if (value.len == 0 or value.len > limits.max_json_bytes or
+        !std.unicode.utf8ValidateSlice(value))
+    {
+        return error.InvalidCanvasProjection;
+    }
+    const parsed = std.json.parseFromSlice(
+        std.json.Value,
+        std.heap.c_allocator,
+        value,
+        .{},
+    ) catch return error.InvalidCanvasProjection;
+    defer parsed.deinit();
+    return std.math.add(u64, total_value, value.len) catch
+        error.EventTooLarge;
+}
+
+fn addOptionalProjectedText(
+    total_value: u64,
+    value: ?[]const u8,
+) !u64 {
+    return if (value) |text|
+        addProjectedBytes(
+            total_value,
+            text,
+            (canvas.Limits{}).max_text_bytes,
+            true,
+        )
+    else
+        total_value;
+}
+
+fn addOptionalProjectedJson(
+    total_value: u64,
+    value: anytype,
+) !u64 {
+    return if (value) |document|
+        addProjectedJson(total_value, document.bytes)
+    else
+        total_value;
+}
+
+fn addCanvasSnapshotBytes(
+    total_value: u64,
+    snapshot: *const canvas.Snapshot,
+) !u64 {
+    const limits = canvas.Limits{};
+    if (snapshot.declarations.len > limits.max_registry_entries or
+        snapshot.instances.len > limits.max_instances)
+    {
+        return error.InvalidCanvasProjection;
+    }
+    var total = total_value;
+    var action_count: usize = 0;
+    for (snapshot.declarations) |declaration| {
+        total = try addProjectedBytes(
+            total,
+            declaration.provider.id.bytes,
+            limits.max_identifier_bytes,
+            false,
+        );
+        total = try addProjectedBytes(
+            total,
+            declaration.provider.name,
+            limits.max_text_bytes,
+            true,
+        );
+        total = try addProjectedBytes(
+            total,
+            declaration.id.bytes,
+            limits.max_identifier_bytes,
+            false,
+        );
+        total = try addProjectedBytes(
+            total,
+            declaration.display_name,
+            limits.max_text_bytes,
+            true,
+        );
+        total = try addProjectedBytes(
+            total,
+            declaration.description,
+            limits.max_text_bytes,
+            true,
+        );
+        total = try addOptionalProjectedJson(total, declaration.input_schema);
+        action_count = std.math.add(
+            usize,
+            action_count,
+            declaration.actions.len,
+        ) catch return error.EventTooLarge;
+        if (declaration.actions.len > limits.max_actions_per_canvas) {
+            return error.InvalidCanvasProjection;
+        }
+        for (declaration.actions) |action| {
+            total = try addProjectedBytes(
+                total,
+                action.name.bytes,
+                limits.max_identifier_bytes,
+                false,
+            );
+            total = try addProjectedBytes(
+                total,
+                action.description,
+                limits.max_text_bytes,
+                true,
+            );
+            total = try addOptionalProjectedJson(total, action.input_schema);
+        }
+    }
+    _ = std.math.cast(u32, action_count) orelse return error.EventTooLarge;
+    for (snapshot.instances) |instance| {
+        const key = instance.key.view();
+        if (key.extension_id.len + key.canvas_id.len + key.instance_id.len >
+            limits.max_key_bytes)
+        {
+            return error.InvalidCanvasProjection;
+        }
+        total = try addProjectedBytes(
+            total,
+            key.extension_id,
+            limits.max_identifier_bytes,
+            false,
+        );
+        total = try addProjectedBytes(
+            total,
+            key.canvas_id,
+            limits.max_identifier_bytes,
+            false,
+        );
+        total = try addProjectedBytes(
+            total,
+            key.instance_id,
+            limits.max_identifier_bytes,
+            false,
+        );
+        total = try addOptionalProjectedJson(total, instance.open_input);
+        total = try addOptionalProjectedText(total, instance.title);
+        total = try addOptionalProjectedText(total, instance.url);
+        total = try addOptionalProjectedText(total, instance.status);
+        total = try addOptionalProjectedText(total, instance.recorded_title);
+        total = try addOptionalProjectedJson(total, instance.recorded_input);
+        if (instance.renderer_generation) |generation| {
+            if (generation.value() == 0) return error.InvalidCanvasProjection;
+        }
+    }
+    return total;
+}
+
+fn addCanvasCompletionBytes(
+    total_value: u64,
+    completion: *const canvas.CommandCompletion,
+) !u64 {
+    if (completion.request_id.value() == 0) {
+        return error.InvalidCanvasProjection;
+    }
+    var total = total_value;
+    switch (completion.result) {
+        .open => |result_value| switch (result_value) {
+            .succeeded => |open| {
+                total = try addOptionalProjectedText(total, open.title);
+                total = try addOptionalProjectedText(total, open.url);
+                total = try addOptionalProjectedText(total, open.status);
+            },
+            .failed => {},
+        },
+        .close => {},
+        .action => |result_value| switch (result_value) {
+            .succeeded => |document| {
+                total = try addProjectedJson(total, document.bytes);
+            },
+            .failed => {},
+        },
+    }
+    return total;
 }
 
 fn byteCount(projected: Projected) !u32 {
@@ -746,6 +1120,12 @@ fn byteCount(projected: Projected) !u32 {
         total = std.math.add(u64, total, item.text.len) catch
             return error.EventTooLarge;
     }
+    if (projected.canvas_snapshot) |snapshot| {
+        total = try addCanvasSnapshotBytes(total, snapshot);
+    }
+    if (projected.canvas_completion) |completion| {
+        total = try addCanvasCompletionBytes(total, completion);
+    }
     if (total > std.math.maxInt(u32)) return error.EventTooLarge;
     return @intCast(total);
 }
@@ -787,6 +1167,28 @@ fn sessionCount(projected: Projected) !u32 {
 
 fn transcriptItemCount(projected: Projected) !u32 {
     return std.math.cast(u32, projected.transcript.len) orelse
+        error.EventTooLarge;
+}
+
+fn canvasDeclarationCount(projected: Projected) !u32 {
+    const snapshot = projected.canvas_snapshot orelse return 0;
+    return std.math.cast(u32, snapshot.declarations.len) orelse
+        error.EventTooLarge;
+}
+
+fn canvasActionCount(projected: Projected) !u32 {
+    const snapshot = projected.canvas_snapshot orelse return 0;
+    var count: usize = 0;
+    for (snapshot.declarations) |declaration| {
+        count = std.math.add(usize, count, declaration.actions.len) catch
+            return error.EventTooLarge;
+    }
+    return std.math.cast(u32, count) orelse error.EventTooLarge;
+}
+
+fn canvasInstanceCount(projected: Projected) !u32 {
+    const snapshot = projected.canvas_snapshot orelse return 0;
+    return std.math.cast(u32, snapshot.instances.len) orelse
         error.EventTooLarge;
 }
 
@@ -903,6 +1305,384 @@ fn writeTranscriptItem(
     };
 }
 
+fn cCanvasCapability(
+    value: canvas.CapabilityState,
+) c.vivi_backend_canvas_capability_t {
+    return switch (value) {
+        .unknown => c.VIVI_BACKEND_CANVAS_CAPABILITY_UNKNOWN,
+        .unsupported => c.VIVI_BACKEND_CANVAS_CAPABILITY_UNSUPPORTED,
+        .supported => c.VIVI_BACKEND_CANVAS_CAPABILITY_SUPPORTED,
+    };
+}
+
+fn cCanvasRuntime(
+    value: canvas.RuntimeTag,
+) c.vivi_backend_canvas_runtime_t {
+    return switch (value) {
+        .closed => c.VIVI_BACKEND_CANVAS_RUNTIME_CLOSED,
+        .opening => c.VIVI_BACKEND_CANVAS_RUNTIME_OPENING,
+        .opened => c.VIVI_BACKEND_CANVAS_RUNTIME_OPENED,
+        .closing => c.VIVI_BACKEND_CANVAS_RUNTIME_CLOSING,
+        .unavailable => c.VIVI_BACKEND_CANVAS_RUNTIME_UNAVAILABLE,
+    };
+}
+
+fn cCanvasRecord(
+    value: canvas.RecordTag,
+) c.vivi_backend_canvas_record_t {
+    return switch (value) {
+        .recorded => c.VIVI_BACKEND_CANVAS_RECORD_RECORDED,
+        .removed => c.VIVI_BACKEND_CANVAS_RECORD_REMOVED,
+    };
+}
+
+fn cCanvasDegradation(
+    value: ?canvas.Degradation,
+) c.vivi_backend_canvas_degradation_t {
+    const degradation = value orelse
+        return c.VIVI_BACKEND_CANVAS_DEGRADATION_NONE;
+    return switch (degradation) {
+        .invalid_signal => c.VIVI_BACKEND_CANVAS_DEGRADATION_INVALID_SIGNAL,
+        .limit_exceeded => c.VIVI_BACKEND_CANVAS_DEGRADATION_LIMIT_EXCEEDED,
+        .backpressure => c.VIVI_BACKEND_CANVAS_DEGRADATION_BACKPRESSURE,
+        .host_failure => c.VIVI_BACKEND_CANVAS_DEGRADATION_HOST_FAILURE,
+    };
+}
+
+fn cCanvasFailure(
+    value: canvas.OperationFailure,
+) c.vivi_backend_canvas_operation_failure_t {
+    return switch (value) {
+        .disabled => c.VIVI_BACKEND_CANVAS_FAILURE_DISABLED,
+        .unsupported => c.VIVI_BACKEND_CANVAS_FAILURE_UNSUPPORTED,
+        .unavailable => c.VIVI_BACKEND_CANVAS_FAILURE_UNAVAILABLE,
+        .invalid_request => c.VIVI_BACKEND_CANVAS_FAILURE_INVALID_REQUEST,
+        .backpressure => c.VIVI_BACKEND_CANVAS_FAILURE_BACKPRESSURE,
+        .host_failure => c.VIVI_BACKEND_CANVAS_FAILURE_HOST_FAILURE,
+        .invalid_sdk_result => c.VIVI_BACKEND_CANVAS_FAILURE_INVALID_SDK_RESULT,
+        .stale => c.VIVI_BACKEND_CANVAS_FAILURE_STALE,
+        .shutdown => c.VIVI_BACKEND_CANVAS_FAILURE_SHUTDOWN,
+    };
+}
+
+fn writeCanvasKey(
+    destination: []u8,
+    offset: *u32,
+    key: canvas.KeyView,
+) c.vivi_backend_canvas_key_t {
+    return .{
+        .extension_id = appendBytes(destination, offset, key.extension_id),
+        .canvas_id = appendBytes(destination, offset, key.canvas_id),
+        .instance_id = appendBytes(destination, offset, key.instance_id),
+    };
+}
+
+fn writeOptionalBytes(
+    destination: []u8,
+    offset: *u32,
+    value: ?[]const u8,
+    flags: *u32,
+    flag: u32,
+) c.vivi_backend_span_t {
+    const bytes = value orelse return .{ .offset = 0, .length = 0 };
+    flags.* |= flag;
+    return appendBytes(destination, offset, bytes);
+}
+
+fn writeCanvasSnapshot(
+    snapshot: *const canvas.Snapshot,
+    destination: []u8,
+    offset: *u32,
+    declarations: []c.vivi_backend_canvas_declaration_t,
+    actions: []c.vivi_backend_canvas_action_t,
+    instances: []c.vivi_backend_canvas_instance_t,
+) void {
+    var action_index: u32 = 0;
+    for (snapshot.declarations, 0..) |declaration, declaration_index| {
+        var flags: u32 = 0;
+        const schema = writeOptionalBytes(
+            destination,
+            offset,
+            if (declaration.input_schema) |value| value.bytes else null,
+            &flags,
+            c.VIVI_BACKEND_CANVAS_DECLARATION_INPUT_SCHEMA_PRESENT,
+        );
+        declarations[declaration_index] = .{
+            .extension_id = appendBytes(
+                destination,
+                offset,
+                declaration.provider.id.bytes,
+            ),
+            .extension_name = appendBytes(
+                destination,
+                offset,
+                declaration.provider.name,
+            ),
+            .canvas_id = appendBytes(destination, offset, declaration.id.bytes),
+            .display_name = appendBytes(
+                destination,
+                offset,
+                declaration.display_name,
+            ),
+            .description = appendBytes(
+                destination,
+                offset,
+                declaration.description,
+            ),
+            .input_schema_json = schema,
+            .action_offset = action_index,
+            .action_count = @intCast(declaration.actions.len),
+            .flags = flags,
+            .reserved = 0,
+        };
+        for (declaration.actions) |action| {
+            var action_flags: u32 = 0;
+            const action_schema = writeOptionalBytes(
+                destination,
+                offset,
+                if (action.input_schema) |value| value.bytes else null,
+                &action_flags,
+                c.VIVI_BACKEND_CANVAS_ACTION_INPUT_SCHEMA_PRESENT,
+            );
+            actions[action_index] = .{
+                .name = appendBytes(destination, offset, action.name.bytes),
+                .description = appendBytes(
+                    destination,
+                    offset,
+                    action.description,
+                ),
+                .input_schema_json = action_schema,
+                .flags = action_flags,
+                .reserved = 0,
+            };
+            action_index += 1;
+        }
+    }
+    for (snapshot.instances, 0..) |instance, index| {
+        var flags: u32 = 0;
+        const open_input = writeOptionalBytes(
+            destination,
+            offset,
+            if (instance.open_input) |value| value.bytes else null,
+            &flags,
+            c.VIVI_BACKEND_CANVAS_INSTANCE_OPEN_INPUT_PRESENT,
+        );
+        const title = writeOptionalBytes(
+            destination,
+            offset,
+            instance.title,
+            &flags,
+            c.VIVI_BACKEND_CANVAS_INSTANCE_TITLE_PRESENT,
+        );
+        const url = writeOptionalBytes(
+            destination,
+            offset,
+            instance.url,
+            &flags,
+            c.VIVI_BACKEND_CANVAS_INSTANCE_URL_PRESENT,
+        );
+        const status = writeOptionalBytes(
+            destination,
+            offset,
+            instance.status,
+            &flags,
+            c.VIVI_BACKEND_CANVAS_INSTANCE_STATUS_PRESENT,
+        );
+        const recorded_title = writeOptionalBytes(
+            destination,
+            offset,
+            instance.recorded_title,
+            &flags,
+            c.VIVI_BACKEND_CANVAS_INSTANCE_RECORDED_TITLE_PRESENT,
+        );
+        const recorded_input = writeOptionalBytes(
+            destination,
+            offset,
+            if (instance.recorded_input) |value| value.bytes else null,
+            &flags,
+            c.VIVI_BACKEND_CANVAS_INSTANCE_RECORDED_INPUT_PRESENT,
+        );
+        var generation: u64 = 0;
+        if (instance.renderer_generation) |value| {
+            flags |= c.VIVI_BACKEND_CANVAS_INSTANCE_RENDERER_GENERATION_PRESENT;
+            generation = value.value();
+        }
+        instances[index] = .{
+            .key = writeCanvasKey(destination, offset, instance.key.view()),
+            .open_input_json = open_input,
+            .title = title,
+            .url = url,
+            .status = status,
+            .recorded_title = recorded_title,
+            .recorded_input_json = recorded_input,
+            .renderer_generation = generation,
+            .runtime = cCanvasRuntime(instance.runtime),
+            .record = cCanvasRecord(instance.record),
+            .degradation = cCanvasDegradation(instance.degradation),
+            .flags = flags,
+            .reserved = .{ 0, 0 },
+        };
+    }
+}
+
+fn canvasSnapshotMetadata(
+    snapshot: *const canvas.Snapshot,
+    declaration_count: u32,
+    action_count: u32,
+    instance_count: u32,
+) c.vivi_backend_canvas_snapshot_t {
+    return .{
+        .capability = cCanvasCapability(snapshot.capability),
+        .registry_degradation = cCanvasDegradation(
+            snapshot.registry_degradation,
+        ),
+        .operation_degradation = cCanvasDegradation(
+            snapshot.operation_degradation,
+        ),
+        .flags = if (snapshot.shutdown_requested)
+            c.VIVI_BACKEND_CANVAS_SNAPSHOT_SHUTDOWN_REQUESTED
+        else
+            0,
+        .declaration_count = declaration_count,
+        .action_count = action_count,
+        .instance_count = instance_count,
+        .reserved = 0,
+    };
+}
+
+fn projectedOptionalSpan(
+    offset: *u32,
+    value: ?[]const u8,
+    flags: *u32,
+    flag: u32,
+) c.vivi_backend_span_t {
+    const bytes = value orelse return .{ .offset = 0, .length = 0 };
+    const span: c.vivi_backend_span_t = .{
+        .offset = offset.*,
+        .length = @intCast(bytes.len),
+    };
+    offset.* += span.length;
+    flags.* |= flag;
+    return span;
+}
+
+fn canvasCompletionMetadata(
+    completion: *const canvas.CommandCompletion,
+) c.vivi_backend_canvas_completion_t {
+    var output = std.mem.zeroes(c.vivi_backend_canvas_completion_t);
+    output.operation_id = completion.request_id.value();
+    var offset: u32 = 0;
+    switch (completion.result) {
+        .open => |result_value| {
+            output.kind = c.VIVI_BACKEND_CANVAS_OPERATION_OPEN;
+            switch (result_value) {
+                .succeeded => |open| {
+                    output.outcome = c.VIVI_BACKEND_CANVAS_OPERATION_SUCCEEDED;
+                    output.title = projectedOptionalSpan(
+                        &offset,
+                        open.title,
+                        &output.flags,
+                        c.VIVI_BACKEND_CANVAS_COMPLETION_TITLE_PRESENT,
+                    );
+                    output.url = projectedOptionalSpan(
+                        &offset,
+                        open.url,
+                        &output.flags,
+                        c.VIVI_BACKEND_CANVAS_COMPLETION_URL_PRESENT,
+                    );
+                    output.status = projectedOptionalSpan(
+                        &offset,
+                        open.status,
+                        &output.flags,
+                        c.VIVI_BACKEND_CANVAS_COMPLETION_STATUS_PRESENT,
+                    );
+                },
+                .failed => |failure| {
+                    output.outcome = c.VIVI_BACKEND_CANVAS_OPERATION_FAILED;
+                    output.failure = cCanvasFailure(failure);
+                },
+            }
+        },
+        .close => |result_value| {
+            output.kind = c.VIVI_BACKEND_CANVAS_OPERATION_CLOSE;
+            switch (result_value) {
+                .succeeded => {
+                    output.outcome = c.VIVI_BACKEND_CANVAS_OPERATION_SUCCEEDED;
+                },
+                .failed => |failure| {
+                    output.outcome = c.VIVI_BACKEND_CANVAS_OPERATION_FAILED;
+                    output.failure = cCanvasFailure(failure);
+                },
+            }
+        },
+        .action => |result_value| {
+            output.kind = c.VIVI_BACKEND_CANVAS_OPERATION_INVOKE_ACTION;
+            switch (result_value) {
+                .succeeded => |document| {
+                    output.outcome = c.VIVI_BACKEND_CANVAS_OPERATION_SUCCEEDED;
+                    output.action_result_json = projectedOptionalSpan(
+                        &offset,
+                        document.bytes,
+                        &output.flags,
+                        c.VIVI_BACKEND_CANVAS_COMPLETION_ACTION_RESULT_PRESENT,
+                    );
+                },
+                .failed => |failure| {
+                    output.outcome = c.VIVI_BACKEND_CANVAS_OPERATION_FAILED;
+                    output.failure = cCanvasFailure(failure);
+                },
+            }
+        },
+    }
+    return output;
+}
+
+fn writeCanvasCompletion(
+    completion: *const canvas.CommandCompletion,
+    destination: []u8,
+    offset: *u32,
+) c.vivi_backend_canvas_completion_t {
+    const output = canvasCompletionMetadata(completion);
+    switch (completion.result) {
+        .open => |result_value| {
+            switch (result_value) {
+                .succeeded => |open| {
+                    if (open.title) |value| _ = appendBytes(
+                        destination,
+                        offset,
+                        value,
+                    );
+                    if (open.url) |value| _ = appendBytes(
+                        destination,
+                        offset,
+                        value,
+                    );
+                    if (open.status) |value| _ = appendBytes(
+                        destination,
+                        offset,
+                        value,
+                    );
+                },
+                .failed => {},
+            }
+        },
+        .close => {},
+        .action => |result_value| {
+            switch (result_value) {
+                .succeeded => |document| {
+                    _ = appendBytes(
+                        destination,
+                        offset,
+                        document.bytes,
+                    );
+                },
+                .failed => {},
+            }
+        },
+    }
+    return output;
+}
+
 fn copyProjected(
     projected: Projected,
     output: *c.vivi_backend_event_t,
@@ -946,6 +1726,12 @@ fn copyProjectedWithSpans(
         0,
         null,
         0,
+        null,
+        0,
+        null,
+        0,
+        null,
+        0,
     );
 }
 
@@ -962,6 +1748,12 @@ fn copyProjectedFull(
     session_capacity: u32,
     transcript_items: ?[*]c.vivi_backend_transcript_item_t,
     transcript_item_capacity: u32,
+    canvas_declarations: ?[*]c.vivi_backend_canvas_declaration_t,
+    canvas_declaration_capacity: u32,
+    canvas_actions: ?[*]c.vivi_backend_canvas_action_t,
+    canvas_action_capacity: u32,
+    canvas_instances: ?[*]c.vivi_backend_canvas_instance_t,
+    canvas_instance_capacity: u32,
 ) c.vivi_backend_result_t {
     const required_bytes = byteCount(projected) catch return c.VIVI_BACKEND_FAILED;
     const required_models = modelCount(projected) catch return c.VIVI_BACKEND_FAILED;
@@ -970,6 +1762,12 @@ fn copyProjectedFull(
     const required_sessions = sessionCount(projected) catch
         return c.VIVI_BACKEND_FAILED;
     const required_transcript_items = transcriptItemCount(projected) catch
+        return c.VIVI_BACKEND_FAILED;
+    const required_canvas_declarations = canvasDeclarationCount(projected) catch
+        return c.VIVI_BACKEND_FAILED;
+    const required_canvas_actions = canvasActionCount(projected) catch
+        return c.VIVI_BACKEND_FAILED;
+    const required_canvas_instances = canvasInstanceCount(projected) catch
         return c.VIVI_BACKEND_FAILED;
     output.* = .{
         .kind = projected.kind,
@@ -1001,11 +1799,27 @@ fn copyProjectedFull(
         .skipped_invalid_shards = @intFromBool(projected.skipped_invalid_shards),
         .session_reserved = 0,
         .reserved = 0,
+        .canvas_snapshot = if (projected.canvas_snapshot) |snapshot|
+            canvasSnapshotMetadata(
+                snapshot,
+                required_canvas_declarations,
+                required_canvas_actions,
+                required_canvas_instances,
+            )
+        else
+            std.mem.zeroes(c.vivi_backend_canvas_snapshot_t),
+        .canvas_completion = if (projected.canvas_completion) |completion|
+            canvasCompletionMetadata(completion)
+        else
+            std.mem.zeroes(c.vivi_backend_canvas_completion_t),
     };
     if (byte_capacity < required_bytes or model_capacity < required_models or
         semantic_span_capacity < required_semantic_spans or
         session_capacity < required_sessions or
-        transcript_item_capacity < required_transcript_items)
+        transcript_item_capacity < required_transcript_items or
+        canvas_declaration_capacity < required_canvas_declarations or
+        canvas_action_capacity < required_canvas_actions or
+        canvas_instance_capacity < required_canvas_instances)
     {
         return c.VIVI_BACKEND_BUFFER_TOO_SMALL;
     }
@@ -1014,6 +1828,9 @@ fn copyProjectedFull(
     var empty_semantic_spans: [0]c.vivi_backend_semantic_span_t = .{};
     var empty_sessions: [0]c.vivi_backend_session_summary_t = .{};
     var empty_transcript_items: [0]c.vivi_backend_transcript_item_t = .{};
+    var empty_canvas_declarations: [0]c.vivi_backend_canvas_declaration_t = .{};
+    var empty_canvas_actions: [0]c.vivi_backend_canvas_action_t = .{};
+    var empty_canvas_instances: [0]c.vivi_backend_canvas_instance_t = .{};
     const byte_destination: []u8 = if (required_bytes > 0)
         (bytes orelse return c.VIVI_BACKEND_INVALID_ARGUMENT)[0..required_bytes]
     else
@@ -1037,6 +1854,24 @@ fn copyProjectedFull(
             (transcript_items orelse return c.VIVI_BACKEND_INVALID_ARGUMENT)[0..required_transcript_items]
         else
             &empty_transcript_items;
+    const canvas_declaration_destination: []c.vivi_backend_canvas_declaration_t =
+        if (required_canvas_declarations > 0)
+            (canvas_declarations orelse
+                return c.VIVI_BACKEND_INVALID_ARGUMENT)[0..required_canvas_declarations]
+        else
+            &empty_canvas_declarations;
+    const canvas_action_destination: []c.vivi_backend_canvas_action_t =
+        if (required_canvas_actions > 0)
+            (canvas_actions orelse
+                return c.VIVI_BACKEND_INVALID_ARGUMENT)[0..required_canvas_actions]
+        else
+            &empty_canvas_actions;
+    const canvas_instance_destination: []c.vivi_backend_canvas_instance_t =
+        if (required_canvas_instances > 0)
+            (canvas_instances orelse
+                return c.VIVI_BACKEND_INVALID_ARGUMENT)[0..required_canvas_instances]
+        else
+            &empty_canvas_instances;
     var offset: u32 = 0;
     output.content = appendBytes(byte_destination, &offset, projected.text);
     output.selected_model_id = appendBytes(
@@ -1126,6 +1961,23 @@ fn copyProjectedFull(
             item,
         );
     }
+    if (projected.canvas_snapshot) |snapshot| {
+        writeCanvasSnapshot(
+            snapshot,
+            byte_destination,
+            &offset,
+            canvas_declaration_destination,
+            canvas_action_destination,
+            canvas_instance_destination,
+        );
+    }
+    if (projected.canvas_completion) |completion| {
+        output.canvas_completion = writeCanvasCompletion(
+            completion,
+            byte_destination,
+            &offset,
+        );
+    }
     return c.VIVI_BACKEND_OK;
 }
 
@@ -1142,6 +1994,12 @@ export fn vivi_backend_next_event(
     session_capacity: u32,
     transcript_items: ?[*]c.vivi_backend_transcript_item_t,
     transcript_item_capacity: u32,
+    canvas_declarations: ?[*]c.vivi_backend_canvas_declaration_t,
+    canvas_declaration_capacity: u32,
+    canvas_actions: ?[*]c.vivi_backend_canvas_action_t,
+    canvas_action_capacity: u32,
+    canvas_instances: ?[*]c.vivi_backend_canvas_instance_t,
+    canvas_instance_capacity: u32,
 ) callconv(.c) c.vivi_backend_result_t {
     const self = handle(conversation) orelse return c.VIVI_BACKEND_INVALID_ARGUMENT;
     const output = out_event orelse return c.VIVI_BACKEND_INVALID_ARGUMENT;
@@ -1174,6 +2032,12 @@ export fn vivi_backend_next_event(
             .skipped_invalid_shards = 0,
             .session_reserved = 0,
             .reserved = 0,
+            .canvas_snapshot = std.mem.zeroes(
+                c.vivi_backend_canvas_snapshot_t,
+            ),
+            .canvas_completion = std.mem.zeroes(
+                c.vivi_backend_canvas_completion_t,
+            ),
         };
         return c.VIVI_BACKEND_OK;
     }
@@ -1186,6 +2050,14 @@ export fn vivi_backend_next_event(
         self.pending = null;
     }
     const projected = project(&self.pending.?).?;
+    if (projected.canvas_completion) |completion| {
+        if (self.control_operation != .canvas or
+            self.active_canvas_request_id == null or
+            self.active_canvas_request_id.? != completion.request_id)
+        {
+            return c.VIVI_BACKEND_FAILED;
+        }
+    }
     const copied = copyProjectedFull(
         projected,
         output,
@@ -1199,6 +2071,12 @@ export fn vivi_backend_next_event(
         session_capacity,
         transcript_items,
         transcript_item_capacity,
+        canvas_declarations,
+        canvas_declaration_capacity,
+        canvas_actions,
+        canvas_action_capacity,
+        canvas_instances,
+        canvas_instance_capacity,
     );
     if (copied != c.VIVI_BACKEND_OK) return copied;
     if (projected.kind == c.VIVI_BACKEND_EVENT_FAILURE) {
@@ -1230,6 +2108,11 @@ export fn vivi_backend_next_event(
         self.control_operation == .resume_session)
     {
         self.control_operation = .none;
+    } else if (projected.kind == c.VIVI_BACKEND_EVENT_CANVAS_OPERATION and
+        self.control_operation == .canvas)
+    {
+        self.control_operation = .none;
+        self.active_canvas_request_id = null;
     }
     self.pending.?.deinit();
     self.pending = null;
@@ -1255,6 +2138,13 @@ export fn vivi_backend_destroy(
 test "C launch policy rejects unknown values" {
     const invalid: c.vivi_backend_copilot_cli_launch_t = 99;
     try std.testing.expect(copilotCliLaunch(invalid) == null);
+}
+
+test "C canvas mode is explicit and closed by default" {
+    try std.testing.expectEqual(false, canvasMode(c.VIVI_BACKEND_CANVAS_DISABLED).?);
+    try std.testing.expectEqual(true, canvasMode(c.VIVI_BACKEND_CANVAS_ENABLED).?);
+    const invalid: c.vivi_backend_canvas_mode_t = 99;
+    try std.testing.expect(canvasMode(invalid) == null);
 }
 
 test "C wake coalesces before arming and schedules after arming" {
@@ -1661,6 +2551,12 @@ test "C session catalog copy is atomic and preserves opaque keys" {
                 0,
                 null,
                 0,
+                null,
+                0,
+                null,
+                0,
+                null,
+                0,
             ),
     );
     try std.testing.expectEqual(@as(u8, 0xaa), bytes[0]);
@@ -1680,6 +2576,12 @@ test "C session catalog copy is atomic and preserves opaque keys" {
                 0,
                 &sessions,
                 sessions.len,
+                null,
+                0,
+                null,
+                0,
+                null,
+                0,
                 null,
                 0,
             ),
@@ -1754,6 +2656,12 @@ test "C session resume copies summary and ordered transcript atomically" {
                 sessions.len,
                 &transcript,
                 2,
+                null,
+                0,
+                null,
+                0,
+                null,
+                0,
             ),
     );
     try std.testing.expectEqual(@as(u64, 0), sessions[0].key.generation);
@@ -1774,6 +2682,12 @@ test "C session resume copies summary and ordered transcript atomically" {
                 sessions.len,
                 &transcript,
                 transcript.len,
+                null,
+                0,
+                null,
+                0,
+                null,
+                0,
             ),
     );
     try std.testing.expect(
@@ -1792,6 +2706,763 @@ test "C session resume copies summary and ordered transcript atomically" {
     try std.testing.expectEqualStrings(
         "thinking",
         bytes[transcript[1].text.offset..][0..transcript[1].text.length],
+    );
+}
+
+fn canvasProjectionFixture(
+    allocator: std.mem.Allocator,
+) !backend.ConversationEvent {
+    const actions = [_]canvas.ActionDeclarationInput{
+        .{
+            .name = "refresh",
+            .description = "Refresh",
+            .input_schema_json = "{\"type\":\"object\"}",
+        },
+        .{
+            .name = "focus",
+            .description = "Focus",
+        },
+    };
+    const declarations = [_]canvas.CanvasDeclarationInput{.{
+        .extension_id = "fixture.extension",
+        .extension_name = "Fixture",
+        .canvas_id = "review",
+        .display_name = "Review",
+        .description = "Review changes",
+        .input_schema_json = "{\"type\":\"object\"}",
+        .actions = &actions,
+    }};
+    var state = canvas.State.init(allocator, .{});
+    defer state.deinit();
+    state.setCapability(.supported);
+    try state.applyRegistry(.{ .replacement = &declarations });
+    var open_input = try canvas.OpenInputDocument.init(
+        allocator,
+        "{\"path\":\"root.zig\"}",
+        .{},
+    );
+    defer open_input.deinit(allocator);
+    const key: canvas.KeyView = .{
+        .extension_id = "fixture.extension",
+        .canvas_id = "review",
+        .instance_id = "review:main",
+    };
+    try state.applyProviderSignal(.{ .opened = .{
+        .key = key,
+        .input = &open_input,
+        .result = .{
+            .title = "",
+            .url = "vivi://review",
+            .status = "ready",
+        },
+    } });
+    try state.applyProviderSignal(.{ .recorded = .{
+        .key = key,
+        .title = "Saved",
+        .input = &open_input,
+    } });
+    state.noteDegradation(.registry, .backpressure);
+    state.noteDegradation(.operations, .host_failure);
+    state.noteDegradation(.{ .instance = key }, .invalid_signal);
+    return .{ .canvas_snapshot = try state.snapshot(allocator) };
+}
+
+fn expectCanvasSentinels(
+    bytes: []const u8,
+    declarations: []const c.vivi_backend_canvas_declaration_t,
+    actions: []const c.vivi_backend_canvas_action_t,
+    instances: []const c.vivi_backend_canvas_instance_t,
+) !void {
+    try std.testing.expectEqual(@as(u8, 0xaa), bytes[0]);
+    try std.testing.expectEqual(
+        @as(u8, 0xaa),
+        std.mem.asBytes(&declarations[0])[0],
+    );
+    try std.testing.expectEqual(
+        @as(u8, 0xaa),
+        std.mem.asBytes(&actions[0])[0],
+    );
+    try std.testing.expectEqual(
+        @as(u8, 0xaa),
+        std.mem.asBytes(&instances[0])[0],
+    );
+}
+
+test "C canvas operation decoder validates role-specific spans" {
+    const input = "unusedfixture.extensionreviewmain{\"open\":true}refresh{\"action\":true}";
+    const extension = std.mem.indexOf(u8, input, "fixture.extension").?;
+    const canvas_id = std.mem.indexOf(u8, input, "review").?;
+    const instance = std.mem.indexOf(u8, input, "main").?;
+    const open_json = std.mem.indexOf(u8, input, "{\"open\":true}").?;
+    const action = std.mem.indexOf(u8, input, "refresh").?;
+    const action_json = std.mem.indexOf(u8, input, "{\"action\":true}").?;
+    const key: c.vivi_backend_canvas_key_t = .{
+        .extension_id = .{ .offset = @intCast(extension), .length = 17 },
+        .canvas_id = .{ .offset = @intCast(canvas_id), .length = 6 },
+        .instance_id = .{ .offset = @intCast(instance), .length = 4 },
+    };
+    const base: c.vivi_backend_canvas_operation_t = .{
+        .abi_version = c.VIVI_BACKEND_ABI_VERSION,
+        .struct_size = @sizeOf(c.vivi_backend_canvas_operation_t),
+        .kind = c.VIVI_BACKEND_CANVAS_OPERATION_OPEN,
+        .reserved0 = 0,
+        .key = key,
+        .action_name = .{ .offset = 0, .length = 0 },
+        .open_input_json = .{
+            .offset = @intCast(open_json),
+            .length = 13,
+        },
+        .action_input_json = .{ .offset = 0, .length = 0 },
+        .reserved = .{ 0, 0 },
+    };
+    const decoded_open = try decodeCanvasOperation(&base, input);
+    try std.testing.expectEqualStrings(
+        "{\"open\":true}",
+        decoded_open.open.input_json.?,
+    );
+
+    var overlapping = base;
+    overlapping.key.canvas_id = overlapping.key.extension_id;
+    overlapping.key.instance_id = overlapping.key.extension_id;
+    _ = try decodeCanvasOperation(&overlapping, input);
+
+    var invoke = base;
+    invoke.kind = c.VIVI_BACKEND_CANVAS_OPERATION_INVOKE_ACTION;
+    invoke.action_name = .{ .offset = @intCast(action), .length = 7 };
+    invoke.open_input_json = .{ .offset = 0, .length = 0 };
+    invoke.action_input_json = .{
+        .offset = @intCast(action_json),
+        .length = 15,
+    };
+    const decoded_action = try decodeCanvasOperation(&invoke, input);
+    try std.testing.expectEqualStrings(
+        "{\"action\":true}",
+        decoded_action.invoke_action.input_json.?,
+    );
+
+    var close = base;
+    close.kind = c.VIVI_BACKEND_CANVAS_OPERATION_CLOSE;
+    close.open_input_json = .{ .offset = 0, .length = 0 };
+    const decoded_close = try decodeCanvasOperation(&close, input);
+    try std.testing.expectEqualStrings(
+        "fixture.extension",
+        decoded_close.close.extension_id,
+    );
+
+    var invalid = base;
+    invalid.open_input_json = .{ .offset = 1, .length = 0 };
+    try std.testing.expectError(
+        error.InvalidCanvasOperation,
+        decodeCanvasOperation(&invalid, input),
+    );
+    invalid = base;
+    invalid.reserved[1] = 1;
+    try std.testing.expectError(
+        error.InvalidCanvasOperation,
+        decodeCanvasOperation(&invalid, input),
+    );
+    invalid = base;
+    invalid.action_name = .{ .offset = @intCast(action), .length = 7 };
+    try std.testing.expectError(
+        error.InvalidCanvasOperation,
+        decodeCanvasOperation(&invalid, input),
+    );
+    invalid = base;
+    invalid.open_input_json = .{
+        .offset = @intCast(open_json),
+        .length = 1,
+    };
+    try std.testing.expectError(
+        error.InvalidCanvasOperation,
+        decodeCanvasOperation(&invalid, input),
+    );
+    invalid = base;
+    invalid.key.instance_id = .{
+        .offset = std.math.maxInt(u32),
+        .length = 2,
+    };
+    try std.testing.expectError(
+        error.InvalidCanvasOperation,
+        decodeCanvasOperation(&invalid, input),
+    );
+    invalid = base;
+    invalid.key.canvas_id = .{
+        .offset = @intCast(input.len - 1),
+        .length = 2,
+    };
+    try std.testing.expectError(
+        error.InvalidCanvasOperation,
+        decodeCanvasOperation(&invalid, input),
+    );
+    invalid = base;
+    invalid.abi_version -= 1;
+    try std.testing.expectError(
+        error.InvalidCanvasOperation,
+        decodeCanvasOperation(&invalid, input),
+    );
+    invalid = base;
+    invalid.struct_size -= 1;
+    try std.testing.expectError(
+        error.InvalidCanvasOperation,
+        decodeCanvasOperation(&invalid, input),
+    );
+    invalid = base;
+    invalid.reserved0 = 1;
+    try std.testing.expectError(
+        error.InvalidCanvasOperation,
+        decodeCanvasOperation(&invalid, input),
+    );
+    invalid = base;
+    invalid.kind = 99;
+    try std.testing.expectError(
+        error.InvalidCanvasOperation,
+        decodeCanvasOperation(&invalid, input),
+    );
+    const invalid_utf8 = [_]u8{0xff};
+    invalid = close;
+    invalid.key = .{
+        .extension_id = .{ .offset = 0, .length = 1 },
+        .canvas_id = .{ .offset = 0, .length = 1 },
+        .instance_id = .{ .offset = 0, .length = 1 },
+    };
+    try std.testing.expectError(
+        error.InvalidCanvasOperation,
+        decodeCanvasOperation(&invalid, &invalid_utf8),
+    );
+}
+
+test "C canvas snapshot projection is typed and transactional" {
+    const allocator = std.testing.allocator;
+    var event = try canvasProjectionFixture(allocator);
+    defer event.deinit();
+    const projected = project(&event).?;
+    var metadata: c.vivi_backend_event_t = undefined;
+    try std.testing.expect(
+        c.VIVI_BACKEND_BUFFER_TOO_SMALL ==
+            copyProjectedFull(
+                projected,
+                &metadata,
+                null,
+                0,
+                null,
+                0,
+                null,
+                0,
+                null,
+                0,
+                null,
+                0,
+                null,
+                0,
+                null,
+                0,
+                null,
+                0,
+            ),
+    );
+    try std.testing.expect(
+        metadata.kind == c.VIVI_BACKEND_EVENT_CANVAS_SNAPSHOT,
+    );
+    try std.testing.expectEqual(@as(u32, 1), metadata.canvas_snapshot.declaration_count);
+    try std.testing.expectEqual(@as(u32, 2), metadata.canvas_snapshot.action_count);
+    try std.testing.expectEqual(@as(u32, 1), metadata.canvas_snapshot.instance_count);
+
+    var bytes = [_]u8{0xaa} ** 512;
+    var declarations: [1]c.vivi_backend_canvas_declaration_t = undefined;
+    var actions: [2]c.vivi_backend_canvas_action_t = undefined;
+    var instances: [1]c.vivi_backend_canvas_instance_t = undefined;
+    @memset(std.mem.asBytes(&declarations), 0xaa);
+    @memset(std.mem.asBytes(&actions), 0xaa);
+    @memset(std.mem.asBytes(&instances), 0xaa);
+    var mask: u32 = 1;
+    while (mask < 16) : (mask += 1) {
+        @memset(&bytes, 0xaa);
+        @memset(std.mem.asBytes(&declarations), 0xaa);
+        @memset(std.mem.asBytes(&actions), 0xaa);
+        @memset(std.mem.asBytes(&instances), 0xaa);
+        const byte_capacity = if (mask & 1 != 0)
+            metadata.byte_count - 1
+        else
+            metadata.byte_count;
+        const declaration_capacity: u32 = if (mask & 2 != 0) 0 else 1;
+        const action_capacity: u32 = if (mask & 4 != 0) 1 else 2;
+        const instance_capacity: u32 = if (mask & 8 != 0) 0 else 1;
+        try std.testing.expect(
+            c.VIVI_BACKEND_BUFFER_TOO_SMALL ==
+                copyProjectedFull(
+                    projected,
+                    &metadata,
+                    &bytes,
+                    byte_capacity,
+                    null,
+                    0,
+                    null,
+                    0,
+                    null,
+                    0,
+                    null,
+                    0,
+                    &declarations,
+                    declaration_capacity,
+                    &actions,
+                    action_capacity,
+                    &instances,
+                    instance_capacity,
+                ),
+        );
+        try expectCanvasSentinels(
+            &bytes,
+            &declarations,
+            &actions,
+            &instances,
+        );
+    }
+
+    var first_metadata: c.vivi_backend_event_t = undefined;
+    var second_metadata: c.vivi_backend_event_t = undefined;
+    var first_bytes: [512]u8 = undefined;
+    var second_bytes: [512]u8 = undefined;
+    var first_declarations: [1]c.vivi_backend_canvas_declaration_t = undefined;
+    var second_declarations: [1]c.vivi_backend_canvas_declaration_t = undefined;
+    var first_actions: [2]c.vivi_backend_canvas_action_t = undefined;
+    var second_actions: [2]c.vivi_backend_canvas_action_t = undefined;
+    var first_instances: [1]c.vivi_backend_canvas_instance_t = undefined;
+    var second_instances: [1]c.vivi_backend_canvas_instance_t = undefined;
+    inline for (.{
+        .{
+            &first_metadata,
+            &first_bytes,
+            &first_declarations,
+            &first_actions,
+            &first_instances,
+        },
+        .{
+            &second_metadata,
+            &second_bytes,
+            &second_declarations,
+            &second_actions,
+            &second_instances,
+        },
+    }) |destinations| {
+        try std.testing.expect(
+            c.VIVI_BACKEND_OK ==
+                copyProjectedFull(
+                    projected,
+                    destinations[0],
+                    destinations[1],
+                    metadata.byte_count,
+                    null,
+                    0,
+                    null,
+                    0,
+                    null,
+                    0,
+                    null,
+                    0,
+                    destinations[2],
+                    1,
+                    destinations[3],
+                    2,
+                    destinations[4],
+                    1,
+                ),
+        );
+    }
+    try std.testing.expectEqualSlices(
+        u8,
+        std.mem.asBytes(&first_metadata),
+        std.mem.asBytes(&second_metadata),
+    );
+    try std.testing.expectEqualSlices(
+        u8,
+        first_bytes[0..metadata.byte_count],
+        second_bytes[0..metadata.byte_count],
+    );
+    try std.testing.expectEqualSlices(
+        u8,
+        std.mem.sliceAsBytes(&first_declarations),
+        std.mem.sliceAsBytes(&second_declarations),
+    );
+    try std.testing.expectEqualSlices(
+        u8,
+        std.mem.sliceAsBytes(&first_actions),
+        std.mem.sliceAsBytes(&second_actions),
+    );
+    try std.testing.expectEqualSlices(
+        u8,
+        std.mem.sliceAsBytes(&first_instances),
+        std.mem.sliceAsBytes(&second_instances),
+    );
+    try std.testing.expect(
+        first_declarations[0].flags &
+            c.VIVI_BACKEND_CANVAS_DECLARATION_INPUT_SCHEMA_PRESENT != 0,
+    );
+    try std.testing.expectEqual(@as(u32, 0), first_declarations[0].action_offset);
+    try std.testing.expectEqual(@as(u32, 2), first_declarations[0].action_count);
+    try std.testing.expect(
+        first_instances[0].flags &
+            c.VIVI_BACKEND_CANVAS_INSTANCE_RENDERER_GENERATION_PRESENT != 0,
+    );
+    try std.testing.expect(
+        first_instances[0].runtime == c.VIVI_BACKEND_CANVAS_RUNTIME_OPENED,
+    );
+    try std.testing.expect(
+        first_instances[0].record == c.VIVI_BACKEND_CANVAS_RECORD_RECORDED,
+    );
+    try std.testing.expect(
+        first_instances[0].degradation ==
+            c.VIVI_BACKEND_CANVAS_DEGRADATION_INVALID_SIGNAL,
+    );
+
+    @memset(&bytes, 0xaa);
+    @memset(std.mem.asBytes(&declarations), 0xaa);
+    @memset(std.mem.asBytes(&actions), 0xaa);
+    @memset(std.mem.asBytes(&instances), 0xaa);
+    try std.testing.expect(
+        c.VIVI_BACKEND_INVALID_ARGUMENT ==
+            copyProjectedFull(
+                projected,
+                &metadata,
+                null,
+                metadata.byte_count,
+                null,
+                0,
+                null,
+                0,
+                null,
+                0,
+                null,
+                0,
+                &declarations,
+                1,
+                &actions,
+                2,
+                &instances,
+                1,
+            ),
+    );
+    try expectCanvasSentinels(&bytes, &declarations, &actions, &instances);
+    try std.testing.expect(
+        c.VIVI_BACKEND_INVALID_ARGUMENT ==
+            copyProjectedFull(
+                projected,
+                &metadata,
+                &bytes,
+                metadata.byte_count,
+                null,
+                0,
+                null,
+                0,
+                null,
+                0,
+                null,
+                0,
+                null,
+                1,
+                &actions,
+                2,
+                &instances,
+                1,
+            ),
+    );
+    try expectCanvasSentinels(&bytes, &declarations, &actions, &instances);
+    try std.testing.expect(
+        c.VIVI_BACKEND_INVALID_ARGUMENT ==
+            copyProjectedFull(
+                projected,
+                &metadata,
+                &bytes,
+                metadata.byte_count,
+                null,
+                0,
+                null,
+                0,
+                null,
+                0,
+                null,
+                0,
+                &declarations,
+                1,
+                null,
+                2,
+                &instances,
+                1,
+            ),
+    );
+    try expectCanvasSentinels(&bytes, &declarations, &actions, &instances);
+    try std.testing.expect(
+        c.VIVI_BACKEND_INVALID_ARGUMENT ==
+            copyProjectedFull(
+                projected,
+                &metadata,
+                &bytes,
+                metadata.byte_count,
+                null,
+                0,
+                null,
+                0,
+                null,
+                0,
+                null,
+                0,
+                &declarations,
+                1,
+                &actions,
+                2,
+                null,
+                1,
+            ),
+    );
+    try expectCanvasSentinels(&bytes, &declarations, &actions, &instances);
+}
+
+test "C canvas completion projection covers payloads and failures" {
+    const allocator = std.testing.allocator;
+    var open_result = try canvas.OpenResult.init(allocator, .{
+        .title = "",
+        .url = "vivi://review",
+        .status = "ready",
+    }, .{});
+    var open_event: backend.ConversationEvent = .{ .canvas_operation = .{
+        .allocator = allocator,
+        .request_id = @enumFromInt(41),
+        .result = .{ .open = .{ .succeeded = open_result } },
+    } };
+    open_result = undefined;
+    defer open_event.deinit();
+    const projected = project(&open_event).?;
+    var metadata: c.vivi_backend_event_t = undefined;
+    try std.testing.expect(
+        c.VIVI_BACKEND_BUFFER_TOO_SMALL ==
+            copyProjectedFull(
+                projected,
+                &metadata,
+                null,
+                0,
+                null,
+                0,
+                null,
+                0,
+                null,
+                0,
+                null,
+                0,
+                null,
+                0,
+                null,
+                0,
+                null,
+                0,
+            ),
+    );
+    try std.testing.expectEqual(@as(u64, 41), metadata.canvas_completion.operation_id);
+    try std.testing.expect(
+        metadata.canvas_completion.kind ==
+            c.VIVI_BACKEND_CANVAS_OPERATION_OPEN,
+    );
+    try std.testing.expect(
+        metadata.canvas_completion.outcome ==
+            c.VIVI_BACKEND_CANVAS_OPERATION_SUCCEEDED,
+    );
+    try std.testing.expect(
+        metadata.canvas_completion.flags &
+            c.VIVI_BACKEND_CANVAS_COMPLETION_TITLE_PRESENT != 0,
+    );
+    try std.testing.expectEqual(
+        @as(u32, 0),
+        metadata.canvas_completion.title.length,
+    );
+
+    const failures = [_]canvas.OperationFailure{
+        .disabled,
+        .unsupported,
+        .unavailable,
+        .invalid_request,
+        .backpressure,
+        .host_failure,
+        .invalid_sdk_result,
+        .stale,
+        .shutdown,
+    };
+    const expected = [_]c.vivi_backend_canvas_operation_failure_t{
+        c.VIVI_BACKEND_CANVAS_FAILURE_DISABLED,
+        c.VIVI_BACKEND_CANVAS_FAILURE_UNSUPPORTED,
+        c.VIVI_BACKEND_CANVAS_FAILURE_UNAVAILABLE,
+        c.VIVI_BACKEND_CANVAS_FAILURE_INVALID_REQUEST,
+        c.VIVI_BACKEND_CANVAS_FAILURE_BACKPRESSURE,
+        c.VIVI_BACKEND_CANVAS_FAILURE_HOST_FAILURE,
+        c.VIVI_BACKEND_CANVAS_FAILURE_INVALID_SDK_RESULT,
+        c.VIVI_BACKEND_CANVAS_FAILURE_STALE,
+        c.VIVI_BACKEND_CANVAS_FAILURE_SHUTDOWN,
+    };
+    for (failures, expected) |failure, expected_failure| {
+        var failed_event: backend.ConversationEvent = .{
+            .canvas_operation = .{
+                .allocator = allocator,
+                .request_id = @enumFromInt(7),
+                .result = .{ .close = .{ .failed = failure } },
+            },
+        };
+        defer failed_event.deinit();
+        const failed_metadata = canvasCompletionMetadata(
+            project(&failed_event).?.canvas_completion.?,
+        );
+        try std.testing.expect(
+            failed_metadata.outcome ==
+                c.VIVI_BACKEND_CANVAS_OPERATION_FAILED,
+        );
+        try std.testing.expectEqual(expected_failure, failed_metadata.failure);
+    }
+
+    var close_event: backend.ConversationEvent = .{ .canvas_operation = .{
+        .allocator = allocator,
+        .request_id = @enumFromInt(8),
+        .result = .{ .close = .succeeded },
+    } };
+    defer close_event.deinit();
+    const close_metadata = canvasCompletionMetadata(
+        project(&close_event).?.canvas_completion.?,
+    );
+    try std.testing.expect(
+        close_metadata.kind == c.VIVI_BACKEND_CANVAS_OPERATION_CLOSE,
+    );
+    try std.testing.expect(
+        close_metadata.outcome == c.VIVI_BACKEND_CANVAS_OPERATION_SUCCEEDED,
+    );
+
+    var action_result = try canvas.ActionResultDocument.init(
+        allocator,
+        "{\"updated\":true}",
+        .{},
+    );
+    var action_event: backend.ConversationEvent = .{ .canvas_operation = .{
+        .allocator = allocator,
+        .request_id = @enumFromInt(42),
+        .result = .{ .action = .{ .succeeded = action_result } },
+    } };
+    action_result = undefined;
+    defer action_event.deinit();
+    const action_projected = project(&action_event).?;
+    var action_metadata: c.vivi_backend_event_t = undefined;
+    var action_bytes: [32]u8 = undefined;
+    try std.testing.expect(
+        c.VIVI_BACKEND_OK ==
+            copyProjectedFull(
+                action_projected,
+                &action_metadata,
+                &action_bytes,
+                action_bytes.len,
+                null,
+                0,
+                null,
+                0,
+                null,
+                0,
+                null,
+                0,
+                null,
+                0,
+                null,
+                0,
+                null,
+                0,
+            ),
+    );
+    try std.testing.expect(
+        action_metadata.canvas_completion.kind ==
+            c.VIVI_BACKEND_CANVAS_OPERATION_INVOKE_ACTION,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"updated\":true}",
+        action_bytes[action_metadata.canvas_completion.action_result_json.offset..][0..action_metadata.canvas_completion.action_result_json.length],
+    );
+}
+
+test "C non-canvas events zero canvas metadata" {
+    const event: backend.ConversationEvent = .idle;
+    const projected = project(&event).?;
+    var metadata: c.vivi_backend_event_t = undefined;
+    try std.testing.expect(
+        c.VIVI_BACKEND_OK ==
+            copyProjectedFull(
+                projected,
+                &metadata,
+                null,
+                0,
+                null,
+                0,
+                null,
+                0,
+                null,
+                0,
+                null,
+                0,
+                null,
+                0,
+                null,
+                0,
+                null,
+                0,
+            ),
+    );
+    const empty_snapshot = std.mem.zeroes(c.vivi_backend_canvas_snapshot_t);
+    const empty_completion = std.mem.zeroes(
+        c.vivi_backend_canvas_completion_t,
+    );
+    try std.testing.expectEqualSlices(
+        u8,
+        std.mem.asBytes(&empty_snapshot),
+        std.mem.asBytes(&metadata.canvas_snapshot),
+    );
+    try std.testing.expectEqualSlices(
+        u8,
+        std.mem.asBytes(&empty_completion),
+        std.mem.asBytes(&metadata.canvas_completion),
+    );
+}
+
+test "C canvas projection rejects malformed domain values" {
+    const allocator = std.testing.allocator;
+    var event = try canvasProjectionFixture(allocator);
+    defer event.deinit();
+    event.canvas_snapshot.declarations[0].provider.id.bytes[0] = 0xff;
+    const projected = project(&event).?;
+    try std.testing.expectError(
+        error.InvalidCanvasProjection,
+        byteCount(projected),
+    );
+}
+
+test "C canvas enum mappings cover every domain state" {
+    try std.testing.expect(
+        cCanvasCapability(.unknown) ==
+            c.VIVI_BACKEND_CANVAS_CAPABILITY_UNKNOWN,
+    );
+    try std.testing.expect(
+        cCanvasCapability(.unsupported) ==
+            c.VIVI_BACKEND_CANVAS_CAPABILITY_UNSUPPORTED,
+    );
+    try std.testing.expect(
+        cCanvasCapability(.supported) ==
+            c.VIVI_BACKEND_CANVAS_CAPABILITY_SUPPORTED,
+    );
+    inline for (.{
+        .{ canvas.RuntimeTag.closed, c.VIVI_BACKEND_CANVAS_RUNTIME_CLOSED },
+        .{ canvas.RuntimeTag.opening, c.VIVI_BACKEND_CANVAS_RUNTIME_OPENING },
+        .{ canvas.RuntimeTag.opened, c.VIVI_BACKEND_CANVAS_RUNTIME_OPENED },
+        .{ canvas.RuntimeTag.closing, c.VIVI_BACKEND_CANVAS_RUNTIME_CLOSING },
+        .{
+            canvas.RuntimeTag.unavailable,
+            c.VIVI_BACKEND_CANVAS_RUNTIME_UNAVAILABLE,
+        },
+    }) |pair| {
+        try std.testing.expect(cCanvasRuntime(pair[0]) == pair[1]);
+    }
+    try std.testing.expect(
+        cCanvasRecord(.recorded) == c.VIVI_BACKEND_CANVAS_RECORD_RECORDED,
+    );
+    try std.testing.expect(
+        cCanvasRecord(.removed) == c.VIVI_BACKEND_CANVAS_RECORD_REMOVED,
     );
 }
 

@@ -129,6 +129,26 @@ PR 3 wires the proven public typed surface without resolving unknown semantics:
 No C ABI, Swift/WebView, terminal renderer, model-visible canvas tool, or
 host-facing canvas UI is added by this adapter.
 
+## PR 4 ABI decision
+
+ABI v9 projects the SDK-free canvas domain without exposing SDK values. One
+`canvas_mode` maps an explicit host opt-in to both internal SDK request flags;
+it defaults to disabled, and every current native call site remains disabled.
+One versioned `vivi_backend_perform_canvas` command accepts a full
+extension/canvas/instance key plus role-specific open or action JSON spans and
+returns a Vivi-local operation ID after copying all referenced bytes.
+
+Canvas snapshots and operation completions use the existing `next_event`
+queue. Declarations, actions, and instances are three flat caller-owned typed
+arrays whose strings and JSON documents are spans into the event byte buffer.
+The existing exact-capacity transaction applies across every old and new
+destination: any shortage writes no payload, retains the pending event, and
+an exact retry copies identical data before consuming it once. This ABI does
+not add registry deltas, refresh, provider correlation, a reopen operation,
+caller-authored generation preconditions, browser behavior, or rendering.
+PR 5 remains the gate for native or CLI opt-in, decoding, and user-visible
+canvas behavior.
+
 ## Synthesis decision
 
 The probe uses one standalone semantic test module. It combines fixture-backed
