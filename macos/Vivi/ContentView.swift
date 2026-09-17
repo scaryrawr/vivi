@@ -447,6 +447,7 @@ private struct ChatItemView: View {
         }
       }
       .frame(maxWidth: .infinity, alignment: .leading)
+      .fixedSize(horizontal: false, vertical: true)
       .textSelection(.enabled)
     }
 
