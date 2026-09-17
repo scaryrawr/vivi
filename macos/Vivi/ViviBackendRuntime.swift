@@ -248,6 +248,7 @@ final class NativeChatStore: ObservableObject {
   let workspace: String
   private var activeAssistant: UUID?
   private var activeReasoning: UUID?
+  private var pendingReasoningCompletion: UUID?
   private var activeReasoningPrefix = ""
   private var responseHeaderVisible = false
   private let driver: ViviConversationDriving
@@ -378,6 +379,7 @@ final class NativeChatStore: ObservableObject {
     case .assistantStarted:
       activeAssistant = nil
       activeReasoning = nil
+      pendingReasoningCompletion = nil
       activeReasoningPrefix = ""
       responseHeaderVisible = false
       lifecycle = .responding
@@ -397,6 +399,7 @@ final class NativeChatStore: ObservableObject {
     case .toolStarted(let activity):
       ensureResponseHeader()
       activeReasoning = nil
+      pendingReasoningCompletion = nil
       activeReasoningPrefix = ""
       activeAssistant = nil
       if let index = transcript.firstIndex(where: { item in
@@ -433,6 +436,7 @@ final class NativeChatStore: ObservableObject {
     case .idle:
       activeAssistant = nil
       activeReasoning = nil
+      pendingReasoningCompletion = nil
       activeReasoningPrefix = ""
       lifecycle = .idle
     case .failure(let message):
@@ -441,6 +445,7 @@ final class NativeChatStore: ObservableObject {
     case .closed:
       activeAssistant = nil
       activeReasoning = nil
+      pendingReasoningCompletion = nil
       activeReasoningPrefix = ""
       finishClose()
     }
@@ -517,16 +522,18 @@ final class NativeChatStore: ObservableObject {
       activeAssistant = nil
       if case .reasoning(let id, let existing) = transcript.last {
         activeReasoning = id
+        pendingReasoningCompletion = id
         activeReasoningPrefix = existing.isEmpty ? "" : existing + "\n\n"
         startsNewSegment = true
       } else if case .assistant = transcript.last,
-        let id = latestReasoningIDInCurrentResponse()
+        let id = pendingReasoningCompletion
       {
         activeReasoning = id
         activeReasoningPrefix = ""
       } else {
         let id = UUID()
         activeReasoning = id
+        pendingReasoningCompletion = id
         activeReasoningPrefix = ""
         let item = ChatItem.reasoning(id: id, text: "")
         if case .assistant = transcript.last {
@@ -549,22 +556,6 @@ final class NativeChatStore: ObservableObject {
     transcript[index] = .reasoning(id: id, text: replacement)
   }
 
-  private func latestReasoningIDInCurrentResponse() -> UUID? {
-    guard
-      let headerIndex = transcript.lastIndex(where: {
-        if case .assistantHeader = $0 { return true }
-        return false
-      }),
-      headerIndex + 1 < transcript.count
-    else { return nil }
-    for item in transcript[(headerIndex + 1)...].reversed() {
-      if case .reasoning(let id, _) = item {
-        return id
-      }
-    }
-    return nil
-  }
-
   private func finishClose() {
     lifecycle = .closed
     let completions = closeCompletions
@@ -577,6 +568,7 @@ final class NativeChatStore: ObservableObject {
   private func finishStreamingRows() {
     activeAssistant = nil
     activeReasoning = nil
+    pendingReasoningCompletion = nil
     activeReasoningPrefix = ""
   }
 

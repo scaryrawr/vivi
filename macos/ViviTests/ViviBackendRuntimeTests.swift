@@ -205,11 +205,11 @@ final class ViviBackendRuntimeTests: XCTestCase {
     else { return XCTFail("Expected completed reasoning to replace the streamed reasoning") }
   }
 
-  func testLateReasoningCompletionFindsReasoningAcrossToolRow() {
+  func testLateReasoningCompletionAfterToolCreatesNewSegment() {
     let store = NativeChatStore(workspace: "/tmp/work", driver: FakeConversationDriver())
 
     store.reduce(.assistantStarted)
-    store.reduce(.reasoningComplete("same reasoning"))
+    store.reduce(.reasoningComplete("before tool"))
     store.reduce(
       .toolStarted(
         ToolActivity(
@@ -222,14 +222,15 @@ final class ViviBackendRuntimeTests: XCTestCase {
           output: nil,
           outputPresentation: nil)))
     store.reduce(.assistantComplete("answer"))
-    store.reduce(.reasoningComplete("same reasoning"))
+    store.reduce(.reasoningComplete("after tool"))
 
-    XCTAssertEqual(store.transcript.count, 4)
+    XCTAssertEqual(store.transcript.count, 5)
     guard case .assistantHeader = store.transcript[0],
-      case .reasoning(_, "same reasoning") = store.transcript[1],
+      case .reasoning(_, "before tool") = store.transcript[1],
       case .tool = store.transcript[2],
-      case .assistant(_, "answer") = store.transcript[3]
-    else { return XCTFail("Expected one reasoning row before the tool and assistant response") }
+      case .reasoning(_, "after tool") = store.transcript[3],
+      case .assistant(_, "answer") = store.transcript[4]
+    else { return XCTFail("Expected late reasoning after the tool and before the assistant") }
   }
 
   func testLateFirstReasoningInsertsBeforeAssistantResponse() {
