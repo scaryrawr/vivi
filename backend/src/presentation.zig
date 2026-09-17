@@ -659,6 +659,172 @@ test "strict source rejection rerenders the raw payload as literal" {
     );
 }
 
+test "tool result presentation preserves classification edge coverage" {
+    const cases = [_]struct {
+        summary: TestSummary,
+        raw: []const u8,
+        kind: PresentationKind,
+    }{
+        .{
+            .summary = .{ .read = .{
+                .path = "example.py",
+                .offset = 2,
+                .limit = 1,
+            } },
+            .raw = "    return 1\n",
+            .kind = .source,
+        },
+        .{
+            .summary = .{ .read = .{
+                .path = "records.jsonl",
+                .offset = null,
+                .limit = null,
+            } },
+            .raw = "{\"first\": true}\n{\"second\": false}\n",
+            .kind = .source,
+        },
+        .{
+            .summary = .{ .read = .{
+                .path = "changes.patch",
+                .offset = null,
+                .limit = null,
+            } },
+            .raw = "--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-old\n+new\n",
+            .kind = .source,
+        },
+        .{
+            .summary = .{ .read = .{
+                .path = "changes.diff",
+                .offset = null,
+                .limit = null,
+            } },
+            .raw = "diff --git a/file.txt b/file.txt\n--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-old\n+new\n",
+            .kind = .source,
+        },
+        .{
+            .summary = .{ .bash = .{ .run = .{
+                .command = "cat -- 'workflow.yaml'",
+            } } },
+            .raw = "name: vivi\n",
+            .kind = .source,
+        },
+        .{
+            .summary = .{ .bash = .{ .run = .{
+                .command = "cat \"workflow.yaml\"",
+            } } },
+            .raw = "name: vivi\n",
+            .kind = .source,
+        },
+        .{
+            .summary = .{ .bash = .{ .run = .{
+                .command = "git -C repo --no-pager --no-ext-diff diff --cached --no-color --",
+            } } },
+            .raw = "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-old\n+new\n",
+            .kind = .source,
+        },
+    };
+    for (cases) |case| {
+        var value = try presentToolResult(
+            std.testing.allocator,
+            case.summary,
+            .succeeded,
+            case.raw,
+        );
+        defer value.deinit();
+        try std.testing.expectEqual(case.kind, value.kind());
+    }
+
+    const rejected = [_][]const u8{
+        "cat a.yml b.yml",
+        "cat -n a.yml",
+        "cat a.yml | sed s/a/b/",
+        "cat a.yml > copy.yml",
+        "cat a.yml\nprintf done",
+        "cat \"$FILE\"",
+        "cat \"workflow.\\yml\"",
+        "cat `find . -name ci.yml`",
+        "cat workflow.\xffyml",
+        "git diff --stat",
+        "git diff --color",
+        "git diff && echo done",
+        "printf 'name: value'",
+    };
+    for (rejected) |command| {
+        var value = try presentToolResult(
+            std.testing.allocator,
+            TestSummary{ .bash = .{ .run = .{ .command = command } } },
+            .succeeded,
+            "name: value\n",
+        );
+        defer value.deinit();
+        try std.testing.expectEqual(PresentationKind.literal, value.kind());
+    }
+}
+
+test "fragment and diff document presentations retain semantic tokens" {
+    const cases = [_]struct {
+        summary: TestSummary,
+        raw: []const u8,
+        token: SemanticToken,
+        text: []const u8,
+        count: usize,
+    }{
+        .{
+            .summary = .{ .read = .{
+                .path = "example.py",
+                .offset = 2,
+                .limit = 1,
+            } },
+            .raw = "    return 1\n",
+            .token = .keyword,
+            .text = "return",
+            .count = 1,
+        },
+        .{
+            .summary = .{ .read = .{
+                .path = "records.jsonl",
+                .offset = null,
+                .limit = null,
+            } },
+            .raw = "{\"first\": true}\n{\"second\": false}\n",
+            .token = .property,
+            .text = "",
+            .count = 2,
+        },
+        .{
+            .summary = .{ .read = .{
+                .path = "changes.patch",
+                .offset = null,
+                .limit = null,
+            } },
+            .raw = "--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-old\n+new\n",
+            .token = .inserted,
+            .text = "+new",
+            .count = 1,
+        },
+    };
+    for (cases) |case| {
+        var value = try presentToolResult(
+            std.testing.allocator,
+            case.summary,
+            .succeeded,
+            case.raw,
+        );
+        defer value.deinit();
+        const source = value.content.source;
+        var matches: usize = 0;
+        for (source.tokens) |span| {
+            if (span.token == case.token and
+                (case.text.len == 0 or
+                    std.mem.eql(u8, value.text[span.start..span.end], case.text)))
+            {
+                matches += 1;
+            }
+        }
+        try std.testing.expectEqual(case.count, matches);
+    }
+}
+
 test "Bash input and known fenced fragments share semantic tokens" {
     var input = try presentToolInput(
         std.testing.allocator,

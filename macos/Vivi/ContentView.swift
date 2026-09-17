@@ -464,7 +464,7 @@ private struct ChatItemView: View {
       case .code:
         ScrollView(.horizontal) {
           if let presentation = block.codePresentation {
-            PresentationView(presentation: presentation)
+            PresentationView(presentation: presentation, inline: true)
           } else {
             Text(block.content)
           }

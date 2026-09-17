@@ -591,7 +591,55 @@ struct MarkdownBlock: Equatable {
   var codePresentation: ToolPresentation? = nil
 }
 
-func markdownBlocks(_ text: String) -> [MarkdownBlock] {
+@MainActor
+final class CodePresentationCache {
+  static let shared = CodePresentationCache(capacity: 128)
+
+  private struct Key: Hashable {
+    let language: String
+    let source: String
+  }
+
+  private let capacity: Int
+  private var entries: [Key: ToolPresentation] = [:]
+  private var insertionOrder: [Key] = []
+
+  init(capacity: Int) {
+    precondition(capacity > 0)
+    self.capacity = capacity
+  }
+
+  func presentation(
+    language: String,
+    source: String,
+    load: (String, String) throws -> ToolPresentation = nativeCodePresentation
+  ) rethrows -> ToolPresentation {
+    let key = Key(language: language, source: source)
+    if let cached = entries[key] {
+      return cached
+    }
+    let value = try load(language, source)
+    if entries.count == capacity, let oldest = insertionOrder.first {
+      entries.removeValue(forKey: oldest)
+      insertionOrder.removeFirst()
+    }
+    entries[key] = value
+    insertionOrder.append(key)
+    return value
+  }
+
+  func removeAll() {
+    entries.removeAll(keepingCapacity: true)
+    insertionOrder.removeAll(keepingCapacity: true)
+  }
+}
+
+@MainActor
+func markdownBlocks(
+  _ text: String,
+  codePresentationCache: CodePresentationCache = .shared,
+  loadCodePresentation: (String, String) throws -> ToolPresentation = nativeCodePresentation
+) -> [MarkdownBlock] {
   guard
     let rendered = try? AttributedString(
       markdown: text,
@@ -621,9 +669,10 @@ func markdownBlocks(_ text: String) -> [MarkdownBlock] {
   if !blocks.isEmpty {
     for index in blocks.indices {
       guard case .code(let language) = blocks[index].kind else { continue }
-      blocks[index].codePresentation = try? nativeCodePresentation(
+      blocks[index].codePresentation = try? codePresentationCache.presentation(
         language: language ?? "",
-        source: String(blocks[index].content.characters))
+        source: String(blocks[index].content.characters),
+        load: loadCodePresentation)
     }
   }
 
@@ -703,14 +752,6 @@ enum NativeEventDecoder {
         throw NativeEventDecodingError.malformed
       }
       return Data(bytes[start..<(start + length)])
-    }
-
-    func json(_ span: vivi_backend_span_t) throws -> String {
-      let value = try data(span)
-      guard let text = String(data: value, encoding: .utf8),
-        (try? JSONSerialization.jsonObject(with: value)) != nil
-      else { throw NativeEventDecodingError.malformed }
-      return text
     }
 
     func reasoning(_ raw: vivi_backend_reasoning_effort_t) throws -> ReasoningEffort {
@@ -867,7 +908,7 @@ enum NativeEventDecoder {
           callID: callID,
           title: title,
           detail: try text(event.tool_detail),
-          input: try json(event.tool_input),
+          input: try text(event.tool_input),
           inputPresentation: inputPresentation!,
           result: .running,
           output: nil,
