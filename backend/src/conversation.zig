@@ -686,6 +686,7 @@ pub const Event = union(enum) {
     session_catalog_failed: OwnedText,
     session_tracking_failed: OwnedText,
     session_resume: SessionResumeResult,
+    session_title: OwnedText,
     status: OwnedText,
     assistant_started,
     reasoning_delta: OwnedText,
@@ -705,6 +706,7 @@ pub const Event = union(enum) {
             .assistant_delta,
             .assistant_complete,
             .command_completed,
+            .session_title,
             => |*text| text.deinit(),
             .tool_activity => |*update| update.deinit(),
             .user_input_requested => |*request| request.deinit(),
@@ -1031,6 +1033,12 @@ pub const Worker = struct {
     pub fn status(self: *Worker, message: []const u8) !void {
         try self.publish(.{
             .status = try OwnedText.init(self.core.allocator, message),
+        });
+    }
+
+    pub fn sessionTitle(self: *Worker, title: []const u8) !void {
+        try self.publish(.{
+            .session_title = try OwnedText.init(self.core.allocator, title),
         });
     }
 

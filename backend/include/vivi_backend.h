@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define VIVI_BACKEND_ABI_VERSION 3
+#define VIVI_BACKEND_ABI_VERSION 4
 
 typedef enum vivi_backend_result {
     VIVI_BACKEND_OK = 0,
@@ -33,6 +33,8 @@ typedef enum vivi_backend_copilot_cli_launch {
 typedef struct vivi_backend_conversation_options {
     const uint8_t *working_directory;
     uint32_t working_directory_length;
+    const uint8_t *settings_path;
+    uint32_t settings_path_length;
     vivi_backend_copilot_cli_launch_t copilot_cli_launch;
     vivi_backend_wake_fn wake;
     void *wake_context;
@@ -47,17 +49,74 @@ typedef enum vivi_backend_event_kind {
     VIVI_BACKEND_EVENT_IDLE = 6,
     VIVI_BACKEND_EVENT_FAILURE = 7,
     VIVI_BACKEND_EVENT_CLOSED = 8,
+    VIVI_BACKEND_EVENT_SESSION_TITLE = 9,
+    VIVI_BACKEND_EVENT_REASONING_DELTA = 10,
+    VIVI_BACKEND_EVENT_REASONING_COMPLETE = 11,
+    VIVI_BACKEND_EVENT_MODEL_CATALOG = 12,
+    VIVI_BACKEND_EVENT_MODEL_CATALOG_FAILURE = 13,
+    VIVI_BACKEND_EVENT_MODEL_SWITCH = 14,
 } vivi_backend_event_kind_t;
 
 typedef enum vivi_backend_content_kind {
     VIVI_BACKEND_CONTENT_NONE = 0,
     VIVI_BACKEND_CONTENT_TEXT = 1,
+    VIVI_BACKEND_CONTENT_MODEL_CATALOG = 2,
+    VIVI_BACKEND_CONTENT_MODEL_SWITCH = 3,
 } vivi_backend_content_kind_t;
+
+typedef enum vivi_backend_reasoning_effort {
+    VIVI_BACKEND_REASONING_NONE = -1,
+    VIVI_BACKEND_REASONING_OFF = 0,
+    VIVI_BACKEND_REASONING_LOW = 1,
+    VIVI_BACKEND_REASONING_MEDIUM = 2,
+    VIVI_BACKEND_REASONING_HIGH = 3,
+    VIVI_BACKEND_REASONING_XHIGH = 4,
+    VIVI_BACKEND_REASONING_MAX = 5,
+} vivi_backend_reasoning_effort_t;
+
+typedef enum vivi_backend_model_switch_outcome {
+    VIVI_BACKEND_MODEL_SWITCH_NONE = 0,
+    VIVI_BACKEND_MODEL_SWITCH_UNCHANGED = 1,
+    VIVI_BACKEND_MODEL_SWITCH_DEFAULT_UPDATED = 2,
+    VIVI_BACKEND_MODEL_SWITCH_SWITCHED = 3,
+    VIVI_BACKEND_MODEL_SWITCH_FAILED = 4,
+} vivi_backend_model_switch_outcome_t;
+
+typedef enum vivi_backend_history_effect {
+    VIVI_BACKEND_HISTORY_NONE = 0,
+    VIVI_BACKEND_HISTORY_PRESERVED = 1,
+    VIVI_BACKEND_HISTORY_RESET_VISIBLE_TRANSCRIPT_PRESERVED = 2,
+} vivi_backend_history_effect_t;
+
+typedef struct vivi_backend_span {
+    uint32_t offset;
+    uint32_t length;
+} vivi_backend_span_t;
+
+typedef struct vivi_backend_model {
+    vivi_backend_span_t id;
+    vivi_backend_span_t display_name;
+    uint64_t max_context_window_tokens;
+    uint64_t max_output_tokens;
+    uint8_t supports_vision;
+    uint8_t reasoning_mask;
+    int8_t advertised_default_reasoning;
+    uint8_t reserved;
+} vivi_backend_model_t;
 
 typedef struct vivi_backend_event {
     vivi_backend_event_kind_t kind;
     vivi_backend_content_kind_t content_kind;
-    uint32_t content_length;
+    uint32_t byte_count;
+    uint32_t model_count;
+    vivi_backend_span_t content;
+    vivi_backend_span_t selected_model_id;
+    vivi_backend_reasoning_effort_t selected_reasoning;
+    vivi_backend_model_switch_outcome_t switch_outcome;
+    vivi_backend_history_effect_t history_effect;
+    uint8_t default_saved;
+    uint8_t cleanup_failed;
+    uint16_t reserved;
 } vivi_backend_event_t;
 
 /* Open and submit copy their input bytes before returning. */
@@ -68,11 +127,26 @@ vivi_backend_result_t vivi_backend_submit(
     vivi_backend_conversation_t *conversation,
     const uint8_t *prompt,
     uint32_t prompt_length);
+vivi_backend_result_t vivi_backend_refresh_models(
+    vivi_backend_conversation_t *conversation);
+vivi_backend_result_t vivi_backend_switch_model(
+    vivi_backend_conversation_t *conversation,
+    const uint8_t *model_id,
+    uint32_t model_id_length,
+    vivi_backend_reasoning_effort_t reasoning);
+/*
+ * next_event always fills out_event for a pending event. If either caller-owned
+ * buffer is too small it returns BUFFER_TOO_SMALL without writing either
+ * buffer or consuming the event; byte_count and model_count report capacities.
+ * Every span is relative to bytes and is valid only for the completed call.
+ */
 vivi_backend_result_t vivi_backend_next_event(
     vivi_backend_conversation_t *conversation,
     vivi_backend_event_t *out_event,
-    uint8_t *content,
-    uint32_t content_capacity);
+    uint8_t *bytes,
+    uint32_t byte_capacity,
+    vivi_backend_model_t *models,
+    uint32_t model_capacity);
 vivi_backend_result_t vivi_backend_close(
     vivi_backend_conversation_t *conversation);
 /*

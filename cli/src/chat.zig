@@ -3617,6 +3617,19 @@ const ChatUi = struct {
                 .status,
                 message.bytes,
             ),
+            .session_title => |title| {
+                const message = try std.fmt.allocPrint(
+                    self.allocator,
+                    "Session title: {s}",
+                    .{title.bytes},
+                );
+                defer self.allocator.free(message);
+                try self.transcript.append(
+                    self.allocator,
+                    .status,
+                    message,
+                );
+            },
             .session_resume => |result| {
                 if (self.phase == .resuming) self.phase = .ready;
                 self.menu_mode = .closed;

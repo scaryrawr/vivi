@@ -10,7 +10,7 @@ const tool_activity = @import("tool_activity.zig");
 const tools = @import("tools.zig");
 
 pub const version = build_options.version;
-pub const abi_version: u32 = 3;
+pub const abi_version: u32 = 4;
 pub const Conversation = conversation.Conversation;
 pub const ConversationEvent = conversation.Event;
 pub const ConversationWake = conversation.Wake;
@@ -2225,20 +2225,10 @@ fn streamSessionResponse(
                         };
                     }
                 }
-                const message = std.fmt.allocPrint(
-                    worker.allocator(),
-                    "Session title: {s}",
-                    .{title.data.title},
-                ) catch {
+                worker.sessionTitle(title.data.title) catch {
                     worker.closeFailure(.stream, "Unable to display session title.");
                     return .failed;
                 };
-                defer worker.allocator().free(message);
-                if (!reportStreamStatus(
-                    worker,
-                    message,
-                    "Unable to display session title.",
-                )) return .failed;
             },
             .session_context_changed => {
                 if (!reportStreamStatus(
@@ -2457,7 +2447,9 @@ fn runSdkConversation(
         omlx_options,
     )) |catalog| {
         worker.modelCatalog(catalog) catch {};
-    } else |_| {}
+    } else |err| {
+        worker.modelCatalogFailed(@errorName(err)) catch {};
+    }
 
     while (true) {
         var command = worker.waitCommand();

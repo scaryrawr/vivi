@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 
 @main
@@ -95,6 +96,7 @@ private final class ChatWindowController: NSWindowController, NSWindowDelegate {
   private let store: NativeChatStore
   private let onClosed: @MainActor (UUID) -> Void
   private var closeStarted = false
+  private var titleObservation: AnyCancellable?
 
   init(
     id: UUID,
@@ -116,6 +118,11 @@ private final class ChatWindowController: NSWindowController, NSWindowDelegate {
     super.init(window: window)
     window.title = workspace
     window.contentViewController = NSHostingController(rootView: ContentView(store: store))
+    titleObservation = store.$sessionTitle
+      .removeDuplicates()
+      .sink { [weak window] title in
+        window?.title = title
+      }
     window.center()
     window.delegate = self
   }
