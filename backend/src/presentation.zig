@@ -186,10 +186,11 @@ fn presentSource(
         .fragment => try syntax.spans(allocator, language, text),
     };
     const tokens = maybe_tokens orelse {
+        const fallback = try renderOutput(allocator, raw);
         allocator.free(text);
         return .{
             .allocator = allocator,
-            .text = try renderOutput(allocator, raw),
+            .text = fallback,
             .content = .literal,
         };
     };
