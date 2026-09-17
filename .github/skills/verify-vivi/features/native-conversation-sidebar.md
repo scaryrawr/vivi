@@ -43,5 +43,5 @@ interaction.
   existing row.
 - Red close and application quit intentionally have different conversation
   lifetime effects.
-- Session catalog and resume controls belong to the later native session stack,
-  not this sidebar verification.
+- Persisted session discovery and resume have their own
+  [native session history](./native-session-history.md) verification flow.

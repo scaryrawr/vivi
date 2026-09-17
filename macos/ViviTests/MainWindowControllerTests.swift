@@ -69,4 +69,66 @@ final class MainWindowControllerTests: XCTestCase {
         duplicateBadge: "2",
         accessibilityLabel: "Vivi, /tmp/vivi, conversation 2 of 3"))
   }
+
+  func testSavedViviSessionHistoryGroupsWorkspacesAndFiltersCurrentSession() {
+    let catalog = SessionCatalog(
+      scope: .local,
+      sessions: [
+        historySummary(slot: 1, workspace: "/work/current", title: "Current", isCurrent: true),
+        historySummary(slot: 2, workspace: "/work/other", title: "Earlier"),
+        historySummary(slot: 3, workspace: "/work/current", title: nil),
+        historySummary(slot: 4, workspace: "/work/other", title: "Oldest"),
+      ],
+      skippedInvalidShards: false)
+
+    let groups = sessionHistoryPresentation(
+      catalog: catalog,
+      currentWorkspace: "/work/current",
+      formatLastUsed: { "\($0) ms" })
+
+    XCTAssertEqual(groups.map(\.id), ["/work/other", "/work/current"])
+    XCTAssertEqual(groups.map(\.title), ["/work/other", "This Workspace"])
+    XCTAssertEqual(groups[0].rows.map(\.title), ["Earlier", "Oldest"])
+    XCTAssertEqual(groups[1].rows.map(\.title), ["current"])
+    XCTAssertEqual(
+      groups[0].rows[0].accessibilityLabel,
+      "Earlier, /work/other, Summary 2, Last used 2 ms")
+  }
+
+  func testWorkspaceCopilotSessionHistoryPreservesBackendOrderWithoutGrouping() {
+    let catalog = SessionCatalog(
+      scope: .broader,
+      sessions: [
+        historySummary(slot: 7, workspace: "/work/current", title: "Recent"),
+        historySummary(slot: 8, workspace: "/work/current", title: "Earlier"),
+      ],
+      skippedInvalidShards: false)
+
+    let groups = sessionHistoryPresentation(
+      catalog: catalog,
+      currentWorkspace: "/work/current",
+      formatLastUsed: { "\($0)" })
+
+    XCTAssertEqual(groups.count, 1)
+    XCTAssertNil(groups[0].title)
+    XCTAssertEqual(groups[0].rows.map(\.title), ["Recent", "Earlier"])
+    XCTAssertEqual(groups[0].rows.map(\.lastUsed), ["7", "8"])
+  }
+}
+
+private func historySummary(
+  slot: UInt32,
+  workspace: String,
+  title: String?,
+  isCurrent: Bool = false
+) -> SessionSummary {
+  SessionSummary(
+    key: ResumeKey(generation: 42, slot: slot, scope: .broader),
+    workingDirectory: workspace,
+    modelID: "copilot/test",
+    title: title,
+    summary: "Summary \(slot)",
+    lastUsedUnixMilliseconds: Int64(slot),
+    reasoning: .medium,
+    isCurrent: isCurrent)
 }

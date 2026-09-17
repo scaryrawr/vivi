@@ -311,6 +311,7 @@ final class NativeChatStore: ObservableObject {
   @Published private(set) var modelState: ModelControlState = .loading
   @Published private(set) var catalog: ModelCatalog?
   @Published private(set) var sessionCatalog: SessionCatalog?
+  @Published private(set) var sessionCatalogFailure: String?
   @Published private(set) var sessionState: SessionControlState = .ready
   @Published var draft = ""
 
@@ -419,6 +420,7 @@ final class NativeChatStore: ObservableObject {
     let result = driver.refreshSessions(request)
     if result == .accepted {
       sessionCatalog = nil
+      sessionCatalogFailure = nil
       sessionState = .refreshing(request)
     } else {
       transcript.append(
@@ -541,15 +543,18 @@ final class NativeChatStore: ObservableObject {
       guard case .refreshing(let request) = sessionState,
         catalog.scope == expectedScope(for: request)
       else {
-        transcript.append(
-          .failure(id: UUID(), text: "The backend returned an unexpected session catalog."))
+        let message = "The backend returned an unexpected session catalog."
+        transcript.append(.failure(id: UUID(), text: message))
+        sessionCatalogFailure = message
         sessionState = .ready
         break
       }
       sessionCatalog = catalog
+      sessionCatalogFailure = nil
       sessionState = .ready
     case .sessionCatalogFailure(let message):
       transcript.append(.failure(id: UUID(), text: message))
+      sessionCatalogFailure = message
       sessionState = .ready
     case .sessionTrackingFailure(let message):
       transcript.append(.failure(id: UUID(), text: message))
@@ -675,6 +680,7 @@ final class NativeChatStore: ObservableObject {
           ?? URL(fileURLWithPath: resumed.summary.workingDirectory).lastPathComponent,
         transcript: snapshot,
         confirmedSelection: selection)
+      sessionCatalogFailure = nil
       if let catalog {
         self.catalog = ModelCatalog(
           selected: selection,

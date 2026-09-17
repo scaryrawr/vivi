@@ -66,9 +66,11 @@ extension NativeChatStore {
   }
 
   var conversationNavigationPublisher: AnyPublisher<ConversationNavigation, Never> {
-    $sessionTitle
-      .map { [workspace] title in
-        ConversationNavigation(workspacePath: workspace, title: title)
+    $activePresentation
+      .map { presentation in
+        ConversationNavigation(
+          workspacePath: presentation.workspace,
+          title: presentation.sessionTitle)
       }
       .eraseToAnyPublisher()
   }

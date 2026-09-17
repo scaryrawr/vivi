@@ -66,6 +66,49 @@ final class NativeApplicationCoordinatorTests: XCTestCase {
     XCTAssertEqual(harness.coordinator.conversations.selectedID, record.id)
   }
 
+  func testCrossWorkspaceResumeKeepsConversationIdentitySelectionAndUpdatesDuplicates() {
+    let harness = CoordinatorHarness()
+    harness.coordinator.open([
+      URL(string: "vivi://chat?workspace=/tmp/one")!,
+      URL(string: "vivi://chat?workspace=/tmp/two")!,
+    ])
+    let conversations = harness.coordinator.conversations
+    let record = conversations.records[0]
+    conversations.select(record.id)
+    harness.drivers[0].send(.ready)
+    harness.drivers[0].send(.modelCatalog(coordinatorModelCatalog()))
+    let key = ResumeKey(generation: 9, slot: 2, scope: .local)
+    let summary = SessionSummary(
+      key: key,
+      workingDirectory: "/tmp/two",
+      modelID: "copilot/test",
+      title: "Resumed conversation",
+      summary: nil,
+      lastUsedUnixMilliseconds: 10,
+      reasoning: .medium,
+      isCurrent: false)
+
+    record.store.refreshSessions(.local)
+    harness.drivers[0].send(
+      .sessionCatalog(
+        SessionCatalog(scope: .local, sessions: [summary], skippedInvalidShards: false)))
+    record.store.resumeSession(key)
+    harness.drivers[0].send(
+      .sessionResume(
+        .resumed(
+          ResumedSession(
+            summary: summary,
+            transcript: [.assistant("restored")],
+            cleanupFailed: false))))
+
+    XCTAssertTrue(conversations.records[0] === record)
+    XCTAssertEqual(conversations.selectedID, record.id)
+    XCTAssertEqual(record.navigation.workspace.canonicalPath, "/tmp/two")
+    XCTAssertEqual(record.navigation.title, "Resumed conversation")
+    XCTAssertEqual(conversations.duplicatePosition(for: record.id)?.ordinal, 1)
+    XCTAssertEqual(conversations.duplicatePosition(for: conversations.records[1].id)?.ordinal, 2)
+  }
+
   func testTerminationWaitsForEveryUniqueConversationAndDefersReply() async {
     let harness = CoordinatorHarness()
     harness.coordinator.open([
@@ -161,6 +204,8 @@ private final class FakeMainWindow: MainWindowControlling {
 
 final class ControllableConversationDriver: ViviConversationDriving {
   private(set) var closeCount = 0
+  private(set) var sessionRequests: [SessionCatalogRequest] = []
+  private(set) var resumeKeys: [ResumeKey] = []
   private var receive: (@MainActor (ChatEvent) -> Void)?
   private var closeCompletions: [@MainActor () -> Void] = []
 
@@ -183,6 +228,16 @@ final class ControllableConversationDriver: ViviConversationDriving {
     .accepted
   }
 
+  func refreshSessions(_ request: SessionCatalogRequest) -> ConversationOperationResult {
+    sessionRequests.append(request)
+    return .accepted
+  }
+
+  func resumeSession(_ key: ResumeKey) -> ConversationOperationResult {
+    resumeKeys.append(key)
+    return .accepted
+  }
+
   func close(completion: @escaping @MainActor () -> Void) {
     closeCount += 1
     closeCompletions.append(completion)
@@ -201,4 +256,20 @@ final class ControllableConversationDriver: ViviConversationDriving {
       completion()
     }
   }
+
+}
+
+private func coordinatorModelCatalog() -> ModelCatalog {
+  ModelCatalog(
+    selected: ModelSelection(modelID: "copilot/test", reasoning: .medium),
+    models: [
+      ModelInfo(
+        id: "copilot/test",
+        displayName: "Test",
+        maxContextWindowTokens: 1,
+        maxOutputTokens: 1,
+        supportsVision: false,
+        reasoning: [.medium],
+        advertisedDefaultReasoning: .medium)
+    ])
 }
