@@ -67,8 +67,11 @@ open a bare `vivi://` URL: multiple worktree bundles share the production
 identifier, so Launch Services may route it to stale code.
 
 `zig build test` does not compile test blocks in every imported backend module.
-When changing `backend/src/settings.zig` or `backend/src/session_store.zig`,
-also run `zig test` directly on the changed module.
+When changing `backend/src/attachment.zig`, `backend/src/settings.zig`, or
+`backend/src/session_store.zig`, also run `zig test` directly on the changed
+module. Do not run `zig test backend/src/conversation.zig` standalone; its
+Tree-sitter C dependencies are supplied by the repository build graph, so use
+`zig build test` for that coverage.
 
 Version every persisted settings or session-shard schema change. Parse each
 supported older version explicitly, migrate it in memory, and test the next
