@@ -23,6 +23,10 @@ may be malformed JSON. Native bindings must validate it as bounded UTF-8 text,
 not require successful JSON parsing or close the conversation solely because
 the rejected arguments are malformed.
 
+Tool starts delimit assistant reasoning segments. A late reasoning completion
+may update only reasoning streamed since the latest tool boundary; otherwise
+preserve earlier reasoning and insert the completed segment before its answer.
+
 ## Build, Test, and Development Commands
 
 Use Zig 0.16.x and Xcode 26.6.
