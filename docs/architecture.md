@@ -44,8 +44,27 @@ Canvas limits are checked before valid registry, input, renderer, or recording
 state is replaced. Backpressure and protocol degradation are scoped, shutdown
 cancels pending local work, and resume projection contains only evidenced
 recorded open-canvas identity, title, and input fields. Transient URL, status,
-and renderer generation never enter resume state. Production SDK adaptation,
-C ABI exposure, and native or CLI rendering remain a separate PR 3 gate.
+and renderer generation never enter resume state.
+
+The production SDK adapter lives privately in `backend/src/root.zig`. One
+adapter and one `canvas.State` follow each active SDK session, and canvas
+commands use the same serialized conversation worker as prompts and other
+control operations. SDK method results complete only the Vivi operation that
+issued that method; provider lifecycle events remain independent authoritative
+observations. Queue-visible commands, completions, and snapshots are owned
+SDK-free values.
+
+`ConversationOptions.request_extensions` and
+`request_canvas_renderer` both default to `false`. The adapter requests only
+the selected public SDK features and does not add model-visible canvas tools or
+Vivi-owned declarations. Registry events are bounded and validated, but the
+production adapter does not apply them because the public API still does not
+establish replacement-versus-delta meaning. Its root-private adapter mode
+keeps replacement behavior available only to credential-free fixtures until
+runtime evidence resolves that gate. Join/resume `open_canvases` is likewise
+omitted; the adapter uses the public snapshot only as positive observations and
+never treats absence as closure. C ABI exposure and native or CLI rendering
+remain later host work.
 
 Native applications are intentionally asymmetric:
 

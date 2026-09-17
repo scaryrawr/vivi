@@ -3699,6 +3699,7 @@ const ChatUi = struct {
                     message.bytes,
                 );
             },
+            .canvas_snapshot, .canvas_operation => {},
             .idle => {
                 self.transcript.endTurn();
                 self.phase = .ready;

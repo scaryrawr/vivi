@@ -92,6 +92,8 @@ pub const ConversationOptions = struct {
     copilot_cli_path: ?[]const u8 = null,
     omlx: OmlxOptions = .{},
     copilot_cli_launch: CopilotCliLaunch = .sdk_default,
+    request_extensions: bool = false,
+    request_canvas_renderer: bool = false,
 };
 
 const ConversationContext = struct {
@@ -104,6 +106,8 @@ const ConversationContext = struct {
     omlx_base_url: []u8,
     omlx_api_key: ?[]u8,
     copilot_cli_launch: CopilotCliLaunch,
+    request_extensions: bool,
+    request_canvas_renderer: bool,
 
     fn init(
         allocator: std.mem.Allocator,
@@ -148,6 +152,8 @@ const ConversationContext = struct {
             .omlx_base_url = undefined,
             .omlx_api_key = null,
             .copilot_cli_launch = options.copilot_cli_launch,
+            .request_extensions = options.request_extensions,
+            .request_canvas_renderer = options.request_canvas_renderer,
         };
         context.omlx_base_url = try allocator.dupe(
             u8,
@@ -547,6 +553,7 @@ fn forwardImmediatePrompts(
             .resume_session,
             .execute_command,
             .user_input_response,
+            .canvas,
             => {
                 return error.UnexpectedStreamingCommand;
             },
@@ -576,6 +583,7 @@ fn startNextQueuedPrompt(
         .resume_session,
         .execute_command,
         .user_input_response,
+        .canvas,
         => {
             return error.UnexpectedStreamingCommand;
         },
@@ -1084,6 +1092,8 @@ fn createSdkSession(
     working_directory: []const u8,
     plan: *const SessionPlan,
     api_key: ?[]const u8,
+    request_extensions: bool,
+    request_canvas_renderer: bool,
 ) !copilot.Session {
     var directories = try WorkspaceCustomizationDirectories.init(
         worker.allocator(),
@@ -1099,6 +1109,11 @@ fn createSdkSession(
     directories.apply(&config);
     config.on_user_input_request = handleSdkUserInput;
     config.user_input_context = worker;
+    applyCanvasRequests(
+        &config,
+        request_extensions,
+        request_canvas_renderer,
+    );
     return client.createSession(config);
 }
 
@@ -1110,6 +1125,8 @@ fn joinSdkSession(
     working_directory: []const u8,
     plan: *const SessionPlan,
     api_key: ?[]const u8,
+    request_extensions: bool,
+    request_canvas_renderer: bool,
 ) !copilot.Session {
     var directories = try WorkspaceCustomizationDirectories.init(
         worker.allocator(),
@@ -1125,7 +1142,21 @@ fn joinSdkSession(
     directories.apply(&config);
     config.on_user_input_request = handleSdkUserInput;
     config.user_input_context = worker;
+    applyCanvasRequests(
+        &config,
+        request_extensions,
+        request_canvas_renderer,
+    );
     return client.joinSession(session_id, config);
+}
+
+fn applyCanvasRequests(
+    config: *copilot.SessionConfig,
+    request_extensions: bool,
+    request_canvas_renderer: bool,
+) void {
+    config.extensions.common.request_extensions = request_extensions;
+    config.extensions.common.request_canvas_renderer = request_canvas_renderer;
 }
 
 fn sessionConfigForPlan(
@@ -1971,10 +2002,789 @@ fn refreshCommandCatalog(
     } else |_| {}
 }
 
+const CanvasRegistryMode = enum {
+    unresolved,
+    replacement,
+};
+
+const CanvasSdkAdapter = struct {
+    allocator: std.mem.Allocator,
+    state: canvas.State,
+    request_extensions: bool,
+    request_canvas_renderer: bool,
+    registry_mode: CanvasRegistryMode,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        request_extensions: bool,
+        request_canvas_renderer: bool,
+        registry_mode: CanvasRegistryMode,
+    ) CanvasSdkAdapter {
+        var state = canvas.State.init(allocator, .{});
+        if (!request_canvas_renderer) state.setCapability(.unsupported);
+        return .{
+            .allocator = allocator,
+            .state = state,
+            .request_extensions = request_extensions,
+            .request_canvas_renderer = request_canvas_renderer,
+            .registry_mode = registry_mode,
+        };
+    }
+
+    fn deinit(self: *CanvasSdkAdapter) void {
+        self.state.deinit();
+        self.* = undefined;
+    }
+
+    fn shutdown(self: *CanvasSdkAdapter) void {
+        self.state.shutdown();
+    }
+
+    fn activate(self: *CanvasSdkAdapter, session: anytype) !void {
+        if (!self.request_canvas_renderer) return;
+        self.state.setCapability(mapCanvasCapability(
+            session.capabilities().state(.canvases),
+        ));
+        if (!self.state.capability.supports()) return;
+
+        var snapshot = session.snapshotOpenCanvases(self.allocator) catch {
+            self.state.noteDegradation(.operations, .host_failure);
+            return;
+        };
+        defer snapshot.deinit();
+        for (snapshot.items) |item| {
+            applyOpenCanvasObservation(&self.state, item) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                noteCanvasInputFailure(
+                    &self.state,
+                    item.extension_id,
+                    item.canvas_id,
+                    item.instance_id,
+                    err,
+                );
+            };
+        }
+    }
+
+    fn execute(
+        self: *CanvasSdkAdapter,
+        session: anytype,
+        command: *const canvas.Command,
+    ) !canvas.CommandCompletion {
+        if (!self.request_canvas_renderer) {
+            return failedCanvasCompletion(
+                self.allocator,
+                command.requestId(),
+                command.*,
+                .disabled,
+            );
+        }
+        return switch (command.*) {
+            .open => |*value| self.executeOpen(session, value),
+            .close => |*value| self.executeClose(session, value),
+            .invoke_action => |*value| self.executeAction(session, value),
+        };
+    }
+
+    fn executeOpen(
+        self: *CanvasSdkAdapter,
+        session: anytype,
+        command: *const canvas.OpenCommand,
+    ) !canvas.CommandCompletion {
+        const token = self.state.beginOpen(command.request()) catch |err| {
+            return failedCanvasCompletion(
+                self.allocator,
+                command.request_id,
+                .{ .open = command.* },
+                canvasFailure(err),
+            );
+        };
+        var result = session.openCanvas(self.allocator, .{
+            .extension_id = command.key.extension_id.bytes,
+            .canvas_id = command.key.canvas_id.bytes,
+            .instance_id = command.key.instance_id.bytes,
+            .input_json = if (command.input) |input| input.bytes else null,
+        }) catch {
+            _ = self.state.completeOpen(token, .failed) catch false;
+            return failedCanvasCompletion(
+                self.allocator,
+                command.request_id,
+                .{ .open = command.* },
+                .host_failure,
+            );
+        };
+        defer result.deinit();
+
+        if (!command.key.eqlView(.{
+            .extension_id = result.value.extension_id,
+            .canvas_id = result.value.canvas_id,
+            .instance_id = result.value.instance_id,
+        })) {
+            _ = self.state.completeOpen(token, .failed) catch false;
+            self.state.noteDegradation(
+                .{ .instance = command.key.view() },
+                .invalid_signal,
+            );
+            return failedCanvasCompletion(
+                self.allocator,
+                command.request_id,
+                .{ .open = command.* },
+                .invalid_sdk_result,
+            );
+        }
+        if (result.value.input_json) |json| {
+            var validated_input = canvas.OpenInputDocument.init(
+                self.allocator,
+                json,
+                self.state.limits,
+            ) catch |err| {
+                _ = self.state.completeOpen(token, .failed) catch false;
+                self.state.noteDegradation(
+                    .{ .instance = command.key.view() },
+                    degradationForError(err),
+                );
+                return failedCanvasCompletion(
+                    self.allocator,
+                    command.request_id,
+                    .{ .open = command.* },
+                    .invalid_sdk_result,
+                );
+            };
+            validated_input.deinit(self.allocator);
+        }
+        var owned_result = canvas.OpenResult.init(
+            self.allocator,
+            .{
+                .title = result.value.title,
+                .url = result.value.url,
+                .status = result.value.status,
+            },
+            self.state.limits,
+        ) catch |err| {
+            _ = self.state.completeOpen(token, .failed) catch false;
+            self.state.noteDegradation(
+                .{ .instance = command.key.view() },
+                degradationForError(err),
+            );
+            return failedCanvasCompletion(
+                self.allocator,
+                command.request_id,
+                .{ .open = command.* },
+                .invalid_sdk_result,
+            );
+        };
+        errdefer owned_result.deinit();
+        const accepted = try self.state.completeOpen(
+            token,
+            .{ .succeeded = owned_result.view() },
+        );
+        if (!accepted) {
+            owned_result.deinit();
+            return failedCanvasCompletion(
+                self.allocator,
+                command.request_id,
+                .{ .open = command.* },
+                .stale,
+            );
+        }
+        return .{
+            .allocator = self.allocator,
+            .request_id = command.request_id,
+            .result = .{ .open = .{ .succeeded = owned_result } },
+        };
+    }
+
+    fn executeClose(
+        self: *CanvasSdkAdapter,
+        session: anytype,
+        command: *const canvas.CloseCommand,
+    ) !canvas.CommandCompletion {
+        const token = self.state.beginClose(command.request()) catch |err| {
+            return failedCanvasCompletion(
+                self.allocator,
+                command.request_id,
+                .{ .close = command.* },
+                canvasFailure(err),
+            );
+        };
+        session.closeCanvas(command.key.instance_id.bytes) catch {
+            _ = self.state.completeClose(token, false) catch false;
+            return failedCanvasCompletion(
+                self.allocator,
+                command.request_id,
+                .{ .close = command.* },
+                .host_failure,
+            );
+        };
+        if (!(try self.state.completeClose(token, true))) {
+            return failedCanvasCompletion(
+                self.allocator,
+                command.request_id,
+                .{ .close = command.* },
+                .stale,
+            );
+        }
+        return .{
+            .allocator = self.allocator,
+            .request_id = command.request_id,
+            .result = .{ .close = .succeeded },
+        };
+    }
+
+    fn executeAction(
+        self: *CanvasSdkAdapter,
+        session: anytype,
+        command: *const canvas.ActionCommand,
+    ) !canvas.CommandCompletion {
+        const token = self.state.beginAction(command.request()) catch |err| {
+            return failedCanvasCompletion(
+                self.allocator,
+                command.request_id,
+                .{ .invoke_action = command.* },
+                canvasFailure(err),
+            );
+        };
+        var result = session.invokeCanvasAction(self.allocator, .{
+            .instance_id = command.key.instance_id.bytes,
+            .action_name = command.action_name.bytes,
+            .input_json = if (command.input) |input| input.bytes else null,
+        }) catch {
+            _ = self.state.completeAction(token, .failed);
+            return failedCanvasCompletion(
+                self.allocator,
+                command.request_id,
+                .{ .invoke_action = command.* },
+                .host_failure,
+            );
+        };
+        defer result.deinit();
+        var document = canvas.ActionResultDocument.init(
+            self.allocator,
+            result.json,
+            self.state.limits,
+        ) catch |err| {
+            _ = self.state.completeAction(token, .failed);
+            self.state.noteDegradation(
+                .{ .instance = command.key.view() },
+                degradationForError(err),
+            );
+            return failedCanvasCompletion(
+                self.allocator,
+                command.request_id,
+                .{ .invoke_action = command.* },
+                .invalid_sdk_result,
+            );
+        };
+        errdefer document.deinit(self.allocator);
+        if (!self.state.completeAction(token, .{ .succeeded = &document })) {
+            document.deinit(self.allocator);
+            return failedCanvasCompletion(
+                self.allocator,
+                command.request_id,
+                .{ .invoke_action = command.* },
+                .stale,
+            );
+        }
+        return .{
+            .allocator = self.allocator,
+            .request_id = command.request_id,
+            .result = .{ .action = .{ .succeeded = document } },
+        };
+    }
+
+    fn observe(
+        self: *CanvasSdkAdapter,
+        session: anytype,
+        event: *const copilot.SessionEvent,
+    ) !bool {
+        switch (event.*) {
+            .capabilities_changed => {
+                if (!self.request_canvas_renderer) return false;
+                self.state.setCapability(mapCanvasCapability(
+                    session.capabilities().state(.canvases),
+                ));
+                return true;
+            },
+            .session_canvas_registry_changed => |payload| {
+                if (!self.request_extensions) return false;
+                return self.observeRegistry(payload.data.canvases);
+            },
+            .session_canvas_opened => |payload| {
+                if (!self.request_canvas_renderer) return false;
+                applyOpenedEvent(&self.state, payload.data) catch |err| {
+                    if (err == error.OutOfMemory) return err;
+                    noteCanvasInputFailure(
+                        &self.state,
+                        payload.data.extension_id,
+                        payload.data.canvas_id,
+                        payload.data.instance_id,
+                        err,
+                    );
+                };
+                return true;
+            },
+            .session_canvas_closed => |payload| {
+                if (!self.request_canvas_renderer) return false;
+                applyKeySignal(
+                    &self.state,
+                    payload.data.extension_id,
+                    payload.data.canvas_id,
+                    payload.data.instance_id,
+                    .closed,
+                ) catch |err| {
+                    if (err == error.OutOfMemory) return err;
+                    noteCanvasInputFailure(
+                        &self.state,
+                        payload.data.extension_id,
+                        payload.data.canvas_id,
+                        payload.data.instance_id,
+                        err,
+                    );
+                };
+                return true;
+            },
+            .session_canvas_unavailable => |payload| {
+                if (!self.request_canvas_renderer) return false;
+                applyKeySignal(
+                    &self.state,
+                    payload.data.extension_id,
+                    payload.data.canvas_id,
+                    payload.data.instance_id,
+                    .unavailable,
+                ) catch |err| {
+                    if (err == error.OutOfMemory) return err;
+                    noteCanvasInputFailure(
+                        &self.state,
+                        payload.data.extension_id,
+                        payload.data.canvas_id,
+                        payload.data.instance_id,
+                        err,
+                    );
+                };
+                return true;
+            },
+            .session_canvas_recorded => |payload| {
+                if (!self.request_canvas_renderer) return false;
+                applyRecordedEvent(&self.state, payload.data) catch |err| {
+                    if (err == error.OutOfMemory) return err;
+                    noteCanvasInputFailure(
+                        &self.state,
+                        payload.data.extension_id,
+                        payload.data.canvas_id,
+                        payload.data.instance_id,
+                        err,
+                    );
+                };
+                return true;
+            },
+            .session_canvas_removed => |payload| {
+                if (!self.request_canvas_renderer) return false;
+                applyKeySignal(
+                    &self.state,
+                    payload.data.extension_id,
+                    payload.data.canvas_id,
+                    payload.data.instance_id,
+                    .removed,
+                ) catch |err| {
+                    if (err == error.OutOfMemory) return err;
+                    noteCanvasInputFailure(
+                        &self.state,
+                        payload.data.extension_id,
+                        payload.data.canvas_id,
+                        payload.data.instance_id,
+                        err,
+                    );
+                };
+                return true;
+            },
+            else => return false,
+        }
+    }
+
+    fn observeRegistry(
+        self: *CanvasSdkAdapter,
+        values: []const copilot.SessionEventTypes.CanvasRegistryChangedCanvas,
+    ) !bool {
+        var scratch = registryInputsFromSdk(
+            self.allocator,
+            values,
+            self.state.limits,
+        ) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            self.state.noteDegradation(
+                .registry,
+                degradationForError(err),
+            );
+            return true;
+        };
+        defer scratch.deinit();
+        switch (self.registry_mode) {
+            .unresolved => return false,
+            .replacement => {
+                self.state.applyRegistry(.{
+                    .replacement = scratch.entries,
+                }) catch |err| {
+                    if (err == error.OutOfMemory) return err;
+                    self.state.noteDegradation(
+                        .registry,
+                        degradationForError(err),
+                    );
+                };
+                return true;
+            },
+        }
+    }
+};
+
+const OwnedRegistryInputs = struct {
+    arena: std.heap.ArenaAllocator,
+    entries: []canvas.CanvasDeclarationInput,
+
+    fn deinit(self: *OwnedRegistryInputs) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+fn registryInputsFromSdk(
+    allocator: std.mem.Allocator,
+    values: []const copilot.SessionEventTypes.CanvasRegistryChangedCanvas,
+    limits: canvas.Limits,
+) !OwnedRegistryInputs {
+    if (values.len > limits.max_registry_entries)
+        return error.TooManyRegistryEntries;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const scratch = arena.allocator();
+    const entries = try scratch.alloc(
+        canvas.CanvasDeclarationInput,
+        values.len,
+    );
+    var total: usize = 0;
+    for (values, 0..) |value, index| {
+        const sdk_actions = value.actions orelse &.{};
+        if (sdk_actions.len > limits.max_actions_per_canvas)
+            return error.TooManyActions;
+        const actions = try scratch.alloc(
+            canvas.ActionDeclarationInput,
+            sdk_actions.len,
+        );
+        for (sdk_actions, 0..) |action, action_index| {
+            const description: []const u8 = action.description orelse "";
+            const schema = if (action.input_schema) |schema|
+                try boundedJsonValue(
+                    allocator,
+                    scratch,
+                    schema,
+                    limits.max_json_bytes,
+                )
+            else
+                null;
+            total = try addBounded(
+                total,
+                action.name.len +
+                    description.len +
+                    if (schema) |json| json.len else 0,
+                limits.max_registry_bytes,
+            );
+            actions[action_index] = .{
+                .name = action.name,
+                .description = description,
+                .input_schema_json = schema,
+            };
+        }
+        const schema = if (value.input_schema) |schema|
+            try boundedJsonValue(
+                allocator,
+                scratch,
+                schema,
+                limits.max_json_bytes,
+            )
+        else
+            null;
+        const extension_name: []const u8 = value.extension_name orelse "";
+        total = try addBounded(
+            total,
+            value.extension_id.len +
+                extension_name.len +
+                value.canvas_id.len +
+                value.display_name.len +
+                value.description.len +
+                if (schema) |json| json.len else 0,
+            limits.max_registry_bytes,
+        );
+        entries[index] = .{
+            .extension_id = value.extension_id,
+            .extension_name = extension_name,
+            .canvas_id = value.canvas_id,
+            .display_name = value.display_name,
+            .description = value.description,
+            .input_schema_json = schema,
+            .actions = actions,
+        };
+        var validated = try canvas.CanvasDeclaration.init(
+            scratch,
+            entries[index],
+            limits,
+        );
+        validated.deinit(scratch);
+    }
+    return .{ .arena = arena, .entries = entries };
+}
+
+fn boundedJsonValue(
+    temporary_allocator: std.mem.Allocator,
+    destination_allocator: std.mem.Allocator,
+    value: std.json.Value,
+    max_bytes: usize,
+) ![]const u8 {
+    const buffer = try temporary_allocator.alloc(u8, max_bytes + 1);
+    defer temporary_allocator.free(buffer);
+    var writer = std.Io.Writer.fixed(buffer);
+    std.json.Stringify.value(value, .{}, &writer) catch
+        return error.JsonDocumentTooLong;
+    const encoded = writer.buffered();
+    if (encoded.len > max_bytes) return error.JsonDocumentTooLong;
+    return destination_allocator.dupe(u8, encoded);
+}
+
+fn addBounded(total: usize, amount: usize, maximum: usize) !usize {
+    const result = std.math.add(usize, total, amount) catch
+        return error.AggregateLimitExceeded;
+    if (result > maximum) return error.AggregateLimitExceeded;
+    return result;
+}
+
+fn applyOpenCanvasObservation(
+    state: *canvas.State,
+    value: copilot.OpenCanvas,
+) !void {
+    var arena = std.heap.ArenaAllocator.init(state.allocator);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var key = try canvas.InstanceKey.init(scratch, .{
+        .extension_id = value.extension_id,
+        .canvas_id = value.canvas_id,
+        .instance_id = value.instance_id,
+    }, state.limits);
+    defer key.deinit(scratch);
+    var input = if (value.input_json) |json|
+        try canvas.OpenInputDocument.init(scratch, json, state.limits)
+    else
+        null;
+    defer if (input) |*document| document.deinit(scratch);
+    var result = try canvas.OpenResult.init(scratch, .{
+        .title = value.title,
+        .url = value.url,
+        .status = value.status,
+    }, state.limits);
+    defer result.deinit();
+    try state.applyProviderSignal(.{ .opened = .{
+        .key = key.view(),
+        .input = if (input) |*document| document else null,
+        .result = result.view(),
+    } });
+}
+
+fn applyOpenedEvent(
+    state: *canvas.State,
+    value: copilot.SessionEventTypes.CanvasOpenedData,
+) !void {
+    var arena = std.heap.ArenaAllocator.init(state.allocator);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var key = try canvas.InstanceKey.init(scratch, .{
+        .extension_id = value.extension_id,
+        .canvas_id = value.canvas_id,
+        .instance_id = value.instance_id,
+    }, state.limits);
+    defer key.deinit(scratch);
+    const input_json = if (value.input) |input|
+        try boundedJsonValue(
+            state.allocator,
+            scratch,
+            input,
+            state.limits.max_json_bytes,
+        )
+    else
+        null;
+    var input = if (input_json) |json|
+        try canvas.OpenInputDocument.init(scratch, json, state.limits)
+    else
+        null;
+    defer if (input) |*document| document.deinit(scratch);
+    var result = try canvas.OpenResult.init(scratch, .{
+        .title = value.title,
+        .url = value.url,
+        .status = value.status,
+    }, state.limits);
+    defer result.deinit();
+    try state.applyProviderSignal(.{ .opened = .{
+        .key = key.view(),
+        .input = if (input) |*document| document else null,
+        .result = result.view(),
+    } });
+}
+
+fn applyRecordedEvent(
+    state: *canvas.State,
+    value: copilot.SessionEventTypes.CanvasRecordedData,
+) !void {
+    var arena = std.heap.ArenaAllocator.init(state.allocator);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var key = try canvas.InstanceKey.init(scratch, .{
+        .extension_id = value.extension_id,
+        .canvas_id = value.canvas_id,
+        .instance_id = value.instance_id,
+    }, state.limits);
+    defer key.deinit(scratch);
+    const input_json = if (value.input) |input|
+        try boundedJsonValue(
+            state.allocator,
+            scratch,
+            input,
+            state.limits.max_json_bytes,
+        )
+    else
+        null;
+    var input = if (input_json) |json|
+        try canvas.OpenInputDocument.init(scratch, json, state.limits)
+    else
+        null;
+    defer if (input) |*document| document.deinit(scratch);
+    try state.applyProviderSignal(.{ .recorded = .{
+        .key = key.view(),
+        .title = value.title,
+        .input = if (input) |*document| document else null,
+    } });
+}
+
+const KeySignal = enum {
+    closed,
+    unavailable,
+    removed,
+};
+
+fn applyKeySignal(
+    state: *canvas.State,
+    extension_id: []const u8,
+    canvas_id: []const u8,
+    instance_id: []const u8,
+    signal: KeySignal,
+) !void {
+    var arena = std.heap.ArenaAllocator.init(state.allocator);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var key = try canvas.InstanceKey.init(scratch, .{
+        .extension_id = extension_id,
+        .canvas_id = canvas_id,
+        .instance_id = instance_id,
+    }, state.limits);
+    defer key.deinit(scratch);
+    try state.applyProviderSignal(switch (signal) {
+        .closed => .{ .closed = key.view() },
+        .unavailable => .{ .unavailable = key.view() },
+        .removed => .{ .removed = key.view() },
+    });
+}
+
+fn noteCanvasInputFailure(
+    state: *canvas.State,
+    extension_id: []const u8,
+    canvas_id: []const u8,
+    instance_id: []const u8,
+    err: anyerror,
+) void {
+    var arena = std.heap.ArenaAllocator.init(state.allocator);
+    defer arena.deinit();
+    var key = canvas.InstanceKey.init(arena.allocator(), .{
+        .extension_id = extension_id,
+        .canvas_id = canvas_id,
+        .instance_id = instance_id,
+    }, state.limits) catch {
+        state.noteDegradation(.operations, degradationForError(err));
+        return;
+    };
+    defer key.deinit(arena.allocator());
+    if (state.runtimeTag(key.view()) == null and
+        state.recordTag(key.view()) == null)
+    {
+        state.noteDegradation(.operations, degradationForError(err));
+        return;
+    }
+    state.noteDegradation(
+        .{ .instance = key.view() },
+        degradationForError(err),
+    );
+}
+
+fn mapCanvasCapability(value: copilot.CapabilityState) canvas.CapabilityState {
+    return switch (value) {
+        .unknown => .unknown,
+        .unsupported => .unsupported,
+        .supported => .supported,
+    };
+}
+
+fn degradationForError(err: anyerror) canvas.Degradation {
+    return switch (err) {
+        error.IdentifierTooLong,
+        error.KeyTooLong,
+        error.TextTooLong,
+        error.JsonDocumentTooLong,
+        error.TooManyActions,
+        error.TooManyRegistryEntries,
+        error.TooManyInstances,
+        error.AggregateLimitExceeded,
+        => .limit_exceeded,
+        else => .invalid_signal,
+    };
+}
+
+fn canvasFailure(err: anyerror) canvas.OperationFailure {
+    return switch (err) {
+        error.CanvasUnsupported => .unsupported,
+        error.CanvasUnavailable,
+        error.CanvasNotOpen,
+        error.ActionUnavailable,
+        => .unavailable,
+        error.Backpressure => .backpressure,
+        error.Shutdown => .shutdown,
+        error.OutOfMemory => .host_failure,
+        else => .invalid_request,
+    };
+}
+
+fn failedCanvasCompletion(
+    allocator: std.mem.Allocator,
+    request_id: canvas.RequestId,
+    command: canvas.Command,
+    failure: canvas.OperationFailure,
+) canvas.CommandCompletion {
+    return .{
+        .allocator = allocator,
+        .request_id = request_id,
+        .result = switch (command) {
+            .open => .{ .open = .{ .failed = failure } },
+            .close => .{ .close = .{ .failed = failure } },
+            .invoke_action => .{ .action = .{ .failed = failure } },
+        },
+    };
+}
+
+fn publishCanvasSnapshot(
+    worker: *conversation.Worker,
+    adapter: *CanvasSdkAdapter,
+) !void {
+    try worker.canvasSnapshot(try adapter.state.snapshot(worker.allocator()));
+}
+
 fn streamSessionResponse(
     worker: *conversation.Worker,
     client: *copilot.Client,
     session: copilot.Session,
+    canvas_adapter: *CanvasSdkAdapter,
     tool_service: *tools.Service,
     store: ?*session_store.Store,
     session_tracking_enabled: *bool,
@@ -1990,6 +2800,19 @@ fn streamSessionResponse(
             return .failed;
         };
         defer event.deinit(worker.allocator());
+
+        if (canvas_adapter.observe(session, &event) catch |err| {
+            worker.closeFailure(.stream, @errorName(err));
+            return .failed;
+        }) {
+            publishCanvasSnapshot(worker, canvas_adapter) catch {
+                worker.closeFailure(
+                    .stream,
+                    "Unable to deliver canvas state.",
+                );
+                return .failed;
+            };
+        }
 
         switch (event) {
             .assistant_message_delta => |delta| {
@@ -2043,6 +2866,7 @@ fn streamSessionResponse(
                 }) {
                     .sent => continue,
                     .stop => {
+                        canvas_adapter.shutdown();
                         session.disconnect() catch |err| {
                             worker.closeFailure(
                                 .stream,
@@ -2351,6 +3175,7 @@ fn streamSessionResponse(
         }) {
             .none, .sent => {},
             .stop => {
+                canvas_adapter.shutdown();
                 session.disconnect() catch |err| {
                     worker.closeFailure(.stream, @errorName(err));
                     return .failed;
@@ -2474,12 +3299,28 @@ fn runSdkConversation(
         active_working_directory,
         &active_plan,
         context.omlx_api_key,
+        context.request_extensions,
+        context.request_canvas_renderer,
     ) catch |err| {
         worker.closeFailure(.startup, @errorName(err));
         return;
     };
     var session_connected = true;
     defer if (session_connected) session.disconnect() catch {};
+    var canvas_adapter = CanvasSdkAdapter.init(
+        worker.allocator(),
+        context.request_extensions,
+        context.request_canvas_renderer,
+        .unresolved,
+    );
+    defer {
+        canvas_adapter.shutdown();
+        canvas_adapter.deinit();
+    }
+    canvas_adapter.activate(session) catch |err| {
+        worker.closeFailure(.startup, @errorName(err));
+        return;
+    };
     if (store) |*value| {
         value.recordCreated(
             session.id,
@@ -2505,6 +3346,12 @@ fn runSdkConversation(
         worker.closeRequested();
         return;
     }
+    if (context.request_extensions or context.request_canvas_renderer) {
+        publishCanvasSnapshot(worker, &canvas_adapter) catch {
+            worker.closeFailure(.startup, "Unable to publish canvas state.");
+            return;
+        };
+    }
 
     const initial_commands = buildCommandCatalog(
         worker.allocator(),
@@ -2529,6 +3376,7 @@ fn runSdkConversation(
         defer command.deinit();
         switch (command) {
             .stop => {
+                canvas_adapter.shutdown();
                 session.disconnect() catch |err| {
                     worker.closeFailure(.stream, @errorName(err));
                     return;
@@ -2536,6 +3384,30 @@ fn runSdkConversation(
                 session_connected = false;
                 worker.closeRequested();
                 return;
+            },
+            .canvas => |*canvas_command| {
+                var completion = canvas_adapter.execute(
+                    session,
+                    canvas_command,
+                ) catch |err| {
+                    worker.closeFailure(.stream, @errorName(err));
+                    return;
+                };
+                publishCanvasSnapshot(worker, &canvas_adapter) catch {
+                    completion.deinit();
+                    worker.closeFailure(
+                        .stream,
+                        "Unable to deliver canvas state.",
+                    );
+                    return;
+                };
+                worker.completeCanvasCommand(completion) catch {
+                    worker.closeFailure(
+                        .stream,
+                        "Unable to deliver canvas completion.",
+                    );
+                    return;
+                };
             },
             .refresh_commands => {
                 const catalog = buildCommandCatalog(
@@ -2863,6 +3735,8 @@ fn runSdkConversation(
                     target.working_directory,
                     &target_plan,
                     context.omlx_api_key,
+                    context.request_extensions,
+                    context.request_canvas_renderer,
                 ) catch |err| {
                     candidate_tools.deinit();
                     target_plan.deinit(worker.allocator());
@@ -2955,20 +3829,43 @@ fn runSdkConversation(
                     continue;
                 };
 
+                var candidate_canvas = CanvasSdkAdapter.init(
+                    worker.allocator(),
+                    context.request_extensions,
+                    context.request_canvas_renderer,
+                    .unresolved,
+                );
+                candidate_canvas.activate(candidate) catch |err| {
+                    candidate_canvas.deinit();
+                    var mutable_summary = summary;
+                    mutable_summary.deinit();
+                    var mutable_snapshot = snapshot;
+                    mutable_snapshot.deinit();
+                    worker.allocator().free(candidate_working_directory);
+                    candidate.disconnect() catch {};
+                    candidate_tools.deinit();
+                    target_plan.deinit(worker.allocator());
+                    worker.closeFailure(.stream, @errorName(err));
+                    return;
+                };
                 const previous_session = session;
+                var previous_canvas = canvas_adapter;
                 var previous_tools = tool_service;
                 const previous_working_directory = active_working_directory;
                 var previous_plan = active_plan;
                 session_connected = false;
                 session = candidate;
+                canvas_adapter = candidate_canvas;
                 tool_service = candidate_tools;
                 active_working_directory = candidate_working_directory;
                 active_plan = target_plan;
                 session_connected = true;
+                previous_canvas.shutdown();
                 const cleanup_failed = if (previous_session.disconnect())
                     false
                 else |_|
                     true;
+                previous_canvas.deinit();
                 previous_tools.deinit();
                 worker.allocator().free(previous_working_directory);
                 previous_plan.deinit(worker.allocator());
@@ -2983,6 +3880,17 @@ fn runSdkConversation(
                     );
                     return;
                 };
+                if (context.request_extensions or
+                    context.request_canvas_renderer)
+                {
+                    publishCanvasSnapshot(worker, &canvas_adapter) catch {
+                        worker.closeFailure(
+                            .stream,
+                            "Unable to publish canvas state.",
+                        );
+                        return;
+                    };
+                }
                 if (buildCommandCatalog(
                     worker.allocator(),
                     &client,
@@ -3041,6 +3949,7 @@ fn runSdkConversation(
                                 worker,
                                 &client,
                                 session,
+                                &canvas_adapter,
                                 &tool_service,
                                 if (store) |*value| value else null,
                                 &session_tracking_enabled,
@@ -3132,6 +4041,7 @@ fn runSdkConversation(
                                 .switch_model,
                                 .resume_session,
                                 .execute_command,
+                                .canvas,
                                 => unreachable,
                             }
                         },
@@ -3311,6 +4221,8 @@ fn runSdkConversation(
                     active_working_directory,
                     &target_plan,
                     context.omlx_api_key,
+                    context.request_extensions,
+                    context.request_canvas_renderer,
                 ) catch |err| {
                     target_plan.deinit(worker.allocator());
                     worker.completeModelSwitch(.{
@@ -3457,9 +4369,31 @@ fn runSdkConversation(
                     settings_update = null;
                 }
 
+                var candidate_canvas = CanvasSdkAdapter.init(
+                    worker.allocator(),
+                    context.request_extensions,
+                    context.request_canvas_renderer,
+                    .unresolved,
+                );
+                candidate_canvas.activate(candidate) catch |err| {
+                    candidate_canvas.deinit();
+                    candidate.disconnect() catch {};
+                    target_plan.deinit(worker.allocator());
+                    var mutable = info;
+                    mutable.deinit();
+                    selected.deinit();
+                    if (persisted_value) |saved| {
+                        var mutable_value = saved;
+                        mutable_value.deinit();
+                    }
+                    worker.closeFailure(.stream, @errorName(err));
+                    return;
+                };
                 const previous_session = session;
+                var previous_canvas = canvas_adapter;
                 session_connected = false;
                 session = candidate;
+                canvas_adapter = candidate_canvas;
                 session_connected = true;
                 active_plan.deinit(worker.allocator());
                 active_plan = target_plan;
@@ -3469,10 +4403,12 @@ fn runSdkConversation(
                     }
                     persisted_settings.default_selection = value;
                 }
+                previous_canvas.shutdown();
                 const cleanup_failed = if (previous_session.disconnect())
                     false
                 else |_|
                     true;
+                previous_canvas.deinit();
                 worker.completeModelSwitch(.{ .switched = .{
                     .model = info,
                     .selection = selected,
@@ -3486,6 +4422,17 @@ fn runSdkConversation(
                     );
                     return;
                 };
+                if (context.request_extensions or
+                    context.request_canvas_renderer)
+                {
+                    publishCanvasSnapshot(worker, &canvas_adapter) catch {
+                        worker.closeFailure(
+                            .stream,
+                            "Unable to publish canvas state.",
+                        );
+                        return;
+                    };
+                }
                 if (buildCommandCatalog(
                     worker.allocator(),
                     &client,
@@ -3516,6 +4463,7 @@ fn runSdkConversation(
                     worker,
                     &client,
                     session,
+                    &canvas_adapter,
                     &tool_service,
                     if (store) |*value| value else null,
                     &session_tracking_enabled,
@@ -3539,6 +4487,525 @@ fn runSdkConversation(
             },
         }
     }
+}
+
+const canvas_test_key: canvas.KeyView = .{
+    .extension_id = "fixture.extension",
+    .canvas_id = "review",
+    .instance_id = "review:main",
+};
+
+const canvas_test_actions = [_]canvas.ActionDeclarationInput{.{
+    .name = "refresh",
+    .description = "Refresh",
+}};
+
+const canvas_test_declaration: canvas.CanvasDeclarationInput = .{
+    .extension_id = "fixture.extension",
+    .extension_name = "Fixture",
+    .canvas_id = "review",
+    .display_name = "Review",
+    .description = "Review changes",
+    .actions = &canvas_test_actions,
+};
+
+const FakeCanvasSession = struct {
+    capability: copilot.CapabilityState = .supported,
+    snapshot_calls: usize = 0,
+    open_calls: usize = 0,
+    close_calls: usize = 0,
+    action_calls: usize = 0,
+    mismatch_open_identity: bool = false,
+    action_json: []const u8 = "{\"refreshed\":true}",
+
+    fn capabilities(self: *FakeCanvasSession) copilot.CapabilitySet {
+        return .{ .canvases = self.capability };
+    }
+
+    fn snapshotOpenCanvases(
+        self: *FakeCanvasSession,
+        allocator: std.mem.Allocator,
+    ) !copilot.OpenCanvasSnapshot {
+        self.snapshot_calls += 1;
+        return .{
+            .allocator = allocator,
+            .items = try allocator.alloc(copilot.OpenCanvas, 0),
+        };
+    }
+
+    fn openCanvas(
+        self: *FakeCanvasSession,
+        allocator: std.mem.Allocator,
+        request: copilot.OpenCanvasRequest,
+    ) !copilot.OpenCanvasResult {
+        self.open_calls += 1;
+        try std.testing.expectEqualStrings(
+            canvas_test_key.extension_id,
+            request.extension_id.?,
+        );
+        try std.testing.expectEqualStrings(
+            canvas_test_key.canvas_id,
+            request.canvas_id,
+        );
+        try std.testing.expectEqualStrings(
+            canvas_test_key.instance_id,
+            request.instance_id,
+        );
+        const extension_id = try allocator.dupe(
+            u8,
+            if (self.mismatch_open_identity)
+                "other.extension"
+            else
+                request.extension_id.?,
+        );
+        errdefer allocator.free(extension_id);
+        const canvas_id = try allocator.dupe(u8, request.canvas_id);
+        errdefer allocator.free(canvas_id);
+        const instance_id = try allocator.dupe(u8, request.instance_id);
+        errdefer allocator.free(instance_id);
+        const title = try allocator.dupe(u8, "Review");
+        errdefer allocator.free(title);
+        const status = try allocator.dupe(u8, "ready");
+        errdefer allocator.free(status);
+        const input_json = if (request.input_json) |json|
+            try allocator.dupe(u8, json)
+        else
+            null;
+        return .{
+            .allocator = allocator,
+            .value = .{
+                .instance_id = instance_id,
+                .extension_id = extension_id,
+                .canvas_id = canvas_id,
+                .title = title,
+                .status = status,
+                .input_json = input_json,
+            },
+        };
+    }
+
+    fn closeCanvas(
+        self: *FakeCanvasSession,
+        instance_id: []const u8,
+    ) !void {
+        self.close_calls += 1;
+        try std.testing.expectEqualStrings(
+            canvas_test_key.instance_id,
+            instance_id,
+        );
+    }
+
+    fn invokeCanvasAction(
+        self: *FakeCanvasSession,
+        allocator: std.mem.Allocator,
+        request: copilot.InvokeCanvasActionRequest,
+    ) !copilot.OwnedJson {
+        self.action_calls += 1;
+        try std.testing.expectEqualStrings("refresh", request.action_name);
+        try std.testing.expectEqualStrings(
+            canvas_test_key.instance_id,
+            request.instance_id,
+        );
+        return .{
+            .allocator = allocator,
+            .json = try allocator.dupe(u8, self.action_json),
+        };
+    }
+};
+
+fn testCanvasAdapter() !CanvasSdkAdapter {
+    var adapter = CanvasSdkAdapter.init(
+        std.testing.allocator,
+        true,
+        true,
+        .replacement,
+    );
+    errdefer adapter.deinit();
+    adapter.state.setCapability(.supported);
+    try adapter.state.applyRegistry(.{
+        .replacement = &.{canvas_test_declaration},
+    });
+    return adapter;
+}
+
+test "canvas SDK request flags are explicit and disabled by default" {
+    const defaults = ConversationOptions{ .working_directory = "/tmp" };
+    try std.testing.expect(!defaults.request_extensions);
+    try std.testing.expect(!defaults.request_canvas_renderer);
+
+    const cases = [_]struct {
+        extensions: bool,
+        renderer: bool,
+    }{
+        .{ .extensions = false, .renderer = false },
+        .{ .extensions = true, .renderer = false },
+        .{ .extensions = false, .renderer = true },
+        .{ .extensions = true, .renderer = true },
+    };
+    for (cases) |case| {
+        var config = copilot.SessionConfig{};
+        applyCanvasRequests(&config, case.extensions, case.renderer);
+        try std.testing.expectEqual(
+            case.extensions,
+            config.extensions.common.request_extensions,
+        );
+        try std.testing.expectEqual(
+            case.renderer,
+            config.extensions.common.request_canvas_renderer,
+        );
+        try std.testing.expectEqual(@as(usize, 0), config.extensions.common.canvases.len);
+        try std.testing.expect(config.extensions.canvas_provider == null);
+    }
+}
+
+test "disabled canvas adapter performs no SDK canvas work" {
+    var adapter = CanvasSdkAdapter.init(
+        std.testing.allocator,
+        false,
+        false,
+        .unresolved,
+    );
+    defer adapter.deinit();
+    var session: FakeCanvasSession = .{};
+    try adapter.activate(&session);
+    try std.testing.expectEqual(@as(usize, 0), session.snapshot_calls);
+    try std.testing.expectEqual(
+        canvas.CapabilityState.unsupported,
+        adapter.state.capability,
+    );
+}
+
+test "registry adapter validates typed declarations and gates unknown meaning" {
+    const actions = [_]copilot.SessionEventTypes.CanvasRegistryChangedCanvasAction{.{
+        .name = "refresh",
+        .description = "Refresh",
+    }};
+    const entries = [_]copilot.SessionEventTypes.CanvasRegistryChangedCanvas{.{
+        .extension_id = "fixture.extension",
+        .extension_name = "Fixture",
+        .canvas_id = "review",
+        .display_name = "Review",
+        .description = "Review changes",
+        .actions = &actions,
+    }};
+    var adapter = CanvasSdkAdapter.init(
+        std.testing.allocator,
+        true,
+        true,
+        .unresolved,
+    );
+    defer adapter.deinit();
+    try std.testing.expect(!try adapter.observeRegistry(&entries));
+    try std.testing.expectEqual(@as(usize, 0), adapter.state.registryCount());
+
+    adapter.registry_mode = .replacement;
+    try std.testing.expect(try adapter.observeRegistry(&entries));
+    try std.testing.expectEqual(@as(usize, 1), adapter.state.registryCount());
+
+    const invalid = [_]copilot.SessionEventTypes.CanvasRegistryChangedCanvas{.{
+        .extension_id = "",
+        .canvas_id = "broken",
+        .display_name = "Broken",
+        .description = "Broken",
+    }};
+    try std.testing.expect(try adapter.observeRegistry(&invalid));
+    try std.testing.expectEqual(@as(usize, 1), adapter.state.registryCount());
+    try std.testing.expectEqual(
+        canvas.Degradation.invalid_signal,
+        adapter.state.registry_degradation.?,
+    );
+}
+
+test "typed canvas lifecycle variants preserve runtime record orthogonality" {
+    var adapter = try testCanvasAdapter();
+    defer adapter.deinit();
+
+    try applyOpenedEvent(&adapter.state, .{
+        .instance_id = canvas_test_key.instance_id,
+        .extension_id = canvas_test_key.extension_id,
+        .canvas_id = canvas_test_key.canvas_id,
+        .title = "Review",
+        .status = "ready",
+    });
+    try applyRecordedEvent(&adapter.state, .{
+        .instance_id = canvas_test_key.instance_id,
+        .extension_id = canvas_test_key.extension_id,
+        .canvas_id = canvas_test_key.canvas_id,
+        .title = "Saved",
+    });
+    try std.testing.expectEqual(
+        canvas.RuntimeTag.opened,
+        adapter.state.runtimeTag(canvas_test_key).?,
+    );
+    try std.testing.expectEqual(
+        canvas.RecordTag.recorded,
+        adapter.state.recordTag(canvas_test_key).?,
+    );
+
+    try applyKeySignal(
+        &adapter.state,
+        canvas_test_key.extension_id,
+        canvas_test_key.canvas_id,
+        canvas_test_key.instance_id,
+        .unavailable,
+    );
+    try std.testing.expectEqual(
+        canvas.RuntimeTag.unavailable,
+        adapter.state.runtimeTag(canvas_test_key).?,
+    );
+    try std.testing.expectEqual(
+        canvas.RecordTag.recorded,
+        adapter.state.recordTag(canvas_test_key).?,
+    );
+    try applyKeySignal(
+        &adapter.state,
+        canvas_test_key.extension_id,
+        canvas_test_key.canvas_id,
+        canvas_test_key.instance_id,
+        .removed,
+    );
+    try std.testing.expectEqual(
+        canvas.RecordTag.removed,
+        adapter.state.recordTag(canvas_test_key).?,
+    );
+    try applyKeySignal(
+        &adapter.state,
+        canvas_test_key.extension_id,
+        canvas_test_key.canvas_id,
+        canvas_test_key.instance_id,
+        .closed,
+    );
+    try std.testing.expectEqual(
+        canvas.RuntimeTag.closed,
+        adapter.state.runtimeTag(canvas_test_key).?,
+    );
+}
+
+test "canvas adapter consumes every public typed SDK event variant" {
+    var adapter = CanvasSdkAdapter.init(
+        std.testing.allocator,
+        true,
+        true,
+        .replacement,
+    );
+    defer adapter.deinit();
+    var session: FakeCanvasSession = .{};
+    const fixtures = [_][]const u8{
+        "{\"type\":\"capabilities.changed\",\"data\":{}}",
+        "{\"type\":\"session.canvas.registry_changed\",\"data\":{\"canvases\":[{\"extensionId\":\"fixture.extension\",\"extensionName\":\"Fixture\",\"canvasId\":\"review\",\"displayName\":\"Review\",\"description\":\"Review changes\",\"actions\":[{\"name\":\"refresh\",\"description\":\"Refresh\"}]}]}}",
+        "{\"type\":\"session.canvas.opened\",\"data\":{\"instanceId\":\"review:main\",\"extensionId\":\"fixture.extension\",\"canvasId\":\"review\",\"title\":\"Review\",\"status\":\"ready\",\"input\":{\"path\":\"root.zig\"}}}",
+        "{\"type\":\"session.canvas.recorded\",\"data\":{\"instanceId\":\"review:main\",\"extensionId\":\"fixture.extension\",\"canvasId\":\"review\",\"title\":\"Saved\",\"input\":{\"path\":\"root.zig\"}}}",
+        "{\"type\":\"session.canvas.unavailable\",\"data\":{\"instanceId\":\"review:main\",\"extensionId\":\"fixture.extension\",\"canvasId\":\"review\"}}",
+        "{\"type\":\"session.canvas.removed\",\"data\":{\"instanceId\":\"review:main\",\"extensionId\":\"fixture.extension\",\"canvasId\":\"review\"}}",
+        "{\"type\":\"session.canvas.closed\",\"data\":{\"instanceId\":\"review:main\",\"extensionId\":\"fixture.extension\",\"canvasId\":\"review\"}}",
+    };
+    for (fixtures) |fixture| {
+        var event = try parseCanvasTestEvent(fixture);
+        defer event.deinit(std.testing.allocator);
+        try std.testing.expect(try adapter.observe(&session, &event));
+    }
+    try std.testing.expectEqual(@as(usize, 1), adapter.state.registryCount());
+    try std.testing.expectEqual(
+        canvas.RuntimeTag.closed,
+        adapter.state.runtimeTag(canvas_test_key).?,
+    );
+    try std.testing.expectEqual(
+        canvas.RecordTag.removed,
+        adapter.state.recordTag(canvas_test_key).?,
+    );
+}
+
+fn parseCanvasTestEvent(json: []const u8) !copilot.SessionEvent {
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        json,
+        .{},
+    );
+    defer parsed.deinit();
+    return copilot.session.parseEvent(std.testing.allocator, parsed.value);
+}
+
+test "canvas adapter executes open action and close with local correlation" {
+    var adapter = try testCanvasAdapter();
+    defer adapter.deinit();
+    var session: FakeCanvasSession = .{};
+
+    var open: canvas.Command = .{ .open = try canvas.OpenCommand.init(
+        std.testing.allocator,
+        @enumFromInt(1),
+        .{ .key = canvas_test_key, .input_json = "{\"path\":\"root.zig\"}" },
+        .{},
+    ) };
+    defer open.deinit();
+    var opened = try adapter.execute(&session, &open);
+    defer opened.deinit();
+    try std.testing.expectEqual(@as(u64, 1), opened.request_id.value());
+    try std.testing.expect(opened.result == .open);
+    try std.testing.expect(opened.result.open == .succeeded);
+    try std.testing.expectEqual(
+        canvas.RuntimeTag.opened,
+        adapter.state.runtimeTag(canvas_test_key).?,
+    );
+
+    var action: canvas.Command = .{
+        .invoke_action = try canvas.ActionCommand.init(
+            std.testing.allocator,
+            @enumFromInt(2),
+            .{
+                .key = canvas_test_key,
+                .action_name = "refresh",
+                .input_json = "{}",
+            },
+            .{},
+        ),
+    };
+    defer action.deinit();
+    var action_done = try adapter.execute(&session, &action);
+    defer action_done.deinit();
+    try std.testing.expect(action_done.result == .action);
+    try std.testing.expect(action_done.result.action == .succeeded);
+    try std.testing.expectEqualStrings(
+        "{\"refreshed\":true}",
+        action_done.result.action.succeeded.bytes,
+    );
+
+    var close: canvas.Command = .{ .close = try canvas.CloseCommand.init(
+        std.testing.allocator,
+        @enumFromInt(3),
+        canvas_test_key,
+        .{},
+    ) };
+    defer close.deinit();
+    var closed = try adapter.execute(&session, &close);
+    defer closed.deinit();
+    try std.testing.expect(closed.result == .close);
+    try std.testing.expect(closed.result.close == .succeeded);
+    try std.testing.expectEqual(
+        canvas.RuntimeTag.closed,
+        adapter.state.runtimeTag(canvas_test_key).?,
+    );
+    try std.testing.expectEqual(@as(usize, 1), session.open_calls);
+    try std.testing.expectEqual(@as(usize, 1), session.action_calls);
+    try std.testing.expectEqual(@as(usize, 1), session.close_calls);
+}
+
+test "canvas adapter rejects mismatched and oversized SDK results locally" {
+    var adapter = try testCanvasAdapter();
+    defer adapter.deinit();
+    var session: FakeCanvasSession = .{ .mismatch_open_identity = true };
+    var open: canvas.Command = .{ .open = try canvas.OpenCommand.init(
+        std.testing.allocator,
+        @enumFromInt(1),
+        .{ .key = canvas_test_key },
+        .{},
+    ) };
+    defer open.deinit();
+    var mismatch = try adapter.execute(&session, &open);
+    defer mismatch.deinit();
+    try std.testing.expectEqual(
+        canvas.OperationFailure.invalid_sdk_result,
+        mismatch.result.open.failed,
+    );
+
+    session.mismatch_open_identity = false;
+    var reopen: canvas.Command = .{ .open = try canvas.OpenCommand.init(
+        std.testing.allocator,
+        @enumFromInt(2),
+        .{ .key = canvas_test_key },
+        .{},
+    ) };
+    defer reopen.deinit();
+    var reopened = try adapter.execute(&session, &reopen);
+    defer reopened.deinit();
+    try std.testing.expect(reopened.result.open == .succeeded);
+
+    const oversized_title = try std.testing.allocator.alloc(
+        u8,
+        adapter.state.limits.max_text_bytes + 1,
+    );
+    defer std.testing.allocator.free(oversized_title);
+    @memset(oversized_title, 't');
+    applyOpenedEvent(&adapter.state, .{
+        .instance_id = canvas_test_key.instance_id,
+        .extension_id = canvas_test_key.extension_id,
+        .canvas_id = canvas_test_key.canvas_id,
+        .title = oversized_title,
+    }) catch |err| noteCanvasInputFailure(
+        &adapter.state,
+        canvas_test_key.extension_id,
+        canvas_test_key.canvas_id,
+        canvas_test_key.instance_id,
+        err,
+    );
+    try std.testing.expectEqual(@as(usize, 1), adapter.state.registryCount());
+    try std.testing.expectEqual(
+        canvas.Degradation.limit_exceeded,
+        adapter.state.instanceDegradation(canvas_test_key).?,
+    );
+
+    const oversized = try std.testing.allocator.alloc(
+        u8,
+        adapter.state.limits.max_json_bytes + 1,
+    );
+    defer std.testing.allocator.free(oversized);
+    @memset(oversized, 'x');
+    session.action_json = oversized;
+    var action: canvas.Command = .{
+        .invoke_action = try canvas.ActionCommand.init(
+            std.testing.allocator,
+            @enumFromInt(3),
+            .{ .key = canvas_test_key, .action_name = "refresh" },
+            .{},
+        ),
+    };
+    defer action.deinit();
+    var rejected = try adapter.execute(&session, &action);
+    defer rejected.deinit();
+    try std.testing.expectEqual(
+        canvas.OperationFailure.invalid_sdk_result,
+        rejected.result.action.failed,
+    );
+    try std.testing.expectEqual(
+        canvas.Degradation.limit_exceeded,
+        adapter.state.instanceDegradation(canvas_test_key).?,
+    );
+}
+
+test "canvas shutdown rejects later effects without invoking SDK" {
+    var adapter = try testCanvasAdapter();
+    defer adapter.deinit();
+    adapter.shutdown();
+    var session: FakeCanvasSession = .{};
+    var open: canvas.Command = .{ .open = try canvas.OpenCommand.init(
+        std.testing.allocator,
+        @enumFromInt(1),
+        .{ .key = canvas_test_key },
+        .{},
+    ) };
+    defer open.deinit();
+    var completion = try adapter.execute(&session, &open);
+    defer completion.deinit();
+    try std.testing.expectEqual(
+        canvas.OperationFailure.shutdown,
+        completion.result.open.failed,
+    );
+    try std.testing.expectEqual(@as(usize, 0), session.open_calls);
+}
+
+test "bounded SDK JSON rejects overflow before domain allocation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const oversized = "0123456789";
+    try std.testing.expectError(
+        error.JsonDocumentTooLong,
+        boundedJsonValue(
+            std.testing.allocator,
+            arena.allocator(),
+            .{ .string = oversized },
+            4,
+        ),
+    );
 }
 
 test "image tool result serializes binary content for Copilot, not the transcript" {

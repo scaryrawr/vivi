@@ -696,6 +696,8 @@ fn project(event: *const backend.ConversationEvent) ?Projected {
         },
         .command_catalog,
         .command_completed,
+        .canvas_snapshot,
+        .canvas_operation,
         => null,
     };
 }

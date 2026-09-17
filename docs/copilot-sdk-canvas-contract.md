@@ -2,11 +2,12 @@
 
 ## Scope
 
-Vivi does not expose canvases to a host. This note records the public typed
-canvas contract used by the SDK-free domain in `backend/src/canvas.zig`. The
-accompanying probe imports `copilot_sdk` only from a standalone test root; no
-production canvas adapter, C ABI, CLI, or native host imports those SDK types,
-starts Copilot CLI, or requires credentials.
+Vivi does not expose canvases to a native or CLI renderer. This note records
+the public typed canvas contract used by the SDK-free domain in
+`backend/src/canvas.zig` and the production adapter in `backend/src/root.zig`.
+Only `root.zig` imports `copilot_sdk` in production. The standalone contract
+probe and adapter fixtures require neither credentials nor a running Copilot
+CLI.
 
 `build.zig.zon` remains the sole dependency pin. The tested revision is
 `7695c34cb0ccfc4ec09aaadf91f29e4a12f86379`. The first public
@@ -94,10 +95,39 @@ three-part key. The domain treats that as a new local open operation and
 generation so stale renderer work can be rejected. It does not name or imply a
 provider `reopen` operation, because no such SDK method is evidenced.
 
-PR 3 remains gated on an adapter proving how SDK registry signals map to the
-tagged reducer input, how renderer work is hosted, and how the SDK's
-uncorrelated lifecycle signals are sequenced. Until then there is no production
-SDK wiring or host-visible canvas behavior.
+## PR 3 adapter decision
+
+PR 3 wires the proven public typed surface without resolving unknown semantics:
+
+- `ConversationOptions.request_extensions` and
+  `request_canvas_renderer` independently map to the matching SDK feature
+  fields and default to `false`.
+- One root-private adapter and one SDK-free `canvas.State` belong to each
+  active SDK session. Session replacement swaps that pair transactionally.
+- Open, close, and action commands run on the existing serialized conversation
+  worker. Their Vivi-owned request IDs are observable; internal operation
+  tokens correlate only the direct result of the exact SDK method call.
+- Opened, closed, unavailable, recorded, and removed events are validated and
+  reduced independently. No lifecycle event is correlated by identity, timing,
+  or arrival order.
+- Repeating `openCanvas` with the same full key is another open operation. No
+  provider reopen method is assumed.
+- Registry declarations are fully bounded and validated, but production keeps
+  the registry adapter mode unresolved and does not apply the list. Replacement
+  mode exists only as a root-private fixture path until controlled runtime
+  evidence proves snapshot semantics.
+- `snapshotOpenCanvases` contributes positive opened observations only when a
+  renderer was requested and capability is explicitly supported. Missing
+  entries do not imply close or removal.
+- Create has no restoration field. Join/resume always omits
+  `open_canvases`; the domain projection remains unwired until inclusion and
+  round-trip semantics are proven.
+- Invalid or oversized data degrades the registry, operations, or an existing
+  instance without closing chat. An invalid registry never replaces the last
+  accepted registry.
+
+No C ABI, Swift/WebView, terminal renderer, model-visible canvas tool, or
+host-facing canvas UI is added by this adapter.
 
 ## Synthesis decision
 
