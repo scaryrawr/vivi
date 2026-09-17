@@ -606,6 +606,22 @@ pub const PromptDelivery = enum {
     enqueue,
 };
 
+pub const max_user_input_request_id_bytes = 4 * 1024;
+pub const max_user_input_question_bytes = 64 * 1024;
+pub const max_user_input_choices = 100;
+pub const max_user_input_choice_bytes = 16 * 1024;
+pub const max_user_input_answer_bytes = 64 * 1024;
+
+fn validateUserInputText(
+    text: []const u8,
+    max_bytes: usize,
+    empty_error: anyerror,
+) !void {
+    if (text.len == 0) return empty_error;
+    if (text.len > max_bytes) return error.UserInputTextTooLong;
+    if (!std.unicode.utf8ValidateSlice(text)) return error.InvalidUserInputUtf8;
+}
+
 pub const UserInputRequest = struct {
     allocator: std.mem.Allocator,
     request_id: []u8,
@@ -628,6 +644,34 @@ pub const UserInputRequest = struct {
         choices: []const []const u8,
         allow_freeform: bool,
     ) !UserInputRequest {
+        try validateUserInputText(
+            request_id,
+            max_user_input_request_id_bytes,
+            error.EmptyUserInputRequestId,
+        );
+        try validateUserInputText(
+            question,
+            max_user_input_question_bytes,
+            error.EmptyUserInputQuestion,
+        );
+        if (choices.len > max_user_input_choices) {
+            return error.TooManyUserInputChoices;
+        }
+        if (choices.len == 0 and !allow_freeform) {
+            return error.UserInputRequestHasNoAnswers;
+        }
+        for (choices, 0..) |choice, index| {
+            try validateUserInputText(
+                choice,
+                max_user_input_choice_bytes,
+                error.EmptyUserInputChoice,
+            );
+            for (choices[0..index]) |previous| {
+                if (std.mem.eql(u8, choice, previous)) {
+                    return error.DuplicateUserInputChoice;
+                }
+            }
+        }
         const owned_choices = try allocator.alloc([]u8, choices.len);
         errdefer allocator.free(owned_choices);
         var initialized: usize = 0;
@@ -660,6 +704,78 @@ pub const UserInputRequest = struct {
             self.choices,
             self.allow_freeform,
         );
+    }
+};
+
+pub const UserInputAnswer = union(enum) {
+    choice: []const u8,
+    freeform: []const u8,
+
+    pub fn text(self: UserInputAnswer) []const u8 {
+        return switch (self) {
+            inline else => |value| value,
+        };
+    }
+};
+
+pub const UserInputResponse = struct {
+    request_id: []const u8,
+    answer: UserInputAnswer,
+};
+
+const OwnedUserInputAnswer = union(enum) {
+    choice: OwnedText,
+    freeform: OwnedText,
+
+    fn init(allocator: std.mem.Allocator, answer: UserInputAnswer) !OwnedUserInputAnswer {
+        return switch (answer) {
+            .choice => |value| .{ .choice = try OwnedText.init(allocator, value) },
+            .freeform => |value| .{ .freeform = try OwnedText.init(allocator, value) },
+        };
+    }
+
+    fn view(self: *const OwnedUserInputAnswer) UserInputAnswer {
+        return switch (self.*) {
+            .choice => |value| .{ .choice = value.bytes },
+            .freeform => |value| .{ .freeform = value.bytes },
+        };
+    }
+
+    fn deinit(self: *OwnedUserInputAnswer) void {
+        switch (self.*) {
+            inline else => |*value| value.deinit(),
+        }
+        self.* = undefined;
+    }
+};
+
+const OwnedUserInputResponse = struct {
+    request_id: OwnedText,
+    answer: OwnedUserInputAnswer,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        response: UserInputResponse,
+    ) !OwnedUserInputResponse {
+        var request_id = try OwnedText.init(allocator, response.request_id);
+        errdefer request_id.deinit();
+        return .{
+            .request_id = request_id,
+            .answer = try .init(allocator, response.answer),
+        };
+    }
+
+    pub fn view(self: *const OwnedUserInputResponse) UserInputResponse {
+        return .{
+            .request_id = self.request_id.bytes,
+            .answer = self.answer.view(),
+        };
+    }
+
+    fn deinit(self: *OwnedUserInputResponse) void {
+        self.request_id.deinit();
+        self.answer.deinit();
+        self.* = undefined;
     }
 };
 
@@ -737,11 +853,7 @@ pub const Command = union(enum) {
     switch_model: OwnedModelSelection,
     resume_session: ResumeKey,
     execute_command: OwnedText,
-    user_input_response: struct {
-        request_id: OwnedText,
-        answer: OwnedText,
-        was_freeform: bool,
-    },
+    user_input_response: OwnedUserInputResponse,
     stop,
 
     pub fn deinit(self: *Command) void {
@@ -749,10 +861,7 @@ pub const Command = union(enum) {
             .prompt => |*prompt| prompt.message.deinit(),
             .switch_model => |*selection| selection.deinit(),
             .execute_command => |*text| text.deinit(),
-            .user_input_response => |*response| {
-                response.request_id.deinit();
-                response.answer.deinit();
-            },
+            .user_input_response => |*response| response.deinit(),
             .refresh_commands,
             .refresh_models,
             .refresh_sessions,
@@ -800,6 +909,8 @@ const Core = struct {
     state: State = .starting,
     commands: std.ArrayList(Command) = .empty,
     events: std.ArrayList(Event) = .empty,
+    pending_user_input: ?UserInputRequest = null,
+    next_user_input_request_id: u64 = 1,
     wake_pending: bool = false,
     stop_requested: bool = false,
     worker: ?std.Io.Future(void) = null,
@@ -936,12 +1047,61 @@ pub const Worker = struct {
 
     pub fn userInputRequested(
         self: *Worker,
-        request: UserInputRequest,
+        question: []const u8,
+        choices: []const []const u8,
+        allow_freeform: bool,
     ) !void {
         try self.core.mutex.lock(self.core.io);
-        if (!self.core.stop_requested) self.core.state = .awaiting_user_input;
+        if (self.core.stop_requested) {
+            self.core.mutex.unlock(self.core.io);
+            return error.Stopping;
+        }
+        const request_number = self.core.next_user_input_request_id;
+        if (request_number == std.math.maxInt(u64)) {
+            self.core.mutex.unlock(self.core.io);
+            return error.UserInputRequestIdExhausted;
+        }
+        self.core.next_user_input_request_id += 1;
         self.core.mutex.unlock(self.core.io);
-        try self.publish(.{ .user_input_requested = request });
+
+        const request_id = try std.fmt.allocPrint(
+            self.core.allocator,
+            "user-input-{d}",
+            .{request_number},
+        );
+        defer self.core.allocator.free(request_id);
+        var request = try UserInputRequest.init(
+            self.core.allocator,
+            request_id,
+            question,
+            choices,
+            allow_freeform,
+        );
+        errdefer request.deinit();
+        {
+            var pending = try request.clone(self.core.allocator);
+            errdefer pending.deinit();
+            try self.core.mutex.lock(self.core.io);
+            if (self.core.stop_requested) {
+                self.core.mutex.unlock(self.core.io);
+                return error.Stopping;
+            }
+            if (self.core.pending_user_input != null) {
+                self.core.mutex.unlock(self.core.io);
+                return error.AlreadyAwaitingUserInput;
+            }
+            self.core.pending_user_input = pending;
+            self.core.state = .awaiting_user_input;
+            self.core.mutex.unlock(self.core.io);
+        }
+        self.publish(.{ .user_input_requested = request }) catch |err| {
+            try self.core.mutex.lock(self.core.io);
+            if (self.core.pending_user_input) |*active| active.deinit();
+            self.core.pending_user_input = null;
+            if (!self.core.stop_requested) self.core.state = .streaming;
+            self.core.mutex.unlock(self.core.io);
+            return err;
+        };
     }
 
     pub fn commandCompleted(self: *Worker, message: []const u8) !void {
@@ -1212,37 +1372,47 @@ pub const Conversation = struct {
 
     pub fn respondToUserInput(
         self: *Conversation,
-        request_id: []const u8,
-        answer: []const u8,
-        was_freeform: bool,
+        response: UserInputResponse,
     ) !void {
-        if (std.mem.trim(u8, answer, " \t\r\n").len == 0) {
-            return error.EmptyAnswer;
-        }
-        const owned_request_id = try OwnedText.init(
-            self.core.allocator,
-            request_id,
+        try validateUserInputText(
+            response.request_id,
+            max_user_input_request_id_bytes,
+            error.EmptyUserInputRequestId,
         );
-        errdefer {
-            var mutable = owned_request_id;
-            mutable.deinit();
-        }
-        const owned_answer = try OwnedText.init(self.core.allocator, answer);
-        errdefer {
-            var mutable = owned_answer;
-            mutable.deinit();
-        }
+        const answer = response.answer.text();
+        if (std.mem.trim(u8, answer, " \t\r\n").len == 0) return error.EmptyAnswer;
+        if (answer.len > max_user_input_answer_bytes) return error.UserInputTextTooLong;
+        if (!std.unicode.utf8ValidateSlice(answer)) return error.InvalidUserInputUtf8;
+        var owned_response = try OwnedUserInputResponse.init(
+            self.core.allocator,
+            response,
+        );
+        errdefer owned_response.deinit();
 
         try self.core.mutex.lock(self.core.io);
         defer self.core.mutex.unlock(self.core.io);
         if (self.core.state != .awaiting_user_input) return error.NotAwaitingInput;
-        try self.core.commands.append(self.core.allocator, .{
-            .user_input_response = .{
-                .request_id = owned_request_id,
-                .answer = owned_answer,
-                .was_freeform = was_freeform,
+        const request = self.core.pending_user_input orelse
+            return error.NotAwaitingInput;
+        if (!std.mem.eql(u8, request.request_id, response.request_id)) {
+            return error.StaleUserInputRequest;
+        }
+        switch (response.answer) {
+            .choice => |choice| {
+                for (request.choices) |expected| {
+                    if (std.mem.eql(u8, expected, choice)) break;
+                } else return error.InvalidUserInputChoice;
             },
+            .freeform => {
+                if (!request.allow_freeform) return error.FreeformUserInputNotAllowed;
+            },
+        }
+        try self.core.commands.append(self.core.allocator, .{
+            .user_input_response = owned_response,
         });
+        var completed = self.core.pending_user_input.?;
+        completed.deinit();
+        self.core.pending_user_input = null;
         self.core.state = .streaming;
         self.core.command_ready.signal(self.core.io);
     }
@@ -1302,6 +1472,7 @@ pub const Conversation = struct {
         self.core.commands.deinit(self.core.allocator);
         for (self.core.events.items) |*event| event.deinit();
         self.core.events.deinit(self.core.allocator);
+        if (self.core.pending_user_input) |*request| request.deinit();
         const allocator = self.core.allocator;
         switch (self.core.runner) {
             .plain => {},
@@ -1635,25 +1806,24 @@ test "conversation accepts an answer only while user input is pending" {
                 worker.closeFailure(.stream, "Expected prompt.");
                 return;
             }
-            worker.userInputRequested(UserInputRequest.init(
-                worker.allocator(),
-                "request-1",
+            worker.userInputRequested(
                 "Choose",
                 &.{ "one", "two" },
                 false,
-            ) catch return) catch return;
+            ) catch return;
 
             var response = worker.waitCommand();
             defer response.deinit();
             switch (response) {
                 .user_input_response => |value| {
+                    const typed = value.view();
                     if (!std.mem.eql(
                         u8,
-                        value.request_id.bytes,
-                        "request-1",
+                        typed.request_id,
+                        "user-input-1",
                     ) or
-                        !std.mem.eql(u8, value.answer.bytes, "two") or
-                        value.was_freeform)
+                        typed.answer != .choice or
+                        !std.mem.eql(u8, typed.answer.text(), "two"))
                     {
                         worker.closeFailure(.stream, "Unexpected answer.");
                         return;
@@ -1701,7 +1871,10 @@ test "conversation accepts an answer only while user input is pending" {
 
     try std.testing.expectError(
         error.NotAwaitingInput,
-        conversation.respondToUserInput("request-1", "two", false),
+        conversation.respondToUserInput(.{
+            .request_id = "user-input-1",
+            .answer = .{ .choice = "two" },
+        }),
     );
     try conversation.submit(.{ .text = "ask" }, .immediate);
 
@@ -1721,7 +1894,73 @@ test "conversation accepts an answer only while user input is pending" {
         }
     }
 
-    try conversation.respondToUserInput("request-1", "two", false);
+    try std.testing.expectError(
+        error.StaleUserInputRequest,
+        conversation.respondToUserInput(.{
+            .request_id = "user-input-2",
+            .answer = .{ .choice = "two" },
+        }),
+    );
+    try std.testing.expectError(
+        error.InvalidUserInputChoice,
+        conversation.respondToUserInput(.{
+            .request_id = "user-input-1",
+            .answer = .{ .choice = "three" },
+        }),
+    );
+    try std.testing.expectError(
+        error.FreeformUserInputNotAllowed,
+        conversation.respondToUserInput(.{
+            .request_id = "user-input-1",
+            .answer = .{ .freeform = "two" },
+        }),
+    );
+    try conversation.respondToUserInput(.{
+        .request_id = "user-input-1",
+        .answer = .{ .choice = "two" },
+    });
+    try std.testing.expectError(
+        error.NotAwaitingInput,
+        conversation.respondToUserInput(.{
+            .request_id = "user-input-1",
+            .answer = .{ .choice = "two" },
+        }),
+    );
+}
+
+test "user input request validates typed answer surface" {
+    try std.testing.expectError(
+        error.EmptyUserInputRequestId,
+        UserInputRequest.init(std.testing.allocator, "", "Question?", &.{"yes"}, false),
+    );
+    try std.testing.expectError(
+        error.EmptyUserInputQuestion,
+        UserInputRequest.init(std.testing.allocator, "request", "", &.{"yes"}, false),
+    );
+    try std.testing.expectError(
+        error.UserInputRequestHasNoAnswers,
+        UserInputRequest.init(std.testing.allocator, "request", "Question?", &.{}, false),
+    );
+    try std.testing.expectError(
+        error.DuplicateUserInputChoice,
+        UserInputRequest.init(
+            std.testing.allocator,
+            "request",
+            "Question?",
+            &.{ "yes", "yes" },
+            false,
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidUserInputUtf8,
+        UserInputRequest.init(
+            std.testing.allocator,
+            "request",
+            "Question?",
+            &.{"\xff"},
+            false,
+        ),
+    );
 }
 
 test "waiting for user input preserves queued prompts" {
@@ -1752,14 +1991,13 @@ test "waiting for user input preserves queued prompts" {
         },
     });
     try core.commands.append(std.testing.allocator, .{
-        .user_input_response = .{
-            .request_id = try OwnedText.init(
-                std.testing.allocator,
-                "request-1",
-            ),
-            .answer = try OwnedText.init(std.testing.allocator, "two"),
-            .was_freeform = false,
-        },
+        .user_input_response = try OwnedUserInputResponse.init(
+            std.testing.allocator,
+            .{
+                .request_id = "request-1",
+                .answer = .{ .choice = "two" },
+            },
+        ),
     });
 
     var worker: Worker = .{ .core = &core };

@@ -98,6 +98,136 @@ final class ViviBackendRuntimeTests: XCTestCase {
       [.status(id: store.transcript[0].id, text: "Chat is busy.")])
   }
 
+  func testUserInputChoicePreservesToolChronologyAndBackendIdentity() {
+    let driver = FakeConversationDriver()
+    let store = NativeChatStore(workspace: "/tmp/work", driver: driver)
+    let tool = ToolActivity(
+      callID: "ask-1",
+      title: "Ask user",
+      detail: "",
+      input: "",
+      inputPresentation: .literal(""),
+      result: .running,
+      output: nil,
+      outputPresentation: nil)
+    let request = UserInputRequest(
+      id: "user-input-7",
+      question: "Choose a direction",
+      choices: ["Focused", "Broad"],
+      allowsFreeform: true)
+
+    store.reduce(.assistantStarted)
+    store.reduce(.toolStarted(tool))
+    store.reduce(.userInputRequested(request))
+
+    XCTAssertEqual(store.lifecycle, .awaitingInput)
+    XCTAssertEqual(store.transcript.count, 3)
+    guard case .assistantHeader = store.transcript[0],
+      case .tool = store.transcript[1],
+      case .userInput(_, let pending, nil) = store.transcript[2]
+    else { return XCTFail("Expected the request after the active tool") }
+    XCTAssertEqual(pending, request)
+
+    store.submitUserInputChoice("Focused")
+
+    XCTAssertEqual(driver.userInputResponses.count, 1)
+    XCTAssertEqual(driver.userInputResponses[0].0, "user-input-7")
+    XCTAssertEqual(driver.userInputResponses[0].1, .choice("Focused"))
+    XCTAssertNil(store.activeUserInput)
+    XCTAssertEqual(store.lifecycle, .responding)
+    guard case .userInput(_, let completed, .choice("Focused")) = store.transcript[2] else {
+      return XCTFail("Expected the accepted answer to complete the same transcript row")
+    }
+    XCTAssertEqual(completed, request)
+  }
+
+  func testRejectedFreeformAnswerRetainsRequestDraftAndAllowsRetry() {
+    let driver = FakeConversationDriver()
+    driver.userInputResult = .rejected
+    let store = NativeChatStore(workspace: "/tmp/work", driver: driver)
+    let request = UserInputRequest(
+      id: "user-input-2",
+      question: "What should change?",
+      choices: ["Nothing"],
+      allowsFreeform: true)
+
+    store.reduce(.assistantStarted)
+    store.reduce(.userInputRequested(request))
+    store.revealFreeformInput()
+    store.updateFreeformDraft("Keep my custom answer")
+    store.submitUserInputFreeform()
+
+    XCTAssertEqual(store.lifecycle, .awaitingInput)
+    XCTAssertEqual(store.activeUserInput?.freeformDraft, "Keep my custom answer")
+    XCTAssertEqual(
+      store.activeUserInput?.state,
+      .failed("That response was not accepted. Try again."))
+    guard case .userInput(_, _, nil) = store.transcript.last else {
+      return XCTFail("Rejected answers must not destructively complete the row")
+    }
+
+    driver.userInputResult = .accepted
+    store.submitUserInputFreeform()
+
+    XCTAssertEqual(driver.userInputResponses.count, 2)
+    XCTAssertEqual(driver.userInputResponses[1].1, .freeform("Keep my custom answer"))
+    XCTAssertNil(store.activeUserInput)
+  }
+
+  func testPendingUserInputBlocksPromptAndSessionResume() {
+    let driver = FakeConversationDriver()
+    let store = NativeChatStore(workspace: "/tmp/work", driver: driver)
+    let catalog = swiftSessionCatalog(scope: .local)
+    store.reduce(.ready)
+    store.reduce(.modelCatalog(testCatalog()))
+    store.refreshSessions(.local)
+    store.reduce(.sessionCatalog(catalog))
+    store.draft = "Do not send this"
+    store.reduce(
+      .userInputRequested(
+        UserInputRequest(
+          id: "user-input-1",
+          question: "Continue?",
+          choices: ["Yes"],
+          allowsFreeform: false)))
+
+    store.submit()
+    store.resumeSession(catalog.sessions[0].key)
+
+    XCTAssertTrue(driver.submittedPrompts.isEmpty)
+    XCTAssertTrue(driver.resumeKeys.isEmpty)
+    XCTAssertEqual(store.draft, "Do not send this")
+  }
+
+  func testSeparateStoresNeverRouteInteractiveRequestIdentity() {
+    let firstDriver = FakeConversationDriver()
+    let secondDriver = FakeConversationDriver()
+    let first = NativeChatStore(workspace: "/tmp/first", driver: firstDriver)
+    let second = NativeChatStore(workspace: "/tmp/second", driver: secondDriver)
+    first.reduce(.assistantStarted)
+    second.reduce(.assistantStarted)
+    first.reduce(
+      .userInputRequested(
+        UserInputRequest(
+          id: "user-input-1",
+          question: "First?",
+          choices: ["A"],
+          allowsFreeform: false)))
+    second.reduce(
+      .userInputRequested(
+        UserInputRequest(
+          id: "user-input-1",
+          question: "Second?",
+          choices: ["B"],
+          allowsFreeform: false)))
+
+    second.submitUserInputChoice("B")
+
+    XCTAssertTrue(firstDriver.userInputResponses.isEmpty)
+    XCTAssertEqual(secondDriver.userInputResponses.first?.1, .choice("B"))
+    XCTAssertNotNil(first.activeUserInput)
+  }
+
   func testFailureIsVisibleUntilClosed() {
     let store = NativeChatStore(
       workspace: "/tmp/work",
@@ -542,6 +672,83 @@ final class ViviBackendRuntimeTests: XCTestCase {
     XCTAssertEqual(catalog.models[0].displayName, "GPT-5")
     XCTAssertEqual(catalog.models[0].reasoning, [.off, .high, .max])
     XCTAssertTrue(catalog.models[0].supportsVision)
+  }
+
+  func testDecoderCopiesTypedUserInputRequest() throws {
+    let requestID = Array("user-input-9".utf8)
+    let question = Array("Choose a scope".utf8)
+    let first = Array("Focused".utf8)
+    let second = Array("Broad".utf8)
+    let bytes = requestID + question + first + second
+    var event = vivi_backend_event_t()
+    event.kind = VIVI_BACKEND_EVENT_USER_INPUT_REQUEST
+    event.content_kind = VIVI_BACKEND_CONTENT_USER_INPUT_REQUEST
+    event.byte_count = UInt32(bytes.count)
+    event.user_input_choice_count = 2
+    event.user_input_request_id = vivi_backend_span_t(
+      offset: 0,
+      length: UInt32(requestID.count))
+    event.user_input_question = vivi_backend_span_t(
+      offset: UInt32(requestID.count),
+      length: UInt32(question.count))
+    event.allow_freeform = 1
+    event.selected_reasoning = VIVI_BACKEND_REASONING_NONE
+    let choices = [
+      vivi_backend_user_input_choice_t(
+        text: vivi_backend_span_t(
+          offset: UInt32(requestID.count + question.count),
+          length: UInt32(first.count)),
+        reserved: 0),
+      vivi_backend_user_input_choice_t(
+        text: vivi_backend_span_t(
+          offset: UInt32(requestID.count + question.count + first.count),
+          length: UInt32(second.count)),
+        reserved: 0),
+    ]
+
+    XCTAssertEqual(
+      try NativeEventDecoder.decode(
+        event,
+        bytes: bytes,
+        models: [],
+        userInputChoices: choices),
+      .userInputRequested(
+        UserInputRequest(
+          id: "user-input-9",
+          question: "Choose a scope",
+          choices: ["Focused", "Broad"],
+          allowsFreeform: true)))
+  }
+
+  func testDecoderRejectsDuplicateAndMalformedUserInputChoices() {
+    let bytes = Array("user-input-1QuestionChoice".utf8)
+    var event = vivi_backend_event_t()
+    event.kind = VIVI_BACKEND_EVENT_USER_INPUT_REQUEST
+    event.content_kind = VIVI_BACKEND_CONTENT_USER_INPUT_REQUEST
+    event.byte_count = UInt32(bytes.count)
+    event.user_input_choice_count = 2
+    event.user_input_request_id = vivi_backend_span_t(offset: 0, length: 12)
+    event.user_input_question = vivi_backend_span_t(offset: 12, length: 8)
+    event.selected_reasoning = VIVI_BACKEND_REASONING_NONE
+    let choice = vivi_backend_user_input_choice_t(
+      text: vivi_backend_span_t(offset: 20, length: 6),
+      reserved: 0)
+
+    XCTAssertThrowsError(
+      try NativeEventDecoder.decode(
+        event,
+        bytes: bytes,
+        models: [],
+        userInputChoices: [choice, choice]))
+
+    event.user_input_choice_count = 1
+    event.allow_freeform = 2
+    XCTAssertThrowsError(
+      try NativeEventDecoder.decode(
+        event,
+        bytes: bytes,
+        models: [],
+        userInputChoices: [choice]))
   }
 
   func testDecoderRejectsOutOfBoundsModelSpan() {
@@ -1400,10 +1607,12 @@ private final class FakeConversationDriver: ViviConversationDriving {
   var switchResult = ConversationOperationResult.accepted
   var refreshSessionsResult = ConversationOperationResult.accepted
   var resumeResult = ConversationOperationResult.accepted
+  var userInputResult = ConversationOperationResult.accepted
   var selections: [ModelSelection] = []
   var sessionRequests: [SessionCatalogRequest] = []
   var resumeKeys: [ResumeKey] = []
   var submittedPrompts: [String] = []
+  var userInputResponses: [(String, UserInputAnswer)] = []
   private var receive: (@MainActor (ChatEvent) -> Void)?
 
   func start(
@@ -1435,6 +1644,14 @@ private final class FakeConversationDriver: ViviConversationDriving {
   func resumeSession(_ key: ResumeKey) -> ConversationOperationResult {
     resumeKeys.append(key)
     return resumeResult
+  }
+
+  func respondToUserInput(
+    requestID: String,
+    answer: UserInputAnswer
+  ) -> ConversationOperationResult {
+    userInputResponses.append((requestID, answer))
+    return userInputResult
   }
 
   func close(completion: @escaping @MainActor () -> Void) {

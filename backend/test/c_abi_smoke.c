@@ -30,7 +30,7 @@ int main(void) {
     options.copilot_cli_launch = (vivi_backend_copilot_cli_launch_t)99;
     assert(vivi_backend_open(&options, &conversation) == VIVI_BACKEND_INVALID_ARGUMENT);
     assert(conversation == 0);
-    assert(VIVI_BACKEND_ABI_VERSION == 8);
+    assert(VIVI_BACKEND_ABI_VERSION == 9);
     assert(VIVI_BACKEND_PRESENTATION_SOURCE == 3);
     assert(VIVI_BACKEND_LANGUAGE_PYTHON == 15);
     assert(VIVI_BACKEND_TOKEN_META == 11);
@@ -40,7 +40,20 @@ int main(void) {
     assert(VIVI_BACKEND_EVENT_TOOL_FINISHED == 16);
     assert(VIVI_BACKEND_EVENT_SESSION_CATALOG == 17);
     assert(VIVI_BACKEND_EVENT_SESSION_RESUME == 20);
+    assert(VIVI_BACKEND_EVENT_USER_INPUT_REQUEST == 21);
+    assert(VIVI_BACKEND_CONTENT_USER_INPUT_REQUEST == 7);
+    assert(VIVI_BACKEND_USER_INPUT_ANSWER_CHOICE == 1);
+    assert(VIVI_BACKEND_USER_INPUT_ANSWER_FREEFORM == 2);
     assert(VIVI_BACKEND_TOOL_RESULT_IMAGE == 4);
+    vivi_backend_user_input_response_t response = {
+        .struct_size = sizeof(vivi_backend_user_input_response_t),
+        .answer_kind = VIVI_BACKEND_USER_INPUT_ANSWER_CHOICE,
+        .request_id = (const uint8_t *)"user-input-1",
+        .request_id_length = 12,
+        .answer = (const uint8_t *)"Yes",
+        .answer_length = 3,
+        .reserved = 0,
+    };
     vivi_backend_resume_key_t key = {
         .generation = 1,
         .slot = 0,
@@ -63,6 +76,10 @@ int main(void) {
     assert(vivi_backend_refresh_sessions(0, VIVI_BACKEND_SESSION_REQUEST_LOCAL)
         == VIVI_BACKEND_INVALID_ARGUMENT);
     assert(vivi_backend_resume_session(0, key) == VIVI_BACKEND_INVALID_ARGUMENT);
+    assert(vivi_backend_respond_to_user_input(0, &response)
+        == VIVI_BACKEND_INVALID_ARGUMENT);
+    assert(vivi_backend_respond_to_user_input(0, 0)
+        == VIVI_BACKEND_INVALID_ARGUMENT);
     assert(vivi_backend_close(0) == VIVI_BACKEND_INVALID_ARGUMENT);
     vivi_backend_destroy(0);
     return 0;

@@ -6,6 +6,7 @@ enum ChatLifecycle: Equatable {
   case starting
   case idle
   case responding
+  case awaitingInput
   case closing
   case closed
 }
@@ -219,6 +220,37 @@ struct ToolActivity: Equatable {
   var outputPresentation: ToolPresentation?
 }
 
+struct UserInputRequest: Equatable {
+  let id: String
+  let question: String
+  let choices: [String]
+  let allowsFreeform: Bool
+}
+
+enum UserInputAnswer: Equatable {
+  case choice(String)
+  case freeform(String)
+
+  var text: String {
+    switch self {
+    case .choice(let text), .freeform(let text): text
+    }
+  }
+}
+
+enum UserInputSubmissionState: Equatable {
+  case pending
+  case submitting
+  case failed(String)
+}
+
+struct ActiveUserInput: Equatable {
+  let request: UserInputRequest
+  var state: UserInputSubmissionState = .pending
+  var showsFreeform: Bool
+  var freeformDraft = ""
+}
+
 enum ChatItem: Identifiable, Equatable {
   case user(id: UUID, text: String)
   case assistantHeader(id: UUID)
@@ -227,13 +259,15 @@ enum ChatItem: Identifiable, Equatable {
   case tool(id: UUID, activity: ToolActivity)
   case status(id: UUID, text: String)
   case failure(id: UUID, text: String)
+  case userInput(id: UUID, request: UserInputRequest, answer: UserInputAnswer?)
 
   var id: UUID {
     switch self {
     case .assistantHeader(let id):
       id
     case .user(let id, _), .assistant(let id, _), .reasoning(let id, _),
-      .tool(let id, _), .status(let id, _), .failure(let id, _):
+      .tool(let id, _), .status(let id, _), .failure(let id, _),
+      .userInput(let id, _, _):
       id
     }
   }
@@ -247,6 +281,8 @@ enum ChatItem: Identifiable, Equatable {
       text
     case .tool(_, let activity):
       activity.outputPresentation?.text ?? ""
+    case .userInput(_, let request, let answer):
+      answer.map { "\(request.question)\n\($0.text)" } ?? request.question
     }
   }
 }
@@ -274,6 +310,7 @@ enum ChatEvent: Equatable {
   case sessionCatalogFailure(String)
   case sessionTrackingFailure(String)
   case sessionResume(SessionResumeResult)
+  case userInputRequested(UserInputRequest)
   case idle
   case failure(String)
   case closed
@@ -281,6 +318,7 @@ enum ChatEvent: Equatable {
 
 enum ConversationOperationResult: Equatable {
   case accepted
+  case rejected
   case busy
   case stopping
   case closed
@@ -294,6 +332,10 @@ protocol ViviConversationDriving: AnyObject {
   func switchModel(_ selection: ModelSelection) -> ConversationOperationResult
   func refreshSessions(_ request: SessionCatalogRequest) -> ConversationOperationResult
   func resumeSession(_ key: ResumeKey) -> ConversationOperationResult
+  func respondToUserInput(
+    requestID: String,
+    answer: UserInputAnswer
+  ) -> ConversationOperationResult
   func close(completion: @escaping @MainActor () -> Void)
 }
 
@@ -313,6 +355,7 @@ final class NativeChatStore: ObservableObject {
   @Published private(set) var sessionCatalog: SessionCatalog?
   @Published private(set) var sessionCatalogFailure: String?
   @Published private(set) var sessionState: SessionControlState = .ready
+  @Published private(set) var activeUserInput: ActiveUserInput?
   @Published var draft = ""
 
   var workspace: String { activePresentation.workspace }
@@ -357,6 +400,11 @@ final class NativeChatStore: ObservableObject {
       && !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
   }
 
+  var canSubmitUserInput: Bool {
+    guard lifecycle == .awaitingInput, let activeUserInput else { return false }
+    return activeUserInput.state != .submitting
+  }
+
   var selectedModelID: String? {
     confirmedSelection?.modelID
   }
@@ -398,11 +446,55 @@ final class NativeChatStore: ObservableObject {
       transcript.append(.status(id: UUID(), text: message(for: result, action: "send message")))
       return
     }
+
     finishStreamingRows()
     responseHeaderVisible = false
     transcript.append(.user(id: UUID(), text: prompt))
     draft = ""
     lifecycle = .responding
+  }
+
+  func revealFreeformInput() {
+    guard var interaction = activeUserInput, interaction.request.allowsFreeform,
+      interaction.state != .submitting
+    else { return }
+    interaction.showsFreeform = true
+    if case .failed = interaction.state {
+      interaction.state = .pending
+    }
+    activeUserInput = interaction
+  }
+
+  func hideFreeformInput() {
+    guard var interaction = activeUserInput, !interaction.request.choices.isEmpty,
+      interaction.state != .submitting
+    else { return }
+    interaction.showsFreeform = false
+    interaction.state = .pending
+    activeUserInput = interaction
+  }
+
+  func updateFreeformDraft(_ value: String) {
+    guard var interaction = activeUserInput, interaction.state != .submitting else { return }
+    interaction.freeformDraft = value
+    if case .failed = interaction.state {
+      interaction.state = .pending
+    }
+    activeUserInput = interaction
+  }
+
+  func submitUserInputChoice(_ choice: String) {
+    guard let interaction = activeUserInput,
+      interaction.request.choices.contains(choice)
+    else { return }
+    submitUserInput(.choice(choice))
+  }
+
+  func submitUserInputFreeform() {
+    guard let interaction = activeUserInput else { return }
+    let answer = interaction.freeformDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !answer.isEmpty else { return }
+    submitUserInput(.freeform(answer))
   }
 
   func refreshModels() {
@@ -561,6 +653,15 @@ final class NativeChatStore: ObservableObject {
     case .sessionResume(let result):
       apply(result)
       sessionState = .ready
+    case .userInputRequested(let request):
+      finishStreamingRows()
+      ensureResponseHeader()
+      let interaction = ActiveUserInput(
+        request: request,
+        showsFreeform: request.choices.isEmpty)
+      activeUserInput = interaction
+      transcript.append(.userInput(id: UUID(), request: request, answer: nil))
+      lifecycle = .awaitingInput
     case .idle:
       activeAssistant = nil
       activeReasoning = nil
@@ -575,6 +676,7 @@ final class NativeChatStore: ObservableObject {
       activeReasoning = nil
       pendingReasoningCompletion = nil
       activeReasoningPrefix = ""
+      activeUserInput = nil
       finishClose()
     }
   }
@@ -602,6 +704,31 @@ final class NativeChatStore: ObservableObject {
     } else {
       transcript.append(.failure(id: UUID(), text: message(for: result, action: "switch models")))
     }
+  }
+
+  private func submitUserInput(_ answer: UserInputAnswer) {
+    guard var interaction = activeUserInput, canSubmitUserInput else { return }
+    interaction.state = .submitting
+    activeUserInput = interaction
+    let result = driver.respondToUserInput(
+      requestID: interaction.request.id,
+      answer: answer)
+    guard result == .accepted else {
+      interaction.state = .failed(message(for: result, action: "send answer"))
+      activeUserInput = interaction
+      return
+    }
+    if let index = transcript.firstIndex(where: { item in
+      guard case .userInput(_, let request, nil) = item else { return false }
+      return request.id == interaction.request.id
+    }) {
+      transcript[index] = .userInput(
+        id: transcript[index].id,
+        request: interaction.request,
+        answer: answer)
+    }
+    activeUserInput = nil
+    lifecycle = .responding
   }
 
   private func apply(_ outcome: ModelSwitchOutcome) {
@@ -793,6 +920,7 @@ final class NativeChatStore: ObservableObject {
   private func message(for result: ConversationOperationResult, action: String) -> String {
     switch result {
     case .accepted: ""
+    case .rejected: "That response was not accepted. Try again."
     case .busy: "Chat is busy."
     case .stopping: "Chat is closing."
     case .closed: "Chat is closed."
@@ -958,14 +1086,16 @@ enum NativeEventDecoder {
     models: [vivi_backend_model_t],
     semanticSpans: [vivi_backend_semantic_span_t] = [],
     sessions: [vivi_backend_session_summary_t] = [],
-    transcriptItems: [vivi_backend_transcript_item_t] = []
+    transcriptItems: [vivi_backend_transcript_item_t] = [],
+    userInputChoices: [vivi_backend_user_input_choice_t] = []
   ) throws -> ChatEvent {
-    guard event.reserved == 0, event.session_reserved == 0,
+    guard event.reserved == 0, event.allow_freeform <= 1,
       bytes.count == Int(event.byte_count),
       models.count == Int(event.model_count),
       semanticSpans.count == Int(event.semantic_span_count),
       sessions.count == Int(event.session_count),
-      transcriptItems.count == Int(event.transcript_item_count)
+      transcriptItems.count == Int(event.transcript_item_count),
+      userInputChoices.count == Int(event.user_input_choice_count)
     else { throw NativeEventDecodingError.malformed }
 
     func text(_ span: vivi_backend_span_t) throws -> String {
@@ -1082,6 +1212,13 @@ enum NativeEventDecoder {
       }
     }
 
+    func userInputChoice(_ raw: vivi_backend_user_input_choice_t) throws -> String {
+      guard raw.reserved == 0 else { throw NativeEventDecodingError.malformed }
+      let value = try text(raw.text)
+      guard !value.isEmpty else { throw NativeEventDecodingError.malformed }
+      return value
+    }
+
     func presentation(
       _ raw: vivi_backend_presentation_t,
       required: Bool
@@ -1158,6 +1295,12 @@ enum NativeEventDecoder {
         event.session_scope == VIVI_BACKEND_SESSION_SCOPE_NONE,
         event.session_resume_outcome == VIVI_BACKEND_SESSION_RESUME_NONE,
         event.skipped_invalid_shards == 0
+      else { throw NativeEventDecodingError.malformed }
+    }
+    let isUserInputPayload = event.kind == VIVI_BACKEND_EVENT_USER_INPUT_REQUEST
+    if !isUserInputPayload {
+      guard userInputChoices.isEmpty, event.allow_freeform == 0,
+        zero(event.user_input_request_id), zero(event.user_input_question)
       else { throw NativeEventDecodingError.malformed }
     }
     func content() throws -> String {
@@ -1372,6 +1515,27 @@ enum NativeEventDecoder {
       default:
         throw NativeEventDecodingError.malformed
       }
+    case VIVI_BACKEND_EVENT_USER_INPUT_REQUEST:
+      guard event.content_kind == VIVI_BACKEND_CONTENT_USER_INPUT_REQUEST,
+        models.isEmpty, semanticSpans.isEmpty, sessions.isEmpty, transcriptItems.isEmpty,
+        event.default_saved == 0, event.cleanup_failed == 0,
+        event.skipped_invalid_shards == 0, zero(event.content),
+        hasNeutralConversationMetadata
+      else { throw NativeEventDecodingError.malformed }
+      let requestID = try text(event.user_input_request_id)
+      let question = try text(event.user_input_question)
+      let choices = try userInputChoices.map(userInputChoice)
+      let allowsFreeform = event.allow_freeform != 0
+      guard !requestID.isEmpty, !question.isEmpty,
+        Set(choices).count == choices.count,
+        !choices.isEmpty || allowsFreeform
+      else { throw NativeEventDecodingError.malformed }
+      return .userInputRequested(
+        UserInputRequest(
+          id: requestID,
+          question: question,
+          choices: choices,
+          allowsFreeform: allowsFreeform))
     case VIVI_BACKEND_EVENT_IDLE: return .idle
     case VIVI_BACKEND_EVENT_FAILURE: return .failure(try content())
     case VIVI_BACKEND_EVENT_CLOSED: return .closed
@@ -1659,6 +1823,35 @@ final class ViviConversationDriver: ViviConversationDriving, @unchecked Sendable
     }
   }
 
+  func respondToUserInput(
+    requestID: String,
+    answer: UserInputAnswer
+  ) -> ConversationOperationResult {
+    let requestBytes = Array(requestID.utf8)
+    let answerBytes = Array(answer.text.utf8)
+    let answerKind: vivi_backend_user_input_answer_kind_t =
+      switch answer {
+      case .choice: VIVI_BACKEND_USER_INPUT_ANSWER_CHOICE
+      case .freeform: VIVI_BACKEND_USER_INPUT_ANSWER_FREEFORM
+      }
+    return queue.sync {
+      guard let handle else { return .closed }
+      var response = vivi_backend_user_input_response_t()
+      response.struct_size = UInt32(MemoryLayout<vivi_backend_user_input_response_t>.size)
+      response.answer_kind = answerKind
+      response.request_id_length = UInt32(requestBytes.count)
+      response.answer_length = UInt32(answerBytes.count)
+      return requestBytes.withUnsafeBufferPointer { requestBuffer in
+        answerBytes.withUnsafeBufferPointer { answerBuffer in
+          response.request_id = requestBuffer.baseAddress
+          response.answer = answerBuffer.baseAddress
+          return Self.operationResult(
+            vivi_backend_respond_to_user_input(handle, &response))
+        }
+      }
+    }
+  }
+
   func close(completion: @escaping @MainActor () -> Void) {
     queue.async { [self] in
       if let handle {
@@ -1687,7 +1880,7 @@ final class ViviConversationDriver: ViviConversationDriving, @unchecked Sendable
     while true {
       var event = vivi_backend_event_t()
       let result = vivi_backend_next_event(
-        handle, &event, nil, 0, nil, 0, nil, 0, nil, 0, nil, 0)
+        handle, &event, nil, 0, nil, 0, nil, 0, nil, 0, nil, 0, nil, 0)
       if result == VIVI_BACKEND_NO_EVENT {
         deliver(events)
         return
@@ -1707,25 +1900,32 @@ final class ViviConversationDriver: ViviConversationDriving, @unchecked Sendable
       var transcriptItems = Array(
         repeating: vivi_backend_transcript_item_t(),
         count: Int(event.transcript_item_count))
+      var userInputChoices = Array(
+        repeating: vivi_backend_user_input_choice_t(),
+        count: Int(event.user_input_choice_count))
       if result == VIVI_BACKEND_BUFFER_TOO_SMALL {
         let copied = bytes.withUnsafeMutableBufferPointer { byteBuffer in
           models.withUnsafeMutableBufferPointer { modelBuffer in
             semanticSpans.withUnsafeMutableBufferPointer { spanBuffer in
               sessions.withUnsafeMutableBufferPointer { sessionBuffer in
                 transcriptItems.withUnsafeMutableBufferPointer { transcriptBuffer in
-                  vivi_backend_next_event(
-                    handle,
-                    &event,
-                    byteBuffer.baseAddress,
-                    UInt32(byteBuffer.count),
-                    modelBuffer.baseAddress,
-                    UInt32(modelBuffer.count),
-                    spanBuffer.baseAddress,
-                    UInt32(spanBuffer.count),
-                    sessionBuffer.baseAddress,
-                    UInt32(sessionBuffer.count),
-                    transcriptBuffer.baseAddress,
-                    UInt32(transcriptBuffer.count))
+                  userInputChoices.withUnsafeMutableBufferPointer { choiceBuffer in
+                    vivi_backend_next_event(
+                      handle,
+                      &event,
+                      byteBuffer.baseAddress,
+                      UInt32(byteBuffer.count),
+                      modelBuffer.baseAddress,
+                      UInt32(modelBuffer.count),
+                      spanBuffer.baseAddress,
+                      UInt32(spanBuffer.count),
+                      sessionBuffer.baseAddress,
+                      UInt32(sessionBuffer.count),
+                      transcriptBuffer.baseAddress,
+                      UInt32(transcriptBuffer.count),
+                      choiceBuffer.baseAddress,
+                      UInt32(choiceBuffer.count))
+                  }
                 }
               }
             }
@@ -1743,7 +1943,8 @@ final class ViviConversationDriver: ViviConversationDriving, @unchecked Sendable
           models: models,
           semanticSpans: semanticSpans,
           sessions: sessions,
-          transcriptItems: transcriptItems)
+          transcriptItems: transcriptItems,
+          userInputChoices: userInputChoices)
         events.append(decoded)
         if decoded == .closed {
           destroyLocked(handle, requestClose: false)
@@ -1793,6 +1994,7 @@ final class ViviConversationDriver: ViviConversationDriving, @unchecked Sendable
   ) -> ConversationOperationResult {
     switch result {
     case VIVI_BACKEND_OK: .accepted
+    case VIVI_BACKEND_INVALID_ARGUMENT: .rejected
     case VIVI_BACKEND_BUSY: .busy
     case VIVI_BACKEND_STOPPING: .stopping
     case VIVI_BACKEND_CLOSED: .closed

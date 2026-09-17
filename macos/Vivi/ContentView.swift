@@ -33,7 +33,7 @@ struct ContentView: View {
         ScrollView {
           LazyVStack(alignment: .leading, spacing: 12) {
             ForEach(store.transcript) { item in
-              ChatItemView(item: item)
+              ChatItemView(item: item, store: store)
                 .id(item.id)
             }
           }
@@ -73,6 +73,7 @@ struct ContentView: View {
       .textFieldStyle(.plain)
       .lineLimit(2...6)
       .onSubmit(store.submit)
+      .disabled(store.activeUserInput != nil)
 
       HStack(spacing: 10) {
         modelMenu
@@ -168,6 +169,7 @@ struct ContentView: View {
     case .starting: return "Starting"
     case .idle: return "Ready"
     case .responding: return "Responding"
+    case .awaitingInput: return "Waiting for your answer"
     case .closing: return "Closing"
     case .closed: return "Closed"
     }
@@ -176,6 +178,7 @@ struct ContentView: View {
 
 private struct ChatItemView: View {
   let item: ChatItem
+  @ObservedObject var store: NativeChatStore
 
   var body: some View {
     switch item {
@@ -218,6 +221,142 @@ private struct ChatItemView: View {
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(.red.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+    case .userInput(_, let request, let answer):
+      UserInputRequestView(
+        request: request,
+        answer: answer,
+        interaction: store.activeUserInput?.request.id == request.id
+          ? store.activeUserInput : nil,
+        revealFreeform: store.revealFreeformInput,
+        hideFreeform: store.hideFreeformInput,
+        updateFreeform: store.updateFreeformDraft,
+        submitChoice: store.submitUserInputChoice,
+        submitFreeform: store.submitUserInputFreeform)
+    }
+  }
+
+  private struct UserInputRequestView: View {
+    let request: UserInputRequest
+    let answer: UserInputAnswer?
+    let interaction: ActiveUserInput?
+    let revealFreeform: () -> Void
+    let hideFreeform: () -> Void
+    let updateFreeform: (String) -> Void
+    let submitChoice: (String) -> Void
+    let submitFreeform: () -> Void
+
+    @FocusState private var freeformFocused: Bool
+
+    var body: some View {
+      VStack(alignment: .leading, spacing: 12) {
+        Label("Vivi needs your input", systemImage: "questionmark.bubble.fill")
+          .font(.caption.weight(.semibold))
+          .foregroundStyle(.tint)
+
+        Text(request.question)
+          .font(.body.weight(.medium))
+          .textSelection(.enabled)
+
+        if let answer {
+          Label(answer.text, systemImage: "checkmark.circle.fill")
+            .foregroundStyle(.secondary)
+            .textSelection(.enabled)
+            .accessibilityLabel("Answered \(answer.text)")
+        } else if let interaction {
+          controls(interaction)
+        }
+      }
+      .padding(14)
+      .frame(maxWidth: .infinity, alignment: .leading)
+      .background(.tint.opacity(0.07), in: RoundedRectangle(cornerRadius: 12))
+      .overlay {
+        RoundedRectangle(cornerRadius: 12)
+          .stroke(.tint.opacity(0.35), lineWidth: 1)
+      }
+      .accessibilityElement(children: .contain)
+      .accessibilityLabel(request.question)
+      .accessibilityIdentifier("user-input-request")
+    }
+
+    @ViewBuilder
+    private func controls(_ interaction: ActiveUserInput) -> some View {
+      VStack(alignment: .leading, spacing: 8) {
+        ForEach(Array(request.choices.enumerated()), id: \.offset) { index, choice in
+          Button {
+            submitChoice(choice)
+          } label: {
+            Text(choice)
+              .frame(maxWidth: .infinity, alignment: .leading)
+          }
+          .buttonStyle(.bordered)
+          .disabled(interaction.state == .submitting)
+          .accessibilityLabel(choice)
+          .accessibilityHint("Answers Vivi’s question")
+          .accessibilityIdentifier("user-input-choice-\(index)")
+        }
+
+        if request.allowsFreeform {
+          if interaction.showsFreeform {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+              TextField(
+                "Type your answer",
+                text: Binding(
+                  get: { interaction.freeformDraft },
+                  set: updateFreeform)
+              )
+              .textFieldStyle(.roundedBorder)
+              .focused($freeformFocused)
+              .onSubmit(submitFreeform)
+              .onKeyPress(.escape) {
+                guard !request.choices.isEmpty else { return .ignored }
+                hideFreeform()
+                return .handled
+              }
+              .disabled(interaction.state == .submitting)
+              .accessibilityIdentifier("user-input-freeform")
+
+              Button("Answer", action: submitFreeform)
+                .buttonStyle(.borderedProminent)
+                .disabled(
+                  interaction.state == .submitting
+                    || interaction.freeformDraft
+                      .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                )
+                .accessibilityIdentifier("user-input-freeform-submit")
+            }
+            .onAppear {
+              freeformFocused = true
+            }
+          } else {
+            Button("Other…", action: revealFreeform)
+              .buttonStyle(.bordered)
+              .disabled(interaction.state == .submitting)
+              .accessibilityHint("Enter a custom answer")
+              .accessibilityIdentifier("user-input-other")
+          }
+        }
+
+        if interaction.state == .submitting {
+          HStack(spacing: 8) {
+            ProgressView()
+              .controlSize(.small)
+              .accessibilityHidden(true)
+            Text("Sending answer…")
+              .font(.caption)
+              .foregroundStyle(.secondary)
+          }
+          .accessibilityElement(children: .combine)
+          .accessibilityLabel("Sending answer")
+          .accessibilityIdentifier("user-input-submitting")
+        }
+
+        if case .failed(let message) = interaction.state {
+          Label(message, systemImage: "exclamationmark.triangle.fill")
+            .font(.caption)
+            .foregroundStyle(.red)
+            .accessibilityIdentifier("user-input-error")
+        }
+      }
     }
   }
 
