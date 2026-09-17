@@ -10,6 +10,7 @@ final class ViviBackendRuntimeTests: XCTestCase {
     let store = NativeChatStore(workspace: "/tmp/Vivi chat", driver: driver)
 
     store.reduce(.ready)
+    store.reduce(.modelCatalog(testCatalog()))
     store.draft = "Write a haiku"
     store.submit()
     store.reduce(.assistantStarted)
@@ -39,6 +40,7 @@ final class ViviBackendRuntimeTests: XCTestCase {
     )
 
     store.reduce(.ready)
+    store.reduce(.modelCatalog(testCatalog()))
     store.draft = "Keep this"
     store.submit()
 
@@ -442,6 +444,31 @@ final class ViviBackendRuntimeTests: XCTestCase {
     XCTAssertTrue(candidates.contains("/Users/vivi/.volta/bin/copilot"))
     XCTAssertEqual(candidates.filter { $0 == "/opt/homebrew/bin/copilot" }.count, 1)
   }
+
+  func testNVMVersionsSortNumericallyNewestFirst() {
+    let versions = ["v9.22.1", "v20.19.5", "v18.20.8"].map {
+      URL(fileURLWithPath: "/Users/vivi/.nvm/versions/node/\($0)")
+    }
+
+    XCTAssertEqual(
+      nativeNodeVersionsNewestFirst(versions).map(\.lastPathComponent),
+      ["v20.19.5", "v18.20.8", "v9.22.1"])
+  }
+
+  func testSubmitIsBlockedDuringModelOperation() {
+    let driver = FakeConversationDriver()
+    let store = NativeChatStore(workspace: "/tmp/work", driver: driver)
+    store.reduce(.ready)
+    store.reduce(.modelCatalog(testCatalog()))
+    store.draft = "hello"
+
+    store.refreshModels()
+    store.submit()
+
+    XCTAssertFalse(store.canSubmit)
+    XCTAssertTrue(driver.submittedPrompts.isEmpty)
+    XCTAssertEqual(store.draft, "hello")
+  }
 }
 
 private final class FakeConversationDriver: ViviConversationDriving {
@@ -449,6 +476,7 @@ private final class FakeConversationDriver: ViviConversationDriving {
   var refreshResult = ConversationOperationResult.accepted
   var switchResult = ConversationOperationResult.accepted
   var selections: [ModelSelection] = []
+  var submittedPrompts: [String] = []
   private var receive: (@MainActor (ChatEvent) -> Void)?
 
   func start(
@@ -458,8 +486,9 @@ private final class FakeConversationDriver: ViviConversationDriving {
     return .accepted
   }
 
-  func submit(_: String) -> ConversationOperationResult {
-    submitResult
+  func submit(_ prompt: String) -> ConversationOperationResult {
+    submittedPrompts.append(prompt)
+    return submitResult
   }
 
   func refreshModels() -> ConversationOperationResult {

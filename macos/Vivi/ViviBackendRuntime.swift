@@ -212,6 +212,11 @@ final class NativeChatStore: ObservableObject {
     lifecycle != .idle
   }
 
+  var canSubmit: Bool {
+    !isBusy && modelState == .ready
+      && !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+  }
+
   var selectedModelID: String? {
     confirmedSelection?.modelID
   }
@@ -246,7 +251,7 @@ final class NativeChatStore: ObservableObject {
 
   func submit() {
     let prompt = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !prompt.isEmpty, lifecycle == .idle else { return }
+    guard canSubmit else { return }
     let result = driver.submit(prompt)
     guard result == .accepted else {
       finishStreamingRows()
@@ -822,6 +827,12 @@ func nativeCopilotExecutableCandidates(home: URL, path: String?) -> [String] {
   return candidates.filter { seen.insert($0).inserted }
 }
 
+func nativeNodeVersionsNewestFirst(_ versions: [URL]) -> [URL] {
+  versions.sorted {
+    $0.lastPathComponent.compare($1.lastPathComponent, options: .numeric) == .orderedDescending
+  }
+}
+
 func nativeCopilotExecutablePath(
   fileManager: FileManager = .default,
   environment: [String: String] = ProcessInfo.processInfo.environment
@@ -834,7 +845,7 @@ func nativeCopilotExecutablePath(
     includingPropertiesForKeys: nil
   ) {
     candidates.append(
-      contentsOf: versions.sorted { $0.lastPathComponent > $1.lastPathComponent }.map {
+      contentsOf: nativeNodeVersionsNewestFirst(versions).map {
         $0.appendingPathComponent("bin/copilot").path
       })
   }
