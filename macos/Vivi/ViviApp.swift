@@ -73,6 +73,14 @@ func nativeChatRequest(from url: URL) -> NativeChatRequest? {
 }
 
 @MainActor
+func restoreWindow(_ controller: NSWindowController) {
+  if controller.window?.isMiniaturized == true {
+    controller.window?.deminiaturize(nil)
+  }
+  controller.showWindow(nil)
+}
+
+@MainActor
 protocol ChatWindowManaging {
   var isEmpty: Bool { get }
 
@@ -82,10 +90,36 @@ protocol ChatWindowManaging {
 }
 
 @MainActor
-private final class ChatWindowRegistry {
-  private var controllers: [UUID: ChatWindowController] = [:]
-  private var lastRequest = NativeChatRequest(
-    workspace: FileManager.default.homeDirectoryForCurrentUser.path)
+protocol ChatWindowControlling: AnyObject {
+  var id: UUID { get }
+  var isClosing: Bool { get }
+
+  func restore()
+  func closeForTermination(completion: @escaping @MainActor () -> Void)
+}
+
+@MainActor
+final class ChatWindowRegistry {
+  typealias ControllerFactory =
+    @MainActor (
+      UUID,
+      String,
+      @escaping @MainActor (UUID) -> Void
+    ) -> any ChatWindowControlling
+
+  private var controllers: [UUID: any ChatWindowControlling] = [:]
+  private var lastRequest: NativeChatRequest
+  private let makeController: ControllerFactory
+
+  init(
+    homeDirectory: String = FileManager.default.homeDirectoryForCurrentUser.path,
+    makeController: @escaping ControllerFactory = { id, workspace, onClosed in
+      ChatWindowController(id: id, workspace: workspace, onClosed: onClosed)
+    }
+  ) {
+    self.lastRequest = NativeChatRequest(workspace: homeDirectory)
+    self.makeController = makeController
+  }
 
   var isEmpty: Bool {
     controllers.isEmpty
@@ -94,14 +128,11 @@ private final class ChatWindowRegistry {
   func open(request: NativeChatRequest) {
     lastRequest = request
     let id = UUID()
-    let controller = ChatWindowController(
-      id: id,
-      workspace: request.workspace,
-      onClosed: { [weak self] id in
-        self?.controllers.removeValue(forKey: id)
-      })
+    let controller = makeController(id, request.workspace) { [weak self] id in
+      self?.controllers.removeValue(forKey: id)
+    }
     controllers[id] = controller
-    controller.showWindow(nil)
+    controller.restore()
     NSApp.activate(ignoringOtherApps: true)
   }
 
@@ -109,7 +140,7 @@ private final class ChatWindowRegistry {
     let reusable = controllers.values.filter { !$0.isClosing }
     if !reusable.isEmpty {
       for controller in reusable {
-        controller.showWindow(nil)
+        controller.restore()
       }
       NSApp.activate(ignoringOtherApps: true)
       return
@@ -189,6 +220,10 @@ private final class ChatWindowController: NSWindowController, NSWindowDelegate {
     finishClose()
   }
 
+  func restore() {
+    restoreWindow(self)
+  }
+
   func closeForTermination(completion: @escaping @MainActor () -> Void) {
     window?.orderOut(nil)
     finishClose(completion: completion)
@@ -208,3 +243,5 @@ private final class ChatWindowController: NSWindowController, NSWindowDelegate {
     }
   }
 }
+
+extension ChatWindowController: ChatWindowControlling {}
