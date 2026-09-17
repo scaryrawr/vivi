@@ -60,6 +60,9 @@ cancellation become part of each concrete operation's contract. If core code
 eventually needs OS services such as process discovery or credential storage,
 add private `backend/src/runtime/<os>.zig` adapters only when required; core
 and CLI code must continue compiling without a UI adapter.
+Packaged native apps must not rely on an interactive shell's `PATH` to find
+Copilot. The host resolves a trusted executable to an absolute path and passes
+that copied path through the typed C ABI.
 
 For the CLI chat, `backend/src/conversation.zig` owns the worker, one-command
 mailbox, owned event queue, and lifecycle state. `backend/src/root.zig` owns
