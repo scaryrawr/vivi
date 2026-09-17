@@ -141,6 +141,20 @@ final class ViviBackendRuntimeTests: XCTestCase {
     XCTAssertEqual(finished.result, .succeeded)
   }
 
+  func testLeadingWhitespaceDeltaDoesNotCreateAssistantRowBeforeReasoning() {
+    let store = NativeChatStore(workspace: "/tmp/work", driver: FakeConversationDriver())
+
+    store.reduce(.assistantStarted)
+    store.reduce(.assistantDelta("\n"))
+    store.reduce(.reasoningComplete("thinking"))
+    store.reduce(.assistantComplete("answer"))
+
+    XCTAssertEqual(store.transcript.count, 2)
+    guard case .reasoning(_, "thinking") = store.transcript[0],
+      case .assistant(_, "answer") = store.transcript[1]
+    else { return XCTFail("Expected reasoning before the first nonempty assistant content") }
+  }
+
   func testToolFinishUpdatesOriginalRowByCallID() {
     let store = NativeChatStore(workspace: "/tmp/work", driver: FakeConversationDriver())
     let tool = ToolActivity(
@@ -164,11 +178,23 @@ final class ViviBackendRuntimeTests: XCTestCase {
     XCTAssertEqual(finished.output, "**passed**")
   }
 
-  func testMarkdownRendererInterpretsBoldMarkup() {
-    let rendered = markdownAttributedString("**bold**")
+  func testMarkdownRendererPreservesBlockStructureAndInlineFormatting() {
+    let rendered = markdownBlocks(
+      """
+      ## Structure
 
-    XCTAssertEqual(String(rendered.characters), "bold")
-    XCTAssertFalse(String(rendered.characters).contains("**"))
+      **Core**
+      - `backend/` — domain
+      - `cli/` — terminal
+      """)
+
+    XCTAssertEqual(
+      rendered.map(\.kind),
+      [.heading(level: 2), .paragraph, .unorderedListItem, .unorderedListItem])
+    XCTAssertEqual(
+      rendered.map { String($0.content.characters) },
+      ["Structure", "Core", "backend/ — domain", "cli/ — terminal"])
+    XCTAssertFalse(rendered.map { String($0.content.characters) }.joined().contains("**"))
   }
 
   func testRefreshFailureRetainsCatalogAndFailedSwitchRetainsSelection() {

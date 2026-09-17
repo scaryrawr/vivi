@@ -171,16 +171,14 @@ private struct ChatItemView: View {
         Text("Vivi")
           .font(.caption.weight(.semibold))
           .foregroundStyle(.secondary)
-        Text(markdownAttributedString(text.isEmpty ? "…" : text))
-          .textSelection(.enabled)
+        MarkdownContentView(source: text)
       }
       .frame(maxWidth: .infinity, alignment: .leading)
     case .reasoning(_, let text):
       DisclosureGroup("Reasoning") {
-        Text(markdownAttributedString(text))
+        MarkdownContentView(source: text)
           .font(.callout)
           .foregroundStyle(.secondary)
-          .textSelection(.enabled)
           .frame(maxWidth: .infinity, alignment: .leading)
           .padding(.top, 4)
       }
@@ -243,8 +241,7 @@ private struct ChatItemView: View {
           .font(.caption.weight(.semibold))
           .foregroundStyle(.secondary)
         if markdown {
-          Text(markdownAttributedString(value))
-            .textSelection(.enabled)
+          MarkdownContentView(source: value)
         } else {
           Text(value)
             .textSelection(.enabled)
@@ -277,6 +274,81 @@ private struct ChatItemView: View {
       case .succeeded: .green
       case .failed: .red
       case .image: .blue
+      }
+    }
+  }
+
+  private struct MarkdownContentView: View {
+    let source: String
+
+    private var blocks: [MarkdownBlock] {
+      markdownBlocks(source)
+    }
+
+    var body: some View {
+      VStack(alignment: .leading, spacing: 8) {
+        ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
+          blockView(block)
+        }
+      }
+      .frame(maxWidth: .infinity, alignment: .leading)
+      .textSelection(.enabled)
+    }
+
+    @ViewBuilder
+    private func blockView(_ block: MarkdownBlock) -> some View {
+      switch block.kind {
+      case .paragraph:
+        Text(block.content)
+          .fixedSize(horizontal: false, vertical: true)
+      case .heading(let level):
+        Text(block.content)
+          .font(headingFont(level))
+          .fixedSize(horizontal: false, vertical: true)
+          .padding(.top, level > 2 ? 2 : 6)
+      case .unorderedListItem:
+        listRow(prefix: "•", content: block.content)
+      case .orderedListItem(let ordinal):
+        listRow(prefix: "\(ordinal).", content: block.content)
+      case .code:
+        ScrollView(.horizontal) {
+          Text(block.content)
+            .font(.system(.body, design: .monospaced))
+            .fixedSize(horizontal: true, vertical: true)
+            .padding(10)
+        }
+        .background(.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
+      case .quote:
+        HStack(alignment: .top, spacing: 10) {
+          Rectangle()
+            .fill(.secondary.opacity(0.45))
+            .frame(width: 2)
+          Text(block.content)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+      case .thematicBreak:
+        Divider()
+          .padding(.vertical, 4)
+      }
+    }
+
+    private func listRow(prefix: String, content: AttributedString) -> some View {
+      HStack(alignment: .firstTextBaseline, spacing: 8) {
+        Text(prefix)
+          .foregroundStyle(.secondary)
+          .frame(minWidth: 16, alignment: .trailing)
+        Text(content)
+          .fixedSize(horizontal: false, vertical: true)
+      }
+      .padding(.leading, 4)
+    }
+
+    private func headingFont(_ level: Int) -> Font {
+      switch level {
+      case 1: .title2.weight(.bold)
+      case 2: .title3.weight(.semibold)
+      default: .headline
       }
     }
   }

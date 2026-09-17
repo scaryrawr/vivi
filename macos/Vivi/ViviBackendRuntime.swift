@@ -482,6 +482,7 @@ final class NativeChatStore: ObservableObject {
 
   private func replaceActiveAssistant(_ text: String, append: Bool) {
     if activeAssistant == nil {
+      guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
       let id = UUID()
       activeAssistant = id
       activeReasoning = nil
@@ -505,11 +506,91 @@ final class NativeChatStore: ObservableObject {
   }
 }
 
-func markdownAttributedString(_ text: String) -> AttributedString {
-  (try? AttributedString(
-    markdown: text,
-    options: .init(interpretedSyntax: .full)
-  )) ?? AttributedString(text)
+enum MarkdownBlockKind: Equatable {
+  case paragraph
+  case heading(level: Int)
+  case unorderedListItem
+  case orderedListItem(ordinal: Int)
+  case code(language: String?)
+  case quote
+  case thematicBreak
+}
+
+struct MarkdownBlock: Equatable {
+  let kind: MarkdownBlockKind
+  var content: AttributedString
+}
+
+func markdownBlocks(_ text: String) -> [MarkdownBlock] {
+  guard
+    let rendered = try? AttributedString(
+      markdown: text,
+      options: .init(interpretedSyntax: .full)
+    )
+  else {
+    return [.init(kind: .paragraph, content: AttributedString(text))]
+  }
+
+  var blocks: [MarkdownBlock] = []
+  var blockIdentity: Int?
+
+  for run in rendered.runs {
+    let components = Array(run.presentationIntent?.components ?? [])
+    let identity = components.first?.identity
+    let content = AttributedString(rendered[run.range])
+
+    if identity == blockIdentity, !blocks.isEmpty {
+      blocks[blocks.count - 1].content.append(content)
+      continue
+    }
+
+    blockIdentity = identity
+    blocks.append(.init(kind: markdownBlockKind(components), content: content))
+  }
+
+  return blocks.isEmpty
+    ? [.init(kind: .paragraph, content: AttributedString(text))]
+    : blocks
+}
+
+private func markdownBlockKind(
+  _ components: [PresentationIntent.IntentType]
+) -> MarkdownBlockKind {
+  var listItemOrdinal: Int?
+  var isUnorderedList = false
+  var isOrderedList = false
+  var isQuote = false
+
+  for component in components {
+    switch component.kind {
+    case .header(let level):
+      return .heading(level: level)
+    case .codeBlock(let language):
+      return .code(language: language)
+    case .thematicBreak:
+      return .thematicBreak
+    case .listItem(let ordinal):
+      listItemOrdinal = ordinal
+    case .unorderedList:
+      isUnorderedList = true
+    case .orderedList:
+      isOrderedList = true
+    case .blockQuote:
+      isQuote = true
+    default:
+      break
+    }
+  }
+
+  if let ordinal = listItemOrdinal {
+    if isOrderedList {
+      return .orderedListItem(ordinal: ordinal)
+    }
+    if isUnorderedList {
+      return .unorderedListItem
+    }
+  }
+  return isQuote ? .quote : .paragraph
 }
 
 enum NativeEventDecodingError: Error {
