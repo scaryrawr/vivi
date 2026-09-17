@@ -123,6 +123,26 @@ pub fn build(b: *std.Build) void {
     const backend_tests = b.addTest(.{ .root_module = backend, .use_llvm = use_llvm });
     const run_backend_tests = b.addRunArtifact(backend_tests);
 
+    const canvas_contract_module = b.createModule(.{
+        .root_source_file = b.path("backend/test/copilot_sdk_canvas_contract.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    canvas_contract_module.addImport("copilot_sdk", sdk.module("copilot_sdk"));
+    canvas_contract_module.addAnonymousImport("build_zig_zon", .{
+        .root_source_file = b.path("build.zig.zon"),
+    });
+    const canvas_contract_tests = b.addTest(.{
+        .root_module = canvas_contract_module,
+        .use_llvm = use_llvm,
+    });
+    const run_canvas_contract_tests = b.addRunArtifact(canvas_contract_tests);
+    const canvas_contract_step = b.step(
+        "test-canvas-contract",
+        "Verify the pinned experimental Copilot SDK canvas contract",
+    );
+    canvas_contract_step.dependOn(&run_canvas_contract_tests.step);
+
     const c_api_tests = b.addTest(.{ .root_module = c_api, .use_llvm = use_llvm });
     const run_c_api_tests = b.addRunArtifact(c_api_tests);
 
@@ -207,6 +227,7 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_backend_tests.step);
+    test_step.dependOn(&run_canvas_contract_tests.step);
     test_step.dependOn(&run_c_api_tests.step);
     test_step.dependOn(&run_cli_tests.step);
     test_step.dependOn(&run_chat_tests.step);
