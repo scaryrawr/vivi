@@ -10,7 +10,7 @@ const tool_activity = @import("tool_activity.zig");
 const tools = @import("tools.zig");
 
 pub const version = build_options.version;
-pub const abi_version: u32 = 2;
+pub const abi_version: u32 = 3;
 pub const Conversation = conversation.Conversation;
 pub const ConversationEvent = conversation.Event;
 pub const ConversationWake = conversation.Wake;
@@ -61,6 +61,11 @@ pub const Settings = settings.Settings;
 pub const loadSettings = settings.load;
 pub const saveDefaultSelection = settings.saveDefaultSelection;
 
+pub const CopilotCliLaunch = enum {
+    sdk_default,
+    search_process_path,
+};
+
 pub const ConversationOptions = struct {
     working_directory: []const u8,
     model: ?[]const u8 = null,
@@ -68,6 +73,7 @@ pub const ConversationOptions = struct {
     settings_path: ?[]const u8 = null,
     sessions_directory: ?[]const u8 = null,
     omlx: OmlxOptions = .{},
+    copilot_cli_launch: CopilotCliLaunch = .sdk_default,
 };
 
 const ConversationContext = struct {
@@ -78,6 +84,7 @@ const ConversationContext = struct {
     sessions_directory: ?[]u8,
     omlx_base_url: []u8,
     omlx_api_key: ?[]u8,
+    copilot_cli_launch: CopilotCliLaunch,
 
     fn init(
         allocator: std.mem.Allocator,
@@ -115,6 +122,7 @@ const ConversationContext = struct {
             .sessions_directory = sessions_directory,
             .omlx_base_url = undefined,
             .omlx_api_key = null,
+            .copilot_cli_launch = options.copilot_cli_launch,
         };
         context.omlx_base_url = try allocator.dupe(
             u8,
@@ -164,7 +172,10 @@ pub fn discoverModels(
     var client = copilot.Client.init(
         allocator,
         io,
-        MinimalCodingAgent.clientOptions(working_directory),
+        MinimalCodingAgent.clientOptions(
+            working_directory,
+            .sdk_default,
+        ),
     ) catch {
         return buildModelCatalog(allocator, null, io, &selected, options);
     };
@@ -207,7 +218,11 @@ test "conversation contexts retain their explicit working directories" {
 }
 
 const MinimalCodingAgent = struct {
-    const cli_args = [_][]const u8{"--disable-builtin-mcps"};
+    const direct_cli_args = [_][]const u8{"--disable-builtin-mcps"};
+    const path_lookup_cli_args = [_][]const u8{
+        "copilot",
+        "--disable-builtin-mcps",
+    };
 
     const available_tools = [_][]const u8{
         "custom:*",
@@ -225,10 +240,14 @@ const MinimalCodingAgent = struct {
 
     const sdk_tools = makeSdkTools();
 
-    fn clientOptions(working_directory: []const u8) copilot.ClientOptions {
-        return .{
+    fn clientOptions(
+        working_directory: []const u8,
+        launch: CopilotCliLaunch,
+    ) copilot.ClientOptions {
+        const command = copilotCommand(launch);
+        var options: copilot.ClientOptions = .{
             .working_directory = working_directory,
-            .cli_args = &cli_args,
+            .cli_args = command.args,
             .client_info = .{
                 .application_name = "vivi",
                 .application_version = version,
@@ -236,6 +255,10 @@ const MinimalCodingAgent = struct {
                 .integration_version = version,
             },
         };
+        if (launch == .search_process_path) {
+            options.cli_path = command.executable;
+        }
+        return options;
     }
 
     fn sessionConfig(
@@ -289,6 +312,24 @@ const MinimalCodingAgent = struct {
         return result;
     }
 };
+
+const CopilotCommand = struct {
+    executable: []const u8,
+    args: []const []const u8,
+};
+
+fn copilotCommand(launch: CopilotCliLaunch) CopilotCommand {
+    return switch (launch) {
+        .sdk_default => .{
+            .executable = "copilot",
+            .args = &MinimalCodingAgent.direct_cli_args,
+        },
+        .search_process_path => .{
+            .executable = "/usr/bin/env",
+            .args = &MinimalCodingAgent.path_lookup_cli_args,
+        },
+    };
+}
 
 const hosted_model_id = "copilot/default";
 
@@ -2287,7 +2328,10 @@ fn runSdkConversation(
     var client = copilot.Client.init(
         worker.allocator(),
         worker.io(),
-        MinimalCodingAgent.clientOptions(active_working_directory),
+        MinimalCodingAgent.clientOptions(
+            active_working_directory,
+            context.copilot_cli_launch,
+        ),
     ) catch |err| {
         worker.closeFailure(.startup, @errorName(err));
         return;
@@ -3683,14 +3727,18 @@ test "minimal coding agent limits hosted tools to simplified subset" {
     try std.testing.expectEqualSlices(
         []const u8,
         &.{"--disable-builtin-mcps"},
-        &MinimalCodingAgent.cli_args,
+        &MinimalCodingAgent.direct_cli_args,
     );
 
-    const options = MinimalCodingAgent.clientOptions("/workspace");
+    const options = MinimalCodingAgent.clientOptions(
+        "/workspace",
+        .sdk_default,
+    );
     try std.testing.expectEqualStrings(
         "/workspace",
         options.working_directory.?,
     );
+    try std.testing.expectEqualStrings("copilot", options.cli_path);
 
     try std.testing.expectEqualSlices(
         []const u8,
@@ -3705,6 +3753,38 @@ test "minimal coding agent limits hosted tools to simplified subset" {
             null,
             .{},
         ).available_tools.?,
+    );
+}
+
+test "native path lookup runs fixed copilot command through macOS env" {
+    const options = MinimalCodingAgent.clientOptions(
+        "/workspace",
+        .search_process_path,
+    );
+    try std.testing.expectEqualStrings("/usr/bin/env", options.cli_path);
+    try std.testing.expectEqualSlices(
+        []const u8,
+        &.{ "copilot", "--disable-builtin-mcps" },
+        options.cli_args,
+    );
+}
+
+test "terminal launch preserves SDK default command" {
+    const conversation_options: ConversationOptions = .{
+        .working_directory = "/workspace",
+    };
+    try std.testing.expectEqual(
+        CopilotCliLaunch.sdk_default,
+        conversation_options.copilot_cli_launch,
+    );
+    const command = copilotCommand(
+        conversation_options.copilot_cli_launch,
+    );
+    try std.testing.expectEqualStrings("copilot", command.executable);
+    try std.testing.expectEqualSlices(
+        []const u8,
+        &.{"--disable-builtin-mcps"},
+        command.args,
     );
 }
 

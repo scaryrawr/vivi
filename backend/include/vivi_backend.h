@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define VIVI_BACKEND_ABI_VERSION 2
+#define VIVI_BACKEND_ABI_VERSION 3
 
 typedef enum vivi_backend_result {
     VIVI_BACKEND_OK = 0,
@@ -25,9 +25,15 @@ typedef struct vivi_backend_conversation vivi_backend_conversation_t;
 /* The callback may run on a backend thread. It must only schedule a drain. */
 typedef void (*vivi_backend_wake_fn)(void *context);
 
+typedef enum vivi_backend_copilot_cli_launch {
+    VIVI_BACKEND_COPILOT_CLI_SDK_DEFAULT = 0,
+    VIVI_BACKEND_COPILOT_CLI_SEARCH_PROCESS_PATH = 1,
+} vivi_backend_copilot_cli_launch_t;
+
 typedef struct vivi_backend_conversation_options {
     const uint8_t *working_directory;
     uint32_t working_directory_length;
+    vivi_backend_copilot_cli_launch_t copilot_cli_launch;
     vivi_backend_wake_fn wake;
     void *wake_context;
 } vivi_backend_conversation_options_t;

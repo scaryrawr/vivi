@@ -19,8 +19,8 @@ final class ViviAppDelegate: NSObject, NSApplicationDelegate {
 
   func application(_ application: NSApplication, open urls: [URL]) {
     for url in urls {
-      guard let workspace = nativeChatWorkspace(from: url) else { continue }
-      windows.open(workspace: workspace)
+      guard let request = nativeChatRequest(from: url) else { continue }
+      windows.open(request: request)
     }
   }
 
@@ -35,13 +35,17 @@ final class ViviAppDelegate: NSObject, NSApplicationDelegate {
   }
 }
 
-func nativeChatWorkspace(from url: URL) -> String? {
+struct NativeChatRequest: Equatable {
+  let workspace: String
+}
+
+func nativeChatRequest(from url: URL) -> NativeChatRequest? {
   guard url.scheme == "vivi", url.host == "chat",
     let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
     let workspace = components.queryItems?.first(where: { $0.name == "workspace" })?.value,
     workspace.hasPrefix("/")
   else { return nil }
-  return workspace
+  return NativeChatRequest(workspace: workspace)
 }
 
 @MainActor
@@ -52,11 +56,11 @@ private final class ChatWindowRegistry {
     controllers.isEmpty
   }
 
-  func open(workspace: String) {
+  func open(request: NativeChatRequest) {
     let id = UUID()
     let controller = ChatWindowController(
       id: id,
-      workspace: workspace,
+      workspace: request.workspace,
       onClosed: { [weak self] id in
         self?.controllers.removeValue(forKey: id)
       })

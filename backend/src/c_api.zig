@@ -55,6 +55,16 @@ fn handle(pointer: ?*c.vivi_backend_conversation_t) ?*Handle {
     return @ptrCast(@alignCast(value));
 }
 
+fn copilotCliLaunch(
+    raw: c.vivi_backend_copilot_cli_launch_t,
+) ?backend.CopilotCliLaunch {
+    return switch (raw) {
+        c.VIVI_BACKEND_COPILOT_CLI_SDK_DEFAULT => .sdk_default,
+        c.VIVI_BACKEND_COPILOT_CLI_SEARCH_PROCESS_PATH => .search_process_path,
+        else => null,
+    };
+}
+
 export fn vivi_backend_open(
     options: ?*const c.vivi_backend_conversation_options_t,
     out_conversation: ?*?*c.vivi_backend_conversation_t,
@@ -72,6 +82,8 @@ export fn vivi_backend_open(
     if (!std.fs.path.isAbsolute(working_directory)) {
         return c.VIVI_BACKEND_INVALID_ARGUMENT;
     }
+    const launch = copilotCliLaunch(input.copilot_cli_launch) orelse
+        return c.VIVI_BACKEND_INVALID_ARGUMENT;
 
     const self = std.heap.c_allocator.create(Handle) catch {
         return c.VIVI_BACKEND_FAILED;
@@ -88,7 +100,10 @@ export fn vivi_backend_open(
         std.heap.c_allocator,
         self.io_threaded.io(),
         .{ .context = self, .notify = Handle.notify },
-        .{ .working_directory = working_directory },
+        .{
+            .working_directory = working_directory,
+            .copilot_cli_launch = launch,
+        },
     ) catch {
         self.io_threaded.deinit();
         std.heap.c_allocator.destroy(self);
@@ -231,4 +246,9 @@ export fn vivi_backend_destroy(
 ) callconv(.c) void {
     const self = handle(conversation) orelse return;
     self.deinit();
+}
+
+test "C launch policy rejects unknown values" {
+    const invalid: c.vivi_backend_copilot_cli_launch_t = @enumFromInt(99);
+    try std.testing.expect(copilotCliLaunch(invalid) == null);
 }

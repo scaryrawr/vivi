@@ -80,6 +80,8 @@ pub fn build(b: *std.Build) void {
         .linkage = backend_linkage,
         .use_llvm = use_llvm,
     });
+    library.bundle_compiler_rt = true;
+    library.bundle_ubsan_rt = true;
     library.installHeader(
         b.path("backend/include/vivi_backend.h"),
         "vivi_backend.h",

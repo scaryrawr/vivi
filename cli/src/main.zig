@@ -120,10 +120,36 @@ fn currentDirectory(init: std.process.Init) ![]u8 {
     return init.gpa.dupe(u8, buffer[0..length]);
 }
 
+const NativeChatTarget = union(enum) {
+    app_path: []const u8,
+    bundle_identifier: []const u8,
+};
+
 fn launchNativeChat(init: std.process.Init, workspace: []const u8) !void {
     if (@import("builtin").os.tag != .macos) {
         return error.NativeChatUnsupported;
     }
+    const executable_directory = try std.process.executableDirPathAlloc(
+        init.io,
+        init.gpa,
+    );
+    defer init.gpa.free(executable_directory);
+    const development_app_path = try std.fs.path.join(
+        init.gpa,
+        &.{ executable_directory, "..", "xcode", "Debug", "Vivi.app" },
+    );
+    defer init.gpa.free(development_app_path);
+    const override = init.environ_map.get("VIVI_APP_PATH");
+    if (override) |path| {
+        if (!nativeAppPathIsUsable(init, path)) {
+            return error.NativeChatLaunchFailed;
+        }
+    }
+    const development_app = if (nativeAppPathIsUsable(
+        init,
+        development_app_path,
+    )) development_app_path else null;
+    const target = nativeChatTarget(override, development_app);
     const escaped = try percentEncode(init.gpa, workspace);
     defer init.gpa.free(escaped);
     const url = try std.fmt.allocPrint(
@@ -132,8 +158,9 @@ fn launchNativeChat(init: std.process.Init, workspace: []const u8) !void {
         .{escaped},
     );
     defer init.gpa.free(url);
+    const args = nativeChatLaunchArgs(target, url);
     var child = try std.process.spawn(init.io, .{
-        .argv = &.{ "open", "-b", "com.scaryrawr.vivi", url },
+        .argv = &args,
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .inherit,
@@ -143,6 +170,40 @@ fn launchNativeChat(init: std.process.Init, workspace: []const u8) !void {
         .exited => |code| if (code != 0) return error.NativeChatLaunchFailed,
         else => return error.NativeChatLaunchFailed,
     }
+}
+
+fn nativeChatTarget(
+    override: ?[]const u8,
+    development_app: ?[]const u8,
+) NativeChatTarget {
+    if (override) |path| return .{ .app_path = path };
+    if (development_app) |path| return .{ .app_path = path };
+    return .{ .bundle_identifier = "com.scaryrawr.vivi" };
+}
+
+fn nativeAppPathIsUsable(init: std.process.Init, path: []const u8) bool {
+    if (!std.fs.path.isAbsolute(path)) return false;
+    const executable = std.fs.path.join(
+        init.gpa,
+        &.{ path, "Contents", "MacOS", "Vivi" },
+    ) catch return false;
+    defer init.gpa.free(executable);
+    std.Io.Dir.accessAbsolute(
+        init.io,
+        executable,
+        .{ .execute = true },
+    ) catch return false;
+    return true;
+}
+
+fn nativeChatLaunchArgs(
+    target: NativeChatTarget,
+    url: []const u8,
+) [4][]const u8 {
+    return switch (target) {
+        .app_path => |path| .{ "open", "-a", path, url },
+        .bundle_identifier => |identifier| .{ "open", "-b", identifier, url },
+    };
 }
 
 fn percentEncode(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
@@ -321,6 +382,57 @@ test "native chat URL percent-encodes literal workspace bytes" {
         "/tmp/Vivi%20chat/%E6%97%A5%E6%9C%AC%E8%AA%9E",
         value,
     );
+}
+
+test "native chat target prefers an explicit app over the development app" {
+    const target = nativeChatTarget(
+        "/Applications/Override.app",
+        "/repo/zig-out/xcode/Debug/Vivi.app",
+    );
+    try std.testing.expectEqualStrings(
+        "/Applications/Override.app",
+        target.app_path,
+    );
+}
+
+test "native chat target uses the development app before the installed bundle" {
+    const development = nativeChatTarget(
+        null,
+        "/repo/zig-out/xcode/Debug/Vivi.app",
+    );
+    try std.testing.expectEqualStrings(
+        "/repo/zig-out/xcode/Debug/Vivi.app",
+        development.app_path,
+    );
+    const installed = nativeChatTarget(null, null);
+    try std.testing.expectEqualStrings(
+        "com.scaryrawr.vivi",
+        installed.bundle_identifier,
+    );
+}
+
+test "native chat constructs app and bundle launch arguments" {
+    const app = nativeChatLaunchArgs(
+        .{ .app_path = "/repo/zig-out/xcode/Debug/Vivi.app" },
+        "vivi://chat?workspace=/tmp/Vivi",
+    );
+    try std.testing.expectEqualStrings("open", app[0]);
+    try std.testing.expectEqualStrings("-a", app[1]);
+    try std.testing.expectEqualStrings(
+        "/repo/zig-out/xcode/Debug/Vivi.app",
+        app[2],
+    );
+    try std.testing.expectEqualStrings(
+        "vivi://chat?workspace=/tmp/Vivi",
+        app[3],
+    );
+
+    const bundle = nativeChatLaunchArgs(
+        .{ .bundle_identifier = "com.scaryrawr.vivi" },
+        "vivi://chat?workspace=/tmp/Vivi",
+    );
+    try std.testing.expectEqualStrings("-b", bundle[1]);
+    try std.testing.expectEqualStrings("com.scaryrawr.vivi", bundle[2]);
 }
 
 test "settings path uses the supplied home directory" {

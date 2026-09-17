@@ -199,6 +199,7 @@ final class ViviConversationDriver: ViviConversationDriving, @unchecked Sendable
       var options = vivi_backend_conversation_options_t(
         working_directory: nil,
         working_directory_length: UInt32(bytes.count),
+        copilot_cli_launch: VIVI_BACKEND_COPILOT_CLI_SEARCH_PROCESS_PATH,
         wake: Self.wake,
         wake_context: Unmanaged.passUnretained(self).toOpaque()
       )
