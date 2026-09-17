@@ -5,6 +5,26 @@ import XCTest
 
 @MainActor
 final class ViviBackendRuntimeTests: XCTestCase {
+  func testDockReopenUsesManagedChatWindowsRegardlessOfAppKitVisibility() {
+    let windows = FakeChatWindowManager()
+    let delegate = ViviAppDelegate(windows: windows)
+
+    let shouldAlsoUseDefaultReopen = delegate.applicationShouldHandleReopen(
+      NSApplication.shared,
+      hasVisibleWindows: true)
+
+    XCTAssertFalse(shouldAlsoUseDefaultReopen)
+    XCTAssertEqual(windows.reopenCount, 1)
+  }
+
+  func testLaunchingWithoutAChatURLOpensTheMainWindow() {
+    let windows = FakeChatWindowManager()
+    let delegate = ViviAppDelegate(windows: windows)
+
+    XCTAssertTrue(delegate.applicationOpenUntitledFile(NSApplication.shared))
+    XCTAssertEqual(windows.reopenCount, 1)
+  }
+
   func testReducerCreatesAssistantLazilyAfterReasoning() {
     let driver = FakeConversationDriver()
     let store = NativeChatStore(workspace: "/tmp/Vivi chat", driver: driver)
@@ -29,6 +49,22 @@ final class ViviBackendRuntimeTests: XCTestCase {
         .reasoning(id: store.transcript[2].id, text: "finished thought"),
         .assistant(id: store.transcript[3].id, text: "new answer"),
       ])
+  }
+
+  @MainActor
+  private final class FakeChatWindowManager: ChatWindowManaging {
+    var isEmpty = true
+    var reopenCount = 0
+
+    func open(request: NativeChatRequest) {}
+
+    func reopenLast() {
+      reopenCount += 1
+    }
+
+    func closeAll(completion: @escaping @MainActor () -> Void) {
+      completion()
+    }
   }
 
   func testBusySubmitPreservesDraft() {

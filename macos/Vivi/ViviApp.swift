@@ -15,14 +15,37 @@ struct ViviApp: App {
 
 @MainActor
 final class ViviAppDelegate: NSObject, NSApplicationDelegate {
-  private let windows = ChatWindowRegistry()
+  private let windows: ChatWindowManaging
   private var isTerminating = false
+
+  override init() {
+    self.windows = ChatWindowRegistry()
+    super.init()
+  }
+
+  init(windows: ChatWindowManaging) {
+    self.windows = windows
+    super.init()
+  }
 
   func application(_ application: NSApplication, open urls: [URL]) {
     for url in urls {
       guard let request = nativeChatRequest(from: url) else { continue }
       windows.open(request: request)
     }
+  }
+
+  func applicationOpenUntitledFile(_ sender: NSApplication) -> Bool {
+    windows.reopenLast()
+    return true
+  }
+
+  func applicationShouldHandleReopen(
+    _ sender: NSApplication,
+    hasVisibleWindows _: Bool
+  ) -> Bool {
+    windows.reopenLast()
+    return false
   }
 
   func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -50,14 +73,26 @@ func nativeChatRequest(from url: URL) -> NativeChatRequest? {
 }
 
 @MainActor
+protocol ChatWindowManaging {
+  var isEmpty: Bool { get }
+
+  func open(request: NativeChatRequest)
+  func reopenLast()
+  func closeAll(completion: @escaping @MainActor () -> Void)
+}
+
+@MainActor
 private final class ChatWindowRegistry {
   private var controllers: [UUID: ChatWindowController] = [:]
+  private var lastRequest = NativeChatRequest(
+    workspace: FileManager.default.homeDirectoryForCurrentUser.path)
 
   var isEmpty: Bool {
     controllers.isEmpty
   }
 
   func open(request: NativeChatRequest) {
+    lastRequest = request
     let id = UUID()
     let controller = ChatWindowController(
       id: id,
@@ -68,6 +103,18 @@ private final class ChatWindowRegistry {
     controllers[id] = controller
     controller.showWindow(nil)
     NSApp.activate(ignoringOtherApps: true)
+  }
+
+  func reopenLast() {
+    let reusable = controllers.values.filter { !$0.isClosing }
+    if !reusable.isEmpty {
+      for controller in reusable {
+        controller.showWindow(nil)
+      }
+      NSApp.activate(ignoringOtherApps: true)
+      return
+    }
+    open(request: lastRequest)
   }
 
   func closeAll(completion: @escaping @MainActor () -> Void) {
@@ -90,6 +137,8 @@ private final class ChatWindowRegistry {
   }
 }
 
+extension ChatWindowRegistry: ChatWindowManaging {}
+
 @MainActor
 private final class ChatWindowController: NSWindowController, NSWindowDelegate {
   let id: UUID
@@ -97,6 +146,10 @@ private final class ChatWindowController: NSWindowController, NSWindowDelegate {
   private let onClosed: @MainActor (UUID) -> Void
   private var closeStarted = false
   private var titleObservation: AnyCancellable?
+
+  var isClosing: Bool {
+    closeStarted
+  }
 
   init(
     id: UUID,
