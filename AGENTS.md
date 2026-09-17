@@ -18,6 +18,11 @@ Native hosts share domain semantics through the C ABI, not widgets or view
 models. Do not add speculative sessions, generic JSON bridges, daemons, shared
 UI abstractions, or empty executable targets.
 
+Tool lifecycle events preserve rejected invocations, so canonical tool input
+may be malformed JSON. Native bindings must validate it as bounded UTF-8 text,
+not require successful JSON parsing or close the conversation solely because
+the rejected arguments are malformed.
+
 ## Build, Test, and Development Commands
 
 Use Zig 0.16.x and Xcode 26.6.
