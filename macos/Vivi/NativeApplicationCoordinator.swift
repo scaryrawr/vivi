@@ -212,7 +212,7 @@ final class NativeApplicationCoordinator {
           id: id,
           store: NativeChatStore(
             workspace: path,
-            driver: ViviConversationDriver(workspace: path)))
+            driver: ViviConversationDriver(workspace: path, canvasMode: .disabled)))
       },
       makeWindow: { identity, coordinator, onClosed in
         MainWindowController(

@@ -274,6 +274,7 @@ enum ChatEvent: Equatable {
   case sessionCatalogFailure(String)
   case sessionTrackingFailure(String)
   case sessionResume(SessionResumeResult)
+  case canvas(CanvasEvent)
   case idle
   case failure(String)
   case closed
@@ -314,6 +315,7 @@ final class NativeChatStore: ObservableObject {
   @Published private(set) var sessionCatalogFailure: String?
   @Published private(set) var sessionState: SessionControlState = .ready
   @Published var draft = ""
+  let canvases: NativeCanvasStore
 
   var workspace: String { activePresentation.workspace }
   var sessionTitle: String { activePresentation.sessionTitle }
@@ -331,7 +333,12 @@ final class NativeChatStore: ObservableObject {
   private let driver: ViviConversationDriving
   private var closeCompletions: [@MainActor () -> Void] = []
 
-  init(workspace: String, driver: ViviConversationDriving) {
+  init(
+    workspace: String,
+    driver: ViviConversationDriving,
+    canvasInstanceIDs: CanvasInstanceIDGenerator = CanvasInstanceIDGenerator(),
+    canvasHostDirective: @escaping (CanvasHostDirective) -> Void = { _ in }
+  ) {
     let presentation = ActiveConversationPresentation(
       workspace: workspace,
       sessionTitle: URL(fileURLWithPath: workspace).lastPathComponent,
@@ -339,6 +346,10 @@ final class NativeChatStore: ObservableObject {
       confirmedSelection: nil)
     activePresentation = presentation
     self.driver = driver
+    canvases = NativeCanvasStore(
+      driver: driver as? any CanvasCommandDriving,
+      instanceIDs: canvasInstanceIDs,
+      emitHostDirective: canvasHostDirective)
     let started = driver.start { [weak self] event in
       self?.reduce(event)
     }
@@ -561,6 +572,8 @@ final class NativeChatStore: ObservableObject {
     case .sessionResume(let result):
       apply(result)
       sessionState = .ready
+    case .canvas(let event):
+      canvases.apply(event)
     case .idle:
       activeAssistant = nil
       activeReasoning = nil
@@ -575,6 +588,7 @@ final class NativeChatStore: ObservableObject {
       activeReasoning = nil
       pendingReasoningCompletion = nil
       activeReasoningPrefix = ""
+      canvases.shutdown(reason: .conversationClosed)
       finishClose()
     }
   }
@@ -587,6 +601,7 @@ final class NativeChatStore: ObservableObject {
     }
     guard lifecycle != .closing else { return }
     lifecycle = .closing
+    canvases.shutdown(reason: .conversationClosing)
     driver.close { [self] in
       finishClose()
     }
@@ -659,6 +674,7 @@ final class NativeChatStore: ObservableObject {
           .failure(id: UUID(), text: "The backend resumed an unexpected session."))
         return
       }
+      canvases.resetForSuccessfulResume()
       finishStreamingRows()
       responseHeaderVisible = false
       var snapshot = resumed.transcript.map { item -> ChatItem in
@@ -958,14 +974,28 @@ enum NativeEventDecoder {
     models: [vivi_backend_model_t],
     semanticSpans: [vivi_backend_semantic_span_t] = [],
     sessions: [vivi_backend_session_summary_t] = [],
-    transcriptItems: [vivi_backend_transcript_item_t] = []
+    transcriptItems: [vivi_backend_transcript_item_t] = [],
+    canvasDeclarations: [vivi_backend_canvas_declaration_t] = [],
+    canvasActions: [vivi_backend_canvas_action_t] = [],
+    canvasInstances: [vivi_backend_canvas_instance_t] = []
   ) throws -> ChatEvent {
-    guard event.reserved == 0, event.session_reserved == 0,
-      bytes.count == Int(event.byte_count),
-      models.count == Int(event.model_count),
-      semanticSpans.count == Int(event.semantic_span_count),
-      sessions.count == Int(event.session_count),
-      transcriptItems.count == Int(event.transcript_item_count)
+    guard let byteCount = Int(exactly: event.byte_count),
+      let modelCount = Int(exactly: event.model_count),
+      let semanticSpanCount = Int(exactly: event.semantic_span_count),
+      let sessionCount = Int(exactly: event.session_count),
+      let transcriptItemCount = Int(exactly: event.transcript_item_count),
+      let canvasDeclarationCount = Int(exactly: event.canvas_snapshot.declaration_count),
+      let canvasActionCount = Int(exactly: event.canvas_snapshot.action_count),
+      let canvasInstanceCount = Int(exactly: event.canvas_snapshot.instance_count),
+      event.reserved == 0, event.session_reserved == 0,
+      bytes.count == byteCount,
+      models.count == modelCount,
+      semanticSpans.count == semanticSpanCount,
+      sessions.count == sessionCount,
+      transcriptItems.count == transcriptItemCount,
+      canvasDeclarations.count == canvasDeclarationCount,
+      canvasActions.count == canvasActionCount,
+      canvasInstances.count == canvasInstanceCount
     else { throw NativeEventDecodingError.malformed }
 
     func text(_ span: vivi_backend_span_t) throws -> String {
@@ -1149,6 +1179,15 @@ enum NativeEventDecoder {
 
     guard event.default_saved <= 1, event.cleanup_failed <= 1 else {
       throw NativeEventDecodingError.malformed
+    }
+    if event.kind != VIVI_BACKEND_EVENT_CANVAS_SNAPSHOT
+      && event.kind != VIVI_BACKEND_EVENT_CANVAS_OPERATION
+    {
+      try NativeCanvasEventDecoder.requireAbsent(
+        event,
+        declarations: canvasDeclarations,
+        actions: canvasActions,
+        instances: canvasInstances)
     }
     let isSessionPayload =
       event.kind == VIVI_BACKEND_EVENT_SESSION_CATALOG
@@ -1372,6 +1411,21 @@ enum NativeEventDecoder {
       default:
         throw NativeEventDecodingError.malformed
       }
+    case VIVI_BACKEND_EVENT_CANVAS_SNAPSHOT:
+      return .canvas(
+        .snapshot(
+          try NativeCanvasEventDecoder.decodeSnapshot(
+            event,
+            bytes: bytes,
+            declarations: canvasDeclarations,
+            actions: canvasActions,
+            instances: canvasInstances)))
+    case VIVI_BACKEND_EVENT_CANVAS_OPERATION:
+      return .canvas(
+        .completion(
+          try NativeCanvasEventDecoder.decodeCompletion(
+            event,
+            bytes: bytes)))
     case VIVI_BACKEND_EVENT_IDLE: return .idle
     case VIVI_BACKEND_EVENT_FAILURE: return .failure(try content())
     case VIVI_BACKEND_EVENT_CLOSED: return .closed
@@ -1533,12 +1587,14 @@ func nativeCopilotExecutablePath(
 
 final class ViviConversationDriver: ViviConversationDriving, @unchecked Sendable {
   private let workspace: String
+  private let canvasMode: NativeCanvasMode
   private let queue = DispatchQueue(label: "com.scaryrawr.vivi.conversation")
   private var handle: OpaquePointer?
   private var receive: (@MainActor (ChatEvent) -> Void)?
 
-  init(workspace: String) {
+  init(workspace: String, canvasMode: NativeCanvasMode = .disabled) {
     self.workspace = workspace
+    self.canvasMode = canvasMode
   }
 
   func start(
@@ -1574,7 +1630,8 @@ final class ViviConversationDriver: ViviConversationDriving, @unchecked Sendable
         copilot_cli_launch: VIVI_BACKEND_COPILOT_CLI_EXPLICIT_PATH,
         wake: Self.wake,
         wake_context: Unmanaged.passUnretained(self).toOpaque(),
-        canvas_mode: VIVI_BACKEND_CANVAS_DISABLED,
+        canvas_mode: canvasMode == .enabled
+          ? VIVI_BACKEND_CANVAS_ENABLED : VIVI_BACKEND_CANVAS_DISABLED,
         canvas_options_reserved: 0
       )
       let result = bytes.withUnsafeBufferPointer { buffer in
@@ -1699,42 +1756,99 @@ final class ViviConversationDriver: ViviConversationDriving, @unchecked Sendable
         failDrain(handle, events: &events, message: "Could not read a backend event.")
         return
       }
-      var bytes = Array(repeating: UInt8(0), count: Int(event.byte_count))
-      var models = Array(repeating: vivi_backend_model_t(), count: Int(event.model_count))
+      guard
+        let byteCount = Self.checkedCount(
+          event.byte_count, maximum: 16 * 1_024 * 1_024, stride: 1),
+        let modelCount = Self.checkedCount(
+          event.model_count,
+          maximum: 4_096,
+          stride: MemoryLayout<vivi_backend_model_t>.stride),
+        let semanticSpanCount = Self.checkedCount(
+          event.semantic_span_count,
+          maximum: 1_048_576,
+          stride: MemoryLayout<vivi_backend_semantic_span_t>.stride),
+        let sessionCount = Self.checkedCount(
+          event.session_count,
+          maximum: 100_000,
+          stride: MemoryLayout<vivi_backend_session_summary_t>.stride),
+        let transcriptItemCount = Self.checkedCount(
+          event.transcript_item_count,
+          maximum: 1_048_576,
+          stride: MemoryLayout<vivi_backend_transcript_item_t>.stride),
+        let canvasDeclarationCount = Self.checkedCount(
+          event.canvas_snapshot.declaration_count,
+          maximum: 128,
+          stride: MemoryLayout<vivi_backend_canvas_declaration_t>.stride),
+        let canvasActionCount = Self.checkedCount(
+          event.canvas_snapshot.action_count,
+          maximum: 4_096,
+          stride: MemoryLayout<vivi_backend_canvas_action_t>.stride),
+        let canvasInstanceCount = Self.checkedCount(
+          event.canvas_snapshot.instance_count,
+          maximum: 64,
+          stride: MemoryLayout<vivi_backend_canvas_instance_t>.stride)
+      else {
+        failDrain(handle, events: &events, message: "The backend returned a malformed event.")
+        return
+      }
+      let expectedCounts = [
+        event.byte_count, event.model_count, event.semantic_span_count,
+        event.session_count, event.transcript_item_count,
+        event.canvas_snapshot.declaration_count,
+        event.canvas_snapshot.action_count,
+        event.canvas_snapshot.instance_count,
+      ]
+      var bytes = Array(repeating: UInt8(0), count: byteCount)
+      var models = Array(repeating: vivi_backend_model_t(), count: modelCount)
       var semanticSpans = Array(
         repeating: vivi_backend_semantic_span_t(),
-        count: Int(event.semantic_span_count))
+        count: semanticSpanCount)
       var sessions = Array(
         repeating: vivi_backend_session_summary_t(),
-        count: Int(event.session_count))
+        count: sessionCount)
       var transcriptItems = Array(
         repeating: vivi_backend_transcript_item_t(),
-        count: Int(event.transcript_item_count))
+        count: transcriptItemCount)
+      var canvasDeclarations = Array(
+        repeating: vivi_backend_canvas_declaration_t(),
+        count: canvasDeclarationCount)
+      var canvasActions = Array(
+        repeating: vivi_backend_canvas_action_t(),
+        count: canvasActionCount)
+      var canvasInstances = Array(
+        repeating: vivi_backend_canvas_instance_t(),
+        count: canvasInstanceCount)
       if result == VIVI_BACKEND_BUFFER_TOO_SMALL {
         let copied = bytes.withUnsafeMutableBufferPointer { byteBuffer in
           models.withUnsafeMutableBufferPointer { modelBuffer in
             semanticSpans.withUnsafeMutableBufferPointer { spanBuffer in
               sessions.withUnsafeMutableBufferPointer { sessionBuffer in
                 transcriptItems.withUnsafeMutableBufferPointer { transcriptBuffer in
-                  vivi_backend_next_event(
-                    handle,
-                    &event,
-                    byteBuffer.baseAddress,
-                    UInt32(byteBuffer.count),
-                    modelBuffer.baseAddress,
-                    UInt32(modelBuffer.count),
-                    spanBuffer.baseAddress,
-                    UInt32(spanBuffer.count),
-                    sessionBuffer.baseAddress,
-                    UInt32(sessionBuffer.count),
-                    transcriptBuffer.baseAddress,
-                    UInt32(transcriptBuffer.count),
-                    nil,
-                    0,
-                    nil,
-                    0,
-                    nil,
-                    0)
+                  canvasDeclarations.withUnsafeMutableBufferPointer { declarationBuffer in
+                    canvasActions.withUnsafeMutableBufferPointer { actionBuffer in
+                      canvasInstances.withUnsafeMutableBufferPointer { instanceBuffer in
+                        vivi_backend_next_event(
+                          handle,
+                          &event,
+                          byteBuffer.baseAddress,
+                          UInt32(byteBuffer.count),
+                          modelBuffer.baseAddress,
+                          UInt32(modelBuffer.count),
+                          spanBuffer.baseAddress,
+                          UInt32(spanBuffer.count),
+                          sessionBuffer.baseAddress,
+                          UInt32(sessionBuffer.count),
+                          transcriptBuffer.baseAddress,
+                          UInt32(transcriptBuffer.count),
+                          declarationBuffer.baseAddress,
+                          UInt32(declarationBuffer.count),
+                          actionBuffer.baseAddress,
+                          UInt32(actionBuffer.count),
+                          instanceBuffer.baseAddress,
+                          UInt32(instanceBuffer.count))
+                      }
+                    }
+                  }
                 }
               }
             }
@@ -1742,6 +1856,19 @@ final class ViviConversationDriver: ViviConversationDriving, @unchecked Sendable
         }
         guard copied == VIVI_BACKEND_OK else {
           failDrain(handle, events: &events, message: "Could not copy a backend event.")
+          return
+        }
+        guard
+          expectedCounts
+            == [
+              event.byte_count, event.model_count, event.semantic_span_count,
+              event.session_count, event.transcript_item_count,
+              event.canvas_snapshot.declaration_count,
+              event.canvas_snapshot.action_count,
+              event.canvas_snapshot.instance_count,
+            ]
+        else {
+          failDrain(handle, events: &events, message: "The backend returned a malformed event.")
           return
         }
       }
@@ -1752,7 +1879,10 @@ final class ViviConversationDriver: ViviConversationDriving, @unchecked Sendable
           models: models,
           semanticSpans: semanticSpans,
           sessions: sessions,
-          transcriptItems: transcriptItems)
+          transcriptItems: transcriptItems,
+          canvasDeclarations: canvasDeclarations,
+          canvasActions: canvasActions,
+          canvasInstances: canvasInstances)
         events.append(decoded)
         if decoded == .closed {
           destroyLocked(handle, requestClose: false)
@@ -1807,5 +1937,136 @@ final class ViviConversationDriver: ViviConversationDriving, @unchecked Sendable
     case VIVI_BACKEND_CLOSED: .closed
     default: .failed
     }
+  }
+
+  private static func checkedCount(
+    _ value: UInt32,
+    maximum: Int,
+    stride: Int
+  ) -> Int? {
+    guard stride > 0, let count = Int(exactly: value), count <= maximum,
+      count <= Int.max / stride
+    else { return nil }
+    return count
+  }
+}
+
+extension ViviConversationDriver: CanvasCommandDriving {
+  func openCanvas(
+    key: CanvasInstanceKey,
+    input: CanvasOpenInput?
+  ) -> CanvasCommandTransportResult {
+    performCanvas(.open(key: key, input: input))
+  }
+
+  func openCanvasSameKey(
+    key: CanvasInstanceKey,
+    input: CanvasOpenInput?
+  ) -> CanvasCommandTransportResult {
+    performCanvas(.open(key: key, input: input))
+  }
+
+  func closeCanvas(key: CanvasInstanceKey) -> CanvasCommandTransportResult {
+    performCanvas(.close(key: key))
+  }
+
+  func invokeCanvasAction(
+    name: CanvasActionName,
+    on lease: CanvasRenderLease,
+    input: CanvasActionInput?
+  ) -> CanvasCommandTransportResult {
+    performCanvas(
+      .action(
+        key: lease.key,
+        generation: lease.generation,
+        name: name,
+        input: input))
+  }
+
+  private func performCanvas(_ command: CanvasCommand) -> CanvasCommandTransportResult {
+    guard let encoding = try? NativeCanvasCommandEncoder.encode(command) else {
+      return .failed
+    }
+    var operation = encoding.operation
+    let bytes = encoding.bytes
+    return queue.sync {
+      guard let handle else { return .closed }
+      var operationID: UInt64 = 0
+      let result = bytes.withUnsafeBufferPointer {
+        vivi_backend_perform_canvas(
+          handle,
+          &operation,
+          $0.baseAddress,
+          UInt32(bytes.count),
+          &operationID)
+      }
+      guard result == VIVI_BACKEND_OK else {
+        guard operationID == 0 else { return .failed }
+        switch result {
+        case VIVI_BACKEND_BUSY: return .busy
+        case VIVI_BACKEND_STOPPING: return .stopping
+        case VIVI_BACKEND_CLOSED: return .closed
+        default: return .failed
+        }
+      }
+
+      guard let id = CanvasOperationID(operationID) else { return .failed }
+      return .accepted(id)
+    }
+  }
+}
+
+struct NativeCanvasCommandEncoding {
+  var operation: vivi_backend_canvas_operation_t
+  let bytes: [UInt8]
+}
+
+enum NativeCanvasCommandEncoder {
+  static func encode(_ command: CanvasCommand) throws -> NativeCanvasCommandEncoding {
+    var bytes: [UInt8] = []
+    func append(_ value: String) throws -> vivi_backend_span_t {
+      let encoded = Array(value.utf8)
+      guard let offset = UInt32(exactly: bytes.count),
+        let length = UInt32(exactly: encoded.count)
+      else { throw NativeEventDecodingError.malformed }
+      bytes.append(contentsOf: encoded)
+      return vivi_backend_span_t(offset: offset, length: length)
+    }
+    func appendJSON<Role>(_ value: CanvasJSON<Role>?) throws -> vivi_backend_span_t {
+      guard let value else { return vivi_backend_span_t() }
+      guard let offset = UInt32(exactly: bytes.count),
+        let length = UInt32(exactly: value.data.count)
+      else { throw NativeEventDecodingError.malformed }
+      bytes.append(contentsOf: value.data)
+      return vivi_backend_span_t(offset: offset, length: length)
+    }
+
+    let key: CanvasInstanceKey
+    switch command {
+    case .open(let value, _), .close(let value), .action(let value, _, _, _):
+      key = value
+    }
+    var operation = vivi_backend_canvas_operation_t()
+    operation.abi_version = UInt32(VIVI_BACKEND_ABI_VERSION)
+    operation.struct_size = UInt32(MemoryLayout<vivi_backend_canvas_operation_t>.size)
+    operation.key = try vivi_backend_canvas_key_t(
+      extension_id: append(key.declarationID.extensionID),
+      canvas_id: append(key.declarationID.canvasID),
+      instance_id: append(key.instanceID.encodedValue))
+    switch command {
+    case .open(_, let input):
+      operation.kind = VIVI_BACKEND_CANVAS_OPERATION_OPEN
+      operation.open_input_json = try appendJSON(input)
+    case .close:
+      operation.kind = VIVI_BACKEND_CANVAS_OPERATION_CLOSE
+    case .action(_, _, let name, let input):
+      operation.kind = VIVI_BACKEND_CANVAS_OPERATION_INVOKE_ACTION
+      operation.action_name = try append(name.rawValue)
+      operation.action_input_json = try appendJSON(input)
+    }
+    guard UInt32(exactly: bytes.count) != nil else {
+      throw NativeEventDecodingError.malformed
+    }
+    return NativeCanvasCommandEncoding(operation: operation, bytes: bytes)
   }
 }

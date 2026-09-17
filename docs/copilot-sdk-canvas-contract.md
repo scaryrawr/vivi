@@ -149,6 +149,32 @@ caller-authored generation preconditions, browser behavior, or rendering.
 PR 5 remains the gate for native or CLI opt-in, decoding, and user-visible
 canvas behavior.
 
+## PR 5 macOS ownership decision
+
+The macOS host decodes ABI v9 canvas events but keeps production canvas mode
+disabled. `ViviConversationDriver` remains the sole C boundary and performs
+one exact-capacity retry containing the byte, model, semantic-span, session,
+transcript, canvas-declaration, canvas-action, and canvas-instance buffers.
+Canvas events are accepted only after all counts, spans, UTF-8, role JSON,
+enums, flags, reserved fields, optional-field combinations, ordering,
+non-overlap, and duplicate constraints validate transactionally. A malformed
+event follows the existing conversation failure-plus-close path.
+
+Each `NativeChatStore` owns one `NativeCanvasStore`. It applies full snapshots,
+retains declaration metadata for snapshot-present instances when discovery
+disappears, correlates completions by the exact operation ID, and binds action
+requests to the currently opened renderer generation. Conversation close and
+successful session resume emit explicit host teardown before clearing canvas
+work. App/window coordination does not own canvas state, so selection,
+red-close, Dock reopen, and application resume preserve the existing
+per-conversation ownership rules.
+
+No renderer is introduced. PR 6 must separately pass a secure `WKWebView`
+review before canvas mode can be enabled: nonpersistent storage, denied
+ambient navigation and network access, no arbitrary file access, an
+allowlisted schema-validated message bridge, generation-checked callbacks,
+and complete handler/task/view teardown are required.
+
 ## Synthesis decision
 
 The probe uses one standalone semantic test module. It combines fixture-backed

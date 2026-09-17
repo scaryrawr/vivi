@@ -77,6 +77,26 @@ while retaining the event for an identical retry. Current native call sites
 select `VIVI_BACKEND_CANVAS_DISABLED` and perform no canvas decoding or
 rendering. PR 5 remains the gate for host opt-in and user-visible behavior.
 
+The macOS PR 5 integration keeps `ViviConversationDriver` as the sole C
+boundary. It copies every event buffer in one exact-capacity transaction,
+strictly decodes canvas values into owned Swift types, and routes them to one
+`NativeCanvasStore` owned by each `NativeChatStore`. That store owns registry
+and instance reconciliation, operation-ID correlation, generation-bound
+actions, retained declaration metadata, and explicit renderer teardown.
+Window selection and red-close do not affect it; successful session resume
+tears down and resets it before accepting the resumed conversation's
+snapshots. Application termination tears it down before closing the backend.
+The production driver continues to select `VIVI_BACKEND_CANVAS_DISABLED`.
+
+PR 6 is the earliest point at which macOS may add a canvas renderer. Its
+security gate requires a separately reviewed `WKWebView` design with a
+nonpersistent data store, no ambient network access, a deny-by-default
+navigation policy, no arbitrary host-file access, an allowlisted and
+schema-validated script-message bridge, generation checks on every callback,
+and deterministic teardown of content worlds, handlers, tasks, and web views.
+PR 5 intentionally adds no SwiftUI canvas surface, WebView, URL loading, or
+network behavior.
+
 Native applications are intentionally asymmetric:
 
 | Host | Native UX and build ownership | Core artifact |

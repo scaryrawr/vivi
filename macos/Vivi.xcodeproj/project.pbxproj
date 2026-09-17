@@ -17,6 +17,9 @@
 		A20000000000000000000008 /* NativeApplicationCoordinatorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3000000000000000000000B /* NativeApplicationCoordinatorTests.swift */; };
 		A20000000000000000000009 /* MainWindowControllerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3000000000000000000000C /* MainWindowControllerTests.swift */; };
 		A2000000000000000000000A /* WorkspaceChooser.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3000000000000000000000D /* WorkspaceChooser.swift */; };
+		A2000000000000000000000B /* NativeCanvasStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3000000000000000000000E /* NativeCanvasStore.swift */; };
+		A2000000000000000000000C /* NativeCanvasTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3000000000000000000000F /* NativeCanvasTests.swift */; };
+		A2000000000000000000000D /* NativeCanvasDecoding.swift in Sources */ = {isa = PBXBuildFile; fileRef = A30000000000000000000010 /* NativeCanvasDecoding.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -50,6 +53,9 @@
 		A3000000000000000000000B /* NativeApplicationCoordinatorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeApplicationCoordinatorTests.swift; sourceTree = "<group>"; };
 		A3000000000000000000000C /* MainWindowControllerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MainWindowControllerTests.swift; sourceTree = "<group>"; };
 		A3000000000000000000000D /* WorkspaceChooser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceChooser.swift; sourceTree = "<group>"; };
+		A3000000000000000000000E /* NativeCanvasStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeCanvasStore.swift; sourceTree = "<group>"; };
+		A3000000000000000000000F /* NativeCanvasTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeCanvasTests.swift; sourceTree = "<group>"; };
+		A30000000000000000000010 /* NativeCanvasDecoding.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeCanvasDecoding.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -89,6 +95,8 @@
 				A30000000000000000000009 /* MainWindowController.swift */,
 				A3000000000000000000000A /* MainWindowView.swift */,
 				A30000000000000000000002 /* ContentView.swift */,
+				A3000000000000000000000E /* NativeCanvasStore.swift */,
+				A30000000000000000000010 /* NativeCanvasDecoding.swift */,
 				A30000000000000000000003 /* ViviBackendRuntime.swift */,
 			);
 			path = Vivi;
@@ -100,6 +108,7 @@
 				A30000000000000000000004 /* ViviBackendRuntimeTests.swift */,
 				A3000000000000000000000B /* NativeApplicationCoordinatorTests.swift */,
 				A3000000000000000000000C /* MainWindowControllerTests.swift */,
+				A3000000000000000000000F /* NativeCanvasTests.swift */,
 			);
 			path = ViviTests;
 			sourceTree = "<group>";
@@ -251,6 +260,8 @@
 				A20000000000000000000007 /* MainWindowView.swift in Sources */,
 				A20000000000000000000002 /* ContentView.swift in Sources */,
 				A20000000000000000000003 /* ViviBackendRuntime.swift in Sources */,
+				A2000000000000000000000B /* NativeCanvasStore.swift in Sources */,
+				A2000000000000000000000D /* NativeCanvasDecoding.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -261,6 +272,7 @@
 				A20000000000000000000004 /* ViviBackendRuntimeTests.swift in Sources */,
 				A20000000000000000000008 /* NativeApplicationCoordinatorTests.swift in Sources */,
 				A20000000000000000000009 /* MainWindowControllerTests.swift in Sources */,
+				A2000000000000000000000C /* NativeCanvasTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
