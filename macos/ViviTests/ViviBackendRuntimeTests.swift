@@ -13,7 +13,7 @@ final class ViviBackendRuntimeTests: XCTestCase {
     store.draft = "Write a haiku"
     store.submit()
     store.reduce(.assistantStarted)
-    XCTAssertEqual(store.transcript.count, 1)
+    XCTAssertEqual(store.transcript.count, 2)
     store.reduce(.reasoningComplete("finished thought"))
     store.reduce(.assistantDelta("old "))
     store.reduce(.assistantComplete("new answer"))
@@ -24,8 +24,9 @@ final class ViviBackendRuntimeTests: XCTestCase {
       store.transcript,
       [
         .user(id: store.transcript[0].id, text: "Write a haiku"),
-        .reasoning(id: store.transcript[1].id, text: "finished thought"),
-        .assistant(id: store.transcript[2].id, text: "new answer"),
+        .assistantHeader(id: store.transcript[1].id),
+        .reasoning(id: store.transcript[2].id, text: "finished thought"),
+        .assistant(id: store.transcript[3].id, text: "new answer"),
       ])
   }
 
@@ -74,7 +75,10 @@ final class ViviBackendRuntimeTests: XCTestCase {
 
     XCTAssertEqual(
       store.transcript,
-      [.reasoning(id: store.transcript[0].id, text: "first\n\nsecond")])
+      [
+        .assistantHeader(id: store.transcript[0].id),
+        .reasoning(id: store.transcript[1].id, text: "first\n\nsecond"),
+      ])
   }
 
   func testConsecutiveReasoningDeltaBlocksKeepParagraphBreak() {
@@ -88,7 +92,10 @@ final class ViviBackendRuntimeTests: XCTestCase {
 
     XCTAssertEqual(
       store.transcript,
-      [.reasoning(id: store.transcript[0].id, text: "first\n\nsecond")])
+      [
+        .assistantHeader(id: store.transcript[0].id),
+        .reasoning(id: store.transcript[1].id, text: "first\n\nsecond"),
+      ])
   }
 
   func testToolBetweenReasoningBlocksPreservesChronology() {
@@ -107,12 +114,13 @@ final class ViviBackendRuntimeTests: XCTestCase {
     store.reduce(.reasoningComplete("after"))
     store.reduce(.assistantComplete("answer"))
 
-    XCTAssertEqual(store.transcript.count, 4)
-    guard case .reasoning(_, "before") = store.transcript[0],
-      case .tool(_, let inserted) = store.transcript[1],
-      case .reasoning(_, "after") = store.transcript[2],
-      case .assistant(_, "answer") = store.transcript[3]
-    else { return XCTFail("Expected reasoning, tool, reasoning, assistant order") }
+    XCTAssertEqual(store.transcript.count, 5)
+    guard case .assistantHeader = store.transcript[0],
+      case .reasoning(_, "before") = store.transcript[1],
+      case .tool(_, let inserted) = store.transcript[2],
+      case .reasoning(_, "after") = store.transcript[3],
+      case .assistant(_, "answer") = store.transcript[4]
+    else { return XCTFail("Expected header, reasoning, tool, reasoning, assistant order") }
     XCTAssertEqual(inserted, tool)
   }
 
@@ -133,10 +141,11 @@ final class ViviBackendRuntimeTests: XCTestCase {
     store.reduce(.assistantDelta("done"))
     store.reduce(.assistantComplete("done"))
 
-    XCTAssertEqual(store.transcript.count, 2)
-    guard case .tool(_, let finished) = store.transcript[0],
-      case .assistant(_, "done") = store.transcript[1]
-    else { return XCTFail("Expected tool followed by assistant without an empty row") }
+    XCTAssertEqual(store.transcript.count, 3)
+    guard case .assistantHeader = store.transcript[0],
+      case .tool(_, let finished) = store.transcript[1],
+      case .assistant(_, "done") = store.transcript[2]
+    else { return XCTFail("Expected header and tool followed by assistant without an empty row") }
     XCTAssertEqual(finished.output, "contents")
     XCTAssertEqual(finished.result, .succeeded)
   }
@@ -149,10 +158,11 @@ final class ViviBackendRuntimeTests: XCTestCase {
     store.reduce(.reasoningComplete("thinking"))
     store.reduce(.assistantComplete("answer"))
 
-    XCTAssertEqual(store.transcript.count, 2)
-    guard case .reasoning(_, "thinking") = store.transcript[0],
-      case .assistant(_, "answer") = store.transcript[1]
-    else { return XCTFail("Expected reasoning before the first nonempty assistant content") }
+    XCTAssertEqual(store.transcript.count, 3)
+    guard case .assistantHeader = store.transcript[0],
+      case .reasoning(_, "thinking") = store.transcript[1],
+      case .assistant(_, "answer") = store.transcript[2]
+    else { return XCTFail("Expected header and reasoning before the assistant content") }
   }
 
   func testToolFinishUpdatesOriginalRowByCallID() {

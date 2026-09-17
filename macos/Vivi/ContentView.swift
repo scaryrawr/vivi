@@ -166,14 +166,13 @@ private struct ChatItemView: View {
           .padding(.vertical, 8)
           .background(.tint.opacity(0.14), in: RoundedRectangle(cornerRadius: 12))
       }
+    case .assistantHeader:
+      Text("Vivi")
+        .font(.caption.weight(.semibold))
+        .foregroundStyle(.secondary)
+        .frame(maxWidth: .infinity, alignment: .leading)
     case .assistant(_, let text):
-      VStack(alignment: .leading, spacing: 4) {
-        Text("Vivi")
-          .font(.caption.weight(.semibold))
-          .foregroundStyle(.secondary)
-        MarkdownContentView(source: text)
-      }
-      .frame(maxWidth: .infinity, alignment: .leading)
+      MarkdownContentView(source: text)
     case .reasoning(_, let text):
       DisclosureGroup("Reasoning") {
         MarkdownContentView(source: text)

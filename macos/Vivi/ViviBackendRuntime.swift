@@ -113,6 +113,7 @@ struct ToolActivity: Equatable {
 
 enum ChatItem: Identifiable, Equatable {
   case user(id: UUID, text: String)
+  case assistantHeader(id: UUID)
   case assistant(id: UUID, text: String)
   case reasoning(id: UUID, text: String)
   case tool(id: UUID, activity: ToolActivity)
@@ -121,6 +122,8 @@ enum ChatItem: Identifiable, Equatable {
 
   var id: UUID {
     switch self {
+    case .assistantHeader(let id):
+      id
     case .user(let id, _), .assistant(let id, _), .reasoning(let id, _),
       .tool(let id, _), .status(let id, _), .failure(let id, _):
       id
@@ -129,6 +132,8 @@ enum ChatItem: Identifiable, Equatable {
 
   var text: String {
     switch self {
+    case .assistantHeader:
+      ""
     case .user(_, let text), .assistant(_, let text), .reasoning(_, let text),
       .status(_, let text), .failure(_, let text):
       text
@@ -310,6 +315,7 @@ final class NativeChatStore: ObservableObject {
       activeAssistant = nil
       activeReasoning = nil
       activeReasoningPrefix = ""
+      transcript.append(.assistantHeader(id: UUID()))
       lifecycle = .responding
     case .reasoningDelta(let text):
       updateReasoning(text, append: true)
