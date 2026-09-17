@@ -40,6 +40,11 @@ xcodebuild -project macos/Vivi.xcodeproj -scheme Vivi \
 ./scripts/check.sh                 # full format, Zig, CLI, and Xcode checks
 ```
 
+Concurrent worktrees build macOS apps with the same bundle identifier. Before
+live Dock or URL-handler verification, confirm the running `Vivi` executable
+comes from the current worktree; otherwise macOS can route activation to
+another agent's build.
+
 ## Coding Style & Naming Conventions
 
 Run `zig fmt build.zig backend cli` for Zig. Run `xcrun swift-format format --in-place --recursive macos/Vivi macos/ViviTests` for Swift. Preserve lowercase `vivi` for the CLI and capitalized `Vivi` for app/product names.
