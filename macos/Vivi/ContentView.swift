@@ -112,19 +112,16 @@ struct ContentView: View {
       Divider()
       Button("Refresh Models", systemImage: "arrow.clockwise", action: store.refreshModels)
     } label: {
-      HStack(spacing: 5) {
-        Text(modelLabel)
-          .lineLimit(1)
-        Image(systemName: "chevron.down")
-          .font(.caption2.weight(.semibold))
-      }
-      .font(.callout)
-      .foregroundStyle(.secondary)
-      .padding(.horizontal, 8)
-      .frame(height: 28)
-      .contentShape(Rectangle())
+      Text(modelLabel)
+        .lineLimit(1)
+        .font(.callout)
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 8)
+        .frame(height: 28)
+        .contentShape(Rectangle())
     }
     .menuStyle(.borderlessButton)
+    .menuIndicator(.hidden)
     .fixedSize()
     .help(selectedModel?.detail ?? "Choose a model and reasoning level")
     .disabled(store.modelState != .ready || store.catalog == nil || store.isBusy)
