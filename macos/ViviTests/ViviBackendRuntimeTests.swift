@@ -990,6 +990,221 @@ final class ViviBackendRuntimeTests: XCTestCase {
       ["v20.19.5", "v18.20.8", "v9.22.1"])
   }
 
+  func testDecoderCopiesLocalAndBroaderSessionCatalogs() throws {
+    for (nativeScope, expectedScope) in [
+      (VIVI_BACKEND_SESSION_SCOPE_LOCAL, SessionCatalogScope.local),
+      (VIVI_BACKEND_SESSION_SCOPE_BROADER, SessionCatalogScope.broader),
+    ] {
+      let fixture = sessionFixture(scope: nativeScope)
+      var event = fixture.event
+      event.skipped_invalid_shards =
+        nativeScope == VIVI_BACKEND_SESSION_SCOPE_LOCAL ? 1 : 0
+
+      guard
+        case .sessionCatalog(let catalog) = try NativeEventDecoder.decode(
+          event,
+          bytes: fixture.bytes,
+          models: [],
+          sessions: fixture.sessions)
+      else { return XCTFail("Expected session catalog") }
+
+      XCTAssertEqual(catalog.scope, expectedScope)
+      XCTAssertEqual(catalog.skippedInvalidShards, expectedScope == .local)
+      XCTAssertEqual(catalog.sessions.map(\.key.slot), [7, 3])
+      XCTAssertEqual(catalog.sessions.map(\.isCurrent), [true, false])
+      XCTAssertEqual(catalog.sessions[1].title, nil)
+      XCTAssertEqual(catalog.sessions[1].summary, "Earlier work")
+    }
+  }
+
+  func testDecoderRejectsMalformedSessionMetadata() {
+    let fixture = sessionFixture(scope: VIVI_BACKEND_SESSION_SCOPE_LOCAL)
+
+    var badFlags = fixture.sessions
+    badFlags[0].flags |= 1 << 8
+    XCTAssertThrowsError(
+      try NativeEventDecoder.decode(
+        fixture.event, bytes: fixture.bytes, models: [], sessions: badFlags))
+
+    var reserved = fixture.sessions
+    reserved[0].reserved = 1
+    XCTAssertThrowsError(
+      try NativeEventDecoder.decode(
+        fixture.event, bytes: fixture.bytes, models: [], sessions: reserved))
+
+    var badSpan = fixture.sessions
+    badSpan[0].working_directory = vivi_backend_span_t(
+      offset: UInt32(fixture.bytes.count), length: 1)
+    XCTAssertThrowsError(
+      try NativeEventDecoder.decode(
+        fixture.event, bytes: fixture.bytes, models: [], sessions: badSpan))
+
+    var zeroGeneration = fixture.sessions
+    zeroGeneration[0].key.generation = 0
+    XCTAssertThrowsError(
+      try NativeEventDecoder.decode(
+        fixture.event, bytes: fixture.bytes, models: [], sessions: zeroGeneration))
+
+    var mixedGeneration = fixture.sessions
+    mixedGeneration[1].key.generation += 1
+    XCTAssertThrowsError(
+      try NativeEventDecoder.decode(
+        fixture.event, bytes: fixture.bytes, models: [], sessions: mixedGeneration))
+
+    var mixedScope = fixture.sessions
+    mixedScope[1].key.scope = VIVI_BACKEND_SESSION_SCOPE_BROADER
+    XCTAssertThrowsError(
+      try NativeEventDecoder.decode(
+        fixture.event, bytes: fixture.bytes, models: [], sessions: mixedScope))
+
+    var badCount = fixture.event
+    badCount.session_count += 1
+    XCTAssertThrowsError(
+      try NativeEventDecoder.decode(
+        badCount, bytes: fixture.bytes, models: [], sessions: fixture.sessions))
+
+    var legacy = vivi_backend_event_t()
+    legacy.kind = VIVI_BACKEND_EVENT_READY
+    legacy.session_scope = VIVI_BACKEND_SESSION_SCOPE_LOCAL
+    XCTAssertThrowsError(try NativeEventDecoder.decode(legacy, bytes: [], models: []))
+  }
+
+  func testDecoderCopiesResumeTranscriptExactlyIncludingEmptyText() throws {
+    let fixture = resumeFixture()
+
+    guard
+      case .sessionResume(.resumed(let resumed)) = try NativeEventDecoder.decode(
+        fixture.event,
+        bytes: fixture.bytes,
+        models: [],
+        sessions: [fixture.session],
+        transcriptItems: fixture.items)
+    else { return XCTFail("Expected resumed session") }
+
+    XCTAssertEqual(
+      resumed.transcript,
+      [.user("question"), .reasoning(""), .assistant("answer")])
+    XCTAssertFalse(resumed.summary.isCurrent)
+  }
+
+  func testDecoderRejectsMalformedResumeRoleAndNeutralFailureMetadata() {
+    let fixture = resumeFixture()
+    var items = fixture.items
+    items[0].role = vivi_backend_transcript_role_t(rawValue: 99)
+    XCTAssertThrowsError(
+      try NativeEventDecoder.decode(
+        fixture.event,
+        bytes: fixture.bytes,
+        models: [],
+        sessions: [fixture.session],
+        transcriptItems: items))
+
+    var failure = vivi_backend_event_t()
+    failure.kind = VIVI_BACKEND_EVENT_SESSION_CATALOG_FAILURE
+    failure.content_kind = VIVI_BACKEND_CONTENT_TEXT
+    failure.skipped_invalid_shards = 1
+    XCTAssertThrowsError(try NativeEventDecoder.decode(failure, bytes: [], models: []))
+  }
+
+  func testSessionRefreshClearsCatalogCorrelatesScopeAndForwardsRequests() {
+    let driver = FakeConversationDriver()
+    let store = NativeChatStore(workspace: "/work/current", driver: driver)
+    let local = swiftSessionCatalog(scope: .local)
+    store.reduce(.ready)
+    store.reduce(.modelCatalog(testCatalog()))
+
+    store.refreshSessions(.local)
+    XCTAssertNil(store.sessionCatalog)
+    XCTAssertEqual(store.sessionState, .refreshing(.local))
+    store.reduce(.sessionCatalog(local))
+    XCTAssertEqual(store.sessionCatalog, local)
+    XCTAssertEqual(store.sessionState, .ready)
+
+    store.refreshSessions(.all)
+    XCTAssertNil(store.sessionCatalog)
+    store.reduce(.sessionCatalog(local))
+    XCTAssertNil(store.sessionCatalog)
+    XCTAssertEqual(store.sessionState, .ready)
+    XCTAssertEqual(driver.sessionRequests, [.local, .all])
+  }
+
+  func testResumeFailurePreservesPresentationDraftAndCatalog() {
+    let driver = FakeConversationDriver()
+    let store = NativeChatStore(workspace: "/work/current", driver: driver)
+    let catalog = swiftSessionCatalog(scope: .local)
+    store.reduce(.ready)
+    store.reduce(.modelCatalog(testCatalog()))
+    store.refreshSessions(.local)
+    store.reduce(.sessionCatalog(catalog))
+    store.reduce(.status("existing"))
+    store.draft = "unsent"
+    let before = store.activePresentation
+
+    store.resumeSession(catalog.sessions[0].key)
+    XCTAssertEqual(store.activePresentation, before)
+    store.reduce(.sessionResume(.failed("Could not resume.")))
+
+    XCTAssertEqual(store.workspace, before.workspace)
+    XCTAssertEqual(store.sessionTitle, before.sessionTitle)
+    XCTAssertEqual(store.confirmedSelection, before.confirmedSelection)
+    XCTAssertEqual(store.draft, "unsent")
+    XCTAssertEqual(store.sessionCatalog, catalog)
+    XCTAssertEqual(store.transcript.dropLast(), before.transcript[...])
+    XCTAssertEqual(store.transcript.last?.text, "Could not resume.")
+  }
+
+  func testSuccessfulResumeReplacesActiveAggregateOnceAndPreservesDraft() {
+    let driver = FakeConversationDriver()
+    let store = NativeChatStore(workspace: "/work/current", driver: driver)
+    let catalog = swiftSessionCatalog(scope: .broader)
+    store.reduce(.ready)
+    store.reduce(.modelCatalog(testCatalog()))
+    store.refreshSessions(.all)
+    store.reduce(.sessionCatalog(catalog))
+    store.reduce(.status("old transcript"))
+    store.draft = "keep draft"
+    let key = catalog.sessions[0].key
+    var presentations: [ActiveConversationPresentation] = []
+    let observation = store.$activePresentation.dropFirst().sink { presentations.append($0) }
+
+    store.resumeSession(key)
+    XCTAssertEqual(driver.resumeKeys, [key])
+    XCTAssertEqual(store.transcript.last?.text, "old transcript")
+    store.reduce(
+      .sessionResume(
+        .resumed(
+          ResumedSession(
+            summary: SessionSummary(
+              key: key,
+              workingDirectory: "/work/resumed",
+              modelID: "copilot/retired",
+              title: "Resumed title",
+              summary: nil,
+              lastUsedUnixMilliseconds: 10,
+              reasoning: .medium,
+              isCurrent: false),
+            transcript: [.user(""), .reasoning("thought"), .assistant("answer")],
+            cleanupFailed: true))))
+
+    XCTAssertEqual(presentations.count, 1)
+    XCTAssertEqual(store.workspace, "/work/resumed")
+    XCTAssertEqual(store.sessionTitle, "Resumed title")
+    XCTAssertEqual(
+      store.confirmedSelection,
+      ModelSelection(modelID: "copilot/retired", reasoning: .medium))
+    XCTAssertEqual(store.modelChoices.first?.id, "copilot/retired")
+    XCTAssertEqual(store.draft, "keep draft")
+    XCTAssertNil(store.sessionCatalog)
+    XCTAssertEqual(
+      store.transcript.map(\.text), ["", "thought", "answer", "Previous session cleanup failed."])
+    guard case .user = store.transcript[0],
+      case .reasoning = store.transcript[1],
+      case .assistant = store.transcript[2],
+      case .status = store.transcript[3]
+    else { return XCTFail("Expected snapshot order without an assistant header") }
+    observation.cancel()
+  }
+
   func testSubmitIsBlockedDuringModelOperation() {
     let driver = FakeConversationDriver()
     let store = NativeChatStore(workspace: "/tmp/work", driver: driver)
@@ -1006,11 +1221,146 @@ final class ViviBackendRuntimeTests: XCTestCase {
   }
 }
 
+private func sessionFixture(
+  scope: vivi_backend_session_scope_t
+) -> (
+  event: vivi_backend_event_t,
+  bytes: [UInt8],
+  sessions: [vivi_backend_session_summary_t]
+) {
+  let firstDirectory = Array("/work/current".utf8)
+  let firstModel = Array("copilot/gpt-5".utf8)
+  let firstTitle = Array("Current".utf8)
+  let secondDirectory = Array("/work/earlier".utf8)
+  let secondModel = Array("copilot/other".utf8)
+  let secondSummary = Array("Earlier work".utf8)
+  let bytes =
+    firstDirectory + firstModel + firstTitle + secondDirectory + secondModel + secondSummary
+  var offset = 0
+  func take(_ value: [UInt8]) -> vivi_backend_span_t {
+    defer { offset += value.count }
+    return vivi_backend_span_t(offset: UInt32(offset), length: UInt32(value.count))
+  }
+  let firstDirectorySpan = take(firstDirectory)
+  let firstModelSpan = take(firstModel)
+  let firstTitleSpan = take(firstTitle)
+  let secondDirectorySpan = take(secondDirectory)
+  let secondModelSpan = take(secondModel)
+  let secondSummarySpan = take(secondSummary)
+  let generation: UInt64 = 42
+  let sessions = [
+    vivi_backend_session_summary_t(
+      key: vivi_backend_resume_key_t(generation: generation, slot: 7, scope: scope),
+      working_directory: firstDirectorySpan,
+      model_id: firstModelSpan,
+      title: firstTitleSpan,
+      summary: vivi_backend_span_t(),
+      last_used_unix_ms: 200,
+      reasoning: VIVI_BACKEND_REASONING_HIGH,
+      flags: UInt32(VIVI_BACKEND_SESSION_TITLE_PRESENT.rawValue)
+        | UInt32(VIVI_BACKEND_SESSION_CURRENT.rawValue),
+      reserved: 0),
+    vivi_backend_session_summary_t(
+      key: vivi_backend_resume_key_t(generation: generation, slot: 3, scope: scope),
+      working_directory: secondDirectorySpan,
+      model_id: secondModelSpan,
+      title: vivi_backend_span_t(),
+      summary: secondSummarySpan,
+      last_used_unix_ms: 100,
+      reasoning: VIVI_BACKEND_REASONING_OFF,
+      flags: UInt32(VIVI_BACKEND_SESSION_SUMMARY_PRESENT.rawValue),
+      reserved: 0),
+  ]
+  var event = vivi_backend_event_t()
+  event.kind = VIVI_BACKEND_EVENT_SESSION_CATALOG
+  event.content_kind = VIVI_BACKEND_CONTENT_SESSION_CATALOG
+  event.byte_count = UInt32(bytes.count)
+  event.session_count = UInt32(sessions.count)
+  event.session_scope = scope
+  event.selected_reasoning = VIVI_BACKEND_REASONING_NONE
+  return (event, bytes, sessions)
+}
+
+private func resumeFixture() -> (
+  event: vivi_backend_event_t,
+  bytes: [UInt8],
+  session: vivi_backend_session_summary_t,
+  items: [vivi_backend_transcript_item_t]
+) {
+  let question = Array("question".utf8)
+  let answer = Array("answer".utf8)
+  let directory = Array("/work/resumed".utf8)
+  let model = Array("copilot/retired".utf8)
+  let title = Array("Resumed title".utf8)
+  let bytes = question + answer + directory + model + title
+  let questionSpan = vivi_backend_span_t(offset: 0, length: UInt32(question.count))
+  let answerSpan = vivi_backend_span_t(
+    offset: UInt32(question.count), length: UInt32(answer.count))
+  let directorySpan = vivi_backend_span_t(
+    offset: UInt32(question.count + answer.count), length: UInt32(directory.count))
+  let modelSpan = vivi_backend_span_t(
+    offset: UInt32(question.count + answer.count + directory.count),
+    length: UInt32(model.count))
+  let titleSpan = vivi_backend_span_t(
+    offset: UInt32(question.count + answer.count + directory.count + model.count),
+    length: UInt32(title.count))
+  let session = vivi_backend_session_summary_t(
+    key: vivi_backend_resume_key_t(
+      generation: 42, slot: 7, scope: VIVI_BACKEND_SESSION_SCOPE_BROADER),
+    working_directory: directorySpan,
+    model_id: modelSpan,
+    title: titleSpan,
+    summary: vivi_backend_span_t(),
+    last_used_unix_ms: 100,
+    reasoning: VIVI_BACKEND_REASONING_MEDIUM,
+    flags: UInt32(VIVI_BACKEND_SESSION_TITLE_PRESENT.rawValue),
+    reserved: 0)
+  let items = [
+    vivi_backend_transcript_item_t(
+      text: questionSpan, role: VIVI_BACKEND_TRANSCRIPT_USER, reserved: 0),
+    vivi_backend_transcript_item_t(
+      text: vivi_backend_span_t(), role: VIVI_BACKEND_TRANSCRIPT_REASONING, reserved: 0),
+    vivi_backend_transcript_item_t(
+      text: answerSpan, role: VIVI_BACKEND_TRANSCRIPT_ASSISTANT, reserved: 0),
+  ]
+  var event = vivi_backend_event_t()
+  event.kind = VIVI_BACKEND_EVENT_SESSION_RESUME
+  event.content_kind = VIVI_BACKEND_CONTENT_SESSION_RESUME
+  event.byte_count = UInt32(bytes.count)
+  event.session_count = 1
+  event.transcript_item_count = UInt32(items.count)
+  event.session_scope = VIVI_BACKEND_SESSION_SCOPE_BROADER
+  event.session_resume_outcome = VIVI_BACKEND_SESSION_RESUME_RESUMED
+  event.selected_reasoning = VIVI_BACKEND_REASONING_NONE
+  return (event, bytes, session, items)
+}
+
+private func swiftSessionCatalog(scope: SessionCatalogScope) -> SessionCatalog {
+  SessionCatalog(
+    scope: scope,
+    sessions: [
+      SessionSummary(
+        key: ResumeKey(generation: 42, slot: 7, scope: scope),
+        workingDirectory: "/work/earlier",
+        modelID: "copilot/other",
+        title: "Earlier",
+        summary: nil,
+        lastUsedUnixMilliseconds: 100,
+        reasoning: .medium,
+        isCurrent: false)
+    ],
+    skippedInvalidShards: false)
+}
+
 private final class FakeConversationDriver: ViviConversationDriving {
   var submitResult = ConversationOperationResult.accepted
   var refreshResult = ConversationOperationResult.accepted
   var switchResult = ConversationOperationResult.accepted
+  var refreshSessionsResult = ConversationOperationResult.accepted
+  var resumeResult = ConversationOperationResult.accepted
   var selections: [ModelSelection] = []
+  var sessionRequests: [SessionCatalogRequest] = []
+  var resumeKeys: [ResumeKey] = []
   var submittedPrompts: [String] = []
   private var receive: (@MainActor (ChatEvent) -> Void)?
 
@@ -1033,6 +1383,16 @@ private final class FakeConversationDriver: ViviConversationDriving {
   func switchModel(_ selection: ModelSelection) -> ConversationOperationResult {
     selections.append(selection)
     return switchResult
+  }
+
+  func refreshSessions(_ request: SessionCatalogRequest) -> ConversationOperationResult {
+    sessionRequests.append(request)
+    return refreshSessionsResult
+  }
+
+  func resumeSession(_ key: ResumeKey) -> ConversationOperationResult {
+    resumeKeys.append(key)
+    return resumeResult
   }
 
   func close(completion: @escaping @MainActor () -> Void) {
