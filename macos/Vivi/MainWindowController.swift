@@ -15,7 +15,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, MainWind
 
   init(
     identity: MainWindowIdentity,
-    conversations: ConversationCollection,
+    applicationCoordinator: NativeApplicationCoordinator,
     window: NSWindow = MainWindowController.makeWindow(),
     activate: @escaping @MainActor () -> Void = {
       NSApp.activate(ignoringOtherApps: true)
@@ -23,14 +23,22 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, MainWind
     onClosed: @escaping @MainActor (MainWindowIdentity) -> Void
   ) {
     self.identity = identity
-    self.conversations = conversations
+    conversations = applicationCoordinator.conversations
     self.activate = activate
     self.onClosed = onClosed
     super.init(window: window)
 
     window.title = "Vivi"
     window.contentViewController = NSHostingController(
-      rootView: MainWindowView(conversations: conversations))
+      rootView: MainWindowView(
+        conversations: conversations,
+        applicationPresentation: applicationCoordinator.presentation,
+        requestNewConversation: { [weak applicationCoordinator] in
+          applicationCoordinator?.requestNewConversation()
+        },
+        dismissWorkspaceChoiceFailure: { [weak applicationCoordinator] in
+          applicationCoordinator?.dismissWorkspaceChoiceFailure()
+        }))
     window.delegate = self
     window.setFrameAutosaveName("ViviMainWindow")
     selectionObservation = conversations.$selectedID

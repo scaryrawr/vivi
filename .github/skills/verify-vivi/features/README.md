@@ -83,6 +83,8 @@ user-visible behavior. It then uses exactly four H2 sections in this order:
 - [Native conversation sidebar](./native-conversation-sidebar.md) covers
   occurrence-based native launches, selection, window close and Dock reopen,
   and joined application termination.
+- [Native project entry](./native-project-entry.md) covers directory-selected
+  conversations, live project grouping, cancellation, validation, and Command-N.
 - [Native session history](./native-session-history.md) covers selected-store
   local and broader catalogs, persisted-session resume, and cross-workspace
   navigation identity.

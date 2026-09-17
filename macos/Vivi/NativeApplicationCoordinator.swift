@@ -111,7 +111,6 @@ final class ConversationCollection: ObservableObject {
   func appendAndSelect(_ record: ConversationRecord) {
     precondition(!records.contains(where: { $0.id == record.id }))
     recordObservations[record.id] = record.$navigation
-      .map(\.workspace)
       .removeDuplicates()
       .dropFirst()
       .sink { [weak self] _ in self?.objectWillChange.send() }
@@ -136,6 +135,21 @@ final class ConversationCollection: ObservableObject {
   }
 }
 
+enum WorkspaceChoicePresentation: Equatable {
+  case idle
+  case choosing
+  case failure(String)
+
+  var isChoosing: Bool {
+    self == .choosing
+  }
+}
+
+@MainActor
+final class NativeApplicationPresentation: ObservableObject {
+  @Published fileprivate(set) var workspaceChoice = WorkspaceChoicePresentation.idle
+}
+
 @MainActor
 protocol MainWindowControlling: AnyObject {
   var identity: MainWindowIdentity { get }
@@ -146,9 +160,10 @@ protocol MainWindowControlling: AnyObject {
 @MainActor
 final class NativeApplicationCoordinator {
   typealias ConversationFactory = (ConversationID, WorkspaceIdentity) -> ConversationRecord
+  typealias WorkspaceChooserFactory = () -> any WorkspaceChoosing
   typealias WindowFactory = (
     MainWindowIdentity,
-    ConversationCollection,
+    NativeApplicationCoordinator,
     @escaping @MainActor (MainWindowIdentity) -> Void
   ) -> any MainWindowControlling
 
@@ -159,12 +174,16 @@ final class NativeApplicationCoordinator {
   }
 
   let conversations: ConversationCollection
+  let presentation = NativeApplicationPresentation()
 
   private let makeConversationID: () -> ConversationID
   private let makeConversation: ConversationFactory
+  private let makeWorkspaceChooser: WorkspaceChooserFactory
   private let makeWindow: WindowFactory
   private var mainWindow: (any MainWindowControlling)?
   private var state = State.running
+  private var activeWorkspaceChooser: (any WorkspaceChoosing)?
+  private var workspaceChoiceTask: Task<Void, Never>?
   private var pendingTermination: Set<ConversationID> = []
   private var terminationReply: (@MainActor () -> Void)?
 
@@ -172,11 +191,15 @@ final class NativeApplicationCoordinator {
     conversations: ConversationCollection = ConversationCollection(),
     makeConversationID: @escaping () -> ConversationID,
     makeConversation: @escaping ConversationFactory,
+    makeWorkspaceChooser: @escaping WorkspaceChooserFactory = {
+      AppKitWorkspaceChooser()
+    },
     makeWindow: @escaping WindowFactory
   ) {
     self.conversations = conversations
     self.makeConversationID = makeConversationID
     self.makeConversation = makeConversation
+    self.makeWorkspaceChooser = makeWorkspaceChooser
     self.makeWindow = makeWindow
   }
 
@@ -191,10 +214,10 @@ final class NativeApplicationCoordinator {
             workspace: path,
             driver: ViviConversationDriver(workspace: path)))
       },
-      makeWindow: { identity, conversations, onClosed in
+      makeWindow: { identity, coordinator, onClosed in
         MainWindowController(
           identity: identity,
-          conversations: conversations,
+          applicationCoordinator: coordinator,
           onClosed: onClosed)
       })
   }
@@ -205,19 +228,42 @@ final class NativeApplicationCoordinator {
     var openedConversation = false
     for url in urls {
       guard let request = NativeChatRequest(url: url) else { continue }
-      let record = makeConversation(makeConversationID(), request.workspace)
-      conversations.appendAndSelect(record)
-      openedConversation = true
+      openedConversation = createConversation(in: request.workspace) != nil || openedConversation
     }
     if openedConversation {
       presentMainWindow()
     }
   }
 
+  func requestNewConversation() {
+    guard state == .running, activeWorkspaceChooser == nil else { return }
+
+    let chooser = makeWorkspaceChooser()
+    activeWorkspaceChooser = chooser
+    presentation.workspaceChoice = .choosing
+    workspaceChoiceTask = Task { [weak self] in
+      let selectedURL = await chooser.chooseWorkspace()
+      self?.workspaceChoiceDidFinish(selectedURL, chooser: chooser)
+    }
+  }
+
+  func dismissWorkspaceChoiceFailure() {
+    guard case .failure = presentation.workspaceChoice else { return }
+    presentation.workspaceChoice = .idle
+  }
+
+  @discardableResult
+  func createConversation(in workspace: WorkspaceIdentity) -> ConversationRecord? {
+    guard state == .running else { return nil }
+    let record = makeConversation(makeConversationID(), workspace)
+    conversations.appendAndSelect(record)
+    return record
+  }
+
   func presentMainWindow() {
     guard state == .running else { return }
     if mainWindow == nil {
-      mainWindow = makeWindow(.primary, conversations) { [weak self] identity in
+      mainWindow = makeWindow(.primary, self) { [weak self] identity in
         self?.presentationDidClose(identity)
       }
     }
@@ -236,6 +282,12 @@ final class NativeApplicationCoordinator {
       break
     }
 
+    state = .terminating
+    activeWorkspaceChooser?.cancel()
+    activeWorkspaceChooser = nil
+    workspaceChoiceTask?.cancel()
+    workspaceChoiceTask = nil
+    presentation.workspaceChoice = .idle
     mainWindow?.closeForTermination()
     mainWindow = nil
     guard !conversations.records.isEmpty else {
@@ -243,7 +295,6 @@ final class NativeApplicationCoordinator {
       return .terminateNow
     }
 
-    state = .terminating
     pendingTermination = Set(conversations.records.map(\.id))
     terminationReply = reply
     for record in conversations.records {
@@ -253,6 +304,38 @@ final class NativeApplicationCoordinator {
       }
     }
     return .terminateLater
+  }
+
+  private func workspaceChoiceDidFinish(
+    _ selectedURL: URL?,
+    chooser: any WorkspaceChoosing
+  ) {
+    guard state == .running, activeWorkspaceChooser === chooser else { return }
+    activeWorkspaceChooser = nil
+    workspaceChoiceTask = nil
+
+    guard let selectedURL else {
+      presentation.workspaceChoice = .idle
+      return
+    }
+    guard let workspace = validatedWorkspace(from: selectedURL) else {
+      presentation.workspaceChoice = .failure(
+        "Choose an existing folder with an absolute path.")
+      presentMainWindow()
+      return
+    }
+
+    presentation.workspaceChoice = .idle
+    guard createConversation(in: workspace) != nil else { return }
+    presentMainWindow()
+  }
+
+  private func validatedWorkspace(from url: URL) -> WorkspaceIdentity? {
+    guard url.isFileURL, url.path.first == "/",
+      let values = try? url.resourceValues(forKeys: [.isDirectoryKey]),
+      values.isDirectory == true
+    else { return nil }
+    return WorkspaceIdentity(absolutePath: url.path)
   }
 
   private func presentationDidClose(_ identity: MainWindowIdentity) {

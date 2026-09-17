@@ -1,28 +1,64 @@
 import Foundation
 import SwiftUI
 
-struct SidebarRowPresentation: Equatable {
+struct SidebarConversationPresentation: Equatable, Identifiable {
+  let id: ConversationID
   let title: String
-  let workspace: String
   let duplicateBadge: String?
   let accessibilityLabel: String
 }
 
-func sidebarRowPresentation(
-  title: String,
-  workspace: String,
-  duplicate: (ordinal: Int, total: Int)?
-) -> SidebarRowPresentation {
-  let duplicateLabel = duplicate.map {
-    "conversation \($0.ordinal) of \($0.total)"
+struct SidebarProjectPresentation: Equatable, Identifiable {
+  let workspace: WorkspaceIdentity
+  let title: String
+  let accessibilityLabel: String
+  let conversations: [SidebarConversationPresentation]
+
+  var id: WorkspaceIdentity { workspace }
+}
+
+@MainActor
+func sidebarProjectsPresentation(
+  records: [ConversationRecord]
+) -> [SidebarProjectPresentation] {
+  var workspaceOrder: [WorkspaceIdentity] = []
+  var recordsByWorkspace: [WorkspaceIdentity: [ConversationRecord]] = [:]
+  for record in records {
+    let workspace = record.navigation.workspace
+    if recordsByWorkspace[workspace] == nil {
+      workspaceOrder.append(workspace)
+    }
+    recordsByWorkspace[workspace, default: []].append(record)
   }
-  return SidebarRowPresentation(
-    title: title,
-    workspace: workspace,
-    duplicateBadge: duplicate.map { String($0.ordinal) },
-    accessibilityLabel: [title, workspace, duplicateLabel]
-      .compactMap { $0 }
-      .joined(separator: ", "))
+
+  return workspaceOrder.map { workspace in
+    let records = recordsByWorkspace[workspace, default: []]
+    let path = workspace.canonicalPath
+    let projectTitle =
+      URL(fileURLWithPath: path).lastPathComponent.nilIfEmpty ?? "/"
+    return SidebarProjectPresentation(
+      workspace: workspace,
+      title: projectTitle,
+      accessibilityLabel: "\(projectTitle), \(path)",
+      conversations: records.enumerated().map { index, record in
+        let duplicate =
+          records.count > 1 ? (ordinal: index + 1, total: records.count) : nil
+        let duplicateLabel = duplicate.map {
+          "conversation \($0.ordinal) of \($0.total)"
+        }
+        return SidebarConversationPresentation(
+          id: record.id,
+          title: record.navigation.title,
+          duplicateBadge: duplicate.map { String($0.ordinal) },
+          accessibilityLabel: [
+            record.navigation.title,
+            path,
+            duplicateLabel,
+          ]
+          .compactMap { $0 }
+          .joined(separator: ", "))
+      })
+  }
 }
 
 struct SessionHistoryRowPresentation: Equatable, Identifiable {
@@ -94,25 +130,35 @@ func sessionHistoryPresentation(
 
 struct MainWindowView: View {
   @ObservedObject var conversations: ConversationCollection
+  @ObservedObject var applicationPresentation: NativeApplicationPresentation
+  let requestNewConversation: () -> Void
+  let dismissWorkspaceChoiceFailure: () -> Void
 
   var body: some View {
     NavigationSplitView {
       List(selection: selection) {
-        Section("Conversations") {
-          ForEach(conversations.records) { conversation in
-            ConversationSidebarRow(
-              conversation: conversation,
-              duplicate: conversations.duplicatePosition(for: conversation.id)
-            )
-            .tag(conversation.id)
+        ForEach(sidebarProjectsPresentation(records: conversations.records)) { project in
+          Section {
+            ForEach(project.conversations) { conversation in
+              ConversationSidebarRow(presentation: conversation)
+                .tag(conversation.id)
+            }
+          } header: {
+            ProjectSidebarHeader(presentation: project)
           }
         }
         if let conversation = conversations.selectedConversation {
-          SessionHistorySection(store: conversation.store)
-            .id(conversation.id)
+          SessionHistorySection(
+            store: conversation.store,
+            conversationTitle: conversation.navigation.title
+          )
+          .id(conversation.id)
         }
       }
       .listStyle(.sidebar)
+      .safeAreaInset(edge: .bottom) {
+        newConversationControl
+      }
       .navigationSplitViewColumnWidth(min: 210, ideal: 250, max: 340)
       .accessibilityIdentifier("conversation-sidebar")
     } detail: {
@@ -124,13 +170,64 @@ struct MainWindowView: View {
         ContentUnavailableView {
           Label("No Conversations", systemImage: "bubble.left.and.bubble.right")
         } description: {
-          Text("Run `vivi chat --native` from a workspace to start one.")
+          Text("Choose a workspace to start a conversation.")
+        } actions: {
+          Button("New Conversation", action: requestNewConversation)
+            .buttonStyle(.borderedProminent)
+            .disabled(applicationPresentation.workspaceChoice.isChoosing)
+            .accessibilityIdentifier("new-conversation-empty-state")
         }
         .accessibilityIdentifier("conversation-empty-state")
       }
     }
     .navigationSplitViewStyle(.balanced)
     .frame(minWidth: 760, minHeight: 500)
+    .alert(
+      "Can’t Start Conversation",
+      isPresented: workspaceChoiceFailureIsPresented
+    ) {
+      Button("OK", action: dismissWorkspaceChoiceFailure)
+    } message: {
+      Text(workspaceChoiceFailure ?? "")
+    }
+  }
+
+  private var newConversationControl: some View {
+    Button(action: requestNewConversation) {
+      HStack(spacing: 8) {
+        Label("New Conversation", systemImage: "plus")
+        Spacer()
+        if applicationPresentation.workspaceChoice.isChoosing {
+          ProgressView()
+            .controlSize(.small)
+            .accessibilityLabel("Choosing workspace")
+        }
+      }
+      .contentShape(Rectangle())
+    }
+    .buttonStyle(.plain)
+    .disabled(applicationPresentation.workspaceChoice.isChoosing)
+    .padding(.horizontal, 12)
+    .padding(.vertical, 10)
+    .background(.bar)
+    .accessibilityIdentifier("new-conversation-sidebar")
+  }
+
+  private var workspaceChoiceFailure: String? {
+    guard case .failure(let message) = applicationPresentation.workspaceChoice else {
+      return nil
+    }
+    return message
+  }
+
+  private var workspaceChoiceFailureIsPresented: Binding<Bool> {
+    Binding(
+      get: { workspaceChoiceFailure != nil },
+      set: { isPresented in
+        if !isPresented {
+          dismissWorkspaceChoiceFailure()
+        }
+      })
   }
 
   private var selection: Binding<ConversationID?> {
@@ -146,11 +243,13 @@ struct MainWindowView: View {
 
 private struct SessionHistorySection: View {
   @ObservedObject var store: NativeChatStore
+  let conversationTitle: String
   @State private var isExpanded = false
   @State private var request: SessionCatalogRequest
 
-  init(store: NativeChatStore) {
+  init(store: NativeChatStore, conversationTitle: String) {
     self.store = store
+    self.conversationTitle = conversationTitle
     _request = State(
       initialValue: store.sessionCatalog?.scope == .broader ? .all : .local)
   }
@@ -161,9 +260,16 @@ private struct SessionHistorySection: View {
         scopeMenu
         historyContent
       } label: {
-        Label("History", systemImage: "clock.arrow.circlepath")
+        VStack(alignment: .leading, spacing: 2) {
+          Label("History", systemImage: "clock.arrow.circlepath")
+          Text(conversationTitle)
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+        }
       }
       .accessibilityIdentifier("session-history")
+      .accessibilityLabel("History for \(conversationTitle)")
     }
     .onChange(of: isExpanded) {
       guard isExpanded, shouldLoad else { return }
@@ -353,29 +459,34 @@ private struct SessionHistoryRow: View {
   }
 }
 
-private struct ConversationSidebarRow: View {
-  @ObservedObject var conversation: ConversationRecord
-  let duplicate: (ordinal: Int, total: Int)?
+private struct ProjectSidebarHeader: View {
+  let presentation: SidebarProjectPresentation
 
-  private var presentation: SidebarRowPresentation {
-    sidebarRowPresentation(
-      title: conversation.navigation.title,
-      workspace: conversation.navigation.workspace.canonicalPath,
-      duplicate: duplicate)
+  var body: some View {
+    VStack(alignment: .leading, spacing: 2) {
+      Text(presentation.title)
+        .lineLimit(1)
+      Text(presentation.workspace.canonicalPath)
+        .font(.caption2)
+        .foregroundStyle(.secondary)
+        .lineLimit(1)
+        .truncationMode(.middle)
+    }
+    .help(presentation.workspace.canonicalPath)
+    .accessibilityElement(children: .ignore)
+    .accessibilityLabel(presentation.accessibilityLabel)
+    .accessibilityIdentifier(
+      "project-header-\(presentation.workspace.canonicalPath)")
   }
+}
+
+private struct ConversationSidebarRow: View {
+  let presentation: SidebarConversationPresentation
 
   var body: some View {
     HStack(spacing: 8) {
-      VStack(alignment: .leading, spacing: 2) {
-        Text(presentation.title)
-          .lineLimit(1)
-        Text(presentation.workspace)
-          .font(.caption)
-          .foregroundStyle(.secondary)
-          .lineLimit(1)
-          .truncationMode(.middle)
-          .help(presentation.workspace)
-      }
+      Text(presentation.title)
+        .lineLimit(1)
       Spacer(minLength: 4)
       if let badge = presentation.duplicateBadge {
         Text(badge)
@@ -390,7 +501,7 @@ private struct ConversationSidebarRow: View {
 
     .accessibilityElement(children: .ignore)
     .accessibilityLabel(presentation.accessibilityLabel)
-    .accessibilityIdentifier("conversation-row-\(conversation.id.rawValue)")
+    .accessibilityIdentifier("conversation-row-\(presentation.id.rawValue)")
   }
 }
 

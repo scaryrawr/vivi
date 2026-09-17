@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 
 @main
@@ -9,21 +10,39 @@ struct ViviApp: App {
     Settings {
       EmptyView()
     }
+    .commands {
+      CommandGroup(replacing: .newItem) {
+        Button("New Conversation") {
+          appDelegate.requestNewConversation()
+        }
+        .keyboardShortcut("n")
+        .disabled(!appDelegate.canRequestNewConversation)
+      }
+    }
   }
 }
 
 @MainActor
-final class ViviAppDelegate: NSObject, NSApplicationDelegate {
+final class ViviAppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
+  @Published private(set) var canRequestNewConversation = true
+
   private let applicationCoordinator: NativeApplicationCoordinator
+  private var presentationObservation: AnyCancellable?
 
   override init() {
     applicationCoordinator = .live()
     super.init()
+    observePresentation()
   }
 
   init(applicationCoordinator: NativeApplicationCoordinator) {
     self.applicationCoordinator = applicationCoordinator
     super.init()
+    observePresentation()
+  }
+
+  func requestNewConversation() {
+    applicationCoordinator.requestNewConversation()
   }
 
   func applicationDidFinishLaunching(_ notification: Notification) {
@@ -46,5 +65,14 @@ final class ViviAppDelegate: NSObject, NSApplicationDelegate {
     applicationCoordinator.beginTermination {
       sender.reply(toApplicationShouldTerminate: true)
     }
+  }
+
+  private func observePresentation() {
+    presentationObservation = applicationCoordinator.presentation.$workspaceChoice
+      .map { !$0.isChoosing }
+      .removeDuplicates()
+      .sink { [weak self] canRequest in
+        self?.canRequestNewConversation = canRequest
+      }
   }
 }

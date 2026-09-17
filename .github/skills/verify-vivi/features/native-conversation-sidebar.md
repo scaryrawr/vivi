@@ -9,7 +9,7 @@ from each conversation store.
 - An ordinary launch shows one empty native window.
 - Every `vivi chat --native` occurrence adds and selects a fresh conversation,
   including repeated launches from the same workspace.
-- Sidebar rows show the live conversation title and canonical workspace path;
+- Sidebar sections group live conversations under their canonical workspace;
   repeated workspaces receive stable numeric disambiguation.
 - Selecting a row swaps the detail and native window title without stopping
   other conversations.
@@ -45,3 +45,5 @@ interaction.
   lifetime effects.
 - Persisted session discovery and resume have their own
   [native session history](./native-session-history.md) verification flow.
+- Native directory selection and project grouping have their own
+  [native project entry](./native-project-entry.md) verification flow.

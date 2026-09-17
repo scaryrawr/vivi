@@ -16,6 +16,7 @@
 		A20000000000000000000007 /* MainWindowView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3000000000000000000000A /* MainWindowView.swift */; };
 		A20000000000000000000008 /* NativeApplicationCoordinatorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3000000000000000000000B /* NativeApplicationCoordinatorTests.swift */; };
 		A20000000000000000000009 /* MainWindowControllerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3000000000000000000000C /* MainWindowControllerTests.swift */; };
+		A2000000000000000000000A /* WorkspaceChooser.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3000000000000000000000D /* WorkspaceChooser.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -48,6 +49,7 @@
 		A3000000000000000000000A /* MainWindowView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MainWindowView.swift; sourceTree = "<group>"; };
 		A3000000000000000000000B /* NativeApplicationCoordinatorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeApplicationCoordinatorTests.swift; sourceTree = "<group>"; };
 		A3000000000000000000000C /* MainWindowControllerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MainWindowControllerTests.swift; sourceTree = "<group>"; };
+		A3000000000000000000000D /* WorkspaceChooser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceChooser.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -82,6 +84,7 @@
 			isa = PBXGroup;
 			children = (
 				A30000000000000000000001 /* ViviApp.swift */,
+				A3000000000000000000000D /* WorkspaceChooser.swift */,
 				A30000000000000000000008 /* NativeApplicationCoordinator.swift */,
 				A30000000000000000000009 /* MainWindowController.swift */,
 				A3000000000000000000000A /* MainWindowView.swift */,
@@ -242,6 +245,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				A20000000000000000000001 /* ViviApp.swift in Sources */,
+				A2000000000000000000000A /* WorkspaceChooser.swift in Sources */,
 				A20000000000000000000005 /* NativeApplicationCoordinator.swift in Sources */,
 				A20000000000000000000006 /* MainWindowController.swift in Sources */,
 				A20000000000000000000007 /* MainWindowView.swift in Sources */,
