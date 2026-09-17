@@ -3617,6 +3617,19 @@ const ChatUi = struct {
                 .status,
                 message.bytes,
             ),
+            .session_title => |title| {
+                const message = try std.fmt.allocPrint(
+                    self.allocator,
+                    "Session title: {s}",
+                    .{title.bytes},
+                );
+                defer self.allocator.free(message);
+                try self.transcript.append(
+                    self.allocator,
+                    .status,
+                    message,
+                );
+            },
             .session_resume => |result| {
                 if (self.phase == .resuming) self.phase = .ready;
                 self.menu_mode = .closed;
@@ -4937,6 +4950,7 @@ const App = struct {
         init_args: std.process.Init,
         model: ?[]const u8,
         reasoning: ?backend.ReasoningEffort,
+        working_directory: []const u8,
         settings_path: ?[]const u8,
         sessions_directory: ?[]const u8,
     ) !void {
@@ -4992,6 +5006,7 @@ const App = struct {
             init_args.io,
             .{ .context = self, .notify = wake },
             .{
+                .working_directory = working_directory,
                 .model = model,
                 .reasoning = reasoning,
                 .settings_path = settings_path,
@@ -5265,12 +5280,20 @@ pub fn run(
     init: std.process.Init,
     model: ?[]const u8,
     reasoning: ?backend.ReasoningEffort,
+    working_directory: []const u8,
     settings_path: ?[]const u8,
     sessions_directory: ?[]const u8,
 ) !void {
     const app = try init.gpa.create(App);
     defer init.gpa.destroy(app);
-    try app.init(init, model, reasoning, settings_path, sessions_directory);
+    try app.init(
+        init,
+        model,
+        reasoning,
+        working_directory,
+        settings_path,
+        sessions_directory,
+    );
     defer app.deinit();
     try app.run();
 }

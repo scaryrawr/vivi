@@ -1,4 +1,5 @@
 const std = @import("std");
+const presentation = @import("presentation.zig");
 const build_options = @import("build_options");
 const copilot = @import("copilot_sdk");
 const conversation = @import("conversation.zig");
@@ -10,7 +11,7 @@ const tool_activity = @import("tool_activity.zig");
 const tools = @import("tools.zig");
 
 pub const version = build_options.version;
-pub const abi_version: u32 = 1;
+pub const abi_version: u32 = 6;
 pub const Conversation = conversation.Conversation;
 pub const ConversationEvent = conversation.Event;
 pub const ConversationWake = conversation.Wake;
@@ -60,35 +61,37 @@ pub const default_omlx_base_url = models.default_omlx_base_url;
 pub const Settings = settings.Settings;
 pub const loadSettings = settings.load;
 pub const saveDefaultSelection = settings.saveDefaultSelection;
+pub const renderLiteral = presentation.renderLiteral;
+pub const renderOutput = presentation.renderOutput;
+pub const renderSource = presentation.renderSource;
+pub const renderMarkdown = presentation.renderMarkdown;
 
-pub const Lifecycle = enum(u32) {
-    scaffold = 0,
+pub const CopilotCliLaunch = enum {
+    sdk_default,
+    explicit_path,
 };
-
-pub const Status = struct {
-    abi_version: u32 = abi_version,
-    lifecycle: Lifecycle = .scaffold,
-};
-
-pub fn scaffoldStatus() Status {
-    return .{};
-}
 
 pub const ConversationOptions = struct {
+    working_directory: []const u8,
     model: ?[]const u8 = null,
     reasoning: ?ReasoningEffort = null,
     settings_path: ?[]const u8 = null,
     sessions_directory: ?[]const u8 = null,
+    copilot_cli_path: ?[]const u8 = null,
     omlx: OmlxOptions = .{},
+    copilot_cli_launch: CopilotCliLaunch = .sdk_default,
 };
 
 const ConversationContext = struct {
+    working_directory: []u8,
     model: ?[]u8,
     reasoning: ?ReasoningEffort,
     settings_path: ?[]u8,
     sessions_directory: ?[]u8,
+    copilot_cli_path: ?[]u8,
     omlx_base_url: []u8,
     omlx_api_key: ?[]u8,
+    copilot_cli_launch: CopilotCliLaunch,
 
     fn init(
         allocator: std.mem.Allocator,
@@ -97,6 +100,11 @@ const ConversationContext = struct {
         const context = try allocator.create(ConversationContext);
         errdefer allocator.destroy(context);
 
+        const working_directory = try allocator.dupe(
+            u8,
+            options.working_directory,
+        );
+        errdefer allocator.free(working_directory);
         const model = if (options.model) |value|
             try allocator.dupe(u8, value)
         else
@@ -112,14 +120,22 @@ const ConversationContext = struct {
         else
             null;
         errdefer if (sessions_directory) |value| allocator.free(value);
+        const copilot_cli_path = if (options.copilot_cli_path) |value|
+            try allocator.dupe(u8, value)
+        else
+            null;
+        errdefer if (copilot_cli_path) |value| allocator.free(value);
 
         context.* = .{
+            .working_directory = working_directory,
             .model = model,
             .reasoning = options.reasoning,
             .settings_path = settings_path,
             .sessions_directory = sessions_directory,
+            .copilot_cli_path = copilot_cli_path,
             .omlx_base_url = undefined,
             .omlx_api_key = null,
+            .copilot_cli_launch = options.copilot_cli_launch,
         };
         context.omlx_base_url = try allocator.dupe(
             u8,
@@ -138,9 +154,11 @@ const ConversationContext = struct {
         pointer: *anyopaque,
     ) void {
         const self: *ConversationContext = @ptrCast(@alignCast(pointer));
+        allocator.free(self.working_directory);
         if (self.model) |model| allocator.free(model);
         if (self.settings_path) |path| allocator.free(path);
         if (self.sessions_directory) |path| allocator.free(path);
+        if (self.copilot_cli_path) |path| allocator.free(path);
         allocator.free(self.omlx_base_url);
         if (self.omlx_api_key) |api_key| {
             std.crypto.secureZero(u8, api_key);
@@ -168,7 +186,11 @@ pub fn discoverModels(
     var client = copilot.Client.init(
         allocator,
         io,
-        MinimalCodingAgent.clientOptions(working_directory),
+        MinimalCodingAgent.clientOptions(
+            working_directory,
+            .sdk_default,
+            null,
+        ),
     ) catch {
         return buildModelCatalog(allocator, null, io, &selected, options);
     };
@@ -194,8 +216,28 @@ pub fn openConversation(
     );
 }
 
+test "conversation contexts retain their explicit working directories" {
+    const allocator = std.testing.allocator;
+    const first = try ConversationContext.init(
+        allocator,
+        .{ .working_directory = "/tmp/first" },
+    );
+    defer ConversationContext.destroy(allocator, first);
+    const second = try ConversationContext.init(
+        allocator,
+        .{ .working_directory = "/tmp/second" },
+    );
+    defer ConversationContext.destroy(allocator, second);
+    try std.testing.expectEqualStrings("/tmp/first", first.working_directory);
+    try std.testing.expectEqualStrings("/tmp/second", second.working_directory);
+}
+
 const MinimalCodingAgent = struct {
-    const cli_args = [_][]const u8{"--disable-builtin-mcps"};
+    const direct_cli_args = [_][]const u8{"--disable-builtin-mcps"};
+    const path_lookup_cli_args = [_][]const u8{
+        "copilot",
+        "--disable-builtin-mcps",
+    };
 
     const available_tools = [_][]const u8{
         "custom:*",
@@ -213,10 +255,15 @@ const MinimalCodingAgent = struct {
 
     const sdk_tools = makeSdkTools();
 
-    fn clientOptions(working_directory: []const u8) copilot.ClientOptions {
-        return .{
+    fn clientOptions(
+        working_directory: []const u8,
+        launch: CopilotCliLaunch,
+        copilot_cli_path: ?[]const u8,
+    ) copilot.ClientOptions {
+        const command = copilotCommand(launch, copilot_cli_path);
+        var options: copilot.ClientOptions = .{
             .working_directory = working_directory,
-            .cli_args = &cli_args,
+            .cli_args = command.args,
             .client_info = .{
                 .application_name = "vivi",
                 .application_version = version,
@@ -224,6 +271,10 @@ const MinimalCodingAgent = struct {
                 .integration_version = version,
             },
         };
+        if (launch == .explicit_path) {
+            options.cli_path = command.executable;
+        }
+        return options;
     }
 
     fn sessionConfig(
@@ -277,6 +328,27 @@ const MinimalCodingAgent = struct {
         return result;
     }
 };
+
+const CopilotCommand = struct {
+    executable: []const u8,
+    args: []const []const u8,
+};
+
+fn copilotCommand(
+    launch: CopilotCliLaunch,
+    copilot_cli_path: ?[]const u8,
+) CopilotCommand {
+    return switch (launch) {
+        .sdk_default => .{
+            .executable = "copilot",
+            .args = &MinimalCodingAgent.direct_cli_args,
+        },
+        .explicit_path => .{
+            .executable = copilot_cli_path orelse "",
+            .args = &MinimalCodingAgent.direct_cli_args,
+        },
+    };
+}
 
 const hosted_model_id = "copilot/default";
 
@@ -2172,20 +2244,10 @@ fn streamSessionResponse(
                         };
                     }
                 }
-                const message = std.fmt.allocPrint(
-                    worker.allocator(),
-                    "Session title: {s}",
-                    .{title.data.title},
-                ) catch {
+                worker.sessionTitle(title.data.title) catch {
                     worker.closeFailure(.stream, "Unable to display session title.");
                     return .failed;
                 };
-                defer worker.allocator().free(message);
-                if (!reportStreamStatus(
-                    worker,
-                    message,
-                    "Unable to display session title.",
-                )) return .failed;
             },
             .session_context_changed => {
                 if (!reportStreamStatus(
@@ -2254,17 +2316,9 @@ fn runSdkConversation(
     const context: *ConversationContext = @ptrCast(
         @alignCast(opaque_context),
     );
-    var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const cwd_len = std.process.currentPath(
-        worker.io(),
-        &cwd_buffer,
-    ) catch |err| {
-        worker.closeFailure(.startup, @errorName(err));
-        return;
-    };
     var active_working_directory = worker.allocator().dupe(
         u8,
-        cwd_buffer[0..cwd_len],
+        context.working_directory,
     ) catch |err| {
         worker.closeFailure(.startup, @errorName(err));
         return;
@@ -2283,7 +2337,11 @@ fn runSdkConversation(
     var client = copilot.Client.init(
         worker.allocator(),
         worker.io(),
-        MinimalCodingAgent.clientOptions(active_working_directory),
+        MinimalCodingAgent.clientOptions(
+            active_working_directory,
+            context.copilot_cli_launch,
+            context.copilot_cli_path,
+        ),
     ) catch |err| {
         worker.closeFailure(.startup, @errorName(err));
         return;
@@ -2409,7 +2467,9 @@ fn runSdkConversation(
         omlx_options,
     )) |catalog| {
         worker.modelCatalog(catalog) catch {};
-    } else |_| {}
+    } else |err| {
+        worker.modelCatalogFailed(@errorName(err)) catch {};
+    }
 
     while (true) {
         var command = worker.waitCommand();
@@ -3428,13 +3488,6 @@ fn runSdkConversation(
     }
 }
 
-test "scaffold status is stable" {
-    const status = scaffoldStatus();
-
-    try std.testing.expectEqual(abi_version, status.abi_version);
-    try std.testing.expectEqual(Lifecycle.scaffold, status.lifecycle);
-}
-
 test "image tool result serializes binary content for Copilot, not the transcript" {
     const allocator = std.testing.allocator;
     var result: tools.Result = .{ .image = .{
@@ -3686,14 +3739,19 @@ test "minimal coding agent limits hosted tools to simplified subset" {
     try std.testing.expectEqualSlices(
         []const u8,
         &.{"--disable-builtin-mcps"},
-        &MinimalCodingAgent.cli_args,
+        &MinimalCodingAgent.direct_cli_args,
     );
 
-    const options = MinimalCodingAgent.clientOptions("/workspace");
+    const options = MinimalCodingAgent.clientOptions(
+        "/workspace",
+        .sdk_default,
+        null,
+    );
     try std.testing.expectEqualStrings(
         "/workspace",
         options.working_directory.?,
     );
+    try std.testing.expectEqualStrings("copilot", options.cli_path);
 
     try std.testing.expectEqualSlices(
         []const u8,
@@ -3708,6 +3766,40 @@ test "minimal coding agent limits hosted tools to simplified subset" {
             null,
             .{},
         ).available_tools.?,
+    );
+}
+
+test "native launch uses the host-resolved Copilot path" {
+    const options = MinimalCodingAgent.clientOptions(
+        "/workspace",
+        .explicit_path,
+        "/opt/homebrew/bin/copilot",
+    );
+    try std.testing.expectEqualStrings("/opt/homebrew/bin/copilot", options.cli_path);
+    try std.testing.expectEqualSlices(
+        []const u8,
+        &.{"--disable-builtin-mcps"},
+        options.cli_args,
+    );
+}
+
+test "terminal launch preserves SDK default command" {
+    const conversation_options: ConversationOptions = .{
+        .working_directory = "/workspace",
+    };
+    try std.testing.expectEqual(
+        CopilotCliLaunch.sdk_default,
+        conversation_options.copilot_cli_launch,
+    );
+    const command = copilotCommand(
+        conversation_options.copilot_cli_launch,
+        conversation_options.copilot_cli_path,
+    );
+    try std.testing.expectEqualStrings("copilot", command.executable);
+    try std.testing.expectEqualSlices(
+        []const u8,
+        &.{"--disable-builtin-mcps"},
+        command.args,
     );
 }
 
