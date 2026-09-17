@@ -1,5 +1,6 @@
 const std = @import("std");
 const image = @import("image.zig");
+const presentation = @import("presentation.zig");
 
 pub const ToolCallId = struct {
     bytes: []u8,
@@ -288,6 +289,7 @@ pub const ToolStarted = struct {
     allocator: std.mem.Allocator,
     call_id: ToolCallId,
     invocation: ToolInvocation,
+    input_presentation: presentation.Presentation,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -302,24 +304,38 @@ pub const ToolStarted = struct {
         }
         const owned_arguments = try allocator.dupe(u8, arguments_json);
         errdefer allocator.free(owned_arguments);
+        const owned_summary = try summary.clone(allocator);
+        errdefer {
+            var mutable = owned_summary;
+            mutable.deinit(allocator);
+        }
+        var input_presentation = try presentation.presentToolInput(
+            allocator,
+            summary,
+            arguments_json,
+        );
+        errdefer input_presentation.deinit();
         return .{
             .allocator = allocator,
             .call_id = owned_call_id,
             .invocation = .{
                 .arguments_json = owned_arguments,
-                .summary = try summary.clone(allocator),
+                .summary = owned_summary,
             },
+            .input_presentation = input_presentation,
         };
     }
 
     pub fn eql(self: ToolStarted, other: ToolStarted) bool {
         return self.call_id.eql(other.call_id) and
-            self.invocation.eql(other.invocation);
+            self.invocation.eql(other.invocation) and
+            self.input_presentation.eql(other.input_presentation);
     }
 
     pub fn deinit(self: *ToolStarted) void {
         self.call_id.deinit(self.allocator);
         self.invocation.deinit(self.allocator);
+        self.input_presentation.deinit();
         self.* = undefined;
     }
 };
@@ -328,24 +344,68 @@ pub const ToolFinished = struct {
     allocator: std.mem.Allocator,
     call_id: ToolCallId,
     result: ToolResult,
+    output_presentation: presentation.Presentation,
+
+    pub const ResultInput = union(enum) {
+        succeeded: []const u8,
+        image: image.Image,
+        failed: []const u8,
+    };
 
     pub fn init(
         allocator: std.mem.Allocator,
         call_id: []const u8,
-        result: union(enum) {
-            succeeded: []const u8,
-            image: image.Image,
-            failed: []const u8,
-        },
+        result: ResultInput,
+    ) !ToolFinished {
+        return initOwned(allocator, call_id, result, null);
+    }
+
+    pub fn initPresented(
+        allocator: std.mem.Allocator,
+        call_id: []const u8,
+        summary: ToolSummary,
+        result: ResultInput,
+    ) !ToolFinished {
+        return initOwned(allocator, call_id, result, summary);
+    }
+
+    fn initOwned(
+        allocator: std.mem.Allocator,
+        call_id: []const u8,
+        result: ResultInput,
+        summary: ?ToolSummary,
     ) !ToolFinished {
         const owned_call_id = try ToolCallId.init(allocator, call_id);
         errdefer {
             var mutable = owned_call_id;
             mutable.deinit(allocator);
         }
+        const raw = switch (result) {
+            .succeeded, .failed => |text| text,
+            .image => |value| value.description,
+        };
+        var output_presentation = if (summary) |known|
+            try presentation.presentToolResult(
+                allocator,
+                known,
+                switch (result) {
+                    .succeeded => .succeeded,
+                    .failed => .failed,
+                    .image => .image,
+                },
+                raw,
+            )
+        else
+            presentation.Presentation{
+                .allocator = allocator,
+                .text = try presentation.renderOutput(allocator, raw),
+                .content = .literal,
+            };
+        errdefer output_presentation.deinit();
         return .{
             .allocator = allocator,
             .call_id = owned_call_id,
+            .output_presentation = output_presentation,
             .result = switch (result) {
                 .succeeded => |text| .{
                     .succeeded = try allocator.dupe(u8, text),
@@ -359,12 +419,15 @@ pub const ToolFinished = struct {
     }
 
     pub fn eql(self: ToolFinished, other: ToolFinished) bool {
-        return self.call_id.eql(other.call_id) and self.result.eql(other.result);
+        return self.call_id.eql(other.call_id) and
+            self.result.eql(other.result) and
+            self.output_presentation.eql(other.output_presentation);
     }
 
     pub fn deinit(self: *ToolFinished) void {
         self.call_id.deinit(self.allocator);
         self.result.deinit(self.allocator);
+        self.output_presentation.deinit();
         self.* = undefined;
     }
 };

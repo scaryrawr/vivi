@@ -1,5 +1,5 @@
 const std = @import("std");
-const ts = @import("tree-sitter");
+const ts = @import("tree_sitter.zig");
 
 extern fn tree_sitter_zig() callconv(.c) *const ts.Language;
 extern fn tree_sitter_bash() callconv(.c) *const ts.Language;

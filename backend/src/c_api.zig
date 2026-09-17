@@ -272,6 +272,144 @@ export fn vivi_backend_sanitize_tool_markdown(
     return c.VIVI_BACKEND_OK;
 }
 
+fn cLanguage(value: backend.PresentationLanguage) c.vivi_backend_language_t {
+    return switch (value) {
+        .zig => c.VIVI_BACKEND_LANGUAGE_ZIG,
+        .bash => c.VIVI_BACKEND_LANGUAGE_BASH,
+        .json => c.VIVI_BACKEND_LANGUAGE_JSON,
+        .yaml => c.VIVI_BACKEND_LANGUAGE_YAML,
+        .diff => c.VIVI_BACKEND_LANGUAGE_DIFF,
+        .javascript => c.VIVI_BACKEND_LANGUAGE_JAVASCRIPT,
+        .typescript => c.VIVI_BACKEND_LANGUAGE_TYPESCRIPT,
+        .tsx => c.VIVI_BACKEND_LANGUAGE_TSX,
+        .rust => c.VIVI_BACKEND_LANGUAGE_RUST,
+        .c => c.VIVI_BACKEND_LANGUAGE_C,
+        .cpp => c.VIVI_BACKEND_LANGUAGE_CPP,
+        .go => c.VIVI_BACKEND_LANGUAGE_GO,
+        .java => c.VIVI_BACKEND_LANGUAGE_JAVA,
+        .lua => c.VIVI_BACKEND_LANGUAGE_LUA,
+        .python => c.VIVI_BACKEND_LANGUAGE_PYTHON,
+    };
+}
+
+fn cToken(value: backend.SemanticToken) c.vivi_backend_semantic_token_t {
+    return switch (value) {
+        .comment => c.VIVI_BACKEND_TOKEN_COMMENT,
+        .string => c.VIVI_BACKEND_TOKEN_STRING,
+        .number => c.VIVI_BACKEND_TOKEN_NUMBER,
+        .constant => c.VIVI_BACKEND_TOKEN_CONSTANT,
+        .keyword => c.VIVI_BACKEND_TOKEN_KEYWORD,
+        .function => c.VIVI_BACKEND_TOKEN_FUNCTION,
+        .property => c.VIVI_BACKEND_TOKEN_PROPERTY,
+        .operator => c.VIVI_BACKEND_TOKEN_OPERATOR,
+        .inserted => c.VIVI_BACKEND_TOKEN_INSERTED,
+        .deleted => c.VIVI_BACKEND_TOKEN_DELETED,
+        .meta => c.VIVI_BACKEND_TOKEN_META,
+    };
+}
+
+fn presentationSpanCount(value: *const backend.Presentation) u32 {
+    return switch (value.content) {
+        .source => |source| @intCast(source.tokens.len),
+        .literal, .markdown => 0,
+    };
+}
+
+fn presentationMetadata(
+    value: *const backend.Presentation,
+    content_offset: u32,
+    semantic_offset: u32,
+) c.vivi_backend_presentation_t {
+    return .{
+        .content = .{
+            .offset = content_offset,
+            .length = @intCast(value.text.len),
+        },
+        .kind = switch (value.content) {
+            .literal => c.VIVI_BACKEND_PRESENTATION_LITERAL,
+            .markdown => c.VIVI_BACKEND_PRESENTATION_MARKDOWN,
+            .source => c.VIVI_BACKEND_PRESENTATION_SOURCE,
+        },
+        .language = switch (value.content) {
+            .source => |source| cLanguage(source.language),
+            .literal, .markdown => c.VIVI_BACKEND_LANGUAGE_NONE,
+        },
+        .semantic_span_offset = semantic_offset,
+        .semantic_span_count = presentationSpanCount(value),
+        .reserved = 0,
+    };
+}
+
+fn copyPresentationSpans(
+    value: *const backend.Presentation,
+    content_offset: u32,
+    destination: []c.vivi_backend_semantic_span_t,
+    semantic_offset: *u32,
+) void {
+    switch (value.content) {
+        .source => |source| for (source.tokens) |span| {
+            destination[semantic_offset.*] = .{
+                .bytes = .{
+                    .offset = content_offset + @as(u32, @intCast(span.start)),
+                    .length = @intCast(span.end - span.start),
+                },
+                .token = cToken(span.token),
+                .reserved = 0,
+            };
+            semantic_offset.* += 1;
+        },
+        .literal, .markdown => {},
+    }
+}
+
+export fn vivi_backend_present_code_fragment(
+    language_name: ?[*]const u8,
+    language_name_length: u32,
+    input: ?[*]const u8,
+    input_length: u32,
+    out_presentation: ?*c.vivi_backend_presentation_t,
+    output: ?[*]u8,
+    output_capacity: u32,
+    semantic_spans: ?[*]c.vivi_backend_semantic_span_t,
+    semantic_span_capacity: u32,
+) callconv(.c) c.vivi_backend_result_t {
+    const descriptor = out_presentation orelse return c.VIVI_BACKEND_INVALID_ARGUMENT;
+    const language = if (language_name_length == 0)
+        ""
+    else
+        (language_name orelse return c.VIVI_BACKEND_INVALID_ARGUMENT)[0..language_name_length];
+    const source = if (input_length == 0)
+        ""
+    else
+        (input orelse return c.VIVI_BACKEND_INVALID_ARGUMENT)[0..input_length];
+    var presented = backend.presentCodeFragment(
+        std.heap.c_allocator,
+        language,
+        source,
+    ) catch return c.VIVI_BACKEND_FAILED;
+    defer presented.deinit();
+    if (presented.text.len > std.math.maxInt(u32)) return c.VIVI_BACKEND_FAILED;
+    const span_count = presentationSpanCount(&presented);
+    descriptor.* = presentationMetadata(&presented, 0, 0);
+    if (output_capacity < presented.text.len or semantic_span_capacity < span_count) {
+        return c.VIVI_BACKEND_BUFFER_TOO_SMALL;
+    }
+    var empty_bytes: [0]u8 = .{};
+    var empty_spans: [0]c.vivi_backend_semantic_span_t = .{};
+    const byte_destination: []u8 = if (presented.text.len > 0)
+        (output orelse return c.VIVI_BACKEND_INVALID_ARGUMENT)[0..presented.text.len]
+    else
+        &empty_bytes;
+    const span_destination: []c.vivi_backend_semantic_span_t = if (span_count > 0)
+        (semantic_spans orelse return c.VIVI_BACKEND_INVALID_ARGUMENT)[0..span_count]
+    else
+        &empty_spans;
+    @memcpy(byte_destination, presented.text);
+    var semantic_offset: u32 = 0;
+    copyPresentationSpans(&presented, 0, span_destination, &semantic_offset);
+    return c.VIVI_BACKEND_OK;
+}
+
 const Projected = struct {
     kind: c.vivi_backend_event_kind_t,
     content_kind: c.vivi_backend_content_kind_t = c.VIVI_BACKEND_CONTENT_NONE,
@@ -281,6 +419,8 @@ const Projected = struct {
     tool_title: []const u8 = "",
     tool_detail: []const u8 = "",
     tool_input: []const u8 = "",
+    input_presentation: ?*const backend.Presentation = null,
+    output_presentation: ?*const backend.Presentation = null,
     tool_result: c.vivi_backend_tool_result_t = c.VIVI_BACKEND_TOOL_RESULT_NONE,
     selected_reasoning: c.vivi_backend_reasoning_effort_t = c.VIVI_BACKEND_REASONING_NONE,
     models: []const backend.ModelInfo = &.{},
@@ -357,6 +497,7 @@ fn project(event: *const backend.ConversationEvent) ?Projected {
                     .tool_title = display.title,
                     .tool_detail = display.detail,
                     .tool_input = started.invocation.arguments_json,
+                    .input_presentation = &started.input_presentation,
                     .tool_result = c.VIVI_BACKEND_TOOL_RESULT_RUNNING,
                 };
             },
@@ -373,6 +514,7 @@ fn project(event: *const backend.ConversationEvent) ?Projected {
                     .failed => c.VIVI_BACKEND_TOOL_RESULT_FAILED,
                     .image => c.VIVI_BACKEND_TOOL_RESULT_IMAGE,
                 },
+                .output_presentation = &finished.output_presentation,
             },
         },
         .model_catalog => |*catalog| .{
@@ -453,21 +595,74 @@ fn project(event: *const backend.ConversationEvent) ?Projected {
 }
 
 fn byteCount(projected: Projected) !u32 {
-    var total: u64 = projected.text.len + projected.selected_model_id.len +
-        projected.tool_call_id.len + projected.tool_title.len +
-        projected.tool_detail.len + projected.tool_input.len;
+    var total: u64 = 0;
+    const values = [_][]const u8{
+        projected.text,
+        projected.selected_model_id,
+        projected.tool_call_id,
+        projected.tool_title,
+        projected.tool_detail,
+        projected.tool_input,
+    };
+    for (values) |value| {
+        total = std.math.add(u64, total, value.len) catch
+            return error.EventTooLarge;
+    }
+    if (projected.input_presentation) |value| {
+        total = std.math.add(u64, total, value.text.len) catch
+            return error.EventTooLarge;
+    }
+    if (projected.output_presentation) |value| {
+        total = std.math.add(u64, total, value.text.len) catch
+            return error.EventTooLarge;
+    }
     for (projected.models) |model| {
-        total += model.id.len + model.display_name.len;
+        total = std.math.add(u64, total, model.id.len) catch
+            return error.EventTooLarge;
+        total = std.math.add(u64, total, model.display_name.len) catch
+            return error.EventTooLarge;
     }
     if (projected.model) |model| {
-        total += model.id.len + model.display_name.len;
+        total = std.math.add(u64, total, model.id.len) catch
+            return error.EventTooLarge;
+        total = std.math.add(u64, total, model.display_name.len) catch
+            return error.EventTooLarge;
     }
     if (total > std.math.maxInt(u32)) return error.EventTooLarge;
     return @intCast(total);
 }
 
-fn modelCount(projected: Projected) u32 {
-    return @intCast(projected.models.len + @intFromBool(projected.model != null));
+fn modelCount(projected: Projected) !u32 {
+    const count = std.math.add(
+        usize,
+        projected.models.len,
+        @intFromBool(projected.model != null),
+    ) catch return error.EventTooLarge;
+    return std.math.cast(u32, count) orelse error.EventTooLarge;
+}
+
+fn semanticSpanCount(projected: Projected) !u32 {
+    const input_count = if (projected.input_presentation) |value|
+        presentationSpanCount(value)
+    else
+        0;
+    const output_count = if (projected.output_presentation) |value|
+        presentationSpanCount(value)
+    else
+        0;
+    return std.math.add(u32, input_count, output_count) catch
+        error.EventTooLarge;
+}
+
+fn emptyPresentation() c.vivi_backend_presentation_t {
+    return .{
+        .content = .{ .offset = 0, .length = 0 },
+        .kind = c.VIVI_BACKEND_PRESENTATION_NONE,
+        .language = c.VIVI_BACKEND_LANGUAGE_NONE,
+        .semantic_span_offset = 0,
+        .semantic_span_count = 0,
+        .reserved = 0,
+    };
 }
 
 fn appendBytes(
@@ -509,13 +704,38 @@ fn copyProjected(
     models: ?[*]c.vivi_backend_model_t,
     model_capacity: u32,
 ) c.vivi_backend_result_t {
+    return copyProjectedWithSpans(
+        projected,
+        output,
+        bytes,
+        byte_capacity,
+        models,
+        model_capacity,
+        null,
+        0,
+    );
+}
+
+fn copyProjectedWithSpans(
+    projected: Projected,
+    output: *c.vivi_backend_event_t,
+    bytes: ?[*]u8,
+    byte_capacity: u32,
+    models: ?[*]c.vivi_backend_model_t,
+    model_capacity: u32,
+    semantic_spans: ?[*]c.vivi_backend_semantic_span_t,
+    semantic_span_capacity: u32,
+) c.vivi_backend_result_t {
     const required_bytes = byteCount(projected) catch return c.VIVI_BACKEND_FAILED;
-    const required_models = modelCount(projected);
+    const required_models = modelCount(projected) catch return c.VIVI_BACKEND_FAILED;
+    const required_semantic_spans = semanticSpanCount(projected) catch
+        return c.VIVI_BACKEND_FAILED;
     output.* = .{
         .kind = projected.kind,
         .content_kind = projected.content_kind,
         .byte_count = required_bytes,
         .model_count = required_models,
+        .semantic_span_count = required_semantic_spans,
         .content = .{ .offset = 0, .length = @intCast(projected.text.len) },
         .selected_model_id = .{
             .offset = @intCast(projected.text.len),
@@ -525,6 +745,8 @@ fn copyProjected(
         .tool_title = .{ .offset = 0, .length = 0 },
         .tool_detail = .{ .offset = 0, .length = 0 },
         .tool_input = .{ .offset = 0, .length = 0 },
+        .tool_input_presentation = emptyPresentation(),
+        .tool_output_presentation = emptyPresentation(),
         .tool_result = projected.tool_result,
         .selected_reasoning = projected.selected_reasoning,
         .switch_outcome = projected.switch_outcome,
@@ -533,11 +755,14 @@ fn copyProjected(
         .cleanup_failed = @intFromBool(projected.cleanup_failed),
         .reserved = 0,
     };
-    if (byte_capacity < required_bytes or model_capacity < required_models) {
+    if (byte_capacity < required_bytes or model_capacity < required_models or
+        semantic_span_capacity < required_semantic_spans)
+    {
         return c.VIVI_BACKEND_BUFFER_TOO_SMALL;
     }
     var empty_bytes: [0]u8 = .{};
     var empty_models: [0]c.vivi_backend_model_t = .{};
+    var empty_semantic_spans: [0]c.vivi_backend_semantic_span_t = .{};
     const byte_destination: []u8 = if (required_bytes > 0)
         (bytes orelse return c.VIVI_BACKEND_INVALID_ARGUMENT)[0..required_bytes]
     else
@@ -546,6 +771,11 @@ fn copyProjected(
         (models orelse return c.VIVI_BACKEND_INVALID_ARGUMENT)[0..required_models]
     else
         &empty_models;
+    const semantic_destination: []c.vivi_backend_semantic_span_t =
+        if (required_semantic_spans > 0)
+            (semantic_spans orelse return c.VIVI_BACKEND_INVALID_ARGUMENT)[0..required_semantic_spans]
+        else
+            &empty_semantic_spans;
     var offset: u32 = 0;
     output.content = appendBytes(byte_destination, &offset, projected.text);
     output.selected_model_id = appendBytes(
@@ -573,6 +803,37 @@ fn copyProjected(
         &offset,
         projected.tool_input,
     );
+    var semantic_offset: u32 = 0;
+    if (projected.input_presentation) |value| {
+        const content_offset = offset;
+        output.tool_input_presentation = presentationMetadata(
+            value,
+            content_offset,
+            semantic_offset,
+        );
+        _ = appendBytes(byte_destination, &offset, value.text);
+        copyPresentationSpans(
+            value,
+            content_offset,
+            semantic_destination,
+            &semantic_offset,
+        );
+    }
+    if (projected.output_presentation) |value| {
+        const content_offset = offset;
+        output.tool_output_presentation = presentationMetadata(
+            value,
+            content_offset,
+            semantic_offset,
+        );
+        _ = appendBytes(byte_destination, &offset, value.text);
+        copyPresentationSpans(
+            value,
+            content_offset,
+            semantic_destination,
+            &semantic_offset,
+        );
+    }
     var model_index: usize = 0;
     for (projected.models) |*model| {
         model_destination[model_index] = writeModel(byte_destination, &offset, model);
@@ -591,6 +852,8 @@ export fn vivi_backend_next_event(
     byte_capacity: u32,
     models: ?[*]c.vivi_backend_model_t,
     model_capacity: u32,
+    semantic_spans: ?[*]c.vivi_backend_semantic_span_t,
+    semantic_span_capacity: u32,
 ) callconv(.c) c.vivi_backend_result_t {
     const self = handle(conversation) orelse return c.VIVI_BACKEND_INVALID_ARGUMENT;
     const output = out_event orelse return c.VIVI_BACKEND_INVALID_ARGUMENT;
@@ -601,12 +864,15 @@ export fn vivi_backend_next_event(
             .content_kind = c.VIVI_BACKEND_CONTENT_NONE,
             .byte_count = 0,
             .model_count = 0,
+            .semantic_span_count = 0,
             .content = .{ .offset = 0, .length = 0 },
             .selected_model_id = .{ .offset = 0, .length = 0 },
             .tool_call_id = .{ .offset = 0, .length = 0 },
             .tool_title = .{ .offset = 0, .length = 0 },
             .tool_detail = .{ .offset = 0, .length = 0 },
             .tool_input = .{ .offset = 0, .length = 0 },
+            .tool_input_presentation = emptyPresentation(),
+            .tool_output_presentation = emptyPresentation(),
             .tool_result = c.VIVI_BACKEND_TOOL_RESULT_NONE,
             .selected_reasoning = c.VIVI_BACKEND_REASONING_NONE,
             .switch_outcome = c.VIVI_BACKEND_MODEL_SWITCH_NONE,
@@ -626,13 +892,15 @@ export fn vivi_backend_next_event(
         self.pending = null;
     }
     const projected = project(&self.pending.?).?;
-    const copied = copyProjected(
+    const copied = copyProjectedWithSpans(
         projected,
         output,
         bytes,
         byte_capacity,
         models,
         model_capacity,
+        semantic_spans,
+        semantic_span_capacity,
     );
     if (copied != c.VIVI_BACKEND_OK) return copied;
     if (projected.kind == c.VIVI_BACKEND_EVENT_FAILURE) {
@@ -731,6 +999,143 @@ test "C tool Markdown sanitizer uses atomic caller-owned copy" {
             ),
     );
     try std.testing.expectEqualStrings("# Result\n", bytes[0..required]);
+}
+
+test "C fenced fragment presentation uses atomic caller-owned buffers" {
+    const input = "const café = true;\r\n";
+    var descriptor: c.vivi_backend_presentation_t = undefined;
+    try std.testing.expect(
+        c.VIVI_BACKEND_BUFFER_TOO_SMALL ==
+            vivi_backend_present_code_fragment(
+                "zig",
+                3,
+                input,
+                input.len,
+                &descriptor,
+                null,
+                0,
+                null,
+                0,
+            ),
+    );
+    try std.testing.expect(
+        descriptor.kind == c.VIVI_BACKEND_PRESENTATION_SOURCE,
+    );
+    try std.testing.expect(
+        descriptor.language == c.VIVI_BACKEND_LANGUAGE_ZIG,
+    );
+    var bytes = [_]u8{0xaa} ** 64;
+    var spans = [_]c.vivi_backend_semantic_span_t{
+        std.mem.zeroes(c.vivi_backend_semantic_span_t),
+    } ** 16;
+    const required_bytes = descriptor.content.length;
+    const required_spans = descriptor.semantic_span_count;
+    try std.testing.expect(required_spans > 0);
+    try std.testing.expect(
+        c.VIVI_BACKEND_BUFFER_TOO_SMALL ==
+            vivi_backend_present_code_fragment(
+                "zig",
+                3,
+                input,
+                input.len,
+                &descriptor,
+                &bytes,
+                required_bytes,
+                &spans,
+                required_spans - 1,
+            ),
+    );
+    try std.testing.expectEqual(@as(u8, 0xaa), bytes[0]);
+    try std.testing.expectEqual(@as(u32, 0), spans[0].bytes.length);
+    try std.testing.expect(
+        c.VIVI_BACKEND_OK ==
+            vivi_backend_present_code_fragment(
+                "zig",
+                3,
+                input,
+                input.len,
+                &descriptor,
+                &bytes,
+                required_bytes,
+                &spans,
+                required_spans,
+            ),
+    );
+    try std.testing.expectEqualStrings(
+        "const café = true;\n",
+        bytes[0..required_bytes],
+    );
+    for (spans[0..required_spans]) |span| {
+        try std.testing.expectEqual(@as(u32, 0), span.reserved);
+        try std.testing.expect(span.bytes.length > 0);
+        try std.testing.expect(
+            span.bytes.offset + span.bytes.length <= required_bytes,
+        );
+    }
+}
+
+test "C event presentation copy is atomic across bytes models and spans" {
+    const allocator = std.testing.allocator;
+    var started = try backend.ToolStarted.init(
+        allocator,
+        "call-bash",
+        "{\"command\":\"echo ready\"}",
+        .{ .bash = .{ .run = .{ .command = "echo ready" } } },
+    );
+    var event: backend.ConversationEvent = .{
+        .tool_activity = .{ .started = started },
+    };
+    started = undefined;
+    defer event.deinit();
+
+    const projected = project(&event).?;
+    var metadata: c.vivi_backend_event_t = undefined;
+    var bytes = [_]u8{0xaa} ** 128;
+    var models = [_]c.vivi_backend_model_t{
+        std.mem.zeroes(c.vivi_backend_model_t),
+    };
+    var spans = [_]c.vivi_backend_semantic_span_t{
+        std.mem.zeroes(c.vivi_backend_semantic_span_t),
+    } ** 16;
+    try std.testing.expect(
+        c.VIVI_BACKEND_BUFFER_TOO_SMALL ==
+            copyProjectedWithSpans(
+                projected,
+                &metadata,
+                &bytes,
+                bytes.len,
+                &models,
+                models.len,
+                &spans,
+                0,
+            ),
+    );
+    try std.testing.expectEqual(@as(u8, 0xaa), bytes[0]);
+    try std.testing.expectEqual(@as(u32, 0), models[0].id.length);
+    try std.testing.expectEqual(@as(u32, 0), spans[0].bytes.length);
+    try std.testing.expect(metadata.semantic_span_count > 0);
+
+    try std.testing.expect(
+        c.VIVI_BACKEND_OK ==
+            copyProjectedWithSpans(
+                projected,
+                &metadata,
+                &bytes,
+                bytes.len,
+                &models,
+                models.len,
+                &spans,
+                metadata.semantic_span_count,
+            ),
+    );
+    try std.testing.expect(
+        metadata.tool_input_presentation.kind ==
+            c.VIVI_BACKEND_PRESENTATION_SOURCE,
+    );
+    try std.testing.expect(
+        metadata.tool_input_presentation.language ==
+            c.VIVI_BACKEND_LANGUAGE_BASH,
+    );
 }
 
 test "C model catalog copy-out is atomic and uses checked spans" {
@@ -838,7 +1243,7 @@ test "C model switch projection reports authoritative outcome facts" {
     );
     try std.testing.expect(projected.default_saved);
     try std.testing.expect(projected.cleanup_failed);
-    try std.testing.expectEqual(@as(u32, 1), modelCount(projected));
+    try std.testing.expectEqual(@as(u32, 1), try modelCount(projected));
 }
 
 test "C model switch projection distinguishes non-replacement outcomes" {
@@ -892,7 +1297,7 @@ test "C model switch projection distinguishes non-replacement outcomes" {
         "SelectedModelUnavailable",
         projected_failure.text,
     );
-    try std.testing.expectEqual(@as(u32, 0), modelCount(projected_failure));
+    try std.testing.expectEqual(@as(u32, 0), try modelCount(projected_failure));
 }
 
 test "C session title is a distinct typed text event" {

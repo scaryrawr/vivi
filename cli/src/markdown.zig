@@ -1,5 +1,6 @@
 const std = @import("std");
-const highlight = @import("highlight.zig");
+const backend = @import("vivi_backend");
+const highlight = backend.syntax;
 const vaxis = @import("vaxis");
 const c = @cImport({
     @cInclude("md4c.h");
@@ -222,7 +223,7 @@ pub const HighlightCache = struct {
             {
                 return block.spans;
             }
-            const spans = try highlight.spans(allocator, language, source);
+            const spans = try fragmentSpans(allocator, language, source);
             allocator.free(block.spans);
             block.* = .{
                 .language = language,
@@ -232,7 +233,7 @@ pub const HighlightCache = struct {
             return block.spans;
         }
         std.debug.assert(index == self.blocks.items.len);
-        const spans = try highlight.spans(allocator, language, source);
+        const spans = try fragmentSpans(allocator, language, source);
         errdefer allocator.free(spans);
         try self.blocks.append(allocator, .{
             .language = language,
@@ -253,6 +254,23 @@ pub const HighlightCache = struct {
         }
     }
 };
+
+fn fragmentSpans(
+    allocator: std.mem.Allocator,
+    language: highlight.Language,
+    source: []const u8,
+) ![]highlight.Span {
+    var presented = try backend.presentCodeFragment(
+        allocator,
+        @tagName(language),
+        source,
+    );
+    defer presented.deinit();
+    return switch (presented.content) {
+        .source => |value| allocator.dupe(highlight.Span, value.tokens),
+        .literal, .markdown => allocator.alloc(highlight.Span, 0),
+    };
+}
 
 pub fn combineStyle(base: vaxis.Style, markdown: Style) vaxis.Style {
     var result = base;
@@ -456,7 +474,7 @@ const Builder = struct {
                         source,
                     )
                 else blk: {
-                    owned_highlights = try highlight.spans(
+                    owned_highlights = try fragmentSpans(
                         self.allocator,
                         language,
                         source,

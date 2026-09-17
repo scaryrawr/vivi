@@ -1,5 +1,19 @@
 import SwiftUI
 
+enum ToolInputLayout: Equatable {
+  case presentation(ToolPresentation)
+  case presentationWithCanonicalJSON(ToolPresentation, String)
+}
+
+func toolInputLayout(input: String, presentation: ToolPresentation) -> ToolInputLayout {
+  guard case .source(_, .bash, _) = presentation,
+    input != presentation.text
+  else {
+    return .presentation(presentation)
+  }
+  return .presentationWithCanonicalJSON(presentation, input)
+}
+
 struct ContentView: View {
   @StateObject private var store: NativeChatStore
 
@@ -227,13 +241,13 @@ private struct ChatItemView: View {
       } content: {
         VStack(alignment: .leading, spacing: 8) {
           if !activity.detail.isEmpty {
-            detail("Detail", activity.detail, markdown: false)
+            detail("Detail", .literal(activity.detail))
           }
-          if !activity.input.isEmpty {
-            detail("Input", activity.input, markdown: false)
+          if !activity.inputPresentation.text.isEmpty {
+            inputDetail
           }
-          if !activity.output.isEmpty {
-            detail("Output", activity.output, markdown: true)
+          if let output = activity.outputPresentation, !output.text.isEmpty {
+            detail("Output", output)
           }
         }
         .padding(.horizontal, 10)
@@ -241,18 +255,42 @@ private struct ChatItemView: View {
       }
     }
 
+    private var inputDetail: some View {
+      VStack(alignment: .leading, spacing: 2) {
+        Text("Input")
+          .font(.caption.weight(.semibold))
+          .foregroundStyle(.secondary)
+        switch toolInputLayout(
+          input: activity.input,
+          presentation: activity.inputPresentation)
+        {
+        case .presentation(let presentation):
+          PresentationView(presentation: presentation)
+        case .presentationWithCanonicalJSON(let presentation, let canonicalJSON):
+          PresentationView(presentation: presentation)
+          VStack(alignment: .leading, spacing: 2) {
+            Text("Canonical JSON")
+              .font(.caption.weight(.semibold))
+              .foregroundStyle(.secondary)
+            ScrollView(.horizontal) {
+              Text(canonicalJSON)
+                .font(.system(.body, design: .monospaced))
+                .fixedSize(horizontal: true, vertical: true)
+            }
+            .textSelection(.enabled)
+          }
+        }
+      }
+      .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
     @ViewBuilder
-    private func detail(_ label: String, _ value: String, markdown: Bool) -> some View {
+    private func detail(_ label: String, _ value: ToolPresentation) -> some View {
       VStack(alignment: .leading, spacing: 2) {
         Text(label)
           .font(.caption.weight(.semibold))
           .foregroundStyle(.secondary)
-        if markdown {
-          MarkdownContentView(source: value)
-        } else {
-          Text(value)
-            .textSelection(.enabled)
-        }
+        PresentationView(presentation: value)
       }
       .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -281,6 +319,71 @@ private struct ChatItemView: View {
       case .succeeded: .green
       case .failed: .red
       case .image: .blue
+      }
+    }
+  }
+
+  private struct PresentationView: View {
+    let presentation: ToolPresentation
+    var inline = false
+
+    @ViewBuilder
+    var body: some View {
+      switch presentation {
+      case .literal(let text):
+        Text(text)
+          .font(.system(.body, design: .monospaced))
+          .textSelection(.enabled)
+      case .markdown(let text):
+        MarkdownContentView(source: text)
+      case .source(let text, _, let spans):
+        if inline {
+          Text(attributedSource(text, spans: spans))
+            .font(.system(.body, design: .monospaced))
+            .fixedSize(horizontal: true, vertical: true)
+        } else {
+          ScrollView(.horizontal) {
+            Text(attributedSource(text, spans: spans))
+              .font(.system(.body, design: .monospaced))
+              .fixedSize(horizontal: true, vertical: true)
+          }
+          .textSelection(.enabled)
+        }
+      }
+    }
+
+    private func attributedSource(_ text: String, spans: [SemanticSpan]) -> AttributedString {
+      var result = AttributedString(text)
+      var boundaries: [Int: String.Index] = [0: text.startIndex]
+      var offset = 0
+      var index = text.unicodeScalars.startIndex
+      while index < text.unicodeScalars.endIndex {
+        let next = text.unicodeScalars.index(after: index)
+        offset += text.unicodeScalars[index].utf8.count
+        boundaries[offset] = next
+        index = next
+      }
+      for span in spans {
+        guard let lower = boundaries[span.byteRange.lowerBound],
+          let upper = boundaries[span.byteRange.upperBound],
+          let attributedLower = AttributedString.Index(lower, within: result),
+          let attributedUpper = AttributedString.Index(upper, within: result)
+        else { continue }
+        result[attributedLower..<attributedUpper].foregroundColor = color(span.token)
+      }
+      return result
+    }
+
+    private func color(_ token: SemanticToken) -> Color {
+      switch token {
+      case .comment: .secondary
+      case .string, .inserted: .green
+      case .number, .constant: .orange
+      case .keyword: .purple
+      case .function, .meta: .cyan
+      case .property: .yellow
+      case .operator: .pink
+      case .deleted: .red
       }
     }
   }
@@ -365,11 +468,15 @@ private struct ChatItemView: View {
         listRow(prefix: "\(ordinal).", content: block.content)
       case .code:
         ScrollView(.horizontal) {
-          Text(block.content)
-            .font(.system(.body, design: .monospaced))
-            .fixedSize(horizontal: true, vertical: true)
-            .padding(10)
+          if let presentation = block.codePresentation {
+            PresentationView(presentation: presentation)
+          } else {
+            Text(block.content)
+          }
         }
+        .font(.system(.body, design: .monospaced))
+        .fixedSize(horizontal: true, vertical: true)
+        .padding(10)
         .background(.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
       case .quote:
         HStack(alignment: .top, spacing: 10) {
@@ -404,5 +511,6 @@ private struct ChatItemView: View {
       default: .headline
       }
     }
+
   }
 }
