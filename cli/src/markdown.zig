@@ -223,11 +223,7 @@ pub const HighlightCache = struct {
         source: []const u8,
     ) !Code {
         var digest: [digest_length]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(
-            source[0..@min(source.len, highlight.max_source_bytes)],
-            &digest,
-            .{},
-        );
+        std.crypto.hash.sha2.Sha256.hash(source, &digest, .{});
         if (index < self.blocks.items.len) {
             const block = &self.blocks.items[index];
             if (block.language == language and
@@ -1871,6 +1867,34 @@ test "cached fenced code renders sanitized presentation text" {
     for (code.spans) |span| {
         try std.testing.expect(span.end <= code.text.len);
     }
+}
+
+test "cached fenced code includes bytes beyond parser limit in identity" {
+    var cache: HighlightCache = .{};
+    defer cache.deinit(std.testing.allocator);
+    const source_length = highlight.max_source_bytes + 1;
+    const first = try std.testing.allocator.alloc(u8, source_length);
+    defer std.testing.allocator.free(first);
+    @memset(first, 'a');
+    const second = try std.testing.allocator.dupe(u8, first);
+    defer std.testing.allocator.free(second);
+    second[source_length - 1] = 'b';
+
+    const initial = try cache.codeFor(
+        std.testing.allocator,
+        0,
+        .zig,
+        first,
+    );
+    try std.testing.expectEqual('a', initial.text[source_length - 1]);
+
+    const updated = try cache.codeFor(
+        std.testing.allocator,
+        0,
+        .zig,
+        second,
+    );
+    try std.testing.expectEqual('b', updated.text[source_length - 1]);
 }
 
 test "fenced code parses multiline syntax as one document" {
