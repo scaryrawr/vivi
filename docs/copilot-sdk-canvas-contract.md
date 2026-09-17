@@ -2,11 +2,11 @@
 
 ## Scope
 
-Vivi does not expose or implement canvases. This note records the public typed
-canvas contract available to a future SDK-free domain design. The accompanying
-probe imports `copilot_sdk` only from a standalone test root; it adds no canvas
-types to `backend/src/root.zig`, the C ABI, CLI, or native hosts, and it neither
-starts Copilot CLI nor requires credentials.
+Vivi does not expose canvases to a host. This note records the public typed
+canvas contract used by the SDK-free domain in `backend/src/canvas.zig`. The
+accompanying probe imports `copilot_sdk` only from a standalone test root; no
+production canvas adapter, C ABI, CLI, or native host imports those SDK types,
+starts Copilot CLI, or requires credentials.
 
 `build.zig.zon` remains the sole dependency pin. The tested revision is
 `7695c34cb0ccfc4ec09aaadf91f29e4a12f86379`. The first public
@@ -82,6 +82,22 @@ as schema/input values required by public canvas types.
 | Correlate lifecycle events to host operations | No-go | No public operation/request ID exists |
 | Define reopen, event ordering, or removal causality | No-go | Requires controlled live-runtime evidence |
 | Add C ABI, WebView, CLI, or native UI behavior | No-go | Requires a concrete host contract and user-facing verification |
+
+PR 2 implements only the approved SDK-free commitments. Registry reducer
+inputs are explicitly tagged as replacement or incremental; a future adapter
+must choose one only after SDK evidence establishes the meaning of its source
+signal. Provider lifecycle signals remain uncorrelated with Vivi's monotonic
+domain operation IDs and renderer generations.
+
+A host may request another evidenced open operation for an already known
+three-part key. The domain treats that as a new local open operation and
+generation so stale renderer work can be rejected. It does not name or imply a
+provider `reopen` operation, because no such SDK method is evidenced.
+
+PR 3 remains gated on an adapter proving how SDK registry signals map to the
+tagged reducer input, how renderer work is hosted, and how the SDK's
+uncorrelated lifecycle signals are sequenced. Until then there is no production
+SDK wiring or host-visible canvas behavior.
 
 ## Synthesis decision
 

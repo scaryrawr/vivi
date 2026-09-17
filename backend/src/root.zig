@@ -1,4 +1,5 @@
 const std = @import("std");
+const canvas = @import("canvas.zig");
 const presentation = @import("presentation.zig");
 const build_options = @import("build_options");
 const copilot = @import("copilot_sdk");
@@ -12,6 +13,7 @@ const tools = @import("tools.zig");
 
 pub const version = build_options.version;
 pub const abi_version: u32 = 8;
+pub const canvas_domain = canvas;
 pub const Conversation = conversation.Conversation;
 pub const ConversationEvent = conversation.Event;
 pub const ConversationWake = conversation.Wake;
