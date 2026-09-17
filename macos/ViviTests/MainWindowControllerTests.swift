@@ -10,9 +10,11 @@ final class MainWindowControllerTests: XCTestCase {
     let secondDriver = ControllableConversationDriver()
     let first = ConversationRecord(
       id: ConversationID(rawValue: UUID()),
+      launchWorkspace: WorkspaceIdentity(absolutePath: "/tmp/first")!,
       store: NativeChatStore(workspace: "/tmp/first", driver: firstDriver))
     let second = ConversationRecord(
       id: ConversationID(rawValue: UUID()),
+      launchWorkspace: WorkspaceIdentity(absolutePath: "/tmp/second")!,
       store: NativeChatStore(workspace: "/tmp/second", driver: secondDriver))
     let conversations = ConversationCollection()
     conversations.appendAndSelect(first)
@@ -41,6 +43,7 @@ final class MainWindowControllerTests: XCTestCase {
     conversations.appendAndSelect(
       ConversationRecord(
         id: ConversationID(rawValue: UUID()),
+        launchWorkspace: WorkspaceIdentity(absolutePath: "/tmp/project")!,
         store: NativeChatStore(workspace: "/tmp/project", driver: driver)))
     let window = NSWindow()
     var closedIdentity: MainWindowIdentity?
@@ -70,7 +73,7 @@ final class MainWindowControllerTests: XCTestCase {
         accessibilityLabel: "Vivi, /tmp/vivi, conversation 2 of 3"))
   }
 
-  func testSavedViviSessionHistoryGroupsWorkspacesAndFiltersCurrentSession() {
+  func testProjectSessionHistoryFiltersWorkspaceAndCurrentSession() {
     let catalog = SessionCatalog(
       scope: .local,
       sessions: [
@@ -81,21 +84,18 @@ final class MainWindowControllerTests: XCTestCase {
       ],
       skippedInvalidShards: false)
 
-    let groups = sessionHistoryPresentation(
+    let rows = projectSessionHistoryPresentation(
       catalog: catalog,
-      currentWorkspace: "/work/current",
+      projectWorkspace: "/work/current",
       formatLastUsed: { "\($0) ms" })
 
-    XCTAssertEqual(groups.map(\.id), ["/work/other", "/work/current"])
-    XCTAssertEqual(groups.map(\.title), ["/work/other", "This Workspace"])
-    XCTAssertEqual(groups[0].rows.map(\.title), ["Earlier", "Oldest"])
-    XCTAssertEqual(groups[1].rows.map(\.title), ["current"])
+    XCTAssertEqual(rows.map(\.title), ["current"])
     XCTAssertEqual(
-      groups[0].rows[0].accessibilityLabel,
-      "Earlier, /work/other, Summary 2, Last used 2 ms")
+      rows[0].accessibilityLabel,
+      "current, /work/current, Summary 3, Last used 3 ms")
   }
 
-  func testWorkspaceCopilotSessionHistoryPreservesBackendOrderWithoutGrouping() {
+  func testProjectSessionHistoryPreservesBackendOrder() {
     let catalog = SessionCatalog(
       scope: .broader,
       sessions: [
@@ -104,15 +104,13 @@ final class MainWindowControllerTests: XCTestCase {
       ],
       skippedInvalidShards: false)
 
-    let groups = sessionHistoryPresentation(
+    let rows = projectSessionHistoryPresentation(
       catalog: catalog,
-      currentWorkspace: "/work/current",
+      projectWorkspace: "/work/current",
       formatLastUsed: { "\($0)" })
 
-    XCTAssertEqual(groups.count, 1)
-    XCTAssertNil(groups[0].title)
-    XCTAssertEqual(groups[0].rows.map(\.title), ["Recent", "Earlier"])
-    XCTAssertEqual(groups[0].rows.map(\.lastUsed), ["7", "8"])
+    XCTAssertEqual(rows.map(\.title), ["Recent", "Earlier"])
+    XCTAssertEqual(rows.map(\.lastUsed), ["7", "8"])
   }
 }
 

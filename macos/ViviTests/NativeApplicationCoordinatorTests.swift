@@ -41,6 +41,9 @@ final class NativeApplicationCoordinatorTests: XCTestCase {
     XCTAssertEqual(
       harness.coordinator.conversations.records.map(\.navigation.workspace.canonicalPath),
       ["/tmp/project", "/tmp/project"])
+    XCTAssertEqual(
+      harness.coordinator.conversations.launchWorkspaces.map(\.canonicalPath),
+      ["/tmp/project"])
     XCTAssertNotEqual(
       harness.coordinator.conversations.records[0].id,
       harness.coordinator.conversations.records[1].id)
@@ -64,6 +67,25 @@ final class NativeApplicationCoordinatorTests: XCTestCase {
     XCTAssertEqual(harness.windows.count, 2)
     XCTAssertTrue(harness.coordinator.conversations.records[0] === record)
     XCTAssertEqual(harness.coordinator.conversations.selectedID, record.id)
+  }
+
+  func testProjectHistoryUsesSelectedLaunchConversationThenLatestFallback() {
+    let harness = CoordinatorHarness()
+    harness.coordinator.open([
+      URL(string: "vivi://chat?workspace=/tmp/project")!,
+      URL(string: "vivi://chat?workspace=/tmp/other")!,
+      URL(string: "vivi://chat?workspace=/tmp/project")!,
+    ])
+    let conversations = harness.coordinator.conversations
+    let project = WorkspaceIdentity(absolutePath: "/tmp/project")!
+    let projectRecords = conversations.records(launchedFrom: project)
+
+    XCTAssertEqual(projectRecords.count, 2)
+    XCTAssertTrue(conversations.historyConversation(launchedFrom: project) === projectRecords[1])
+
+    conversations.select(projectRecords[0].id)
+
+    XCTAssertTrue(conversations.historyConversation(launchedFrom: project) === projectRecords[0])
   }
 
   func testCrossWorkspaceResumeKeepsConversationIdentitySelectionAndUpdatesDuplicates() {
@@ -104,6 +126,10 @@ final class NativeApplicationCoordinatorTests: XCTestCase {
     XCTAssertTrue(conversations.records[0] === record)
     XCTAssertEqual(conversations.selectedID, record.id)
     XCTAssertEqual(record.navigation.workspace.canonicalPath, "/tmp/two")
+    XCTAssertEqual(record.launchWorkspace.canonicalPath, "/tmp/one")
+    XCTAssertEqual(
+      conversations.launchWorkspaces.map(\.canonicalPath),
+      ["/tmp/one", "/tmp/two"])
     XCTAssertEqual(record.navigation.title, "Resumed conversation")
     XCTAssertEqual(conversations.duplicatePosition(for: record.id)?.ordinal, 1)
     XCTAssertEqual(conversations.duplicatePosition(for: conversations.records[1].id)?.ordinal, 2)
@@ -163,6 +189,7 @@ private final class CoordinatorHarness {
         self?.drivers.append(driver)
         return ConversationRecord(
           id: id,
+          launchWorkspace: workspace,
           store: NativeChatStore(workspace: workspace.canonicalPath, driver: driver))
       },
       makeWindow: { [weak self] identity, _, onClosed in

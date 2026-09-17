@@ -81,8 +81,8 @@ user-visible behavior. It then uses exactly four H2 sections in this order:
 - [Session resume](./session-resume.md) covers durable Vivi session indexing,
   the `/resume` finder, and continued Copilot history across processes.
 - [Native conversation sidebar](./native-conversation-sidebar.md) covers
-  occurrence-based native launches, selection, window close and Dock reopen,
-  and joined application termination.
+  project-grouped occurrence-based native launches, selection, window close and
+  Dock reopen, and joined application termination.
 - [Native session history](./native-session-history.md) covers selected-store
-  local and broader catalogs, persisted-session resume, and cross-workspace
+  per-project local catalogs, persisted-session resume, and cross-workspace
   navigation identity.

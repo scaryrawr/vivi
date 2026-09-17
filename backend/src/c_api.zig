@@ -823,6 +823,15 @@ fn appendBytes(
     return .{ .offset = start, .length = @intCast(value.len) };
 }
 
+fn appendOptionalBytes(
+    destination: []u8,
+    offset: *u32,
+    value: []const u8,
+) c.vivi_backend_span_t {
+    if (value.len == 0) return .{ .offset = 0, .length = 0 };
+    return appendBytes(destination, offset, value);
+}
+
 fn writeModel(
     destination: []u8,
     offset: *u32,
@@ -978,10 +987,13 @@ fn copyProjectedFull(
         .session_count = required_sessions,
         .transcript_item_count = required_transcript_items,
         .content = .{ .offset = 0, .length = @intCast(projected.text.len) },
-        .selected_model_id = .{
-            .offset = @intCast(projected.text.len),
-            .length = @intCast(projected.selected_model_id.len),
-        },
+        .selected_model_id = if (projected.selected_model_id.len == 0)
+            .{ .offset = 0, .length = 0 }
+        else
+            .{
+                .offset = @intCast(projected.text.len),
+                .length = @intCast(projected.selected_model_id.len),
+            },
         .tool_call_id = .{ .offset = 0, .length = 0 },
         .tool_title = .{ .offset = 0, .length = 0 },
         .tool_detail = .{ .offset = 0, .length = 0 },
@@ -1037,27 +1049,27 @@ fn copyProjectedFull(
             &empty_transcript_items;
     var offset: u32 = 0;
     output.content = appendBytes(byte_destination, &offset, projected.text);
-    output.selected_model_id = appendBytes(
+    output.selected_model_id = appendOptionalBytes(
         byte_destination,
         &offset,
         projected.selected_model_id,
     );
-    output.tool_call_id = appendBytes(
+    output.tool_call_id = appendOptionalBytes(
         byte_destination,
         &offset,
         projected.tool_call_id,
     );
-    output.tool_title = appendBytes(
+    output.tool_title = appendOptionalBytes(
         byte_destination,
         &offset,
         projected.tool_title,
     );
-    output.tool_detail = appendBytes(
+    output.tool_detail = appendOptionalBytes(
         byte_destination,
         &offset,
         projected.tool_detail,
     );
-    output.tool_input = appendBytes(
+    output.tool_input = appendOptionalBytes(
         byte_destination,
         &offset,
         projected.tool_input,
@@ -1790,6 +1802,56 @@ test "C session resume copies summary and ordered transcript atomically" {
     try std.testing.expectEqualStrings(
         "thinking",
         bytes[transcript[1].text.offset..][0..transcript[1].text.length],
+    );
+}
+
+test "C failed session resume keeps optional metadata neutral" {
+    const allocator = std.testing.allocator;
+    var event: backend.ConversationEvent = .{
+        .session_resume = .{
+            .failed = try backend.OwnedText.init(
+                allocator,
+                "The selected session is no longer available.",
+            ),
+        },
+    };
+    defer event.deinit();
+
+    const projected = project(&event).?;
+    var metadata: c.vivi_backend_event_t = undefined;
+    const bytes = try allocator.alloc(u8, try byteCount(projected));
+    defer allocator.free(bytes);
+
+    try std.testing.expect(
+        c.VIVI_BACKEND_OK ==
+            copyProjectedFull(
+                projected,
+                &metadata,
+                bytes.ptr,
+                @intCast(bytes.len),
+                null,
+                0,
+                null,
+                0,
+                null,
+                0,
+                null,
+                0,
+            ),
+    );
+    try std.testing.expect(
+        metadata.session_resume_outcome ==
+            c.VIVI_BACKEND_SESSION_RESUME_FAILED,
+    );
+    try std.testing.expectEqual(@as(u32, 0), metadata.selected_model_id.offset);
+    try std.testing.expectEqual(@as(u32, 0), metadata.selected_model_id.length);
+    try std.testing.expectEqual(@as(u32, 0), metadata.tool_call_id.offset);
+    try std.testing.expectEqual(@as(u32, 0), metadata.tool_title.offset);
+    try std.testing.expectEqual(@as(u32, 0), metadata.tool_detail.offset);
+    try std.testing.expectEqual(@as(u32, 0), metadata.tool_input.offset);
+    try std.testing.expectEqualStrings(
+        "The selected session is no longer available.",
+        bytes[metadata.content.offset..][0..metadata.content.length],
     );
 }
 
