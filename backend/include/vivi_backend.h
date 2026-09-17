@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define VIVI_BACKEND_ABI_VERSION 9
+#define VIVI_BACKEND_ABI_VERSION 10
 
 typedef enum vivi_backend_result {
     VIVI_BACKEND_OK = 0,
@@ -21,6 +21,34 @@ typedef enum vivi_backend_result {
 } vivi_backend_result_t;
 
 typedef struct vivi_backend_conversation vivi_backend_conversation_t;
+
+typedef enum vivi_backend_attachment_media_type {
+    VIVI_BACKEND_ATTACHMENT_PNG = 1,
+    VIVI_BACKEND_ATTACHMENT_JPEG = 2,
+    VIVI_BACKEND_ATTACHMENT_GIF = 3,
+    VIVI_BACKEND_ATTACHMENT_WEBP = 4,
+} vivi_backend_attachment_media_type_t;
+
+typedef struct vivi_backend_submission_attachment {
+    uint32_t struct_size;
+    vivi_backend_attachment_media_type_t media_type;
+    const uint8_t *identity;
+    uint32_t identity_length;
+    const uint8_t *display_name;
+    uint32_t display_name_length;
+    const uint8_t *bytes;
+    uint32_t byte_length;
+    uint32_t reserved;
+} vivi_backend_submission_attachment_t;
+
+typedef struct vivi_backend_submission {
+    uint32_t struct_size;
+    uint32_t reserved;
+    const uint8_t *prompt;
+    uint32_t prompt_length;
+    const vivi_backend_submission_attachment_t *attachments;
+    uint32_t attachment_count;
+} vivi_backend_submission_t;
 
 /* The callback may run on a backend thread. It must only schedule a drain. */
 typedef void (*vivi_backend_wake_fn)(void *context);
@@ -296,8 +324,7 @@ vivi_backend_result_t vivi_backend_open(
     vivi_backend_conversation_t **out_conversation);
 vivi_backend_result_t vivi_backend_submit(
     vivi_backend_conversation_t *conversation,
-    const uint8_t *prompt,
-    uint32_t prompt_length);
+    const vivi_backend_submission_t *submission);
 vivi_backend_result_t vivi_backend_refresh_models(
     vivi_backend_conversation_t *conversation);
 vivi_backend_result_t vivi_backend_switch_model(

@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 enum ToolInputLayout: Equatable {
@@ -75,7 +76,31 @@ struct ContentView: View {
       .onSubmit(store.submit)
       .disabled(store.activeUserInput != nil)
 
+      if !store.attachments.isEmpty {
+        ScrollView(.horizontal) {
+          HStack(spacing: 8) {
+            ForEach(store.attachments) { attachment in
+              ComposerAttachmentChip(attachment: attachment) {
+                store.removeAttachment(attachment.id)
+              }
+            }
+          }
+          .padding(.vertical, 1)
+        }
+        .scrollIndicators(.hidden)
+        .accessibilityIdentifier("composer-attachments")
+      }
+
+      if let attachmentError = store.attachmentError {
+        Label(attachmentError, systemImage: "exclamationmark.triangle.fill")
+          .font(.caption)
+          .foregroundStyle(.red)
+          .fixedSize(horizontal: false, vertical: true)
+          .accessibilityIdentifier("composer-attachment-error")
+      }
+
       HStack(spacing: 10) {
+        attachmentMenu
         modelMenu
 
         if store.modelState == .loading || store.modelState == .refreshing
@@ -110,6 +135,25 @@ struct ContentView: View {
       RoundedRectangle(cornerRadius: 16)
         .stroke(.secondary.opacity(0.45), lineWidth: 1)
     }
+  }
+
+  private var attachmentMenu: some View {
+    Menu {
+      Button("Choose Image…", action: store.chooseAttachments)
+        .accessibilityIdentifier("composer-choose-image")
+      Button("Paste Image", action: store.pasteAttachment)
+        .accessibilityIdentifier("composer-paste-image")
+    } label: {
+      Image(systemName: "paperclip")
+        .font(.system(size: 14, weight: .medium))
+        .frame(width: 24, height: 24)
+    }
+    .menuStyle(.borderlessButton)
+    .menuIndicator(.hidden)
+    .help("Add image attachment")
+    .accessibilityLabel("Add image attachment")
+    .accessibilityIdentifier("composer-attachment-menu")
+    .disabled(!store.canAcquireAttachments)
   }
 
   private var modelMenu: some View {
@@ -173,6 +217,57 @@ struct ContentView: View {
     case .closing: return "Closing"
     case .closed: return "Closed"
     }
+  }
+}
+
+private struct ComposerAttachmentChip: View {
+  let attachment: ComposerAttachment
+  let remove: () -> Void
+
+  var body: some View {
+    HStack(spacing: 8) {
+      Group {
+        if let image = NSImage(data: attachment.data) {
+          Image(nsImage: image)
+            .resizable()
+            .scaledToFill()
+        } else {
+          Image(systemName: "photo")
+            .foregroundStyle(.secondary)
+        }
+      }
+      .frame(width: 36, height: 36)
+      .background(.secondary.opacity(0.08))
+      .clipShape(RoundedRectangle(cornerRadius: 7))
+
+      VStack(alignment: .leading, spacing: 1) {
+        Text(attachment.displayName)
+          .font(.caption.weight(.medium))
+          .lineLimit(1)
+          .truncationMode(.middle)
+        Text("\(attachment.media.label) · \(attachment.sizeLabel)")
+          .font(.caption2)
+          .foregroundStyle(.secondary)
+      }
+      .frame(maxWidth: 150, alignment: .leading)
+
+      Button(action: remove) {
+        Image(systemName: "xmark")
+          .font(.caption.weight(.semibold))
+          .frame(width: 22, height: 22)
+          .contentShape(Rectangle())
+      }
+      .buttonStyle(.plain)
+      .help("Remove \(attachment.displayName)")
+      .accessibilityLabel("Remove \(attachment.displayName)")
+      .accessibilityIdentifier("composer-remove-attachment-\(attachment.id.uuidString)")
+    }
+    .padding(6)
+    .background(.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
+    .accessibilityElement(children: .contain)
+    .accessibilityLabel(attachment.displayName)
+    .accessibilityValue("\(attachment.media.label), \(attachment.sizeLabel)")
+    .accessibilityIdentifier("composer-attachment-\(attachment.id.uuidString)")
   }
 }
 

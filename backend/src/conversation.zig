@@ -1,6 +1,6 @@
 const std = @import("std");
 const tool_activity = @import("tool_activity.zig");
-const image = @import("image.zig");
+const attachment = @import("attachment.zig");
 
 pub const Wake = struct {
     context: *anyopaque,
@@ -31,75 +31,65 @@ pub const OwnedText = struct {
 
 pub const Prompt = struct {
     text: []const u8,
-    image_paths: []const []const u8 = &.{},
+    attachments: []const attachment.Input = &.{},
 };
 
 pub const PromptContent = struct {
     text: []const u8,
-    images: []const image.Image = &.{},
+    attachments: []const attachment.Snapshot = &.{},
 };
 
 pub const OwnedPrompt = struct {
     text: OwnedText,
-    images: []image.Image = &.{},
+    attachments: []attachment.Snapshot = &.{},
 
-    fn init(allocator: std.mem.Allocator, io: std.Io, prompt: Prompt) !OwnedPrompt {
+    fn init(allocator: std.mem.Allocator, prompt: Prompt) !OwnedPrompt {
         var text = try OwnedText.init(allocator, prompt.text);
         errdefer text.deinit();
-        const values = try allocator.alloc(image.Image, prompt.image_paths.len);
-        errdefer allocator.free(values);
-        var initialized: usize = 0;
-        errdefer for (values[0..initialized]) |*value| value.deinit(allocator);
-        for (prompt.image_paths, 0..) |path, index| {
-            values[index] = try image.Image.fromFile(allocator, io, path);
-            initialized += 1;
-        }
-        return .{ .text = text, .images = values };
+        return .{
+            .text = text,
+            .attachments = try attachment.snapshotAll(allocator, prompt.attachments),
+        };
     }
 
     pub fn borrow(self: *const OwnedPrompt) PromptContent {
-        return .{ .text = self.text.bytes, .images = self.images };
+        return .{ .text = self.text.bytes, .attachments = self.attachments };
     }
 
     pub fn deinit(self: *OwnedPrompt) void {
-        for (self.images) |*value| value.deinit(self.text.allocator);
-        self.text.allocator.free(self.images);
+        attachment.deinitAll(self.text.allocator, self.attachments);
         self.text.deinit();
         self.* = undefined;
     }
 };
 
-test "image prompt owns submitted bytes even after the file changes or disappears" {
+test "prompt owns submitted attachment bytes and metadata" {
     const allocator = std.testing.allocator;
-    var temporary = std.testing.tmpDir(.{});
-    defer temporary.cleanup();
-    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "image.png", .data = "\x89PNG\r\n\x1a\noriginal" });
-    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const len = try temporary.dir.realPath(std.testing.io, &path_buffer);
-    const path = try std.fs.path.join(allocator, &.{ path_buffer[0..len], "image.png" });
-    defer allocator.free(path);
     const text = try allocator.dupe(u8, "look here");
-    var prompt = try OwnedPrompt.init(allocator, std.testing.io, .{ .text = text, .image_paths = &.{path} });
+    const bytes = try allocator.dupe(u8, "\x89PNG\r\n\x1a\noriginal");
+    const display_name = try allocator.dupe(u8, "image.png");
+    var prompt = try OwnedPrompt.init(allocator, .{
+        .text = text,
+        .attachments = &.{.{
+            .identity = "image-1",
+            .display_name = display_name,
+            .media_type = .png,
+            .bytes = bytes,
+        }},
+    });
     defer prompt.deinit();
     allocator.free(text);
-    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "image.png", .data = "changed" });
-    try temporary.dir.deleteFile(std.testing.io, "image.png");
+    allocator.free(bytes);
+    allocator.free(display_name);
     try std.testing.expectEqualStrings("look here", prompt.borrow().text);
-    try std.testing.expectEqualStrings("\x89PNG\r\n\x1a\noriginal", prompt.borrow().images[0].bytes);
-    try std.testing.expectEqualStrings("image.png", prompt.borrow().images[0].description);
-}
-
-test "image prompt rejects non-absolute and NUL paths" {
-    try std.testing.expectError(error.InvalidImagePath, OwnedPrompt.init(
-        std.testing.allocator,
-        std.testing.io,
-        .{ .text = "", .image_paths = &.{"image.png"} },
-    ));
-    try std.testing.expectError(error.InvalidImagePath, OwnedPrompt.init(
-        std.testing.allocator,
-        std.testing.io,
-        .{ .text = "", .image_paths = &.{"/tmp/image\x00.png"} },
-    ));
+    try std.testing.expectEqualStrings(
+        "\x89PNG\r\n\x1a\noriginal",
+        prompt.borrow().attachments[0].bytes,
+    );
+    try std.testing.expectEqualStrings(
+        "image.png",
+        prompt.borrow().attachments[0].display_name,
+    );
 }
 
 test "session catalog snapshots retain scoped opaque keys and owned display text" {
@@ -1295,7 +1285,7 @@ pub const Conversation = struct {
         prompt: Prompt,
         delivery: PromptDelivery,
     ) !void {
-        if (std.mem.trim(u8, prompt.text, " \t\r\n").len == 0 and prompt.image_paths.len == 0) {
+        if (std.mem.trim(u8, prompt.text, " \t\r\n").len == 0 and prompt.attachments.len == 0) {
             return error.EmptyPrompt;
         }
 
@@ -1308,7 +1298,7 @@ pub const Conversation = struct {
             .stopping => return error.Stopping,
             .closed => return error.Closed,
         }
-        const owned_prompt = try OwnedPrompt.init(self.core.allocator, self.core.io, prompt);
+        const owned_prompt = try OwnedPrompt.init(self.core.allocator, prompt);
         errdefer {
             var mutable = owned_prompt;
             mutable.deinit();
@@ -1986,7 +1976,7 @@ test "waiting for user input preserves queued prompts" {
     }
     try core.commands.append(std.testing.allocator, .{
         .prompt = .{
-            .message = try OwnedPrompt.init(std.testing.allocator, std.testing.io, .{ .text = "later" }),
+            .message = try OwnedPrompt.init(std.testing.allocator, .{ .text = "later" }),
             .delivery = .enqueue,
         },
     });
