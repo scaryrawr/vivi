@@ -514,11 +514,23 @@ final class NativeChatStore: ObservableObject {
         activeReasoning = id
         activeReasoningPrefix = existing.isEmpty ? "" : existing + "\n\n"
         startsNewSegment = true
+      } else if transcript.count >= 2,
+        case .assistant = transcript.last,
+        case .reasoning(let id, let existing) = transcript[transcript.count - 2]
+      {
+        activeReasoning = id
+        activeReasoningPrefix = existing.isEmpty ? "" : existing + "\n\n"
+        startsNewSegment = true
       } else {
         let id = UUID()
         activeReasoning = id
         activeReasoningPrefix = ""
-        transcript.append(.reasoning(id: id, text: ""))
+        let item = ChatItem.reasoning(id: id, text: "")
+        if case .assistant = transcript.last {
+          transcript.insert(item, at: transcript.count - 1)
+        } else {
+          transcript.append(item)
+        }
       }
     }
     guard let id = activeReasoning,

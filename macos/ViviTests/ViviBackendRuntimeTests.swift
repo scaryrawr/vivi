@@ -133,6 +133,49 @@ final class ViviBackendRuntimeTests: XCTestCase {
     XCTAssertEqual(inserted, tool)
   }
 
+  func testLateReasoningCompletionStaysBeforeAssistantResponse() {
+    let store = NativeChatStore(workspace: "/tmp/work", driver: FakeConversationDriver())
+
+    store.reduce(.assistantStarted)
+    store.reduce(.reasoningComplete("before tool"))
+    store.reduce(
+      .toolStarted(
+        ToolActivity(
+          callID: "call-1",
+          title: "Read file",
+          detail: "README.md",
+          input: #"{"path":"README.md"}"#,
+          inputPresentation: .literal(#"{"path":"README.md"}"#),
+          result: .running,
+          output: nil,
+          outputPresentation: nil)))
+    store.reduce(.reasoningComplete("after tool"))
+    store.reduce(.assistantComplete("answer"))
+    store.reduce(.reasoningComplete("late completion"))
+
+    XCTAssertEqual(store.transcript.count, 5)
+    guard case .assistantHeader = store.transcript[0],
+      case .reasoning(_, "before tool") = store.transcript[1],
+      case .tool = store.transcript[2],
+      case .reasoning(_, "after tool\n\nlate completion") = store.transcript[3],
+      case .assistant(_, "answer") = store.transcript[4]
+    else { return XCTFail("Expected late reasoning to remain before the assistant response") }
+  }
+
+  func testLateFirstReasoningInsertsBeforeAssistantResponse() {
+    let store = NativeChatStore(workspace: "/tmp/work", driver: FakeConversationDriver())
+
+    store.reduce(.assistantStarted)
+    store.reduce(.assistantComplete("answer"))
+    store.reduce(.reasoningComplete("late reasoning"))
+
+    XCTAssertEqual(store.transcript.count, 3)
+    guard case .assistantHeader = store.transcript[0],
+      case .reasoning(_, "late reasoning") = store.transcript[1],
+      case .assistant(_, "answer") = store.transcript[2]
+    else { return XCTFail("Expected late reasoning before the assistant response") }
+  }
+
   func testEmptyToolRequestCompletionDoesNotCreateAssistantRow() {
     let store = NativeChatStore(workspace: "/tmp/work", driver: FakeConversationDriver())
     let tool = ToolActivity(

@@ -57,6 +57,10 @@ Default tests must not require Copilot credentials or a running Copilot CLI.
 Any C ABI change must update the header, Zig adapter, smoke test, and every
 implemented native binding together.
 
+For user-visible native app behavior, validation must also drive the built
+native app and retain a screen recording of the changed flow. A CLI or TUI
+capture does not validate native presentation or interaction.
+
 `zig build test` does not compile test blocks in every imported backend module.
 When changing `backend/src/settings.zig` or `backend/src/session_store.zig`,
 also run `zig test` directly on the changed module.
@@ -91,7 +95,8 @@ Every PR that changes user-visible CLI, TUI, or native app behavior must include
 a reviewer-facing demo in its description. Use a short GIF or video when the
 behavior changes over time. Use before-and-after screenshots when a static
 comparison is clearer. Exercise the built application through the same surface
-the user sees. Unit tests, terminal transcripts, and written claims do not
+the user sees; native app changes must show the native app, not substitute CLI
+or TUI media. Unit tests, terminal transcripts, and written claims do not
 replace the visual demo. If the host cannot capture or upload media, state the
 specific blocker in the PR description and do not present the PR as visually
 verified.
