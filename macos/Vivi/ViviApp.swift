@@ -118,7 +118,8 @@ private final class ChatWindowController: NSWindowController, NSWindowDelegate {
     super.init(window: window)
     window.title = workspace
     window.contentViewController = NSHostingController(rootView: ContentView(store: store))
-    titleObservation = store.$sessionTitle
+    titleObservation = store.$activePresentation
+      .map(\.sessionTitle)
       .removeDuplicates()
       .sink { [weak window] title in
         window?.title = title

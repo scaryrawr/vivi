@@ -11,7 +11,7 @@ const tool_activity = @import("tool_activity.zig");
 const tools = @import("tools.zig");
 
 pub const version = build_options.version;
-pub const abi_version: u32 = 7;
+pub const abi_version: u32 = 8;
 pub const Conversation = conversation.Conversation;
 pub const ConversationEvent = conversation.Event;
 pub const ConversationWake = conversation.Wake;
@@ -40,6 +40,7 @@ pub const SessionCatalogScope = conversation.SessionCatalogScope;
 pub const ResumeKey = conversation.ResumeKey;
 pub const TranscriptSnapshot = conversation.TranscriptSnapshot;
 pub const TranscriptItem = conversation.TranscriptItem;
+pub const TranscriptRole = conversation.TranscriptRole;
 pub const ToolActivity = tool_activity.ToolActivity;
 pub const ToolActivityUpdate = tool_activity.ToolActivityUpdate;
 pub const ToolStarted = tool_activity.ToolStarted;
