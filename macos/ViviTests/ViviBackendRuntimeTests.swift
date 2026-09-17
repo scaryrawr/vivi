@@ -19,7 +19,7 @@ final class ViviBackendRuntimeTests: XCTestCase {
     store.draft = "Write a haiku"
     store.submit()
     store.reduce(.assistantStarted)
-    XCTAssertEqual(store.transcript.count, 2)
+    XCTAssertEqual(store.transcript.count, 1)
     store.reduce(.reasoningComplete("finished thought"))
     store.reduce(.assistantDelta("old "))
     store.reduce(.assistantComplete("new answer"))
@@ -34,6 +34,49 @@ final class ViviBackendRuntimeTests: XCTestCase {
         .reasoning(id: store.transcript[2].id, text: "finished thought"),
         .assistant(id: store.transcript[3].id, text: "new answer"),
       ])
+  }
+
+  func testAssistantHeaderWaitsForFirstStreamEventAndAppearsOnce() {
+    let store = NativeChatStore(workspace: "/tmp/work", driver: FakeConversationDriver())
+
+    store.reduce(.assistantStarted)
+    store.reduce(.reasoningDelta(""))
+    store.reduce(.assistantComplete(""))
+
+    XCTAssertTrue(store.transcript.isEmpty)
+
+    store.reduce(.reasoningDelta("thinking"))
+    store.reduce(.reasoningComplete("thinking"))
+    store.reduce(.assistantDelta("answer"))
+    store.reduce(.assistantComplete("answer"))
+
+    XCTAssertEqual(store.transcript.count, 3)
+    guard case .assistantHeader = store.transcript[0],
+      case .reasoning = store.transcript[1],
+      case .assistant = store.transcript[2]
+    else { return XCTFail("Expected one lazy header before streamed response content") }
+  }
+
+  func testToolStartRevealsAssistantHeader() {
+    let store = NativeChatStore(workspace: "/tmp/work", driver: FakeConversationDriver())
+
+    store.reduce(.assistantStarted)
+    store.reduce(
+      .toolStarted(
+        ToolActivity(
+          callID: "call-1",
+          title: "Read file",
+          detail: "README.md",
+          input: #"{"path":"README.md"}"#,
+          inputPresentation: .literal(#"{"path":"README.md"}"#),
+          result: .running,
+          output: nil,
+          outputPresentation: nil)))
+
+    XCTAssertEqual(store.transcript.count, 2)
+    guard case .assistantHeader = store.transcript[0],
+      case .tool = store.transcript[1]
+    else { return XCTFail("Expected one lazy header before the first tool event") }
   }
 
   func testBusySubmitPreservesDraft() {
@@ -133,7 +176,7 @@ final class ViviBackendRuntimeTests: XCTestCase {
     XCTAssertEqual(inserted, tool)
   }
 
-  func testLateReasoningCompletionStaysBeforeAssistantResponse() {
+  func testLateReasoningCompletionReplacesStreamedReasoningBeforeAssistantResponse() {
     let store = NativeChatStore(workspace: "/tmp/work", driver: FakeConversationDriver())
 
     store.reduce(.assistantStarted)
@@ -151,15 +194,15 @@ final class ViviBackendRuntimeTests: XCTestCase {
           outputPresentation: nil)))
     store.reduce(.reasoningComplete("after tool"))
     store.reduce(.assistantComplete("answer"))
-    store.reduce(.reasoningComplete("late completion"))
+    store.reduce(.reasoningComplete("after tool"))
 
     XCTAssertEqual(store.transcript.count, 5)
     guard case .assistantHeader = store.transcript[0],
       case .reasoning(_, "before tool") = store.transcript[1],
       case .tool = store.transcript[2],
-      case .reasoning(_, "after tool\n\nlate completion") = store.transcript[3],
+      case .reasoning(_, "after tool") = store.transcript[3],
       case .assistant(_, "answer") = store.transcript[4]
-    else { return XCTFail("Expected late reasoning to remain before the assistant response") }
+    else { return XCTFail("Expected completed reasoning to replace the streamed reasoning") }
   }
 
   func testLateFirstReasoningInsertsBeforeAssistantResponse() {

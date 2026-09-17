@@ -249,6 +249,7 @@ final class NativeChatStore: ObservableObject {
   private var activeAssistant: UUID?
   private var activeReasoning: UUID?
   private var activeReasoningPrefix = ""
+  private var responseHeaderVisible = false
   private let driver: ViviConversationDriving
   private var closeCompletions: [@MainActor () -> Void] = []
 
@@ -316,6 +317,7 @@ final class NativeChatStore: ObservableObject {
       return
     }
     finishStreamingRows()
+    responseHeaderVisible = false
     transcript.append(.user(id: UUID(), text: prompt))
     draft = ""
     lifecycle = .responding
@@ -377,7 +379,7 @@ final class NativeChatStore: ObservableObject {
       activeAssistant = nil
       activeReasoning = nil
       activeReasoningPrefix = ""
-      transcript.append(.assistantHeader(id: UUID()))
+      responseHeaderVisible = false
       lifecycle = .responding
     case .reasoningDelta(let text):
       updateReasoning(text, append: true)
@@ -393,6 +395,7 @@ final class NativeChatStore: ObservableObject {
       }
       activeAssistant = nil
     case .toolStarted(let activity):
+      ensureResponseHeader()
       activeReasoning = nil
       activeReasoningPrefix = ""
       activeAssistant = nil
@@ -507,6 +510,8 @@ final class NativeChatStore: ObservableObject {
   }
 
   private func updateReasoning(_ text: String, append: Bool) {
+    guard activeReasoning != nil || !text.isEmpty else { return }
+    ensureResponseHeader()
     var startsNewSegment = false
     if activeReasoning == nil {
       activeAssistant = nil
@@ -516,11 +521,10 @@ final class NativeChatStore: ObservableObject {
         startsNewSegment = true
       } else if transcript.count >= 2,
         case .assistant = transcript.last,
-        case .reasoning(let id, let existing) = transcript[transcript.count - 2]
+        case .reasoning(let id, _) = transcript[transcript.count - 2]
       {
         activeReasoning = id
-        activeReasoningPrefix = existing.isEmpty ? "" : existing + "\n\n"
-        startsNewSegment = true
+        activeReasoningPrefix = ""
       } else {
         let id = UUID()
         activeReasoning = id
@@ -564,6 +568,7 @@ final class NativeChatStore: ObservableObject {
   private func replaceActiveAssistant(_ text: String, append: Bool) {
     if activeAssistant == nil {
       guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+      ensureResponseHeader()
       let id = UUID()
       activeAssistant = id
       activeReasoning = nil
@@ -574,6 +579,12 @@ final class NativeChatStore: ObservableObject {
       case .assistant(_, let existing) = transcript[index]
     else { return }
     transcript[index] = .assistant(id: id, text: append ? existing + text : text)
+  }
+
+  private func ensureResponseHeader() {
+    guard lifecycle == .responding, !responseHeaderVisible else { return }
+    responseHeaderVisible = true
+    transcript.append(.assistantHeader(id: UUID()))
   }
 
   private func message(for result: ConversationOperationResult, action: String) -> String {
