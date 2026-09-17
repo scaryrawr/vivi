@@ -11,13 +11,20 @@ struct ContentView: View {
     VStack(spacing: 14) {
       header
       Divider()
-      ScrollView {
-        LazyVStack(alignment: .leading, spacing: 12) {
-          ForEach(store.transcript) { item in
-            ChatItemView(item: item)
+      ScrollViewReader { proxy in
+        ScrollView {
+          LazyVStack(alignment: .leading, spacing: 12) {
+            ForEach(store.transcript) { item in
+              ChatItemView(item: item)
+                .id(item.id)
+            }
           }
+          .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .onChange(of: store.transcript) {
+          guard let last = store.transcript.last else { return }
+          proxy.scrollTo(last.id, anchor: .bottom)
+        }
       }
       composer
     }
@@ -41,7 +48,7 @@ struct ContentView: View {
   private var composer: some View {
     VStack(alignment: .leading, spacing: 12) {
       TextField(
-        "Ask anything. Use / for commands…",
+        "Ask anything…",
         text: $store.draft,
         axis: .vertical
       )
@@ -124,7 +131,7 @@ struct ContentView: View {
     .menuIndicator(.hidden)
     .fixedSize()
     .help(selectedModel?.detail ?? "Choose a model and reasoning level")
-    .disabled(store.modelState != .ready || store.catalog == nil || store.isBusy)
+    .disabled(store.modelState != .ready || store.isBusy)
   }
 
   private var selectedModel: ModelInfo? {
@@ -139,7 +146,8 @@ struct ContentView: View {
   }
 
   private var canSubmit: Bool {
-    !store.isBusy && !store.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    !store.isBusy && store.modelState == .ready
+      && !store.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
   }
 
   private var status: String {

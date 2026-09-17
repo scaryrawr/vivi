@@ -227,6 +227,17 @@ final class ViviBackendRuntimeTests: XCTestCase {
     XCTAssertEqual(store.modelState, .ready)
   }
 
+  func testInitialCatalogFailureCanBeRefreshed() {
+    let store = NativeChatStore(workspace: "/tmp/work", driver: FakeConversationDriver())
+
+    store.reduce(.modelCatalogFailure("offline"))
+    XCTAssertNil(store.catalog)
+    XCTAssertEqual(store.modelState, .ready)
+
+    store.refreshModels()
+    XCTAssertEqual(store.modelState, .refreshing)
+  }
+
   func testCombinedModelChoiceSubmitsOneValidSelection() {
     let driver = FakeConversationDriver()
     let store = NativeChatStore(workspace: "/tmp/work", driver: driver)
@@ -346,6 +357,25 @@ final class ViviBackendRuntimeTests: XCTestCase {
       try NativeEventDecoder.decode(event, bytes: bytes, models: [model]))
   }
 
+  func testDecoderRejectsUnknownAdvertisedReasoning() {
+    let bytes = Array("copilot/gpt-5GPT-5".utf8)
+    var event = vivi_backend_event_t()
+    event.kind = VIVI_BACKEND_EVENT_MODEL_CATALOG
+    event.content_kind = VIVI_BACKEND_CONTENT_MODEL_CATALOG
+    event.byte_count = UInt32(bytes.count)
+    event.model_count = 1
+    event.selected_model_id = vivi_backend_span_t(offset: 0, length: 13)
+    event.selected_reasoning = VIVI_BACKEND_REASONING_OFF
+    var model = vivi_backend_model_t()
+    model.id = vivi_backend_span_t(offset: 0, length: 13)
+    model.display_name = vivi_backend_span_t(offset: 13, length: 5)
+    model.reasoning_mask = 1
+    model.advertised_default_reasoning = 99
+
+    XCTAssertThrowsError(
+      try NativeEventDecoder.decode(event, bytes: bytes, models: [model]))
+  }
+
   func testDecoderCopiesToolStartFields() throws {
     let bytes = Array(#"call-1Read fileREADME.md{"path":"README.md"}"#.utf8)
     var event = vivi_backend_event_t()
@@ -393,6 +423,24 @@ final class ViviBackendRuntimeTests: XCTestCase {
     store.reduce(.ready)
 
     XCTAssertEqual(store.lifecycle, .closed)
+    XCTAssertTrue(store.isBusy)
+  }
+
+  func testToolMarkdownSanitizerRemovesTerminalSequences() throws {
+    XCTAssertEqual(
+      try sanitizedToolMarkdown("\u{1B}[32m# Result\u{1B}[0m\r\n"),
+      "# Result\n")
+  }
+
+  func testCopilotCandidatesIncludeNativePackageManagerLocations() {
+    let candidates = nativeCopilotExecutableCandidates(
+      home: URL(fileURLWithPath: "/Users/vivi"),
+      path: "/custom/bin:/opt/homebrew/bin")
+
+    XCTAssertEqual(candidates.first, "/custom/bin/copilot")
+    XCTAssertTrue(candidates.contains("/Users/vivi/.local/bin/copilot"))
+    XCTAssertTrue(candidates.contains("/Users/vivi/.volta/bin/copilot"))
+    XCTAssertEqual(candidates.filter { $0 == "/opt/homebrew/bin/copilot" }.count, 1)
   }
 }
 

@@ -38,8 +38,8 @@ with their first buildable product slice.
 The scaffold currently verifies:
 
 - `x86_64-linux-gnu` as `libvivi_backend.so`;
-- `x86_64-windows-msvc` as a DLL and import library in Debug;
-- `aarch64-windows-msvc` as a DLL and import library in ReleaseSafe.
+- `x86_64-windows-gnu` as a DLL and import library in Debug;
+- `aarch64-windows-gnu` as a DLL and import library in ReleaseSafe.
 
 Zig 0.16 currently fails while cross-compiling its `libubsan` support for
 ARM64 Windows Debug from macOS. Treat that as a toolchain verification item,

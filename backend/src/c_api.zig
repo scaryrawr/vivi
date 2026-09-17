@@ -11,6 +11,12 @@ comptime {
 }
 
 const Handle = struct {
+    const ControlOperation = enum {
+        none,
+        refresh_models,
+        switch_model,
+    };
+
     io_threaded: std.Io.Threaded,
     conversation: backend.Conversation,
     wake: c.vivi_backend_wake_fn,
@@ -18,6 +24,7 @@ const Handle = struct {
     armed: std.atomic.Value(bool) = .init(false),
     pending_wake: std.atomic.Value(bool) = .init(false),
     accepting_prompt: std.atomic.Value(bool) = .init(false),
+    control_operation: ControlOperation = .none,
     pending: ?backend.ConversationEvent = null,
     emit_closed_after_failure: bool = false,
 
@@ -63,9 +70,19 @@ fn copilotCliLaunch(
 ) ?backend.CopilotCliLaunch {
     return switch (raw) {
         c.VIVI_BACKEND_COPILOT_CLI_SDK_DEFAULT => .sdk_default,
-        c.VIVI_BACKEND_COPILOT_CLI_SEARCH_PROCESS_PATH => .search_process_path,
+        c.VIVI_BACKEND_COPILOT_CLI_EXPLICIT_PATH => .explicit_path,
         else => null,
     };
+}
+
+fn optionalAbsolutePath(
+    pointer: ?[*]const u8,
+    length: u32,
+) error{InvalidPath}!?[]const u8 {
+    if (length == 0) return null;
+    const bytes = (pointer orelse return error.InvalidPath)[0..length];
+    if (!std.fs.path.isAbsolute(bytes)) return error.InvalidPath;
+    return bytes;
 }
 
 export fn vivi_backend_open(
@@ -75,6 +92,11 @@ export fn vivi_backend_open(
     const input = options orelse return c.VIVI_BACKEND_INVALID_ARGUMENT;
     const output = out_conversation orelse return c.VIVI_BACKEND_INVALID_ARGUMENT;
     output.* = null;
+    if (input.abi_version != c.VIVI_BACKEND_ABI_VERSION or
+        input.struct_size < @sizeOf(c.vivi_backend_conversation_options_t))
+    {
+        return c.VIVI_BACKEND_INVALID_ARGUMENT;
+    }
     const working_directory_pointer = input.working_directory orelse
         return c.VIVI_BACKEND_INVALID_ARGUMENT;
     if (input.working_directory_length == 0) {
@@ -85,15 +107,23 @@ export fn vivi_backend_open(
     if (!std.fs.path.isAbsolute(working_directory)) {
         return c.VIVI_BACKEND_INVALID_ARGUMENT;
     }
-    const settings_path = if (input.settings_path_length > 0) blk: {
-        const pointer = input.settings_path orelse
-            return c.VIVI_BACKEND_INVALID_ARGUMENT;
-        const path = pointer[0..input.settings_path_length];
-        if (!std.fs.path.isAbsolute(path)) return c.VIVI_BACKEND_INVALID_ARGUMENT;
-        break :blk path;
-    } else null;
+    const settings_path = optionalAbsolutePath(
+        input.settings_path,
+        input.settings_path_length,
+    ) catch return c.VIVI_BACKEND_INVALID_ARGUMENT;
+    const sessions_directory = optionalAbsolutePath(
+        input.sessions_directory,
+        input.sessions_directory_length,
+    ) catch return c.VIVI_BACKEND_INVALID_ARGUMENT;
+    const copilot_cli_path = optionalAbsolutePath(
+        input.copilot_cli_path,
+        input.copilot_cli_path_length,
+    ) catch return c.VIVI_BACKEND_INVALID_ARGUMENT;
     const launch = copilotCliLaunch(input.copilot_cli_launch) orelse
         return c.VIVI_BACKEND_INVALID_ARGUMENT;
+    if ((launch == .explicit_path) != (copilot_cli_path != null)) {
+        return c.VIVI_BACKEND_INVALID_ARGUMENT;
+    }
 
     const self = std.heap.c_allocator.create(Handle) catch {
         return c.VIVI_BACKEND_FAILED;
@@ -104,6 +134,7 @@ export fn vivi_backend_open(
     self.armed = .init(false);
     self.pending_wake = .init(false);
     self.accepting_prompt = .init(false);
+    self.control_operation = .none;
     self.pending = null;
     self.emit_closed_after_failure = false;
     self.conversation = backend.openConversation(
@@ -113,6 +144,8 @@ export fn vivi_backend_open(
         .{
             .working_directory = working_directory,
             .settings_path = settings_path,
+            .sessions_directory = sessions_directory,
+            .copilot_cli_path = copilot_cli_path,
             .copilot_cli_launch = launch,
         },
     ) catch {
@@ -136,6 +169,7 @@ export fn vivi_backend_submit(
     const self = handle(conversation) orelse return c.VIVI_BACKEND_INVALID_ARGUMENT;
     const bytes = prompt orelse return c.VIVI_BACKEND_INVALID_ARGUMENT;
     if (prompt_length == 0) return c.VIVI_BACKEND_INVALID_ARGUMENT;
+    if (self.control_operation != .none) return c.VIVI_BACKEND_BUSY;
     if (!self.accepting_prompt.swap(false, .acq_rel)) {
         return c.VIVI_BACKEND_BUSY;
     }
@@ -143,7 +177,7 @@ export fn vivi_backend_submit(
         .{ .text = bytes[0..prompt_length] },
         .enqueue,
     ) catch |err| {
-        if (err != error.Busy and err != error.Stopping and err != error.Closed) {
+        if (err != error.Stopping and err != error.Closed) {
             self.accepting_prompt.store(true, .release);
         }
         return result(err);
@@ -178,7 +212,12 @@ export fn vivi_backend_refresh_models(
     conversation: ?*c.vivi_backend_conversation_t,
 ) callconv(.c) c.vivi_backend_result_t {
     const self = handle(conversation) orelse return c.VIVI_BACKEND_INVALID_ARGUMENT;
-    self.conversation.refreshModels() catch |err| return result(err);
+    if (self.control_operation != .none) return c.VIVI_BACKEND_BUSY;
+    self.control_operation = .refresh_models;
+    self.conversation.refreshModels() catch |err| {
+        self.control_operation = .none;
+        return result(err);
+    };
     return c.VIVI_BACKEND_OK;
 }
 
@@ -193,10 +232,43 @@ export fn vivi_backend_switch_model(
     if (model_id_length == 0) return c.VIVI_BACKEND_INVALID_ARGUMENT;
     const selected_reasoning = reasoning(reasoning_value) orelse
         return c.VIVI_BACKEND_INVALID_ARGUMENT;
+    if (self.control_operation != .none) return c.VIVI_BACKEND_BUSY;
+    self.control_operation = .switch_model;
     self.conversation.switchModel(.{
         .model_id = bytes[0..model_id_length],
         .reasoning = selected_reasoning,
-    }) catch |err| return result(err);
+    }) catch |err| {
+        self.control_operation = .none;
+        return result(err);
+    };
+    return c.VIVI_BACKEND_OK;
+}
+
+export fn vivi_backend_sanitize_tool_markdown(
+    input: ?[*]const u8,
+    input_length: u32,
+    output: ?[*]u8,
+    output_capacity: u32,
+    out_length: ?*u32,
+) callconv(.c) c.vivi_backend_result_t {
+    const required = out_length orelse return c.VIVI_BACKEND_INVALID_ARGUMENT;
+    const source: []const u8 = if (input_length > 0)
+        (input orelse return c.VIVI_BACKEND_INVALID_ARGUMENT)[0..input_length]
+    else
+        "";
+    const rendered = backend.renderMarkdown(
+        std.heap.c_allocator,
+        source,
+    ) catch return c.VIVI_BACKEND_FAILED;
+    defer std.heap.c_allocator.free(rendered);
+    if (rendered.len > std.math.maxInt(u32)) return c.VIVI_BACKEND_FAILED;
+    required.* = @intCast(rendered.len);
+    if (output_capacity < rendered.len) return c.VIVI_BACKEND_BUFFER_TOO_SMALL;
+    if (rendered.len > 0) {
+        const destination = (output orelse
+            return c.VIVI_BACKEND_INVALID_ARGUMENT)[0..rendered.len];
+        @memcpy(destination, rendered);
+    }
     return c.VIVI_BACKEND_OK;
 }
 
@@ -574,6 +646,16 @@ export fn vivi_backend_next_event(
     } else if (projected.kind == c.VIVI_BACKEND_EVENT_CLOSED) {
         self.accepting_prompt.store(false, .release);
     }
+    if ((projected.kind == c.VIVI_BACKEND_EVENT_MODEL_CATALOG or
+        projected.kind == c.VIVI_BACKEND_EVENT_MODEL_CATALOG_FAILURE) and
+        self.control_operation == .refresh_models)
+    {
+        self.control_operation = .none;
+    } else if (projected.kind == c.VIVI_BACKEND_EVENT_MODEL_SWITCH and
+        self.control_operation == .switch_model)
+    {
+        self.control_operation = .none;
+    }
     self.pending.?.deinit();
     self.pending = null;
     return c.VIVI_BACKEND_OK;
@@ -598,6 +680,57 @@ export fn vivi_backend_destroy(
 test "C launch policy rejects unknown values" {
     const invalid: c.vivi_backend_copilot_cli_launch_t = 99;
     try std.testing.expect(copilotCliLaunch(invalid) == null);
+}
+
+test "C wake coalesces before arming and schedules after arming" {
+    const Counter = struct {
+        fn wake(context: ?*anyopaque) callconv(.c) void {
+            const count: *usize = @ptrCast(@alignCast(context.?));
+            count.* += 1;
+        }
+    };
+
+    var count: usize = 0;
+    var value: Handle = undefined;
+    value.wake = Counter.wake;
+    value.wake_context = &count;
+    value.armed = .init(false);
+    value.pending_wake = .init(false);
+    Handle.notify(&value);
+    try std.testing.expectEqual(@as(usize, 0), count);
+    try std.testing.expect(value.pending_wake.load(.acquire));
+
+    value.armed.store(true, .release);
+    Handle.notify(&value);
+    try std.testing.expectEqual(@as(usize, 1), count);
+    try std.testing.expect(!value.pending_wake.load(.acquire));
+}
+
+test "C tool Markdown sanitizer uses atomic caller-owned copy" {
+    const input = "\x1b[32m# Result\x1b[0m\r\n";
+    var required: u32 = 0;
+    try std.testing.expect(
+        c.VIVI_BACKEND_BUFFER_TOO_SMALL ==
+            vivi_backend_sanitize_tool_markdown(
+                input,
+                input.len,
+                null,
+                0,
+                &required,
+            ),
+    );
+    var bytes: [64]u8 = undefined;
+    try std.testing.expect(
+        c.VIVI_BACKEND_OK ==
+            vivi_backend_sanitize_tool_markdown(
+                input,
+                input.len,
+                &bytes,
+                bytes.len,
+                &required,
+            ),
+    );
+    try std.testing.expectEqualStrings("# Result\n", bytes[0..required]);
 }
 
 test "C model catalog copy-out is atomic and uses checked spans" {

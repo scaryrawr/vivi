@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define VIVI_BACKEND_ABI_VERSION 5
+#define VIVI_BACKEND_ABI_VERSION 6
 
 typedef enum vivi_backend_result {
     VIVI_BACKEND_OK = 0,
@@ -27,14 +27,20 @@ typedef void (*vivi_backend_wake_fn)(void *context);
 
 typedef enum vivi_backend_copilot_cli_launch {
     VIVI_BACKEND_COPILOT_CLI_SDK_DEFAULT = 0,
-    VIVI_BACKEND_COPILOT_CLI_SEARCH_PROCESS_PATH = 1,
+    VIVI_BACKEND_COPILOT_CLI_EXPLICIT_PATH = 1,
 } vivi_backend_copilot_cli_launch_t;
 
 typedef struct vivi_backend_conversation_options {
+    uint32_t abi_version;
+    uint32_t struct_size;
     const uint8_t *working_directory;
     uint32_t working_directory_length;
     const uint8_t *settings_path;
     uint32_t settings_path_length;
+    const uint8_t *sessions_directory;
+    uint32_t sessions_directory_length;
+    const uint8_t *copilot_cli_path;
+    uint32_t copilot_cli_path_length;
     vivi_backend_copilot_cli_launch_t copilot_cli_launch;
     vivi_backend_wake_fn wake;
     void *wake_context;
@@ -150,6 +156,16 @@ vivi_backend_result_t vivi_backend_switch_model(
     const uint8_t *model_id,
     uint32_t model_id_length,
     vivi_backend_reasoning_effort_t reasoning);
+/*
+ * Sanitizes untrusted tool text for Markdown display. out_length always receives
+ * the required byte count. A short or null output buffer does not write output.
+ */
+vivi_backend_result_t vivi_backend_sanitize_tool_markdown(
+    const uint8_t *input,
+    uint32_t input_length,
+    uint8_t *output,
+    uint32_t output_capacity,
+    uint32_t *out_length);
 /*
  * next_event always fills out_event for a pending event. If either caller-owned
  * buffer is too small it returns BUFFER_TOO_SMALL without writing either

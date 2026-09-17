@@ -209,7 +209,7 @@ final class NativeChatStore: ObservableObject {
   }
 
   var isBusy: Bool {
-    lifecycle == .starting || lifecycle == .responding || lifecycle == .closing
+    lifecycle != .idle
   }
 
   var selectedModelID: String? {
@@ -638,9 +638,15 @@ enum NativeEventDecoder {
       let choices = ReasoningEffort.allCases.filter {
         raw.reasoning_mask & UInt8(1 << $0.rawValue) != 0
       }
-      let advertised =
-        raw.advertised_default_reasoning == Int8(VIVI_BACKEND_REASONING_NONE.rawValue)
-        ? nil : ReasoningEffort(rawValue: Int32(raw.advertised_default_reasoning))
+      let advertised: ReasoningEffort?
+      if raw.advertised_default_reasoning == Int8(VIVI_BACKEND_REASONING_NONE.rawValue) {
+        advertised = nil
+      } else {
+        guard
+          let value = ReasoningEffort(rawValue: Int32(raw.advertised_default_reasoning))
+        else { throw NativeEventDecodingError.malformed }
+        advertised = value
+      }
       if let advertised, !choices.contains(advertised) {
         throw NativeEventDecodingError.malformed
       }
@@ -699,7 +705,10 @@ enum NativeEventDecoder {
       case VIVI_BACKEND_TOOL_RESULT_IMAGE: result = .image
       default: throw NativeEventDecodingError.malformed
       }
-      return .toolFinished(callID: callID, result: result, output: content)
+      return .toolFinished(
+        callID: callID,
+        result: result,
+        output: try sanitizedToolMarkdown(content))
     case VIVI_BACKEND_EVENT_MODEL_CATALOG:
       guard event.content_kind == VIVI_BACKEND_CONTENT_MODEL_CATALOG else {
         throw NativeEventDecodingError.malformed
@@ -765,6 +774,73 @@ enum NativeEventDecoder {
   }
 }
 
+func sanitizedToolMarkdown(_ text: String) throws -> String {
+  let input = Array(text.utf8)
+  var required: UInt32 = 0
+  let probe = input.withUnsafeBufferPointer {
+    vivi_backend_sanitize_tool_markdown(
+      $0.baseAddress,
+      UInt32($0.count),
+      nil,
+      0,
+      &required)
+  }
+  guard probe == VIVI_BACKEND_BUFFER_TOO_SMALL || (probe == VIVI_BACKEND_OK && required == 0)
+  else { throw NativeEventDecodingError.malformed }
+  if required == 0 { return "" }
+
+  var output = [UInt8](repeating: 0, count: Int(required))
+  let copied = input.withUnsafeBufferPointer { inputBuffer in
+    output.withUnsafeMutableBufferPointer { outputBuffer in
+      vivi_backend_sanitize_tool_markdown(
+        inputBuffer.baseAddress,
+        UInt32(inputBuffer.count),
+        outputBuffer.baseAddress,
+        UInt32(outputBuffer.count),
+        &required)
+    }
+  }
+  guard copied == VIVI_BACKEND_OK,
+    let sanitized = String(bytes: output, encoding: .utf8)
+  else { throw NativeEventDecodingError.malformed }
+  return sanitized
+}
+
+func nativeCopilotExecutableCandidates(home: URL, path: String?) -> [String] {
+  var candidates =
+    (path ?? "").split(separator: ":").map {
+      URL(fileURLWithPath: String($0)).appendingPathComponent("copilot").path
+    }
+  candidates.append(contentsOf: [
+    home.appendingPathComponent(".local/bin/copilot").path,
+    home.appendingPathComponent(".npm-global/bin/copilot").path,
+    home.appendingPathComponent(".volta/bin/copilot").path,
+    "/opt/homebrew/bin/copilot",
+    "/usr/local/bin/copilot",
+  ])
+  var seen: Set<String> = []
+  return candidates.filter { seen.insert($0).inserted }
+}
+
+func nativeCopilotExecutablePath(
+  fileManager: FileManager = .default,
+  environment: [String: String] = ProcessInfo.processInfo.environment
+) -> String? {
+  let home = fileManager.homeDirectoryForCurrentUser
+  var candidates = nativeCopilotExecutableCandidates(home: home, path: environment["PATH"])
+  let nodeVersions = home.appendingPathComponent(".nvm/versions/node")
+  if let versions = try? fileManager.contentsOfDirectory(
+    at: nodeVersions,
+    includingPropertiesForKeys: nil
+  ) {
+    candidates.append(
+      contentsOf: versions.sorted { $0.lastPathComponent > $1.lastPathComponent }.map {
+        $0.appendingPathComponent("bin/copilot").path
+      })
+  }
+  return candidates.first { fileManager.isExecutableFile(atPath: $0) }
+}
+
 final class ViviConversationDriver: ViviConversationDriving, @unchecked Sendable {
   private let workspace: String
   private let queue = DispatchQueue(label: "com.scaryrawr.vivi.conversation")
@@ -784,21 +860,42 @@ final class ViviConversationDriver: ViviConversationDriving, @unchecked Sendable
       let settingsPath =
         FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".vivi/settings.json").path
+      let sessionsDirectory =
+        FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".vivi/sessions").path
+      guard let copilotPath = nativeCopilotExecutablePath() else {
+        self.receive = nil
+        return .failed
+      }
       let settingsBytes = Array(settingsPath.utf8)
+      let sessionsBytes = Array(sessionsDirectory.utf8)
+      let copilotBytes = Array(copilotPath.utf8)
       var options = vivi_backend_conversation_options_t(
+        abi_version: UInt32(VIVI_BACKEND_ABI_VERSION),
+        struct_size: UInt32(MemoryLayout<vivi_backend_conversation_options_t>.size),
         working_directory: nil,
         working_directory_length: UInt32(bytes.count),
         settings_path: nil,
         settings_path_length: UInt32(settingsBytes.count),
-        copilot_cli_launch: VIVI_BACKEND_COPILOT_CLI_SEARCH_PROCESS_PATH,
+        sessions_directory: nil,
+        sessions_directory_length: UInt32(sessionsBytes.count),
+        copilot_cli_path: nil,
+        copilot_cli_path_length: UInt32(copilotBytes.count),
+        copilot_cli_launch: VIVI_BACKEND_COPILOT_CLI_EXPLICIT_PATH,
         wake: Self.wake,
         wake_context: Unmanaged.passUnretained(self).toOpaque()
       )
       let result = bytes.withUnsafeBufferPointer { buffer in
         settingsBytes.withUnsafeBufferPointer { settingsBuffer in
-          options.working_directory = buffer.baseAddress
-          options.settings_path = settingsBuffer.baseAddress
-          return vivi_backend_open(&options, &handle)
+          sessionsBytes.withUnsafeBufferPointer { sessionsBuffer in
+            copilotBytes.withUnsafeBufferPointer { copilotBuffer in
+              options.working_directory = buffer.baseAddress
+              options.settings_path = settingsBuffer.baseAddress
+              options.sessions_directory = sessionsBuffer.baseAddress
+              options.copilot_cli_path = copilotBuffer.baseAddress
+              return vivi_backend_open(&options, &handle)
+            }
+          }
         }
       }
       guard result == VIVI_BACKEND_OK else {
