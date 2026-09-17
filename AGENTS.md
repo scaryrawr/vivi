@@ -60,6 +60,9 @@ implemented native binding together.
 For user-visible native app behavior, validation must also drive the built
 native app and retain a screen recording of the changed flow. A CLI or TUI
 capture does not validate native presentation or interaction.
+Launch worktree builds through that worktree's `./zig-out/bin/vivi chat --native`;
+do not open a bare `vivi://` URL, because multiple worktree app bundles share
+the production bundle identifier and Launch Services may route it to stale code.
 
 `zig build test` does not compile test blocks in every imported backend module.
 When changing `backend/src/settings.zig` or `backend/src/session_store.zig`,
