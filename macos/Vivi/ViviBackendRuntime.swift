@@ -519,9 +519,8 @@ final class NativeChatStore: ObservableObject {
         activeReasoning = id
         activeReasoningPrefix = existing.isEmpty ? "" : existing + "\n\n"
         startsNewSegment = true
-      } else if transcript.count >= 2,
-        case .assistant = transcript.last,
-        case .reasoning(let id, _) = transcript[transcript.count - 2]
+      } else if case .assistant = transcript.last,
+        let id = latestReasoningIDInCurrentResponse()
       {
         activeReasoning = id
         activeReasoningPrefix = ""
@@ -548,6 +547,22 @@ final class NativeChatStore: ObservableObject {
         activeReasoningPrefix + text
       }
     transcript[index] = .reasoning(id: id, text: replacement)
+  }
+
+  private func latestReasoningIDInCurrentResponse() -> UUID? {
+    guard
+      let headerIndex = transcript.lastIndex(where: {
+        if case .assistantHeader = $0 { return true }
+        return false
+      }),
+      headerIndex + 1 < transcript.count
+    else { return nil }
+    for item in transcript[(headerIndex + 1)...].reversed() {
+      if case .reasoning(let id, _) = item {
+        return id
+      }
+    }
+    return nil
   }
 
   private func finishClose() {

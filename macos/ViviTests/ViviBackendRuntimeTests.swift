@@ -205,6 +205,33 @@ final class ViviBackendRuntimeTests: XCTestCase {
     else { return XCTFail("Expected completed reasoning to replace the streamed reasoning") }
   }
 
+  func testLateReasoningCompletionFindsReasoningAcrossToolRow() {
+    let store = NativeChatStore(workspace: "/tmp/work", driver: FakeConversationDriver())
+
+    store.reduce(.assistantStarted)
+    store.reduce(.reasoningComplete("same reasoning"))
+    store.reduce(
+      .toolStarted(
+        ToolActivity(
+          callID: "call-1",
+          title: "Read file",
+          detail: "README.md",
+          input: #"{"path":"README.md"}"#,
+          inputPresentation: .literal(#"{"path":"README.md"}"#),
+          result: .running,
+          output: nil,
+          outputPresentation: nil)))
+    store.reduce(.assistantComplete("answer"))
+    store.reduce(.reasoningComplete("same reasoning"))
+
+    XCTAssertEqual(store.transcript.count, 4)
+    guard case .assistantHeader = store.transcript[0],
+      case .reasoning(_, "same reasoning") = store.transcript[1],
+      case .tool = store.transcript[2],
+      case .assistant(_, "answer") = store.transcript[3]
+    else { return XCTFail("Expected one reasoning row before the tool and assistant response") }
+  }
+
   func testLateFirstReasoningInsertsBeforeAssistantResponse() {
     let store = NativeChatStore(workspace: "/tmp/work", driver: FakeConversationDriver())
 
