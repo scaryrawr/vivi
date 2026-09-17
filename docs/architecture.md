@@ -35,6 +35,23 @@ Only the macOS application exists today. Windows and Linux directories record
 their decided native stacks and build contracts; executable targets arrive
 with their first buildable product slice.
 
+The macOS app owns one logical main-window presentation and an ordered,
+in-memory collection of live conversations. A canonical absolute workspace
+path identifies project context, a fresh conversation ID identifies one
+`NativeChatStore` and driver pair, and the main-window identity remains
+independent of both. Every valid `vivi://chat?workspace=...` occurrence creates
+and selects a new conversation, including a repeated workspace. Closing the
+window releases only its AppKit and SwiftUI presentation; Dock reopen rebuilds
+that presentation over the same conversation collection and selection.
+Application termination closes every retained store and waits for all drivers.
+
+`NativeChatStore` remains the authoritative one-conversation aggregate. The
+application collection derives sidebar title and workspace metadata from the
+store rather than copying it. This permits a session resume to replace the
+store's active workspace, title, transcript, and model selection without
+changing application conversation identity. The sidebar does not parse session
+shards, retain backend resume keys, or own transcript and model behavior.
+
 The scaffold currently verifies:
 
 - `x86_64-linux-gnu` as `libvivi_backend.so`;

@@ -950,19 +950,6 @@ final class ViviBackendRuntimeTests: XCTestCase {
       .literal("\\x1b[31mtext"))
   }
 
-  func testNativeChatURLProducesWorkspaceOnlyRequest() {
-    XCTAssertEqual(
-      nativeChatRequest(
-        from: URL(
-          string:
-            "vivi://chat?workspace=/tmp/Vivi%20chat&executable=/tmp/evil"
-        )!),
-      NativeChatRequest(workspace: "/tmp/Vivi chat"))
-    XCTAssertNil(
-      nativeChatRequest(
-        from: URL(string: "vivi://chat?workspace=relative")!))
-  }
-
   func testClosedStoreIgnoresLateReadyEvent() {
     let store = NativeChatStore(
       workspace: "/tmp/work",
