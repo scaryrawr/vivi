@@ -86,16 +86,16 @@ struct ContentView: View {
         Button(action: store.submit) {
           Image(systemName: "arrow.up")
             .font(.system(size: 14, weight: .semibold))
-            .foregroundStyle(canSubmit ? Color.white : Color.secondary)
+            .foregroundStyle(store.canSubmit ? Color.white : Color.secondary)
             .frame(width: 30, height: 30)
             .background(
-              canSubmit ? Color.accentColor : Color.secondary.opacity(0.14),
+              store.canSubmit ? Color.accentColor : Color.secondary.opacity(0.14),
               in: Circle())
         }
         .buttonStyle(.plain)
         .keyboardShortcut(.return, modifiers: .command)
         .help("Send")
-        .disabled(!canSubmit)
+        .disabled(!store.canSubmit)
       }
     }
     .padding(.horizontal, 14)
@@ -157,11 +157,6 @@ struct ContentView: View {
       return store.modelState == .loading ? "Loading models…" : "Models unavailable"
     }
     return "\(model.displayName) · \(reasoning.label)"
-  }
-
-  private var canSubmit: Bool {
-    !store.isBusy && store.modelState == .ready
-      && !store.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
   }
 
   private var status: String {
