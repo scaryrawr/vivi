@@ -174,15 +174,16 @@ private struct ChatItemView: View {
     case .assistant(_, let text):
       MarkdownContentView(source: text)
     case .reasoning(_, let text):
-      DisclosureGroup("Reasoning") {
+      ExpandableCard {
+        Text("Reasoning")
+      } content: {
         MarkdownContentView(source: text)
           .font(.callout)
           .foregroundStyle(.secondary)
           .frame(maxWidth: .infinity, alignment: .leading)
-          .padding(.top, 4)
+          .padding(.horizontal, 10)
+          .padding(.bottom, 10)
       }
-      .padding(10)
-      .background(.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
     case .tool(_, let activity):
       ToolActivityView(activity: activity)
     case .status(_, let text):
@@ -203,20 +204,7 @@ private struct ChatItemView: View {
     let activity: ToolActivity
 
     var body: some View {
-      DisclosureGroup {
-        VStack(alignment: .leading, spacing: 8) {
-          if !activity.detail.isEmpty {
-            detail("Detail", activity.detail, markdown: false)
-          }
-          if !activity.input.isEmpty {
-            detail("Input", activity.input, markdown: false)
-          }
-          if !activity.output.isEmpty {
-            detail("Output", activity.output, markdown: true)
-          }
-        }
-        .padding(.top, 6)
-      } label: {
+      ExpandableCard {
         Label {
           HStack(spacing: 6) {
             Text(activity.title)
@@ -228,9 +216,21 @@ private struct ChatItemView: View {
           Image(systemName: icon)
             .foregroundStyle(statusColor)
         }
+      } content: {
+        VStack(alignment: .leading, spacing: 8) {
+          if !activity.detail.isEmpty {
+            detail("Detail", activity.detail, markdown: false)
+          }
+          if !activity.input.isEmpty {
+            detail("Input", activity.input, markdown: false)
+          }
+          if !activity.output.isEmpty {
+            detail("Output", activity.output, markdown: true)
+          }
+        }
+        .padding(.horizontal, 10)
+        .padding(.bottom, 10)
       }
-      .padding(10)
-      .background(.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
     }
 
     @ViewBuilder
@@ -274,6 +274,52 @@ private struct ChatItemView: View {
       case .failed: .red
       case .image: .blue
       }
+    }
+  }
+
+  private struct ExpandableCard<Label: View, Content: View>: View {
+    @State private var isExpanded = false
+
+    private let label: Label
+    private let content: Content
+
+    init(
+      @ViewBuilder label: () -> Label,
+      @ViewBuilder content: () -> Content
+    ) {
+      self.label = label()
+      self.content = content()
+    }
+
+    var body: some View {
+      VStack(alignment: .leading, spacing: 0) {
+        Button {
+          withAnimation(.easeInOut(duration: 0.16)) {
+            isExpanded.toggle()
+          }
+        } label: {
+          HStack(spacing: 8) {
+            Image(systemName: "chevron.right")
+              .font(.caption.weight(.semibold))
+              .rotationEffect(.degrees(isExpanded ? 90 : 0))
+              .accessibilityHidden(true)
+            label
+            Spacer(minLength: 0)
+          }
+          .frame(maxWidth: .infinity, minHeight: 24, alignment: .leading)
+          .contentShape(Rectangle())
+          .padding(10)
+        }
+        .buttonStyle(.plain)
+        .accessibilityElement(children: .combine)
+        .accessibilityValue(isExpanded ? "Expanded" : "Collapsed")
+
+        if isExpanded {
+          content
+            .transition(.opacity)
+        }
+      }
+      .background(.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
     }
   }
 
