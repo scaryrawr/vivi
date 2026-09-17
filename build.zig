@@ -122,6 +122,17 @@ pub fn build(b: *std.Build) void {
 
     const backend_tests = b.addTest(.{ .root_module = backend, .use_llvm = use_llvm });
     const run_backend_tests = b.addRunArtifact(backend_tests);
+    const canvas_adapter_tests = b.addTest(.{
+        .root_module = backend,
+        .use_llvm = use_llvm,
+        .filters = &.{"canvas"},
+    });
+    const run_canvas_adapter_tests = b.addRunArtifact(canvas_adapter_tests);
+    const canvas_adapter_step = b.step(
+        "test-canvas-adapter",
+        "Run SDK-free canvas domain and production adapter tests",
+    );
+    canvas_adapter_step.dependOn(&run_canvas_adapter_tests.step);
 
     const canvas_contract_module = b.createModule(.{
         .root_source_file = b.path("backend/test/copilot_sdk_canvas_contract.zig"),

@@ -103,12 +103,43 @@ comptime {
         copilot.Session,
         std.mem.Allocator,
     ) anyerror!copilot.OpenCanvasSnapshot = &copilot.Session.snapshotOpenCanvases;
+    const capabilities: *const fn (
+        copilot.Session,
+    ) copilot.CapabilitySet = &copilot.Session.capabilities;
+    const open_result_deinit: *const fn (
+        *copilot.OpenCanvasResult,
+    ) void = &copilot.OpenCanvasResult.deinit;
+    const snapshot_deinit: *const fn (
+        *copilot.OpenCanvasSnapshot,
+    ) void = &copilot.OpenCanvasSnapshot.deinit;
+    const json_deinit: *const fn (
+        *copilot.OwnedJson,
+    ) void = &copilot.OwnedJson.deinit;
     _ = .{
         open_canvas,
         close_canvas,
         invoke_canvas_action,
         snapshot_open_canvases,
+        capabilities,
+        open_result_deinit,
+        snapshot_deinit,
+        json_deinit,
     };
+
+    for (.{
+        "instance_id",
+        "extension_id",
+        "canvas_id",
+        "title",
+        "status",
+        "url",
+        "input_json",
+    }) |field| {
+        if (!@hasField(copilot.OpenCanvas, field))
+            @compileError("review changed OpenCanvas field " ++ field);
+    }
+    if (!@hasField(copilot.OwnedJson, "json"))
+        @compileError("review changed OwnedJson payload");
 
     if (@hasDecl(copilot.Session, "reopenCanvas"))
         @compileError("review the newly public reopenCanvas contract");
@@ -199,6 +230,14 @@ test "declaration callbacks and renderer opt-ins compose through public types" {
     }, canvas.context);
     defer std.testing.allocator.free(result);
     try std.testing.expectEqualStrings("{\"refreshed\":true}", result);
+}
+
+test "canvas renderer and discovery requests default off" {
+    const config: copilot.CreateSessionConfig = .{};
+    try std.testing.expect(!config.extensions.common.request_canvas_renderer);
+    try std.testing.expect(!config.extensions.common.request_extensions);
+    try std.testing.expectEqual(@as(usize, 0), config.extensions.common.canvases.len);
+    try std.testing.expect(config.extensions.canvas_provider == null);
 }
 
 test "runtime identity is explicit while operation correlation is absent" {

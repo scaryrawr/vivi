@@ -1,4 +1,5 @@
 const std = @import("std");
+const canvas = @import("canvas.zig");
 const tool_activity = @import("tool_activity.zig");
 const image = @import("image.zig");
 
@@ -695,6 +696,8 @@ pub const Event = union(enum) {
     assistant_complete: OwnedText,
     tool_activity: tool_activity.ToolActivityUpdate,
     user_input_requested: UserInputRequest,
+    canvas_snapshot: canvas.Snapshot,
+    canvas_operation: canvas.CommandCompletion,
     command_completed: OwnedText,
     idle,
     closed: Closed,
@@ -710,6 +713,8 @@ pub const Event = union(enum) {
             => |*text| text.deinit(),
             .tool_activity => |*update| update.deinit(),
             .user_input_requested => |*request| request.deinit(),
+            .canvas_snapshot => |*snapshot| snapshot.deinit(),
+            .canvas_operation => |*completion| completion.deinit(),
             .command_catalog => |*catalog| catalog.deinit(),
             .model_catalog => |*catalog| catalog.deinit(),
             .model_catalog_failed => |*text| text.deinit(),
@@ -742,6 +747,7 @@ pub const Command = union(enum) {
         answer: OwnedText,
         was_freeform: bool,
     },
+    canvas: canvas.Command,
     stop,
 
     pub fn deinit(self: *Command) void {
@@ -753,6 +759,7 @@ pub const Command = union(enum) {
                 response.request_id.deinit();
                 response.answer.deinit();
             },
+            .canvas => |*value| value.deinit(),
             .refresh_commands,
             .refresh_models,
             .refresh_sessions,
@@ -802,6 +809,7 @@ const Core = struct {
     events: std.ArrayList(Event) = .empty,
     wake_pending: bool = false,
     stop_requested: bool = false,
+    next_canvas_request_id: u64 = 1,
     worker: ?std.Io.Future(void) = null,
 };
 
@@ -896,6 +904,7 @@ pub const Worker = struct {
                 .resume_session,
                 .execute_command,
                 .user_input_response,
+                .canvas,
                 => {},
             }
         }
@@ -1062,6 +1071,20 @@ pub const Worker = struct {
         try self.publish(.{ .tool_activity = update });
     }
 
+    pub fn canvasSnapshot(
+        self: *Worker,
+        snapshot: canvas.Snapshot,
+    ) !void {
+        try self.publish(.{ .canvas_snapshot = snapshot });
+    }
+
+    pub fn completeCanvasCommand(
+        self: *Worker,
+        completion: canvas.CommandCompletion,
+    ) !void {
+        try self.completeControl(.{ .canvas_operation = completion });
+    }
+
     pub fn idle(self: *Worker) !void {
         try self.core.mutex.lock(self.core.io);
         if (!self.core.stop_requested) self.core.state = .idle;
@@ -1210,6 +1233,54 @@ pub const Conversation = struct {
         try self.enqueueControl(.{ .resume_session = key });
     }
 
+    pub fn openCanvas(
+        self: *Conversation,
+        input: canvas.OpenCommandInput,
+    ) !canvas.RequestId {
+        const request_id = try self.takeCanvasRequestId();
+        try self.enqueueControl(.{ .canvas = .{
+            .open = try canvas.OpenCommand.init(
+                self.core.allocator,
+                request_id,
+                input,
+                .{},
+            ),
+        } });
+        return request_id;
+    }
+
+    pub fn closeCanvas(
+        self: *Conversation,
+        key: canvas.KeyView,
+    ) !canvas.RequestId {
+        const request_id = try self.takeCanvasRequestId();
+        try self.enqueueControl(.{ .canvas = .{
+            .close = try canvas.CloseCommand.init(
+                self.core.allocator,
+                request_id,
+                key,
+                .{},
+            ),
+        } });
+        return request_id;
+    }
+
+    pub fn invokeCanvasAction(
+        self: *Conversation,
+        input: canvas.ActionCommandInput,
+    ) !canvas.RequestId {
+        const request_id = try self.takeCanvasRequestId();
+        try self.enqueueControl(.{ .canvas = .{
+            .invoke_action = try canvas.ActionCommand.init(
+                self.core.allocator,
+                request_id,
+                input,
+                .{},
+            ),
+        } });
+        return request_id;
+    }
+
     pub fn respondToUserInput(
         self: *Conversation,
         request_id: []const u8,
@@ -1267,6 +1338,17 @@ pub const Conversation = struct {
         try self.core.commands.append(self.core.allocator, owned_command);
         self.core.state = .controlling;
         self.core.command_ready.signal(self.core.io);
+    }
+
+    fn takeCanvasRequestId(self: *Conversation) !canvas.RequestId {
+        try self.core.mutex.lock(self.core.io);
+        defer self.core.mutex.unlock(self.core.io);
+        const value = self.core.next_canvas_request_id;
+        self.core.next_canvas_request_id +%= 1;
+        if (self.core.next_canvas_request_id == 0) {
+            self.core.next_canvas_request_id = 1;
+        }
+        return @enumFromInt(value);
     }
 
     pub fn tryTakeEvent(self: *Conversation) !?Event {
@@ -1396,6 +1478,7 @@ test "conversation transfers streamed events without SDK access" {
                 .resume_session,
                 .execute_command,
                 .user_input_response,
+                .canvas,
                 => {
                     worker.closeFailure(.stream, "Unexpected control command.");
                     return;
@@ -1447,6 +1530,105 @@ test "conversation transfers streamed events without SDK access" {
         }
     }
     try std.testing.expect(wake_counter.count.load(.monotonic) > 0);
+}
+
+test "conversation serializes owned canvas commands and completions" {
+    const Script = struct {
+        fn run(worker: *Worker) void {
+            if (!(worker.ready() catch return)) {
+                worker.closeRequested();
+                return;
+            }
+            var command = worker.waitCommand();
+            defer command.deinit();
+            switch (command) {
+                .canvas => |value| switch (value) {
+                    .open => |open| {
+                        if (!std.mem.eql(
+                            u8,
+                            "fixture.extension",
+                            open.key.extension_id.bytes,
+                        )) return;
+                        if (!std.mem.eql(
+                            u8,
+                            "{\"owned\":true}",
+                            open.input.?.bytes,
+                        )) return;
+                        worker.completeCanvasCommand(.{
+                            .allocator = worker.allocator(),
+                            .request_id = open.request_id,
+                            .result = .{
+                                .open = .{ .failed = .disabled },
+                            },
+                        }) catch return;
+                    },
+                    else => return,
+                },
+                else => return,
+            }
+            var stop = worker.waitCommand();
+            stop.deinit();
+            worker.closeRequested();
+        }
+    };
+    const WakeCounter = struct {
+        fn notify(_: *anyopaque) void {}
+    };
+
+    var wake_context: u8 = 0;
+    var conversation = try openWithRunner(
+        std.testing.allocator,
+        std.testing.io,
+        .{ .context = &wake_context, .notify = WakeCounter.notify },
+        Script.run,
+    );
+    defer conversation.deinit();
+
+    while (true) {
+        if (try conversation.tryTakeEvent()) |event_value| {
+            var event = event_value;
+            defer event.deinit();
+            if (event == .ready) break;
+        } else {
+            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+    }
+
+    var extension_id = [_]u8{
+        'f', 'i', 'x', 't', 'u', 'r', 'e', '.', 'e', 'x', 't', 'e', 'n',
+        's', 'i', 'o', 'n',
+    };
+    var input_json = "{\"owned\":true}".*;
+    const request_id = try conversation.openCanvas(.{
+        .key = .{
+            .extension_id = &extension_id,
+            .canvas_id = "review",
+            .instance_id = "review:main",
+        },
+        .input_json = &input_json,
+    });
+    extension_id[0] = 'x';
+    input_json[2] = 'x';
+
+    while (true) {
+        if (try conversation.tryTakeEvent()) |event_value| {
+            var event = event_value;
+            defer event.deinit();
+            if (event == .canvas_operation) {
+                try std.testing.expectEqual(
+                    request_id,
+                    event.canvas_operation.request_id,
+                );
+                try std.testing.expectEqual(
+                    canvas.OperationFailure.disabled,
+                    event.canvas_operation.result.open.failed,
+                );
+                break;
+            }
+        } else {
+            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+    }
 }
 
 test "conversation transfers owned tool lifecycle events without SDK access" {

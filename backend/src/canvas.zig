@@ -411,6 +411,40 @@ pub const CanvasDeclaration = struct {
         return false;
     }
 
+    pub fn clone(
+        self: CanvasDeclaration,
+        allocator: std.mem.Allocator,
+        limits: Limits,
+    ) !CanvasDeclaration {
+        const actions = try allocator.alloc(
+            ActionDeclarationInput,
+            self.actions.len,
+        );
+        defer allocator.free(actions);
+        for (self.actions, 0..) |action, index| {
+            actions[index] = .{
+                .name = action.name.bytes,
+                .description = action.description,
+                .input_schema_json = if (action.input_schema) |schema|
+                    schema.bytes
+                else
+                    null,
+            };
+        }
+        return init(allocator, .{
+            .extension_id = self.provider.id.bytes,
+            .extension_name = self.provider.name,
+            .canvas_id = self.id.bytes,
+            .display_name = self.display_name,
+            .description = self.description,
+            .input_schema_json = if (self.input_schema) |schema|
+                schema.bytes
+            else
+                null,
+            .actions = actions,
+        }, limits);
+    }
+
     pub fn deinit(
         self: *CanvasDeclaration,
         allocator: std.mem.Allocator,
@@ -546,10 +580,270 @@ pub const InvokeActionRequest = struct {
     input: ?*const ActionInputDocument = null,
 };
 
+pub const RequestId = enum(u64) {
+    _,
+
+    pub fn value(self: RequestId) u64 {
+        return @intFromEnum(self);
+    }
+};
+
+pub const OpenCommandInput = struct {
+    key: KeyView,
+    input_json: ?[]const u8 = null,
+};
+
+pub const ActionCommandInput = struct {
+    key: KeyView,
+    action_name: []const u8,
+    input_json: ?[]const u8 = null,
+};
+
+pub const OpenCommand = struct {
+    allocator: std.mem.Allocator,
+    request_id: RequestId,
+    key: InstanceKey,
+    input: ?OpenInputDocument,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        request_id: RequestId,
+        value: OpenCommandInput,
+        limits: Limits,
+    ) !OpenCommand {
+        var key = try InstanceKey.init(allocator, value.key, limits);
+        errdefer key.deinit(allocator);
+        return .{
+            .allocator = allocator,
+            .request_id = request_id,
+            .key = key,
+            .input = if (value.input_json) |json|
+                try OpenInputDocument.init(allocator, json, limits)
+            else
+                null,
+        };
+    }
+
+    pub fn request(self: *const OpenCommand) OpenRequest {
+        return .{
+            .key = self.key.view(),
+            .input = if (self.input) |*input| input else null,
+        };
+    }
+
+    pub fn deinit(self: *OpenCommand) void {
+        self.key.deinit(self.allocator);
+        if (self.input) |*input| input.deinit(self.allocator);
+        self.* = undefined;
+    }
+};
+
+pub const CloseCommand = struct {
+    allocator: std.mem.Allocator,
+    request_id: RequestId,
+    key: InstanceKey,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        request_id: RequestId,
+        key: KeyView,
+        limits: Limits,
+    ) !CloseCommand {
+        return .{
+            .allocator = allocator,
+            .request_id = request_id,
+            .key = try InstanceKey.init(allocator, key, limits),
+        };
+    }
+
+    pub fn request(self: *const CloseCommand) CloseRequest {
+        return .{ .key = self.key.view() };
+    }
+
+    pub fn deinit(self: *CloseCommand) void {
+        self.key.deinit(self.allocator);
+        self.* = undefined;
+    }
+};
+
+pub const ActionCommand = struct {
+    allocator: std.mem.Allocator,
+    request_id: RequestId,
+    key: InstanceKey,
+    action_name: ActionName,
+    input: ?ActionInputDocument,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        request_id: RequestId,
+        value: ActionCommandInput,
+        limits: Limits,
+    ) !ActionCommand {
+        var key = try InstanceKey.init(allocator, value.key, limits);
+        errdefer key.deinit(allocator);
+        var action_name = try ActionName.init(
+            allocator,
+            value.action_name,
+            limits,
+        );
+        errdefer action_name.deinit(allocator);
+        return .{
+            .allocator = allocator,
+            .request_id = request_id,
+            .key = key,
+            .action_name = action_name,
+            .input = if (value.input_json) |json|
+                try ActionInputDocument.init(allocator, json, limits)
+            else
+                null,
+        };
+    }
+
+    pub fn request(self: *const ActionCommand) InvokeActionRequest {
+        return .{
+            .key = self.key.view(),
+            .action_name = self.action_name.bytes,
+            .input = if (self.input) |*input| input else null,
+        };
+    }
+
+    pub fn deinit(self: *ActionCommand) void {
+        self.key.deinit(self.allocator);
+        self.action_name.deinit(self.allocator);
+        if (self.input) |*input| input.deinit(self.allocator);
+        self.* = undefined;
+    }
+};
+
+pub const Command = union(enum) {
+    open: OpenCommand,
+    close: CloseCommand,
+    invoke_action: ActionCommand,
+
+    pub fn requestId(self: Command) RequestId {
+        return switch (self) {
+            .open => |value| value.request_id,
+            .close => |value| value.request_id,
+            .invoke_action => |value| value.request_id,
+        };
+    }
+
+    pub fn deinit(self: *Command) void {
+        switch (self.*) {
+            .open => |*value| value.deinit(),
+            .close => |*value| value.deinit(),
+            .invoke_action => |*value| value.deinit(),
+        }
+        self.* = undefined;
+    }
+};
+
 pub const OpenResultInput = struct {
     title: ?[]const u8 = null,
     url: ?[]const u8 = null,
     status: ?[]const u8 = null,
+};
+
+pub const OpenResult = struct {
+    allocator: std.mem.Allocator,
+    title: ?[]u8,
+    url: ?[]u8,
+    status: ?[]u8,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        input: OpenResultInput,
+        limits: Limits,
+    ) !OpenResult {
+        const title = if (input.title) |value|
+            try cloneText(allocator, value, limits)
+        else
+            null;
+        errdefer if (title) |value| allocator.free(value);
+        const url = if (input.url) |value|
+            try cloneText(allocator, value, limits)
+        else
+            null;
+        errdefer if (url) |value| allocator.free(value);
+        return .{
+            .allocator = allocator,
+            .title = title,
+            .url = url,
+            .status = if (input.status) |value|
+                try cloneText(allocator, value, limits)
+            else
+                null,
+        };
+    }
+
+    pub fn view(self: OpenResult) OpenResultInput {
+        return .{
+            .title = self.title,
+            .url = self.url,
+            .status = self.status,
+        };
+    }
+
+    pub fn deinit(self: *OpenResult) void {
+        if (self.title) |value| self.allocator.free(value);
+        if (self.url) |value| self.allocator.free(value);
+        if (self.status) |value| self.allocator.free(value);
+        self.* = undefined;
+    }
+};
+
+pub const OperationFailure = enum {
+    disabled,
+    unsupported,
+    unavailable,
+    invalid_request,
+    backpressure,
+    host_failure,
+    invalid_sdk_result,
+    stale,
+    shutdown,
+};
+
+pub const OpenCompletion = union(enum) {
+    succeeded: OpenResult,
+    failed: OperationFailure,
+};
+
+pub const CloseCompletion = union(enum) {
+    succeeded,
+    failed: OperationFailure,
+};
+
+pub const ActionCompletion = union(enum) {
+    succeeded: ActionResultDocument,
+    failed: OperationFailure,
+};
+
+pub const OperationResult = union(enum) {
+    open: OpenCompletion,
+    close: CloseCompletion,
+    action: ActionCompletion,
+};
+
+pub const CommandCompletion = struct {
+    allocator: std.mem.Allocator,
+    request_id: RequestId,
+    result: OperationResult,
+
+    pub fn deinit(self: *CommandCompletion) void {
+        switch (self.result) {
+            .open => |*result| switch (result.*) {
+                .succeeded => |*value| value.deinit(),
+                .failed => {},
+            },
+            .close => {},
+            .action => |*result| switch (result.*) {
+                .succeeded => |*value| value.deinit(self.allocator),
+                .failed => {},
+            },
+        }
+        self.* = undefined;
+    }
 };
 
 const OpenedState = struct {
@@ -650,6 +944,56 @@ pub const RecordTag = enum {
     removed,
 };
 
+pub const InstanceSnapshot = struct {
+    key: InstanceKey,
+    open_input: ?OpenInputDocument,
+    runtime: RuntimeTag,
+    record: RecordTag,
+    renderer_generation: ?RendererGeneration,
+    title: ?[]u8,
+    url: ?[]u8,
+    status: ?[]u8,
+    recorded_title: ?[]u8,
+    recorded_input: ?OpenInputDocument,
+    degradation: ?Degradation,
+
+    pub fn deinit(
+        self: *InstanceSnapshot,
+        allocator: std.mem.Allocator,
+    ) void {
+        self.key.deinit(allocator);
+        if (self.open_input) |*input| input.deinit(allocator);
+        if (self.title) |value| allocator.free(value);
+        if (self.url) |value| allocator.free(value);
+        if (self.status) |value| allocator.free(value);
+        if (self.recorded_title) |value| allocator.free(value);
+        if (self.recorded_input) |*input| input.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+pub const Snapshot = struct {
+    allocator: std.mem.Allocator,
+    capability: CapabilityState,
+    registry_degradation: ?Degradation,
+    operation_degradation: ?Degradation,
+    shutdown_requested: bool,
+    declarations: []CanvasDeclaration,
+    instances: []InstanceSnapshot,
+
+    pub fn deinit(self: *Snapshot) void {
+        for (self.declarations) |*declaration| {
+            declaration.deinit(self.allocator);
+        }
+        self.allocator.free(self.declarations);
+        for (self.instances) |*instance| {
+            instance.deinit(self.allocator);
+        }
+        self.allocator.free(self.instances);
+        self.* = undefined;
+    }
+};
+
 const RecordedState = struct {
     title: ?[]u8,
     input: ?OpenInputDocument,
@@ -731,6 +1075,7 @@ pub const Degradation = enum {
 
 pub const ProtocolScope = union(enum) {
     registry,
+    operations,
     instance: KeyView,
 };
 
@@ -1052,6 +1397,7 @@ pub const State = struct {
         request: CloseRequest,
     ) !OperationToken {
         try self.requireOperational();
+        if (!self.capability.supports()) return error.CanvasUnsupported;
         try self.requirePendingCapacity();
         const index = self.findInstance(request.key) orelse
             return error.CanvasNotOpen;
@@ -1111,6 +1457,7 @@ pub const State = struct {
         request: InvokeActionRequest,
     ) !OperationToken {
         try self.requireOperational();
+        if (!self.capability.supports()) return error.CanvasUnsupported;
         var action_name = try ActionName.init(
             self.allocator,
             request.action_name,
@@ -1293,13 +1640,120 @@ pub const State = struct {
         self: *State,
         scope: ProtocolScope,
     ) void {
+        self.noteDegradation(scope, .invalid_signal);
+    }
+
+    pub fn noteDegradation(
+        self: *State,
+        scope: ProtocolScope,
+        reason: Degradation,
+    ) void {
         switch (scope) {
-            .registry => self.registry_degradation = .invalid_signal,
+            .registry => self.registry_degradation = reason,
+            .operations => self.operation_degradation = reason,
             .instance => |key| {
                 const index = self.findInstance(key) orelse return;
-                self.instances.items[index].degradation = .invalid_signal;
+                self.instances.items[index].degradation = reason;
             },
         }
+    }
+
+    pub fn snapshot(
+        self: State,
+        allocator: std.mem.Allocator,
+    ) !Snapshot {
+        const declarations = try allocator.alloc(
+            CanvasDeclaration,
+            self.registry.entries.items.len,
+        );
+        errdefer allocator.free(declarations);
+        var declarations_initialized: usize = 0;
+        errdefer for (declarations[0..declarations_initialized]) |*value| {
+            value.deinit(allocator);
+        };
+        for (self.registry.entries.items, 0..) |declaration, index| {
+            declarations[index] = try declaration.clone(
+                allocator,
+                self.limits,
+            );
+            declarations_initialized += 1;
+        }
+
+        const instances = try allocator.alloc(
+            InstanceSnapshot,
+            self.instances.items.len,
+        );
+        errdefer allocator.free(instances);
+        var instances_initialized: usize = 0;
+        errdefer for (instances[0..instances_initialized]) |*value| {
+            value.deinit(allocator);
+        };
+        for (self.instances.items, 0..) |instance, index| {
+            var key = try instance.key.clone(allocator);
+            errdefer key.deinit(allocator);
+            var open_input = if (instance.open_input) |input|
+                try input.clone(allocator)
+            else
+                null;
+            errdefer if (open_input) |*input| input.deinit(allocator);
+            const opened = switch (instance.runtime) {
+                .opened => |value| value,
+                else => null,
+            };
+            const title = if (opened) |value|
+                if (value.title) |text| try allocator.dupe(u8, text) else null
+            else
+                null;
+            errdefer if (title) |value| allocator.free(value);
+            const url = if (opened) |value|
+                if (value.url) |text| try allocator.dupe(u8, text) else null
+            else
+                null;
+            errdefer if (url) |value| allocator.free(value);
+            const status = if (opened) |value|
+                if (value.status) |text| try allocator.dupe(u8, text) else null
+            else
+                null;
+            errdefer if (status) |value| allocator.free(value);
+            const recorded = switch (instance.record) {
+                .recorded => |value| value,
+                .removed => null,
+            };
+            const recorded_title = if (recorded) |value|
+                if (value.title) |text| try allocator.dupe(u8, text) else null
+            else
+                null;
+            errdefer if (recorded_title) |value| allocator.free(value);
+            instances[index] = .{
+                .key = key,
+                .open_input = open_input,
+                .runtime = instance.runtime.tag(),
+                .record = instance.record.tag(),
+                .renderer_generation = if (opened) |value|
+                    value.generation
+                else
+                    null,
+                .title = title,
+                .url = url,
+                .status = status,
+                .recorded_title = recorded_title,
+                .recorded_input = if (recorded) |value|
+                    if (value.input) |input| try input.clone(allocator) else null
+                else
+                    null,
+                .degradation = instance.degradation,
+            };
+            instances_initialized += 1;
+        }
+        return .{
+            .allocator = allocator,
+            .capability = self.capability,
+            .registry_degradation = self.registry_degradation,
+            .operation_degradation = self.operation_degradation,
+            .shutdown_requested = self.shutdown_requested,
+            .declarations = declarations,
+            .instances = instances,
+        };
     }
 
     pub fn resumeProjection(
@@ -1679,6 +2133,82 @@ fn fixtureState(limits: Limits) !State {
     return state;
 }
 
+test "owned canvas commands validate and retain caller input" {
+    var extension_id = [_]u8{ 'f', 'i', 'x', 't', 'u', 'r', 'e' };
+    var action_name = [_]u8{ 'r', 'e', 'f', 'r', 'e', 's', 'h' };
+    var command: Command = .{ .invoke_action = try ActionCommand.init(
+        std.testing.allocator,
+        @enumFromInt(7),
+        .{
+            .key = .{
+                .extension_id = &extension_id,
+                .canvas_id = "review",
+                .instance_id = "review:main",
+            },
+            .action_name = &action_name,
+            .input_json = "{\"refresh\":true}",
+        },
+        .{},
+    ) };
+    defer command.deinit();
+    extension_id[0] = 'x';
+    action_name[0] = 'x';
+
+    try std.testing.expectEqual(@as(u64, 7), command.requestId().value());
+    try std.testing.expectEqualStrings(
+        "fixture",
+        command.invoke_action.key.extension_id.bytes,
+    );
+    try std.testing.expectEqualStrings(
+        "refresh",
+        command.invoke_action.action_name.bytes,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"refresh\":true}",
+        command.invoke_action.input.?.bytes,
+    );
+}
+
+test "snapshot is an owned authoritative projection" {
+    var state = try fixtureState(.{});
+    var input = try OpenInputDocument.init(
+        std.testing.allocator,
+        "{\"selection\":\"root.zig\"}",
+        .{},
+    );
+    defer input.deinit(std.testing.allocator);
+    const token = try state.beginOpen(.{ .key = fixture_key, .input = &input });
+    try std.testing.expect(try state.completeOpen(token, .{ .succeeded = .{
+        .title = "Review",
+        .status = "ready",
+    } }));
+    try state.applyProviderSignal(.{ .recorded = .{
+        .key = fixture_key,
+        .title = "Saved review",
+        .input = &input,
+    } });
+
+    var snapshot_value = try state.snapshot(std.testing.allocator);
+    state.deinit();
+    defer snapshot_value.deinit();
+
+    try std.testing.expectEqual(CapabilityState.supported, snapshot_value.capability);
+    try std.testing.expectEqual(@as(usize, 1), snapshot_value.declarations.len);
+    try std.testing.expectEqual(@as(usize, 1), snapshot_value.instances.len);
+    try std.testing.expectEqual(
+        RuntimeTag.opened,
+        snapshot_value.instances[0].runtime,
+    );
+    try std.testing.expectEqual(
+        RecordTag.recorded,
+        snapshot_value.instances[0].record,
+    );
+    try std.testing.expectEqualStrings(
+        "Saved review",
+        snapshot_value.instances[0].recorded_title.?,
+    );
+}
+
 test "identity roles validate UTF-8 and independent and aggregate limits" {
     const Case = struct {
         value: []const u8,
@@ -1966,6 +2496,15 @@ test "actions fail closed when declaration or runtime availability is absent" {
         .key = fixture_key,
         .action_name = "missing",
     }));
+    state.setCapability(.unsupported);
+    try std.testing.expectError(error.CanvasUnsupported, state.beginClose(.{
+        .key = fixture_key,
+    }));
+    try std.testing.expectError(error.CanvasUnsupported, state.beginAction(.{
+        .key = fixture_key,
+        .action_name = "refresh",
+    }));
+    state.setCapability(.supported);
     try state.applyProviderSignal(.{ .unavailable = fixture_key });
     try std.testing.expectError(error.CanvasNotOpen, state.beginAction(.{
         .key = fixture_key,
