@@ -45,16 +45,6 @@ fn isMouseWheel(mouse: vaxis.Mouse) bool {
         (mouse.button == .wheel_up or mouse.button == .wheel_down);
 }
 
-fn resumeCatalogRequest(input: []const u8) backend.SessionCatalogRequest {
-    const suffix = std.mem.trim(u8, commandArgumentSuffix(input), " \t\r\n");
-    if (std.ascii.eqlIgnoreCase(suffix, "all") or
-        std.ascii.eqlIgnoreCase(suffix, "--all"))
-    {
-        return .all;
-    }
-    return .local;
-}
-
 const Role = enum {
     user,
     queued,
@@ -2267,7 +2257,7 @@ const MenuIdentity = union(enum) {
             .resume_key => |value| switch (right) {
                 .text, .model_selection => false,
                 .resume_key => |other| value.generation == other.generation and
-                    value.slot == other.slot and value.scope == other.scope,
+                    value.slot == other.slot,
             },
         };
     }
@@ -3306,15 +3296,9 @@ const ChatUi = struct {
                 const catalog = self.commands orelse return;
                 const command = catalog.commands[selected.source_index];
                 if (std.ascii.eqlIgnoreCase(command.name, "resume")) {
-                    const contents = try self.input.toOwnedContents(
-                        self.allocator,
-                    );
-                    defer self.allocator.free(contents);
                     self.input.clearRetainingCapacity();
                     self.menu_mode = .loading_sessions;
-                    conversation.refreshSessions(
-                        resumeCatalogRequest(contents),
-                    ) catch |err| switch (err) {
+                    conversation.refreshSessions() catch |err| switch (err) {
                         error.Busy => {
                             self.menu_mode = .closed;
                             return;
@@ -3532,24 +3516,11 @@ const ChatUi = struct {
                 if (self.menu_mode == .loading_sessions) {
                     self.menu_mode = .sessions;
                     try self.rebuildSessionMenu();
-                    const message = try std.fmt.allocPrint(
-                        self.allocator,
-                        "Showing {s}.",
-                        .{catalog.label},
-                    );
-                    defer self.allocator.free(message);
                     try self.transcript.append(
                         self.allocator,
                         .status,
-                        message,
+                        "Showing saved Vivi sessions.",
                     );
-                    if (catalog.skipped_invalid_shards) {
-                        try self.transcript.append(
-                            self.allocator,
-                            .status,
-                            "Some saved sessions could not be listed.",
-                        );
-                    }
                 }
             },
             .session_catalog_failed => |failure| {
@@ -3565,13 +3536,7 @@ const ChatUi = struct {
                     failure.bytes,
                 );
             },
-            .session_tracking_failed => |failure| {
-                try self.transcript.append(
-                    self.allocator,
-                    .status,
-                    failure.bytes,
-                );
-            },
+
             .status => |message| try self.transcript.append(
                 self.allocator,
                 .status,
@@ -3622,10 +3587,6 @@ const ChatUi = struct {
                             .status,
                             message,
                         );
-                        try self.updateSelectedModel(.{
-                            .model_id = success.session.model_id,
-                            .reasoning = success.session.reasoning,
-                        });
                         self.clearToolFocus();
                         self.tool_anchor = null;
                         try self.closeFilePicker();
@@ -4923,8 +4884,7 @@ const App = struct {
         model: ?[]const u8,
         reasoning: ?backend.ReasoningEffort,
         working_directory: []const u8,
-        settings_path: ?[]const u8,
-        sessions_directory: ?[]const u8,
+        settings_path: []const u8,
     ) !void {
         self.allocator = init_args.gpa;
         self.io = init_args.io;
@@ -4982,7 +4942,6 @@ const App = struct {
                 .model = model,
                 .reasoning = reasoning,
                 .settings_path = settings_path,
-                .sessions_directory = sessions_directory,
                 .omlx = .{
                     .base_url = init_args.environ_map.get("OMLX_BASE_URL") orelse
                         backend.default_omlx_base_url,
@@ -5253,8 +5212,7 @@ pub fn run(
     model: ?[]const u8,
     reasoning: ?backend.ReasoningEffort,
     working_directory: []const u8,
-    settings_path: ?[]const u8,
-    sessions_directory: ?[]const u8,
+    settings_path: []const u8,
 ) !void {
     const app = try init.gpa.create(App);
     defer init.gpa.destroy(app);
@@ -5264,7 +5222,6 @@ pub fn run(
         reasoning,
         working_directory,
         settings_path,
-        sessions_directory,
     );
     defer app.deinit();
     try app.run();
@@ -6290,17 +6247,11 @@ test "resuming replaces the visible transcript with the owned history snapshot" 
         .resumed = .{
             .session = .{
                 .allocator = std.testing.allocator,
-                .key = .{ .generation = 2, .slot = 0, .scope = .local },
+                .key = .{ .generation = 2, .slot = 0 },
                 .working_directory = try std.testing.allocator.dupe(
                     u8,
                     "/saved",
                 ),
-                .model_id = try std.testing.allocator.dupe(
-                    u8,
-                    "copilot/default",
-                ),
-                .reasoning = .off,
-                .last_used_unix_ms = 1,
                 .current = true,
             },
             .transcript = .{
@@ -8197,18 +8148,6 @@ test "slash command parsing preserves argument suffixes" {
     try std.testing.expectEqualStrings("autopilot thorough", command_input);
     try std.testing.expectEqualStrings("", slashCommandQuery("/").?);
     try std.testing.expect(slashCommandQuery("not-a-command") == null);
-    try std.testing.expectEqual(
-        backend.SessionCatalogRequest.all,
-        resumeCatalogRequest("/resume all"),
-    );
-    try std.testing.expectEqual(
-        backend.SessionCatalogRequest.all,
-        resumeCatalogRequest("/resume --all"),
-    );
-    try std.testing.expectEqual(
-        backend.SessionCatalogRequest.local,
-        resumeCatalogRequest("/resume"),
-    );
 }
 
 test "file reference query follows the active composer token" {
@@ -8504,7 +8443,6 @@ test "session menu preserves duplicate workspace selection by session key" {
             .identity = .{ .resume_key = .{
                 .generation = 1,
                 .slot = 41,
-                .scope = .local,
             } },
             .key = "/work/project",
             .primary = "project",
@@ -8517,7 +8455,6 @@ test "session menu preserves duplicate workspace selection by session key" {
             .identity = .{ .resume_key = .{
                 .generation = 1,
                 .slot = 42,
-                .scope = .local,
             } },
             .key = "/work/project",
             .primary = "project",
@@ -8540,27 +8477,19 @@ test "session menu preserves duplicate workspace selection by session key" {
 test "session menu filters by title and directory without exposing model" {
     var titled_path = "/work/titled".*;
     var fallback_path = "/work/untitled".*;
-    var titled_model = "copilot/hidden-model".*;
-    var fallback_model = "copilot/other-model".*;
     var title = "Fix resume picker".*;
     const sessions = [_]backend.SessionSummary{
         .{
             .allocator = undefined,
-            .key = .{ .generation = 1, .slot = 0, .scope = .local },
+            .key = .{ .generation = 1, .slot = 0 },
             .working_directory = &titled_path,
-            .model_id = &titled_model,
-            .reasoning = .off,
             .title = &title,
-            .last_used_unix_ms = 20,
             .current = false,
         },
         .{
             .allocator = undefined,
-            .key = .{ .generation = 1, .slot = 1, .scope = .local },
+            .key = .{ .generation = 1, .slot = 1 },
             .working_directory = &fallback_path,
-            .model_id = &fallback_model,
-            .reasoning = .off,
-            .last_used_unix_ms = 10,
             .current = false,
         },
     };
@@ -8590,35 +8519,23 @@ test "session menu labels colliding workspaces with unique path suffixes" {
     var first_path = "/teams/a/project".*;
     var second_path = "/teams/b/project".*;
     var unique_path = "/other/unique".*;
-    var first_model = "copilot/first".*;
-    var second_model = "copilot/second".*;
-    var third_model = "copilot/third".*;
     const sessions = [_]backend.SessionSummary{
         .{
             .allocator = undefined,
-            .key = .{ .generation = 1, .slot = 0, .scope = .local },
+            .key = .{ .generation = 1, .slot = 0 },
             .working_directory = &first_path,
-            .model_id = &first_model,
-            .reasoning = .off,
-            .last_used_unix_ms = 20,
             .current = false,
         },
         .{
             .allocator = undefined,
-            .key = .{ .generation = 1, .slot = 1, .scope = .local },
+            .key = .{ .generation = 1, .slot = 1 },
             .working_directory = &second_path,
-            .model_id = &second_model,
-            .reasoning = .medium,
-            .last_used_unix_ms = 10,
             .current = false,
         },
         .{
             .allocator = undefined,
-            .key = .{ .generation = 1, .slot = 2, .scope = .local },
+            .key = .{ .generation = 1, .slot = 2 },
             .working_directory = &unique_path,
-            .model_id = &third_model,
-            .reasoning = .high,
-            .last_used_unix_ms = 5,
             .current = false,
         },
     };
@@ -8650,13 +8567,10 @@ test "session catalog failure closes stale cached finder" {
     ui.menu_mode = .loading_sessions;
     ui.sessions = .{
         .allocator = std.testing.allocator,
-        .scope = .local,
-        .label = try std.testing.allocator.dupe(u8, "Saved Vivi sessions"),
         .sessions = try std.testing.allocator.alloc(
             backend.SessionSummary,
             0,
         ),
-        .skipped_invalid_shards = false,
     };
 
     var event: backend.ConversationEvent = .{
@@ -8678,35 +8592,6 @@ test "session catalog failure closes stale cached finder" {
     );
 }
 
-test "session tracking failure preserves conversation state" {
-    var environment = std.process.Environ.Map.init(std.testing.allocator);
-    defer environment.deinit();
-    var ui = try ChatUi.init(
-        std.testing.allocator,
-        std.testing.io,
-        &environment,
-    );
-    defer ui.deinit();
-    ui.phase = .ready;
-
-    var event: backend.ConversationEvent = .{
-        .session_tracking_failed = try backend.OwnedText.init(
-            std.testing.allocator,
-            "Session tracking disabled: AccessDenied",
-        ),
-    };
-    defer event.deinit();
-    try std.testing.expectEqual(
-        ConversationOutcome.keep_running,
-        try ui.applyConversationEvent(&event),
-    );
-    try std.testing.expectEqual(UiPhase.ready, ui.phase);
-    try std.testing.expectEqualStrings(
-        "Session tracking disabled: AccessDenied",
-        ui.transcript.messageAt(0).text.items,
-    );
-}
-
 test "session catalog completion restores ready after finder dismissal" {
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
@@ -8722,16 +8607,10 @@ test "session catalog completion restores ready after finder dismissal" {
     var event: backend.ConversationEvent = .{
         .session_catalog = .{
             .allocator = std.testing.allocator,
-            .scope = .local,
-            .label = try std.testing.allocator.dupe(
-                u8,
-                backend.SessionCatalogScope.local.label(),
-            ),
             .sessions = try std.testing.allocator.alloc(
                 backend.SessionSummary,
                 0,
             ),
-            .skipped_invalid_shards = false,
         },
     };
     defer event.deinit();
@@ -8758,16 +8637,10 @@ test "late session catalog preserves stopping phase" {
     var event: backend.ConversationEvent = .{
         .session_catalog = .{
             .allocator = std.testing.allocator,
-            .scope = .local,
-            .label = try std.testing.allocator.dupe(
-                u8,
-                backend.SessionCatalogScope.local.label(),
-            ),
             .sessions = try std.testing.allocator.alloc(
                 backend.SessionSummary,
                 0,
             ),
-            .skipped_invalid_shards = false,
         },
     };
     defer event.deinit();

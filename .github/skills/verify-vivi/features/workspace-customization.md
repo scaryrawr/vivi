@@ -36,10 +36,16 @@ slash menu, and the response produced by invoking it.
 - A skill must declare `user-invocable: true` to appear in the slash menu.
 - Instruction and skill discovery follow Copilot CLI semantics; Vivi does not
   parse or reinterpret those files.
-- Vivi passes only the workspace root as an instruction source and the three
-  documented skill roots; it does not enable ambient workspace configuration
-  discovery or workspace-configured MCP servers.
-- Copilot SDK empty sessions require `enableSkills = true`, and live PTY
-  verification requires absolute paths for explicit skill directories.
+- Vivi enables ambient workspace configuration discovery, including workspace
+  MCP configuration and project skill directories. The built-in GitHub MCP
+  server is not enabled by default.
+- Workspace MCP tools are discoverable but their permission requests are
+  rejected until Vivi provides an explicit user-approval flow.
+- Personal extensions and plugin state are isolated under
+  `~/.vivi/copilot/`; Vivi does not inherit them from `~/.copilot/`.
+- The isolated verification home receives `gh auth token` through the process
+  environment instead of linking the user's Copilot home.
+- Copilot SDK empty sessions require `enableSkills = true`; ambient discovery
+  supplies the workspace skill directories.
 - The recipe needs authenticated Copilot access because its assertions cross
   the production SDK boundary.
