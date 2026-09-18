@@ -14,7 +14,9 @@ export default defineConfig({
     toHaveScreenshot: {
       animations: "disabled",
       caret: "hide",
-      maxDiffPixelRatio: 0.01,
+      // System font rasterization differs slightly between macOS authoring and
+      // Linux CI while the layout and color fields remain deterministic.
+      maxDiffPixelRatio: 0.03,
     },
   },
   webServer: {
