@@ -268,14 +268,9 @@ const MinimalCodingAgent = struct {
         const parsed = request.permission_request orelse
             return .{ .reject = "Vivi does not auto-approve unknown permission requests." };
         return switch (parsed) {
-            .mcp => |mcp| if (std.mem.eql(
-                u8,
-                mcp.server_name,
-                "github-mcp-server",
-            ) and std.mem.eql(u8, mcp.tool_name, "web_search"))
-                .approve_once
-            else
-                .{ .reject = "Workspace MCP tools require an explicit approval boundary." },
+            .mcp => .{
+                .reject = "MCP tools require an explicit approval boundary.",
+            },
             .hook,
             .extension_management,
             .factory,
@@ -343,10 +338,6 @@ const MinimalCodingAgent = struct {
             .enable_skills = true,
             .skip_custom_instructions = false,
             .enable_on_demand_instruction_discovery = true,
-            .github_mcp_tool_config = .{
-                .enable_all_tools = false,
-                .additional_tools = &.{"web_search"},
-            },
             .streaming = true,
             .tools = &sdk_tools,
             .available_tools = &available_tools,
@@ -3638,15 +3629,7 @@ test "minimal coding agent appends Vivi tools to discovered instructions" {
         true,
         config.enable_on_demand_instruction_discovery.?,
     );
-    try std.testing.expectEqual(
-        false,
-        config.github_mcp_tool_config.?.enable_all_tools.?,
-    );
-    try std.testing.expectEqual(@as(usize, 1), config.github_mcp_tool_config.?.additional_tools.?.len);
-    try std.testing.expectEqualStrings(
-        "web_search",
-        config.github_mcp_tool_config.?.additional_tools.?[0],
-    );
+    try std.testing.expect(config.github_mcp_tool_config == null);
     try std.testing.expectEqual(
         copilot.SystemMessageMode.append,
         config.system_message.?.mode,
@@ -3657,13 +3640,13 @@ test "minimal coding agent appends Vivi tools to discovered instructions" {
     );
 }
 
-test "minimal coding agent only auto-approves GitHub web search MCP requests" {
+test "minimal coding agent rejects MCP requests including reserved-name collisions" {
     const invocation: copilot.PermissionInvocation = .{
         .session_id = "session",
         .managed_settings_enabled = false,
     };
-    const web_search: copilot.PermissionRequested = .{
-        .request_id = "web",
+    const collision: copilot.PermissionRequested = .{
+        .request_id = "collision",
         .permission_request_json = undefined,
         .permission_request = .{ .mcp = .{
             .kind = "mcp",
@@ -3673,10 +3656,10 @@ test "minimal coding agent only auto-approves GitHub web search MCP requests" {
             .read_only = true,
         } },
     };
-    try std.testing.expectEqual(
-        copilot.PermissionDecision.approve_once,
-        try MinimalCodingAgent.handlePermission(web_search, invocation, null),
-    );
+    switch (try MinimalCodingAgent.handlePermission(collision, invocation, null)) {
+        .reject => {},
+        else => return error.ExpectedRejectedPermission,
+    }
 
     const workspace_tool: copilot.PermissionRequested = .{
         .request_id = "workspace",

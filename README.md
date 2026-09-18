@@ -40,8 +40,9 @@ to `zig build` or `./scripts/check-zig.sh`; both run the same tests and checks.
 workspace context, and a compact bottom composer. It streams responses as they
 arrive and restores the composer after each completed turn. Hosted Copilot and
 OMLX sessions retain the `ask_user`, `skill`, and `web_fetch` built-ins
-alongside custom tools and tools from configured MCP servers. The built-in
-GitHub MCP server exposes only `web_search`; its other tools remain disabled.
+alongside custom tools and tools discovered from configured MCP servers.
+Workspace MCP permission requests remain denied until Vivi has an explicit
+approval flow, and the built-in GitHub MCP server is not enabled by default.
 Vivi enables ambient workspace configuration discovery, including workspace
 MCP configuration and project skill directories. Copilot also loads the
 workspace's instruction files, including top-level `AGENTS.md`. Skills marked
@@ -140,8 +141,8 @@ Copilot sessions, installed extensions, plugin state, and related runtime
 configuration separate from the user's normal `~/.copilot/` installation while
 still allowing ambient configuration from the active workspace. Workspace MCP
 tools are discovered but denied when they request permission until Vivi has an
-explicit user-approval flow; the built-in GitHub `web_search` tool is the only
-MCP tool automatically approved.
+explicit user-approval flow. The built-in GitHub MCP server is not enabled by
+default; `web_fetch` remains available as the narrow built-in web tool.
 
 During an active chat, type `/` to open Vivi's slash-command menu. The menu
 refreshes the Copilot SDK command catalog each time it opens so commands from

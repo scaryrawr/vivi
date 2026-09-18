@@ -93,11 +93,12 @@ input failures are delivered to the app for normal terminal cleanup.
 The initial coding-agent policy is private to `backend/src/root.zig`. Hosted
 Copilot and OMLX sessions retain only the `ask_user` and `skill` built-ins
 plus `web_fetch`, alongside custom tools and tools from configured MCP servers.
-The built-in GitHub MCP server exposes only `web_search`; its other tools remain
-disabled. Ambient workspace configuration discovery admits workspace MCP
-configuration and project skill directories. The SDK provides its typed
-`ask_user` callback; the session registers exactly four Vivi-owned tools:
-`read`, `bash`, `edit`, and `write`. The `bash` tool
+The built-in GitHub MCP server is not enabled by default, and workspace MCP
+permission requests remain denied until Vivi has an explicit approval flow.
+Ambient workspace configuration discovery admits workspace MCP configuration
+and project skill directories. The SDK provides its typed `ask_user` callback;
+the session registers exactly four Vivi-owned tools: `read`, `bash`, `edit`,
+and `write`. The `bash` tool
 dispatches synchronous `run` plus persistent PTY `start`, `list`, `read`,
 `write`, and `stop` actions. Vivi appends its concise workspace-aware prompt to
 Copilot's system message. Provider-specific
@@ -237,10 +238,9 @@ untouched.
 
 Ambient workspace MCP configuration remains discoverable, but its permission
 requests are rejected until Vivi exposes an explicit approval boundary. The
-permission handler automatically approves only the built-in GitHub
-`web_search` MCP tool; it also rejects extension management, hooks, factories,
-and extension environment or permission access instead of inheriting the SDK's
-approve-all behavior.
+built-in GitHub MCP server is not enabled by default. The permission handler
+also rejects extension management, hooks, factories, and extension environment
+or permission access instead of inheriting the SDK's approve-all behavior.
 
 `/resume` is a first-class broker control operation rather than an SDK slash
 command. It uses the SDK's process-wide `listSessions(null)` catalog, projects
@@ -279,10 +279,10 @@ unchanged until a native caller defines its callback and ownership contract.
 The minimal agent configuration stays private to the SDK-owning root module
 rather than becoming caller-supplied conversation options. This keeps tool
 availability and prompt policy consistent across every host. The session-level
-allowlist is authoritative for model-visible capabilities, and the GitHub MCP
-configuration narrows its built-in server to `web_search`. The SDK declarations
-use the same four descriptors that drive the SDK-free dispatcher, and
-permission requests remain fail-closed because Vivi has no approval UI yet.
+allowlist is authoritative for model-visible capabilities. The SDK declarations
+use the same four descriptors that drive the SDK-free dispatcher. MCP and
+extension permission requests remain fail-closed because Vivi has no approval
+UI yet.
 
 ## Tradeoffs accepted
 
@@ -301,9 +301,8 @@ permission requests remain fail-closed because Vivi has no approval UI yet.
   the backend worker and terminal thread.
 - We accept cooperative cancellation in exchange for never calling the
   single-threaded SDK concurrently.
-- We accept starting the built-in GitHub MCP server in exchange for its
-  `web_search` tool, while using the SDK's explicit tool selection to exclude
-  its other tools.
+- We accept limiting default web access to `web_fetch` until Vivi can safely
+  expose an explicit approval flow for MCP tools.
 - We accept unbounded in-memory tool results in exchange for leaving
   truncation and large-result transport to Copilot.
 - We accept synchronous tool execution on the SDK worker in exchange for one

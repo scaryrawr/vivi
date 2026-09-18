@@ -38,7 +38,7 @@ slash menu, and the response produced by invoking it.
   parse or reinterpret those files.
 - Vivi enables ambient workspace configuration discovery, including workspace
   MCP configuration and project skill directories. The built-in GitHub MCP
-  server is limited to `web_search`.
+  server is not enabled by default.
 - Workspace MCP tools are discoverable but their permission requests are
   rejected until Vivi provides an explicit user-approval flow.
 - Personal extensions and plugin state are isolated under
