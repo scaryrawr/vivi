@@ -9,8 +9,8 @@ projects in the native sidebar.
   project section with its canonical path visible beneath the project name.
 - Live conversation rows appear first in roster order, followed directly by
   resumable sessions in backend catalog order.
-- Loading, failure with retry, empty, and resuming states remain inline in the
-  project section.
+- Failure with retry and per-row resuming states remain inline in the project
+  section; loading and empty catalogs add no placeholder row.
 - Persisted rows are visually and accessibly distinct from live conversation
   rows, and only the requested row shows resume progress.
 - A successful cross-workspace resume keeps the live conversation identity and

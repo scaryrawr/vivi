@@ -43,6 +43,10 @@ func projectAccessibilityLabel(name: String, path: String) -> String {
   "\(name), \(path), project"
 }
 
+func projectName(for workspace: WorkspaceIdentity) -> String {
+  URL(fileURLWithPath: workspace.canonicalPath).lastPathComponent.nilIfEmpty ?? "/"
+}
+
 func conversationSidebarTitle(title: String, launchWorkspace: String) -> String {
   let title = title.nilIfEmpty ?? "Untitled Session"
   let projectName =
@@ -78,10 +82,12 @@ enum SidebarSelection: Hashable {
 
 func resolvedSidebarSelection(
   selectedConversationID: ConversationID?,
-  savedSelection: SidebarSelection?
+  savedSelection: SidebarSelection?,
+  visibleSavedSessionKeys: Set<ResumeKey>
 ) -> SidebarSelection? {
-  if case .savedSession(let conversationID, _) = savedSelection,
-    selectedConversationID == conversationID
+  if case .savedSession(let conversationID, let key) = savedSelection,
+    selectedConversationID == conversationID,
+    visibleSavedSessionKeys.contains(key)
   {
     return savedSelection
   }
@@ -135,7 +141,11 @@ struct MainWindowView: View {
               .padding(.leading, 12)
             }
           } header: {
-            ProjectSidebarHeader(workspace: workspace)
+            ProjectSidebarHeader(
+              workspace: workspace,
+              showsPath: conversations.launchWorkspaces.filter {
+                projectName(for: $0) == projectName(for: workspace)
+              }.count > 1)
           }
         }
       }
@@ -219,7 +229,8 @@ struct MainWindowView: View {
       get: {
         resolvedSidebarSelection(
           selectedConversationID: conversations.selectedID,
-          savedSelection: sidebarSelection)
+          savedSelection: sidebarSelection,
+          visibleSavedSessionKeys: visibleSavedSessionKeys)
       },
       set: { selection in
         guard let selection else { return }
@@ -238,10 +249,26 @@ struct MainWindowView: View {
         }
       })
   }
+
+  private var visibleSavedSessionKeys: Set<ResumeKey> {
+    Set(
+      conversations.launchWorkspaces.flatMap { workspace -> [ResumeKey] in
+        guard let conversation = conversations.historyConversation(launchedFrom: workspace),
+          let catalog = conversation.store.sessionCatalog
+        else {
+          return []
+        }
+        return projectSessionHistoryPresentation(
+          catalog: catalog,
+          projectWorkspace: workspace.canonicalPath
+        ).map(\.key)
+      })
+  }
 }
 
 private struct ProjectSidebarHeader: View {
   let workspace: WorkspaceIdentity
+  let showsPath: Bool
 
   private var presentation: ProjectSidebarHeaderPresentation {
     ProjectSidebarHeaderPresentation(workspace: workspace)
@@ -252,6 +279,13 @@ private struct ProjectSidebarHeader: View {
       Label(presentation.name, systemImage: "folder")
         .font(.body)
         .fontWeight(.semibold)
+      if showsPath {
+        Text(presentation.path)
+          .font(.caption)
+          .foregroundStyle(.secondary)
+          .lineLimit(1)
+          .truncationMode(.middle)
+      }
     }
     .padding(.top, 8)
     .padding(.bottom, 6)
@@ -353,6 +387,9 @@ private struct SessionHistoryRow: View {
       VStack(alignment: .leading, spacing: 2) {
         Text(presentation.title)
           .lineLimit(1)
+        Text("Saved session")
+          .font(.caption)
+          .foregroundStyle(.secondary)
       }
       Spacer(minLength: 4)
       if isResuming {

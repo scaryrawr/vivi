@@ -284,11 +284,23 @@ final class MainWindowControllerTests: XCTestCase {
     let saved = SidebarSelection.savedSession(firstID, ResumeKey(generation: 4, slot: 2))
 
     XCTAssertEqual(
-      resolvedSidebarSelection(selectedConversationID: firstID, savedSelection: saved),
+      resolvedSidebarSelection(
+        selectedConversationID: firstID,
+        savedSelection: saved,
+        visibleSavedSessionKeys: Set([ResumeKey(generation: 4, slot: 2)])),
       saved)
     XCTAssertEqual(
-      resolvedSidebarSelection(selectedConversationID: secondID, savedSelection: saved),
+      resolvedSidebarSelection(
+        selectedConversationID: secondID,
+        savedSelection: saved,
+        visibleSavedSessionKeys: Set([ResumeKey(generation: 4, slot: 2)])),
       .conversation(secondID))
+    XCTAssertEqual(
+      resolvedSidebarSelection(
+        selectedConversationID: firstID,
+        savedSelection: saved,
+        visibleSavedSessionKeys: []),
+      .conversation(firstID))
   }
 
   func testProjectHeaderPresentsNamePathAndAccessibilityHierarchy() {
