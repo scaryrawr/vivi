@@ -11,6 +11,8 @@ the session returns to the ready state.
   word boundaries, and grows the composer vertically for longer drafts.
 - `prompt-submit` adds the submitted text under `You:`.
 - `response-stream` shows the responding state and Vivi output.
+- `session-title` updates the terminal window or tab title to
+  `vivi — <generated session title>` when Vivi accepts a generated title.
 - `reasoning-stream` shows model reasoning as a dim, italic `Thinking` entry
   before the corresponding Vivi response.
 - `tool-activity` shows compact running, successful, or failed rows for file,
@@ -55,6 +57,11 @@ Preconditions:
 - **Observe the result.** `chat-streaming.normalized.txt`, derived from the raw
   PTY transcript by removing terminal control sequences, contains
   `VIVI_STREAM_OK`, which was not present in the submitted prompt.
+- **Observe the terminal title.** `chat-streaming.assertions.txt` records that
+  a generated session title appeared and that the raw
+  `chat-streaming.terminal.log` contains the exact OSC 2 sequence for
+  `vivi — <generated session title>`. The normalized transcript intentionally
+  strips that terminal control sequence.
 - **Record visual review.** Complete every item in
   `chat-streaming.visual-review.md`, set `status: pass`, name the inspected
   frame numbers, then run
