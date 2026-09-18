@@ -14,8 +14,9 @@ project catalog.
 - Invalid, missing, or non-directory selections show an app-shell alert without
   adding transcript content or silently choosing another workspace.
 - Project headers remain visible with one project, identify the canonical launch
-  workspace, and contain live conversation-title children with active-workspace
-  ordinals.
+  workspace through help and accessibility, show paths only for duplicate
+  project names, and contain title-only live conversation children with
+  active-workspace ordinals.
 - Cross-workspace resume preserves the existing conversation identity and launch
   project while updating its live title, workspace, and duplicate ordinal.
 
@@ -45,8 +46,8 @@ be driven and captured through the actual application.
 - Do not open a bare `vivi://` URL; another worktree's bundle may receive it.
 - A duplicate directory choice creates another independent conversation rather
   than selecting the existing one.
-- History remains scoped to each launch-workspace project and uses its selected
-  conversation, or latest conversation when that project is not selected.
+- History remains scoped to each launch-workspace project and uses its first
+  live conversation as the stable catalog and resume owner.
 - Chooser cancellation is not an error. Quit while the chooser is open must not
   admit a late conversation.
 - If local serializer data or the computer-use serializer blocks capture,
