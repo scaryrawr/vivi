@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import SwiftUI
 
@@ -195,10 +196,15 @@ private struct ProjectSidebarSection: View {
         )
         .accessibilityIdentifier("project-\(workspace.canonicalPath)")
     }
-    .onChange(of: historyConversation?.store.historyPresentationGeneration) {
-      isExpanded = true
-      if let store = historyConversation?.store, store.sessionCatalog == nil {
-        store.refreshSessions()
+    .background {
+      if let store = historyConversation?.store {
+        Color.clear
+          .onReceive(store.$historyPresentationGeneration.dropFirst()) { _ in
+            isExpanded = true
+            if store.sessionCatalog == nil {
+              store.refreshSessions()
+            }
+          }
       }
     }
   }

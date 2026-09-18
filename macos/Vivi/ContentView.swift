@@ -170,6 +170,10 @@ struct ContentView: View {
         : .composer
     }
     .onChange(of: store.commandArgumentSession) {
+      guard store.isCommandPalettePresented else {
+        focus = .composer
+        return
+      }
       focus = store.commandArgumentSession == nil ? .commandSearch : .commandArgument
     }
   }
