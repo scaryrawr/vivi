@@ -1,11 +1,12 @@
 import AppKit
 import Foundation
+import ImageIO
 import UniformTypeIdentifiers
 
 let composerAttachmentByteLimit = 20 * 1024 * 1024
 let composerAttachmentCountLimit = 32
 
-enum ComposerAttachmentMedia: UInt32, Equatable {
+enum ComposerAttachmentMedia: UInt32, Equatable, Sendable {
   case png = 1
   case jpeg = 2
   case gif = 3
@@ -40,7 +41,7 @@ enum ComposerAttachmentMedia: UInt32, Equatable {
   }
 }
 
-struct ComposerAttachment: Identifiable, Equatable {
+struct ComposerAttachment: Identifiable, Equatable, Sendable {
   let id: UUID
   let displayName: String
   let media: ComposerAttachmentMedia
@@ -51,7 +52,7 @@ struct ComposerAttachment: Identifiable, Equatable {
   }
 }
 
-enum ComposerAttachmentAcquisitionError: LocalizedError, Equatable {
+enum ComposerAttachmentAcquisitionError: LocalizedError, Equatable, Sendable {
   case noImageOnPasteboard
   case unreadable(String)
   case unsupported(String)
@@ -83,7 +84,7 @@ enum ComposerAttachmentAcquisitionError: LocalizedError, Equatable {
 @MainActor
 protocol ComposerAttachmentAcquiring: AnyObject {
   func chooseImages() async throws -> [ComposerAttachment]
-  func pasteImage() throws -> ComposerAttachment
+  func pasteImage() async throws -> ComposerAttachment
   func cancel()
 }
 
@@ -95,10 +96,12 @@ final class AppKitComposerAttachmentAcquirer: ComposerAttachmentAcquiring {
   func chooseImages() async throws -> [ComposerAttachment] {
     precondition(panel == nil)
     guard let urls = await chooseURLs() else { return [] }
-    return try Self.snapshots(urls)
+    return try await Task.detached {
+      try Self.snapshots(urls)
+    }.value
   }
 
-  func pasteImage() throws -> ComposerAttachment {
+  func pasteImage() async throws -> ComposerAttachment {
     let pasteboard = NSPasteboard.general
     let png = NSPasteboard.PasteboardType("public.png")
     let jpeg = NSPasteboard.PasteboardType("public.jpeg")
@@ -107,7 +110,9 @@ final class AppKitComposerAttachmentAcquirer: ComposerAttachmentAcquiring {
 
     for type in [png, jpeg, gif, webP] {
       if let data = pasteboard.data(forType: type) {
-        return try Self.snapshot(data: data, displayName: "Pasted image")
+        return try await Task.detached {
+          try Self.snapshot(data: data, displayName: "Pasted image")
+        }.value
       }
     }
     guard let data = pasteboard.data(forType: .tiff) else {
@@ -116,15 +121,9 @@ final class AppKitComposerAttachmentAcquirer: ComposerAttachmentAcquiring {
     guard data.count <= composerAttachmentByteLimit else {
       throw ComposerAttachmentAcquisitionError.tooLarge("Pasted image")
     }
-    guard
-      let image = NSImage(data: data),
-      let tiff = image.tiffRepresentation,
-      let representation = NSBitmapImageRep(data: tiff),
-      let pngData = representation.representation(using: .png, properties: [:])
-    else {
-      throw ComposerAttachmentAcquisitionError.unsupported("Pasted image")
-    }
-    return try Self.snapshot(data: pngData, displayName: "Pasted image.png")
+    return try await Task.detached {
+      try Self.snapshotTIFF(data)
+    }.value
   }
 
   func cancel() {
@@ -132,7 +131,7 @@ final class AppKitComposerAttachmentAcquirer: ComposerAttachmentAcquiring {
     finish(nil)
   }
 
-  static func snapshot(_ url: URL) throws -> ComposerAttachment {
+  nonisolated static func snapshot(_ url: URL) throws -> ComposerAttachment {
     let name = url.lastPathComponent
     let handle: FileHandle
     do {
@@ -150,7 +149,7 @@ final class AppKitComposerAttachmentAcquirer: ComposerAttachmentAcquiring {
     return try snapshot(data: data, displayName: name)
   }
 
-  static func snapshots(_ urls: [URL]) throws -> [ComposerAttachment] {
+  nonisolated static func snapshots(_ urls: [URL]) throws -> [ComposerAttachment] {
     guard urls.count <= composerAttachmentCountLimit else {
       throw ComposerAttachmentAcquisitionError.tooMany
     }
@@ -168,7 +167,10 @@ final class AppKitComposerAttachmentAcquirer: ComposerAttachmentAcquiring {
     return attachments
   }
 
-  static func snapshot(data: Data, displayName: String) throws -> ComposerAttachment {
+  nonisolated static func snapshot(
+    data: Data,
+    displayName: String
+  ) throws -> ComposerAttachment {
     guard !data.isEmpty else {
       throw ComposerAttachmentAcquisitionError.empty(displayName)
     }
@@ -183,6 +185,32 @@ final class AppKitComposerAttachmentAcquirer: ComposerAttachmentAcquiring {
       displayName: displayName,
       media: media,
       data: data)
+  }
+
+  nonisolated static func snapshotTIFF(_ data: Data) throws -> ComposerAttachment {
+    guard
+      let source = CGImageSourceCreateWithData(data as CFData, nil),
+      let image = CGImageSourceCreateImageAtIndex(source, 0, nil)
+    else {
+      throw ComposerAttachmentAcquisitionError.unsupported("Pasted image")
+    }
+    let encoded = NSMutableData()
+    guard
+      let destination = CGImageDestinationCreateWithData(
+        encoded,
+        UTType.png.identifier as CFString,
+        1,
+        nil)
+    else {
+      throw ComposerAttachmentAcquisitionError.unsupported("Pasted image")
+    }
+    CGImageDestinationAddImage(destination, image, nil)
+    guard CGImageDestinationFinalize(destination) else {
+      throw ComposerAttachmentAcquisitionError.unsupported("Pasted image")
+    }
+    return try snapshot(
+      data: encoded as Data,
+      displayName: "Pasted image.png")
   }
 
   private func chooseURLs() async -> [URL]? {

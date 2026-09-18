@@ -68,10 +68,13 @@ not as a reason to add target conditionals to domain code.
 The C ABI exposes the backend-owned conversation to native hosts. Extensible
 records carry `abi_version` or `struct_size`; text and binary attachments cross
 as explicit pointer/length pairs; state uses opaque handles with matching
-destroy functions. Submission attachment descriptors are caller-owned only for
-the duration of the call. The backend validates and copies the complete prompt
-before returning success. Platform export/import decoration belongs to
-packaging adapters, never domain code.
+destroy functions. Submission attachment descriptors are fixed-size ABI v10
+array elements because C array iteration uses their compile-time stride, so
+their `struct_size` must equal the known record size. The enclosing submission
+record remains extensible. Descriptors are caller-owned only for the duration
+of the call. The backend validates and copies the complete prompt before
+returning success. Platform export/import decoration belongs to packaging
+adapters, never domain code.
 
 The SDK's blocking work must never run on SwiftUI's main actor, GLib's main
 loop, or the WinUI dispatcher thread. Threading, callback lifetime, and

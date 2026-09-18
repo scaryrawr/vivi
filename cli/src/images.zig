@@ -84,11 +84,21 @@ pub const Store = struct {
         self: *const Store,
         text: []const u8,
     ) !Selection {
+        var selected_count: usize = 0;
+        for (self.files.items) |file| {
+            if (std.mem.indexOf(u8, text, file.token) != null) {
+                selected_count += 1;
+                if (selected_count > backend.max_attachment_count) {
+                    return error.TooManyAttachments;
+                }
+            }
+        }
         var snapshots: std.ArrayList(backend.AttachmentSnapshot) = .empty;
         errdefer {
             for (snapshots.items) |*snapshot| snapshot.deinit(self.allocator);
             snapshots.deinit(self.allocator);
         }
+        var total_bytes: usize = 0;
         for (self.files.items) |file| {
             if (std.mem.indexOf(u8, text, file.token) != null) {
                 var snapshot = try backend.AttachmentSnapshot.fromFile(
@@ -97,6 +107,18 @@ pub const Store = struct {
                     std.fs.path.basename(file.path),
                     file.path,
                 );
+                total_bytes = std.math.add(
+                    usize,
+                    total_bytes,
+                    snapshot.bytes.len,
+                ) catch {
+                    snapshot.deinit(self.allocator);
+                    return error.AttachmentsTooLarge;
+                };
+                if (total_bytes > backend.max_attachment_bytes) {
+                    snapshot.deinit(self.allocator);
+                    return error.AttachmentsTooLarge;
+                }
                 snapshots.append(self.allocator, snapshot) catch |err| {
                     snapshot.deinit(self.allocator);
                     return err;
@@ -198,5 +220,51 @@ test "selected attachment snapshots current temporary file bytes" {
     try std.testing.expectEqualStrings(
         "\x89PNG\r\n\x1a\nchanged",
         selected.inputs[0].bytes,
+    );
+}
+
+test "selected attachments enforce count before reads and aggregate while reading" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const len = try temporary.dir.realPath(std.testing.io, &path_buffer);
+    var store = try Store.init(std.testing.allocator, std.testing.io, path_buffer[0..len]);
+    defer store.deinit();
+
+    var composer: std.ArrayList(u8) = .empty;
+    defer composer.deinit(std.testing.allocator);
+    for (0..backend.max_attachment_count + 1) |_| {
+        const token = try store.save("\x89PNG\r\n\x1a\nsmall");
+        try composer.appendSlice(std.testing.allocator, token);
+    }
+    try std.testing.expectError(
+        error.TooManyAttachments,
+        store.selectedAttachments(composer.items),
+    );
+
+    var aggregate_store = try Store.init(
+        std.testing.allocator,
+        std.testing.io,
+        path_buffer[0..len],
+    );
+    defer aggregate_store.deinit();
+    const large = try std.testing.allocator.alloc(
+        u8,
+        backend.max_attachment_bytes / 2 + 1,
+    );
+    defer std.testing.allocator.free(large);
+    @memset(large, 0);
+    @memcpy(large[0..8], "\x89PNG\r\n\x1a\n");
+    const first = try aggregate_store.save(large);
+    const second = try aggregate_store.save(large);
+    const aggregate_composer = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s} {s}",
+        .{ first, second },
+    );
+    defer std.testing.allocator.free(aggregate_composer);
+    try std.testing.expectError(
+        error.AttachmentsTooLarge,
+        aggregate_store.selectedAttachments(aggregate_composer),
     );
 }

@@ -62,7 +62,7 @@ final class ViviBackendRuntimeTests: XCTestCase {
       [.status(id: store.transcript[0].id, text: "Chat is busy.")])
   }
 
-  func testAttachmentOnlySubmitClearsSelectionAfterAcceptance() {
+  func testAttachmentOnlySubmitClearsSelectionAfterAcceptance() async {
     let driver = FakeConversationDriver()
     let attachment = testAttachment(name: "diagram.png")
     let acquirer = FakeAttachmentAcquirer(pasted: attachment)
@@ -74,6 +74,7 @@ final class ViviBackendRuntimeTests: XCTestCase {
     store.reduce(.ready)
     store.reduce(.modelCatalog(testCatalog()))
     store.pasteAttachment()
+    await store.waitForAttachmentAcquisition()
     XCTAssertTrue(store.canSubmit)
 
     store.submit()
@@ -85,7 +86,7 @@ final class ViviBackendRuntimeTests: XCTestCase {
     XCTAssertEqual(store.transcript.first?.text, "Attached diagram.png")
   }
 
-  func testRejectedAttachmentSubmitPreservesDraftAndSelection() {
+  func testRejectedAttachmentSubmitPreservesDraftAndSelection() async {
     let driver = FakeConversationDriver()
     driver.submitResult = .rejected
     let attachment = testAttachment(name: "reference.png")
@@ -98,6 +99,7 @@ final class ViviBackendRuntimeTests: XCTestCase {
     store.reduce(.modelCatalog(testCatalog()))
     store.draft = "Keep this"
     store.pasteAttachment()
+    await store.waitForAttachmentAcquisition()
     store.submit()
 
     XCTAssertEqual(store.draft, "Keep this")
@@ -106,7 +108,7 @@ final class ViviBackendRuntimeTests: XCTestCase {
     XCTAssertEqual(store.transcript.first?.text, "That response was not accepted. Try again.")
   }
 
-  func testAttachmentAcquisitionFailurePreservesExistingSelection() {
+  func testAttachmentAcquisitionFailurePreservesExistingSelection() async {
     let first = testAttachment(name: "first.png")
     let acquirer = FakeAttachmentAcquirer(pasted: first)
     let store = NativeChatStore(
@@ -117,8 +119,10 @@ final class ViviBackendRuntimeTests: XCTestCase {
     store.reduce(.ready)
     store.reduce(.modelCatalog(testCatalog()))
     store.pasteAttachment()
+    await store.waitForAttachmentAcquisition()
     acquirer.pasteError = ComposerAttachmentAcquisitionError.unsupported("notes.txt")
     store.pasteAttachment()
+    await store.waitForAttachmentAcquisition()
 
     XCTAssertEqual(store.attachments, [first])
     XCTAssertEqual(
@@ -126,7 +130,7 @@ final class ViviBackendRuntimeTests: XCTestCase {
       "“notes.txt” is not a supported PNG, JPEG, GIF, or WebP image.")
   }
 
-  func testAttachmentsRemainSelectedWhileAskUserBlocksSubmissionAndClearOnClose() {
+  func testAttachmentsRemainSelectedWhileAskUserBlocksSubmissionAndClearOnClose() async {
     let attachment = testAttachment(name: "context.png")
     let acquirer = FakeAttachmentAcquirer(pasted: attachment)
     let store = NativeChatStore(
@@ -137,6 +141,7 @@ final class ViviBackendRuntimeTests: XCTestCase {
     store.reduce(.ready)
     store.reduce(.modelCatalog(testCatalog()))
     store.pasteAttachment()
+    await store.waitForAttachmentAcquisition()
     store.reduce(
       .userInputRequested(
         UserInputRequest(
@@ -1389,7 +1394,7 @@ private final class FakeAttachmentAcquirer: ComposerAttachmentAcquiring {
     return chosen
   }
 
-  func pasteImage() throws -> ComposerAttachment {
+  func pasteImage() async throws -> ComposerAttachment {
     if let pasteError { throw pasteError }
     return pasted
   }

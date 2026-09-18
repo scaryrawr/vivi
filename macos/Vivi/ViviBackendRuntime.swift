@@ -478,13 +478,24 @@ final class NativeChatStore: ObservableObject {
   }
 
   func pasteAttachment() {
-    guard canAcquireAttachments else { return }
+    guard canAcquireAttachments, attachmentAcquisitionTask == nil else { return }
     attachmentError = nil
-    do {
-      try appendAttachments([try attachmentAcquirer.pasteImage()])
-    } catch {
-      attachmentError = attachmentMessage(error)
+    attachmentAcquisitionTask = Task { [weak self] in
+      guard let self else { return }
+      defer { attachmentAcquisitionTask = nil }
+      do {
+        let selected = try await attachmentAcquirer.pasteImage()
+        guard !Task.isCancelled, lifecycle != .closing, lifecycle != .closed else { return }
+        try appendAttachments([selected])
+      } catch {
+        guard !Task.isCancelled else { return }
+        attachmentError = attachmentMessage(error)
+      }
     }
+  }
+
+  func waitForAttachmentAcquisition() async {
+    await attachmentAcquisitionTask?.value
   }
 
   func removeAttachment(_ id: UUID) {

@@ -30,6 +30,10 @@ typedef enum vivi_backend_attachment_media_type {
     VIVI_BACKEND_ATTACHMENT_WEBP = 4,
 } vivi_backend_attachment_media_type_t;
 
+/*
+ * Fixed-size ABI v10 array element. struct_size must equal sizeof this record
+ * because attachment arrays use the C element stride.
+ */
 typedef struct vivi_backend_submission_attachment {
     uint32_t struct_size;
     vivi_backend_attachment_media_type_t media_type;

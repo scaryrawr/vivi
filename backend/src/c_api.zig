@@ -202,7 +202,14 @@ fn requiredBytes(pointer: ?[*]const u8, length: u32) ?[]const u8 {
     return (pointer orelse return null)[0..length];
 }
 
-fn parseSubmission(input: ?*const c.vivi_backend_submission_t) !Submission {
+const SubmissionParseError = error{
+    InvalidSubmission,
+    OutOfMemory,
+};
+
+fn parseSubmission(
+    input: ?*const c.vivi_backend_submission_t,
+) SubmissionParseError!Submission {
     const submission = input orelse return error.InvalidSubmission;
     if (submission.struct_size < @sizeOf(c.vivi_backend_submission_t) or
         submission.reserved != 0 or
@@ -258,7 +265,10 @@ export fn vivi_backend_submit(
     submission: ?*const c.vivi_backend_submission_t,
 ) callconv(.c) c.vivi_backend_result_t {
     const self = handle(conversation) orelse return c.VIVI_BACKEND_INVALID_ARGUMENT;
-    const parsed = parseSubmission(submission) catch return c.VIVI_BACKEND_INVALID_ARGUMENT;
+    const parsed = parseSubmission(submission) catch |err| return switch (err) {
+        error.InvalidSubmission => c.VIVI_BACKEND_INVALID_ARGUMENT,
+        error.OutOfMemory => c.VIVI_BACKEND_FAILED,
+    };
     defer parsed.deinit();
     if (self.control_operation != .none) return c.VIVI_BACKEND_BUSY;
     if (!self.accepting_prompt.swap(false, .acq_rel)) {
