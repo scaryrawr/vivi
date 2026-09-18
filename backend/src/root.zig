@@ -1223,7 +1223,11 @@ fn prepareCopilotHome(
         private_directory_permissions,
     );
     if (builtin.os.tag != .windows) {
-        var directory = try std.Io.Dir.openDirAbsolute(io, path, .{});
+        var directory = try std.Io.Dir.openDirAbsolute(
+            io,
+            path,
+            .{ .iterate = true },
+        );
         defer directory.close(io);
         try directory.setPermissions(io, private_directory_permissions);
     }
@@ -3367,7 +3371,7 @@ test "Copilot home uses owner-only POSIX permissions" {
         var directory = try std.Io.Dir.openDirAbsolute(
             std.testing.io,
             first,
-            .{},
+            .{ .iterate = true },
         );
         defer directory.close(std.testing.io);
         try directory.setPermissions(
