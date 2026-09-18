@@ -544,6 +544,39 @@ final class ViviBackendRuntimeTests: XCTestCase {
     XCTAssertTrue(catalog.models[0].supportsVision)
   }
 
+  func testDecoderAcceptsBoundedMultibyteSessionTitle() throws {
+    let title = String(repeating: "界", count: 80)
+
+    XCTAssertEqual(
+      try decodeSessionTitle(Array(title.utf8)),
+      .sessionTitle(title))
+  }
+
+  func testDecoderRejectsInvalidUTF8SessionTitle() {
+    XCTAssertThrowsError(try decodeSessionTitle([0xff]))
+  }
+
+  func testDecoderRejectsEmptySessionTitle() {
+    XCTAssertThrowsError(try decodeSessionTitle([]))
+  }
+
+  func testDecoderRejectsSessionTitleOver80UnicodeScalars() {
+    XCTAssertThrowsError(
+      try decodeSessionTitle(Array(String(repeating: "界", count: 81).utf8)))
+  }
+
+  func testDecoderRejectsSessionTitleNewlinesAndControls() {
+    for title in ["First\nSecond", "First\u{0000}Second", "First\u{007f}Second"] {
+      XCTAssertThrowsError(try decodeSessionTitle(Array(title.utf8)), title)
+    }
+  }
+
+  func testDecoderRejectsNoncanonicalSessionTitleWhitespace() {
+    for title in [" Leading", "Trailing ", "Repeated  space", "Nonbreaking\u{00a0}space"] {
+      XCTAssertThrowsError(try decodeSessionTitle(Array(title.utf8)), title)
+    }
+  }
+
   func testDecoderRejectsOutOfBoundsModelSpan() {
     var event = vivi_backend_event_t()
     event.kind = VIVI_BACKEND_EVENT_MODEL_CATALOG
@@ -1016,6 +1049,15 @@ final class ViviBackendRuntimeTests: XCTestCase {
     XCTAssertFalse(store.canSubmit)
     XCTAssertTrue(driver.submittedPrompts.isEmpty)
     XCTAssertEqual(store.draft, "hello")
+  }
+
+  private func decodeSessionTitle(_ bytes: [UInt8]) throws -> ChatEvent {
+    var event = vivi_backend_event_t()
+    event.kind = VIVI_BACKEND_EVENT_SESSION_TITLE
+    event.content_kind = VIVI_BACKEND_CONTENT_TEXT
+    event.byte_count = UInt32(bytes.count)
+    event.content = vivi_backend_span_t(offset: 0, length: UInt32(bytes.count))
+    return try NativeEventDecoder.decode(event, bytes: bytes, models: [])
   }
 }
 

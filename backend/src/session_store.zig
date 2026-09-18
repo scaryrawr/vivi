@@ -1,9 +1,11 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const conversation = @import("conversation.zig");
+const ReasoningEffort = @import("reasoning.zig").Effort;
+const session_title = @import("session_title.zig");
 
-pub const version: u32 = 3;
+pub const version: u32 = 4;
 pub const max_records_per_shard: usize = 200;
+const legacy_max_title_bytes: usize = 512;
 const max_record_text_bytes =
     512 + std.Io.Dir.max_path_bytes + 512 + 512;
 const max_json_expansion = 6;
@@ -31,7 +33,7 @@ pub const Record = struct {
     working_directory: []u8,
     model_id: []u8,
     title: ?[]u8,
-    reasoning: conversation.ReasoningEffort,
+    reasoning: ReasoningEffort,
     last_used_unix_ms: i64,
 
     pub fn init(
@@ -39,7 +41,7 @@ pub const Record = struct {
         id: []const u8,
         working_directory: []const u8,
         model_id: []const u8,
-        reasoning: conversation.ReasoningEffort,
+        reasoning: ReasoningEffort,
         last_used_unix_ms: i64,
     ) !Record {
         return initWithTitle(
@@ -59,15 +61,14 @@ pub const Record = struct {
         working_directory: []const u8,
         model_id: []const u8,
         title: ?[]const u8,
-        reasoning: conversation.ReasoningEffort,
+        reasoning: ReasoningEffort,
         last_used_unix_ms: i64,
     ) !Record {
         try validateText(id, 512);
         try validateWorkingDirectory(working_directory);
         try validateText(model_id, 512);
-        if (title) |value| {
-            if (!validTitle(value)) return error.InvalidSessionText;
-        }
+        if (title) |value| if (!session_title.isCanonical(value))
+            return error.InvalidSessionText;
         if (last_used_unix_ms < 0) return error.InvalidSessionTimestamp;
 
         const owned_id = try allocator.dupe(u8, id);
@@ -146,7 +147,7 @@ const DocumentRecordV2 = struct {
     id: []const u8,
     working_directory: []const u8,
     model_id: []const u8,
-    reasoning: conversation.ReasoningEffort,
+    reasoning: ReasoningEffort,
     last_used_unix_ms: i64,
 };
 
@@ -161,7 +162,7 @@ const DocumentRecordV3 = struct {
     working_directory: []const u8,
     model_id: []const u8,
     title: ?[]const u8 = null,
-    reasoning: conversation.ReasoningEffort,
+    reasoning: ReasoningEffort,
     last_used_unix_ms: i64,
 };
 
@@ -169,6 +170,21 @@ const DocumentV3 = struct {
     version: u32,
     writer_id: []const u8,
     sessions: []const DocumentRecordV3,
+};
+
+const DocumentRecordV4 = struct {
+    id: []const u8,
+    working_directory: []const u8,
+    model_id: []const u8,
+    title: ?[]const u8 = null,
+    reasoning: ReasoningEffort,
+    last_used_unix_ms: i64,
+};
+
+const DocumentV4 = struct {
+    version: u32,
+    writer_id: []const u8,
+    sessions: []const DocumentRecordV4,
 };
 
 const VersionHeader = struct {
@@ -244,7 +260,7 @@ pub const Store = struct {
         id: []const u8,
         working_directory: []const u8,
         model_id: []const u8,
-        reasoning: conversation.ReasoningEffort,
+        reasoning: ReasoningEffort,
         now_unix_ms: i64,
     ) !void {
         var record = try Record.init(
@@ -278,7 +294,7 @@ pub const Store = struct {
         id: []const u8,
         title: []const u8,
     ) !void {
-        if (!validTitle(title)) return error.InvalidSessionText;
+        if (!session_title.isCanonical(title)) return error.InvalidSessionText;
         const lock = try self.acquireLock();
         defer lock.close(self.io);
 
@@ -461,6 +477,60 @@ pub const Store = struct {
                         continue;
                     }
                     for (parsed.value.sessions) |stored| {
+                        if (stored.title) |title| {
+                            if (title.len > legacy_max_title_bytes) {
+                                skipped_invalid = true;
+                                continue;
+                            }
+                        }
+                        const canonical_title = if (stored.title) |title|
+                            try session_title.canonicalize(self.allocator, title)
+                        else
+                            null;
+                        defer if (canonical_title) |title| {
+                            self.allocator.free(title);
+                        };
+                        var record = Record.initWithTitle(
+                            self.allocator,
+                            stored.id,
+                            stored.working_directory,
+                            stored.model_id,
+                            canonical_title,
+                            stored.reasoning,
+                            stored.last_used_unix_ms,
+                        ) catch |err| switch (err) {
+                            error.InvalidSessionText,
+                            error.InvalidSessionTimestamp,
+                            => {
+                                skipped_invalid = true;
+                                continue;
+                            },
+                            else => return err,
+                        };
+                        errdefer record.deinit();
+                        try mergeRecord(self.allocator, &merged, record);
+                        trimRecords(&merged);
+                    }
+                },
+                4 => {
+                    var parsed = std.json.parseFromSlice(
+                        DocumentV4,
+                        self.allocator,
+                        content,
+                        .{},
+                    ) catch |err| switch (err) {
+                        error.OutOfMemory => return err,
+                        else => {
+                            skipped_invalid = true;
+                            continue;
+                        },
+                    };
+                    defer parsed.deinit();
+                    if (!validDocument(entry.name, parsed.value)) {
+                        skipped_invalid = true;
+                        continue;
+                    }
+                    for (parsed.value.sessions) |stored| {
                         var record = Record.initWithTitle(
                             self.allocator,
                             stored.id,
@@ -589,7 +659,7 @@ pub const Store = struct {
 
     fn save(self: *Store, records: []const Record) !void {
         var document_records = try self.allocator.alloc(
-            DocumentRecordV3,
+            DocumentRecordV4,
             records.len,
         );
         defer self.allocator.free(document_records);
@@ -605,7 +675,7 @@ pub const Store = struct {
         }
         const encoded = try std.json.Stringify.valueAlloc(
             self.allocator,
-            DocumentV3{
+            DocumentV4{
                 .version = version,
                 .writer_id = &self.writer_id,
                 .sessions = document_records,
@@ -668,14 +738,6 @@ fn validateWorkingDirectory(value: []const u8) !void {
     {
         return error.InvalidSessionText;
     }
-}
-
-pub fn validTitle(value: []const u8) bool {
-    validateText(value, 512) catch return false;
-    for (value) |byte| {
-        if (byte < 0x20 or byte == 0x7f) return false;
-    }
-    return true;
 }
 
 fn validDocument(filename: []const u8, document: anytype) bool {
@@ -895,7 +957,7 @@ test "session store migrates version one shards with reasoning off" {
     defer migrated.deinit();
     try std.testing.expectEqual(@as(usize, 1), migrated.records.len);
     try std.testing.expectEqual(
-        conversation.ReasoningEffort.off,
+        ReasoningEffort.off,
         migrated.records[0].reasoning,
     );
 
@@ -910,7 +972,7 @@ test "session store migrates version one shards with reasoning off" {
     try std.testing.expect(std.mem.indexOf(
         u8,
         content,
-        "\"version\": 3",
+        "\"version\": 4",
     ) != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
@@ -965,10 +1027,174 @@ test "session store migrates version two shards without titles" {
     defer migrated.deinit();
     try std.testing.expectEqual(@as(usize, 1), migrated.records.len);
     try std.testing.expectEqual(
-        conversation.ReasoningEffort.medium,
+        ReasoningEffort.medium,
         migrated.records[0].reasoning,
     );
     try std.testing.expectEqual(null, migrated.records[0].title);
+}
+
+test "session store canonicalizes version three titles on compaction" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.createDirPath(std.testing.io, "sessions");
+    const directory = try temporary.dir.realPathFileAlloc(
+        std.testing.io,
+        "sessions",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(directory);
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = "sessions/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json",
+        .data =
+        \\{
+        \\  "version": 3,
+        \\  "writer_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        \\  "sessions": [{
+        \\    "id": "session-a",
+        \\    "working_directory": "/work/a",
+        \\    "model_id": "copilot/model-a",
+        \\    "title": "  Legacy\n title   with\u0001 controls  ",
+        \\    "reasoning": "medium",
+        \\    "last_used_unix_ms": 10
+        \\  }]
+        \\}
+        ,
+    });
+    var store = try Store.initWithWriterId(
+        std.testing.allocator,
+        std.testing.io,
+        directory,
+        [_]u8{'b'} ** writer_id_hex_len,
+    );
+    defer store.deinit();
+
+    var migrated = try store.list();
+    defer migrated.deinit();
+    try std.testing.expectEqual(@as(usize, 1), migrated.records.len);
+    try std.testing.expectEqualStrings(
+        "Legacy title with controls",
+        migrated.records[0].title.?,
+    );
+
+    const content = try temporary.dir.readFileAlloc(
+        std.testing.io,
+        "sessions/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.json",
+        std.testing.allocator,
+        .limited(max_shard_bytes),
+    );
+    defer std.testing.allocator.free(content);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        content,
+        "\"version\": 4",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        content,
+        "\"title\": \"Legacy title with controls\"",
+    ) != null);
+    try std.testing.expectError(
+        error.FileNotFound,
+        temporary.dir.openFile(
+            std.testing.io,
+            "sessions/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json",
+            .{},
+        ),
+    );
+}
+
+test "session store migrates maximum length version three title" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.createDirPath(std.testing.io, "sessions");
+    const directory = try temporary.dir.realPathFileAlloc(
+        std.testing.io,
+        "sessions",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(directory);
+    const legacy_title = [_]u8{'x'} ** legacy_max_title_bytes;
+    const records = [_]DocumentRecordV3{.{
+        .id = "session-a",
+        .working_directory = "/work/a",
+        .model_id = "copilot/model-a",
+        .title = &legacy_title,
+        .reasoning = .medium,
+        .last_used_unix_ms = 10,
+    }};
+    const encoded = try std.json.Stringify.valueAlloc(
+        std.testing.allocator,
+        DocumentV3{
+            .version = 3,
+            .writer_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            .sessions = &records,
+        },
+        .{ .whitespace = .indent_2 },
+    );
+    defer std.testing.allocator.free(encoded);
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = "sessions/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json",
+        .data = encoded,
+    });
+    var store = try Store.initWithWriterId(
+        std.testing.allocator,
+        std.testing.io,
+        directory,
+        [_]u8{'b'} ** writer_id_hex_len,
+    );
+    defer store.deinit();
+
+    var migrated = try store.list();
+    defer migrated.deinit();
+    try std.testing.expectEqual(@as(usize, 1), migrated.records.len);
+    const title = migrated.records[0].title.?;
+    try std.testing.expect(session_title.isCanonical(title));
+    try std.testing.expectEqual(
+        session_title.max_characters,
+        std.unicode.utf8CountCodepoints(title) catch unreachable,
+    );
+    try std.testing.expect(std.mem.endsWith(u8, title, "…"));
+}
+
+test "session store rejects noncanonical version four titles" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.createDirPath(std.testing.io, "sessions");
+    const directory = try temporary.dir.realPathFileAlloc(
+        std.testing.io,
+        "sessions",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(directory);
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = "sessions/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json",
+        .data =
+        \\{
+        \\  "version": 4,
+        \\  "writer_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        \\  "sessions": [{
+        \\    "id": "session-a",
+        \\    "working_directory": "/work/a",
+        \\    "model_id": "copilot/model-a",
+        \\    "title": "two  spaces",
+        \\    "reasoning": "medium",
+        \\    "last_used_unix_ms": 10
+        \\  }]
+        \\}
+        ,
+    });
+    var store = try Store.initWithWriterId(
+        std.testing.allocator,
+        std.testing.io,
+        directory,
+        [_]u8{'b'} ** writer_id_hex_len,
+    );
+    defer store.deinit();
+
+    var index = try store.list();
+    defer index.deinit();
+    try std.testing.expect(index.skipped_invalid_shards);
+    try std.testing.expectEqual(@as(usize, 0), index.records.len);
 }
 
 test "session store persists generated titles" {
@@ -1014,7 +1240,7 @@ test "session store persists generated titles" {
     try std.testing.expect(std.mem.indexOf(
         u8,
         content,
-        "\"version\": 3",
+        "\"version\": 4",
     ) != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
@@ -1124,7 +1350,7 @@ test "session store keeps a title from an older mixed-version shard" {
 }
 
 test "session store rejects mismatched writer identity" {
-    const document = DocumentV3{
+    const document = DocumentV4{
         .version = version,
         .writer_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         .sessions = &.{},
@@ -1157,7 +1383,7 @@ test "session store preserves unsupported version shards" {
         .sub_path = "sessions/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.json",
         .data =
         \\{
-        \\  "version": 4
+        \\  "version": 5
         \\}
         ,
     });
@@ -1193,7 +1419,7 @@ test "session store preserves oversized shards before version inspection" {
     defer store.deinit();
     try store.recordCreated("session-a", "/work/a", "copilot/default", .off, 10);
 
-    const prefix = "{\"version\":3,\"padding\":\"";
+    const prefix = "{\"version\":4,\"padding\":\"";
     const suffix = "\"}";
     const content = try std.testing.allocator.alloc(u8, max_shard_bytes + 1);
     defer std.testing.allocator.free(content);
@@ -1258,7 +1484,7 @@ test "session store read cap accepts maximum serialized shard" {
     const model_id = [_]u8{1} ** 512;
     const title = [_]u8{1} ** 512;
     const records = try std.testing.allocator.alloc(
-        DocumentRecordV3,
+        DocumentRecordV4,
         max_records_per_shard,
     );
     defer std.testing.allocator.free(records);
@@ -1274,7 +1500,7 @@ test "session store read cap accepts maximum serialized shard" {
     }
     const encoded = try std.json.Stringify.valueAlloc(
         std.testing.allocator,
-        DocumentV3{
+        DocumentV4{
             .version = version,
             .writer_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             .sessions = records,

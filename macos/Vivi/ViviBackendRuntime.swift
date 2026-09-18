@@ -896,6 +896,42 @@ enum NativeEventDecoder {
     func content() throws -> String {
       try text(event.content)
     }
+    func canonicalSessionTitle() throws -> String {
+      guard event.content_kind == VIVI_BACKEND_CONTENT_TEXT else {
+        throw NativeEventDecodingError.malformed
+      }
+      let value = try content()
+      let scalars = value.unicodeScalars
+      guard
+        !scalars.isEmpty,
+        scalars.count <= Int(VIVI_BACKEND_SESSION_TITLE_MAX_CHARACTERS)
+      else {
+        throw NativeEventDecodingError.malformed
+      }
+
+      var previousWasSpace = true
+      for scalar in scalars {
+        let scalarValue = scalar.value
+        guard
+          scalarValue > 0x1f,
+          scalarValue < 0x7f || scalarValue > 0x9f
+        else {
+          throw NativeEventDecodingError.malformed
+        }
+        if scalar.properties.isWhitespace {
+          guard scalar.value == 0x20, !previousWasSpace else {
+            throw NativeEventDecodingError.malformed
+          }
+          previousWasSpace = true
+        } else {
+          previousWasSpace = false
+        }
+      }
+      guard !previousWasSpace else {
+        throw NativeEventDecodingError.malformed
+      }
+      return value
+    }
     let inputPresentation = try presentation(
       event.tool_input_presentation,
       required: event.kind == VIVI_BACKEND_EVENT_TOOL_STARTED)
@@ -918,7 +954,7 @@ enum NativeEventDecoder {
     switch event.kind {
     case VIVI_BACKEND_EVENT_READY: return .ready
     case VIVI_BACKEND_EVENT_STATUS: return .status(try content())
-    case VIVI_BACKEND_EVENT_SESSION_TITLE: return .sessionTitle(try content())
+    case VIVI_BACKEND_EVENT_SESSION_TITLE: return .sessionTitle(try canonicalSessionTitle())
     case VIVI_BACKEND_EVENT_ASSISTANT_STARTED: return .assistantStarted
     case VIVI_BACKEND_EVENT_REASONING_DELTA: return .reasoningDelta(try content())
     case VIVI_BACKEND_EVENT_REASONING_COMPLETE: return .reasoningComplete(try content())

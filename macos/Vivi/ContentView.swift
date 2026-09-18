@@ -54,6 +54,8 @@ struct ContentView: View {
     VStack(alignment: .leading, spacing: 4) {
       Text(store.sessionTitle)
         .font(.title2.weight(.semibold))
+        .lineLimit(1)
+        .truncationMode(.tail)
       Text(store.workspace)
         .font(.caption)
         .foregroundStyle(.secondary)

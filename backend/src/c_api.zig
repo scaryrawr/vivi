@@ -461,11 +461,14 @@ fn project(event: *const backend.ConversationEvent) ?Projected {
             .content_kind = c.VIVI_BACKEND_CONTENT_TEXT,
             .text = text.bytes,
         },
-        .session_title => |text| .{
-            .kind = c.VIVI_BACKEND_EVENT_SESSION_TITLE,
-            .content_kind = c.VIVI_BACKEND_CONTENT_TEXT,
-            .text = text.bytes,
-        },
+        .session_title => |text| if (backend.isCanonicalSessionTitle(text.bytes))
+            .{
+                .kind = c.VIVI_BACKEND_EVENT_SESSION_TITLE,
+                .content_kind = c.VIVI_BACKEND_CONTENT_TEXT,
+                .text = text.bytes,
+            }
+        else
+            null,
         .assistant_started => .{ .kind = c.VIVI_BACKEND_EVENT_ASSISTANT_STARTED },
         .reasoning_delta => |text| .{
             .kind = c.VIVI_BACKEND_EVENT_REASONING_DELTA,
@@ -1309,6 +1312,18 @@ test "C session title is a distinct typed text event" {
     const projected = project(&event).?;
     try std.testing.expect(projected.kind == c.VIVI_BACKEND_EVENT_SESSION_TITLE);
     try std.testing.expectEqualStrings("Native title", projected.text);
+}
+
+test "C session title projection rejects noncanonical text" {
+    const allocator = std.testing.allocator;
+    var event: backend.ConversationEvent = .{
+        .session_title = try backend.OwnedText.init(
+            allocator,
+            "Native\n title",
+        ),
+    };
+    defer event.deinit();
+    try std.testing.expectEqual(null, project(&event));
 }
 
 test "C tool start copy-out is atomic and includes display fields" {

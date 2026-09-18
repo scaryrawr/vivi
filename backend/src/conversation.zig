@@ -1,4 +1,6 @@
 const std = @import("std");
+const reasoning = @import("reasoning.zig");
+const session_title = @import("session_title.zig");
 const tool_activity = @import("tool_activity.zig");
 const image = @import("image.zig");
 
@@ -223,21 +225,7 @@ pub const ModelInfo = struct {
     }
 };
 
-pub const ReasoningEffort = enum {
-    off,
-    low,
-    medium,
-    high,
-    xhigh,
-    max,
-
-    pub fn parse(value: []const u8) !ReasoningEffort {
-        inline for (std.meta.tags(ReasoningEffort)) |effort| {
-            if (std.mem.eql(u8, value, @tagName(effort))) return effort;
-        }
-        return error.InvalidReasoningEffort;
-    }
-};
+pub const ReasoningEffort = reasoning.Effort;
 
 pub const ReasoningEffortSet = packed struct(u8) {
     off: bool = false,
@@ -1037,6 +1025,9 @@ pub const Worker = struct {
     }
 
     pub fn sessionTitle(self: *Worker, title: []const u8) !void {
+        if (!session_title.isCanonical(title)) {
+            return error.InvalidSessionTitle;
+        }
         try self.publish(.{
             .session_title = try OwnedText.init(self.core.allocator, title),
         });

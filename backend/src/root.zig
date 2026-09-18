@@ -5,6 +5,7 @@ const copilot = @import("copilot_sdk");
 const conversation = @import("conversation.zig");
 const file_picker = @import("file_picker.zig");
 const models = @import("models.zig");
+const session_title = @import("session_title.zig");
 const session_store = @import("session_store.zig");
 const settings = @import("settings.zig");
 const tool_activity = @import("tool_activity.zig");
@@ -12,6 +13,7 @@ const tools = @import("tools.zig");
 
 pub const version = build_options.version;
 pub const abi_version: u32 = 7;
+pub const max_session_title_characters = session_title.max_characters;
 pub const Conversation = conversation.Conversation;
 pub const ConversationEvent = conversation.Event;
 pub const ConversationWake = conversation.Wake;
@@ -38,6 +40,7 @@ pub const SessionSummary = conversation.SessionSummary;
 pub const SessionCatalogRequest = conversation.SessionCatalogRequest;
 pub const SessionCatalogScope = conversation.SessionCatalogScope;
 pub const ResumeKey = conversation.ResumeKey;
+pub const isCanonicalSessionTitle = session_title.isCanonical;
 pub const TranscriptSnapshot = conversation.TranscriptSnapshot;
 pub const TranscriptItem = conversation.TranscriptItem;
 pub const ToolActivity = tool_activity.ToolActivity;
@@ -1432,9 +1435,12 @@ const RemoteResumeTarget = struct {
     }
 };
 
-fn resumableSessionTitle(summary: ?[]const u8) ?[]const u8 {
+fn resumableSessionTitle(
+    allocator: std.mem.Allocator,
+    summary: ?[]const u8,
+) !?[]u8 {
     const title = summary orelse return null;
-    return if (session_store.validTitle(title)) title else null;
+    return session_title.canonicalize(allocator, title);
 }
 
 const ResumeTargets = union(enum) {
@@ -1495,9 +1501,10 @@ fn buildBroaderSessionCatalog(
                 .modified_time = modified_time,
             };
             errdefer value.deinit(allocator);
-            if (resumableSessionTitle(metadata.summary)) |title| {
-                value.title = try allocator.dupe(u8, title);
-            }
+            value.title = try resumableSessionTitle(
+                allocator,
+                metadata.summary,
+            );
             break :blk value;
         };
         errdefer target.deinit(allocator);
@@ -1703,19 +1710,41 @@ test "raw history projection ignores malformed events" {
     try std.testing.expectEqualStrings("answer", snapshot.items[1].text);
 }
 
-test "broader resume ignores invalid SDK session titles" {
+test "broader resume canonicalizes SDK session titles" {
+    const canonical = (try resumableSessionTitle(
+        std.testing.allocator,
+        "  Remote\n session  ",
+    )).?;
+    defer std.testing.allocator.free(canonical);
     try std.testing.expectEqualStrings(
         "Remote session",
-        resumableSessionTitle("Remote session").?,
+        canonical,
     );
-    try std.testing.expectEqual(null, resumableSessionTitle(null));
-    try std.testing.expectEqual(null, resumableSessionTitle(""));
-    try std.testing.expectEqual(null, resumableSessionTitle(" padded "));
-    try std.testing.expectEqual(null, resumableSessionTitle("line\nbreak"));
-    try std.testing.expectEqual(null, resumableSessionTitle("escape\x1b[2J"));
-    try std.testing.expectEqual(null, resumableSessionTitle("delete\x7fbyte"));
+    try std.testing.expectEqual(
+        null,
+        try resumableSessionTitle(std.testing.allocator, null),
+    );
+    try std.testing.expectEqual(
+        null,
+        try resumableSessionTitle(std.testing.allocator, ""),
+    );
+    const sanitized = (try resumableSessionTitle(
+        std.testing.allocator,
+        "escape\x1b[2J",
+    )).?;
+    defer std.testing.allocator.free(sanitized);
+    try std.testing.expectEqualStrings("escape[2J", sanitized);
     const oversized = [_]u8{'x'} ** 513;
-    try std.testing.expectEqual(null, resumableSessionTitle(&oversized));
+    const truncated = (try resumableSessionTitle(
+        std.testing.allocator,
+        &oversized,
+    )).?;
+    defer std.testing.allocator.free(truncated);
+    try std.testing.expect(session_title.isCanonical(truncated));
+    try std.testing.expectEqual(
+        session_title.max_characters,
+        std.unicode.utf8CountCodepoints(truncated) catch unreachable,
+    );
 }
 
 fn sessionSummaryFromRecord(
@@ -2269,19 +2298,32 @@ fn streamSessionResponse(
                 )) return .failed;
             },
             .session_title_changed => |title| {
-                if (!session_store.validTitle(title.data.title)) {
+                const canonical_title = session_title.canonicalize(
+                    worker.allocator(),
+                    title.data.title,
+                ) catch {
+                    worker.closeFailure(
+                        .stream,
+                        "Unable to display session title.",
+                    );
+                    return .failed;
+                };
+                defer if (canonical_title) |value| {
+                    worker.allocator().free(value);
+                };
+                const canonical = canonical_title orelse {
                     if (!reportStreamStatus(
                         worker,
                         "Session title updated.",
                         "Unable to display session title.",
                     )) return .failed;
                     continue;
-                }
+                };
                 if (session_tracking_enabled.*) {
-                    if (store) |value| {
-                        value.updateTitle(
+                    if (store) |session_store_value| {
+                        session_store_value.updateTitle(
                             session.id,
-                            title.data.title,
+                            canonical,
                         ) catch |err| {
                             session_tracking_enabled.* = false;
                             var buffer: [256]u8 = undefined;
@@ -2294,7 +2336,7 @@ fn streamSessionResponse(
                         };
                     }
                 }
-                worker.sessionTitle(title.data.title) catch {
+                worker.sessionTitle(canonical) catch {
                     worker.closeFailure(.stream, "Unable to display session title.");
                     return .failed;
                 };
