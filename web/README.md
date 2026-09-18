@@ -12,6 +12,8 @@ window.
 - Chromium installed for Playwright (`pnpm exec playwright install chromium`)
 
 Corepack is not required and should not be activated for this workspace.
+The committed `.npmrc` uses the Microsoft npm package-feed proxy required by
+the development and CI environments.
 
 ## Commands
 
