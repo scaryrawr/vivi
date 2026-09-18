@@ -498,11 +498,14 @@ fn project(event: *const backend.ConversationEvent) ?Projected {
             .content_kind = c.VIVI_BACKEND_CONTENT_TEXT,
             .text = text.bytes,
         },
-        .session_title => |text| .{
-            .kind = c.VIVI_BACKEND_EVENT_SESSION_TITLE,
-            .content_kind = c.VIVI_BACKEND_CONTENT_TEXT,
-            .text = text.bytes,
-        },
+        .session_title => |text| if (backend.isCanonicalSessionTitle(text.bytes))
+            .{
+                .kind = c.VIVI_BACKEND_EVENT_SESSION_TITLE,
+                .content_kind = c.VIVI_BACKEND_CONTENT_TEXT,
+                .text = text.bytes,
+            }
+        else
+            null,
         .assistant_started => .{ .kind = c.VIVI_BACKEND_EVENT_ASSISTANT_STARTED },
         .reasoning_delta => |text| .{
             .kind = c.VIVI_BACKEND_EVENT_REASONING_DELTA,
@@ -607,25 +610,31 @@ fn project(event: *const backend.ConversationEvent) ?Projected {
                 .switch_outcome = c.VIVI_BACKEND_MODEL_SWITCH_FAILED,
             },
         },
-        .session_catalog => |*catalog| .{
-            .kind = c.VIVI_BACKEND_EVENT_SESSION_CATALOG,
-            .content_kind = c.VIVI_BACKEND_CONTENT_SESSION_CATALOG,
-            .sessions = catalog.sessions,
-        },
+        .session_catalog => |*catalog| if (hasCanonicalSessionTitles(catalog.sessions))
+            .{
+                .kind = c.VIVI_BACKEND_EVENT_SESSION_CATALOG,
+                .content_kind = c.VIVI_BACKEND_CONTENT_SESSION_CATALOG,
+                .sessions = catalog.sessions,
+            }
+        else
+            null,
         .session_catalog_failed => |text| .{
             .kind = c.VIVI_BACKEND_EVENT_SESSION_CATALOG_FAILURE,
             .content_kind = c.VIVI_BACKEND_CONTENT_TEXT,
             .text = text.bytes,
         },
         .session_resume => |*resume_result| switch (resume_result.*) {
-            .resumed => |*resumed| .{
-                .kind = c.VIVI_BACKEND_EVENT_SESSION_RESUME,
-                .content_kind = c.VIVI_BACKEND_CONTENT_SESSION_RESUME,
-                .session_resume_outcome = c.VIVI_BACKEND_SESSION_RESUME_RESUMED,
-                .resumed_session = &resumed.session,
-                .transcript = resumed.transcript.items,
-                .cleanup_failed = resumed.cleanup_failed,
-            },
+            .resumed => |*resumed| if (hasCanonicalSessionTitle(&resumed.session))
+                .{
+                    .kind = c.VIVI_BACKEND_EVENT_SESSION_RESUME,
+                    .content_kind = c.VIVI_BACKEND_CONTENT_SESSION_RESUME,
+                    .session_resume_outcome = c.VIVI_BACKEND_SESSION_RESUME_RESUMED,
+                    .resumed_session = &resumed.session,
+                    .transcript = resumed.transcript.items,
+                    .cleanup_failed = resumed.cleanup_failed,
+                }
+            else
+                null,
             .failed => |text| .{
                 .kind = c.VIVI_BACKEND_EVENT_SESSION_RESUME,
                 .content_kind = c.VIVI_BACKEND_CONTENT_SESSION_RESUME,
@@ -651,6 +660,18 @@ fn project(event: *const backend.ConversationEvent) ?Projected {
         .command_completed,
         => null,
     };
+}
+
+fn hasCanonicalSessionTitles(sessions: []const backend.SessionSummary) bool {
+    for (sessions) |session| {
+        if (!hasCanonicalSessionTitle(&session)) return false;
+    }
+    return true;
+}
+
+fn hasCanonicalSessionTitle(session: *const backend.SessionSummary) bool {
+    const title = session.title orelse return true;
+    return backend.isCanonicalSessionTitle(title);
 }
 
 fn byteCount(projected: Projected) !u32 {
@@ -1563,6 +1584,18 @@ test "C session title is a distinct typed text event" {
     try std.testing.expectEqualStrings("Native title", projected.text);
 }
 
+test "C session title projection rejects noncanonical text" {
+    const allocator = std.testing.allocator;
+    var event: backend.ConversationEvent = .{
+        .session_title = try backend.OwnedText.init(
+            allocator,
+            "Native\n title",
+        ),
+    };
+    defer event.deinit();
+    try std.testing.expectEqual(null, project(&event));
+}
+
 test "C session catalog copy is atomic and preserves opaque keys" {
     const allocator = std.testing.allocator;
     var event: backend.ConversationEvent = .{ .session_catalog = .{
@@ -1634,6 +1667,23 @@ test "C session catalog copy is atomic and preserves opaque keys" {
         "/tmp/other",
         bytes[sessions[0].working_directory.offset..][0..sessions[0].working_directory.length],
     );
+}
+
+test "C session catalog projection rejects noncanonical titles" {
+    const allocator = std.testing.allocator;
+    var event: backend.ConversationEvent = .{ .session_catalog = .{
+        .allocator = allocator,
+        .sessions = try allocator.alloc(backend.SessionSummary, 1),
+    } };
+    defer event.deinit();
+    event.session_catalog.sessions[0] = .{
+        .allocator = allocator,
+        .key = .{ .generation = 41, .slot = 7 },
+        .working_directory = try allocator.dupe(u8, "/tmp/other"),
+        .title = try allocator.dupe(u8, "Other\nsession"),
+        .current = false,
+    };
+    try std.testing.expectEqual(null, project(&event));
 }
 
 test "C session resume copies summary and ordered transcript atomically" {

@@ -993,6 +993,44 @@ enum NativeEventDecoder {
       span.offset == 0 && span.length == 0
     }
 
+    func canonicalSessionTitle(_ span: vivi_backend_span_t) throws -> String {
+      let value = try text(span)
+      let scalars = value.unicodeScalars
+      guard
+        !scalars.isEmpty,
+        scalars.count <= Int(VIVI_BACKEND_SESSION_TITLE_MAX_CHARACTERS)
+      else {
+        throw NativeEventDecodingError.malformed
+      }
+
+      var previousWasSpace = true
+      for scalar in scalars {
+        let scalarValue = scalar.value
+        guard
+          scalarValue > 0x1f,
+          scalarValue < 0x7f || scalarValue > 0x9f,
+          scalarValue != 0x061c,
+          scalarValue < 0x200e || scalarValue > 0x200f,
+          scalarValue < 0x202a || scalarValue > 0x202e,
+          scalarValue < 0x2066 || scalarValue > 0x2069
+        else {
+          throw NativeEventDecodingError.malformed
+        }
+        if scalar.properties.isWhitespace {
+          guard scalarValue == 0x20, !previousWasSpace else {
+            throw NativeEventDecodingError.malformed
+          }
+          previousWasSpace = true
+        } else {
+          previousWasSpace = false
+        }
+      }
+      guard !previousWasSpace else {
+        throw NativeEventDecodingError.malformed
+      }
+      return value
+    }
+
     func session(_ raw: vivi_backend_session_summary_t) throws -> SessionSummary {
       let knownFlags =
         UInt32(VIVI_BACKEND_SESSION_TITLE_PRESENT.rawValue)
@@ -1013,7 +1051,7 @@ enum NativeEventDecoder {
           generation: raw.key.generation,
           slot: raw.key.slot),
         workingDirectory: workingDirectory,
-        title: hasTitle ? try text(raw.title) : nil,
+        title: hasTitle ? try canonicalSessionTitle(raw.title) : nil,
         isCurrent: raw.flags & UInt32(VIVI_BACKEND_SESSION_CURRENT.rawValue) != 0)
     }
 
@@ -1139,7 +1177,11 @@ enum NativeEventDecoder {
     switch event.kind {
     case VIVI_BACKEND_EVENT_READY: return .ready
     case VIVI_BACKEND_EVENT_STATUS: return .status(try content())
-    case VIVI_BACKEND_EVENT_SESSION_TITLE: return .sessionTitle(try content())
+    case VIVI_BACKEND_EVENT_SESSION_TITLE:
+      guard event.content_kind == VIVI_BACKEND_CONTENT_TEXT else {
+        throw NativeEventDecodingError.malformed
+      }
+      return .sessionTitle(try canonicalSessionTitle(event.content))
     case VIVI_BACKEND_EVENT_ASSISTANT_STARTED: return .assistantStarted
     case VIVI_BACKEND_EVENT_REASONING_DELTA: return .reasoningDelta(try content())
     case VIVI_BACKEND_EVENT_REASONING_COMPLETE: return .reasoningComplete(try content())

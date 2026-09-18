@@ -1,4 +1,5 @@
 const std = @import("std");
+const session_title = @import("session_title.zig");
 const tool_activity = @import("tool_activity.zig");
 const image = @import("image.zig");
 
@@ -968,6 +969,9 @@ pub const Worker = struct {
     }
 
     pub fn sessionTitle(self: *Worker, title: []const u8) !void {
+        if (!session_title.isCanonical(title)) {
+            return error.InvalidSessionTitle;
+        }
         try self.publish(.{
             .session_title = try OwnedText.init(self.core.allocator, title),
         });

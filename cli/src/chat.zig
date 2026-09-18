@@ -4372,20 +4372,32 @@ const ChatUi = struct {
             },
             .status => {
                 const message = entry.constMessage().?;
-                var segments = [_]vaxis.Segment{
-                    .{
-                        .text = "• ",
-                        .style = .{ .fg = accent, .dim = true },
-                    },
-                    .{
+                if (line.start == 0) {
+                    var segments = [_]vaxis.Segment{
+                        .{
+                            .text = "• ",
+                            .style = .{ .fg = accent, .dim = true },
+                        },
+                        .{
+                            .text = message.text.items[line.start..line.end],
+                            .style = .{ .dim = true },
+                        },
+                    };
+                    _ = window.print(&segments, .{
+                        .row_offset = row,
+                        .wrap = .none,
+                    });
+                } else {
+                    var segments = [_]vaxis.Segment{.{
                         .text = message.text.items[line.start..line.end],
                         .style = .{ .dim = true },
-                    },
-                };
-                _ = window.print(&segments, .{
-                    .row_offset = row,
-                    .wrap = .none,
-                });
+                    }};
+                    _ = window.print(&segments, .{
+                        .row_offset = row,
+                        .col_offset = 2,
+                        .wrap = .none,
+                    });
+                }
             },
             .tool => {
                 const tool = &entry.tool;
@@ -5948,6 +5960,149 @@ test "viewport projection retains only visible transcript rows" {
     try std.testing.expect(transcript.messageAt(active).layout_valid);
     try transcript.appendDelta(std.testing.allocator, " update");
     try std.testing.expect(!transcript.messageAt(active).layout_valid);
+}
+
+test "wrapped status projection draws one bullet with hanging indentation" {
+    var ui: ChatUi = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .input = TextInput.init(std.testing.allocator),
+        .cwd = try std.testing.allocator.dupe(u8, "."),
+    };
+    defer ui.deinit();
+    try ui.transcript.append(
+        std.testing.allocator,
+        .status,
+        "Session title: A deliberately long title for narrow terminals",
+    );
+
+    var screen = try vaxis.Screen.init(std.testing.allocator, .{
+        .rows = 8,
+        .cols = 18,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(std.testing.allocator);
+    const window: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = screen.width,
+        .height = screen.height,
+        .screen = &screen,
+    };
+    var projection = try Projection.build(
+        std.testing.allocator,
+        &ui.transcript,
+        window,
+    );
+    defer projection.deinit(std.testing.allocator);
+
+    try std.testing.expect(projection.lines.items.len > 1);
+    for (projection.lines.items, 0..) |line, row| {
+        try std.testing.expectEqual(LineKind.status, line.kind);
+        ui.drawTranscriptLine(window, @intCast(row), &projection, line);
+    }
+
+    var bullet_count: usize = 0;
+    for (0..projection.lines.items.len) |row| {
+        if (std.mem.eql(
+            u8,
+            screen.readCell(0, @intCast(row)).?.char.grapheme,
+            "•",
+        )) {
+            bullet_count += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), bullet_count);
+    try std.testing.expectEqualStrings(
+        "•",
+        screen.readCell(0, 0).?.char.grapheme,
+    );
+    for (projection.lines.items[1..], 1..) |line, row| {
+        try std.testing.expect(line.start > 0);
+        try std.testing.expectEqualStrings(
+            " ",
+            screen.readCell(0, @intCast(row)).?.char.grapheme,
+        );
+        try std.testing.expectEqualStrings(
+            " ",
+            screen.readCell(1, @intCast(row)).?.char.grapheme,
+        );
+        try std.testing.expectEqualStrings(
+            ui.transcript.messageAt(0).text.items[line.start .. line.start + 1],
+            screen.readCell(2, @intCast(row)).?.char.grapheme,
+        );
+    }
+}
+
+test "status viewport starting mid-entry preserves hanging indentation" {
+    var ui: ChatUi = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .input = TextInput.init(std.testing.allocator),
+        .cwd = try std.testing.allocator.dupe(u8, "."),
+    };
+    defer ui.deinit();
+    try ui.transcript.append(
+        std.testing.allocator,
+        .status,
+        "Session title: A deliberately long title for narrow terminals",
+    );
+
+    var screen = try vaxis.Screen.init(std.testing.allocator, .{
+        .rows = 2,
+        .cols = 18,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(std.testing.allocator);
+    const window: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = screen.width,
+        .height = screen.height,
+        .screen = &screen,
+    };
+    var layout = try TranscriptLayout.measure(
+        std.testing.allocator,
+        &ui.transcript,
+        window,
+        null,
+    );
+    defer layout.deinit(std.testing.allocator);
+    var projection = try Projection.buildViewport(
+        std.testing.allocator,
+        &ui.transcript,
+        &layout,
+        window,
+        0,
+        null,
+    );
+    defer projection.deinit(std.testing.allocator);
+
+    try std.testing.expect(layout.entry_rows[0] > window.height);
+    try std.testing.expectEqual(@as(usize, window.height), projection.lines.items.len);
+    try ui.drawTranscript(window, &projection);
+    for (projection.lines.items, 0..) |line, row| {
+        try std.testing.expectEqual(LineKind.status, line.kind);
+        try std.testing.expect(line.start > 0);
+        try std.testing.expectEqualStrings(
+            " ",
+            screen.readCell(0, @intCast(row)).?.char.grapheme,
+        );
+        try std.testing.expectEqualStrings(
+            " ",
+            screen.readCell(1, @intCast(row)).?.char.grapheme,
+        );
+        try std.testing.expectEqualStrings(
+            ui.transcript.messageAt(0).text.items[line.start .. line.start + 1],
+            screen.readCell(2, @intCast(row)).?.char.grapheme,
+        );
+    }
 }
 
 test "single long message materializes only its viewport range" {

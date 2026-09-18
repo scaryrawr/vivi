@@ -376,6 +376,45 @@ final class ViviBackendRuntimeTests: XCTestCase {
       try NativeEventDecoder.decode(event, bytes: bytes, models: [model]))
   }
 
+  func testDecoderAcceptsCanonicalSessionTitleAtScalarLimit() throws {
+    let title = String(repeating: "é", count: Int(VIVI_BACKEND_SESSION_TITLE_MAX_CHARACTERS))
+    XCTAssertEqual(
+      try decodeSessionTitle(Array(title.utf8)),
+      .sessionTitle(title))
+  }
+
+  func testDecoderRejectsMalformedOrOversizedSessionTitles() {
+    XCTAssertThrowsError(try decodeSessionTitle([0xff]))
+    XCTAssertThrowsError(try decodeSessionTitle([]))
+    XCTAssertThrowsError(
+      try decodeSessionTitle(
+        Array(
+          String(
+            repeating: "a",
+            count: Int(VIVI_BACKEND_SESSION_TITLE_MAX_CHARACTERS) + 1
+          ).utf8)))
+  }
+
+  func testDecoderRejectsSessionTitleControlsAndBidiFormatting() {
+    for title in [
+      "First\nSecond",
+      "First\u{007f}Second",
+      "First\u{061c}Second",
+      "First\u{200e}Second",
+      "First\u{200f}Second",
+      "First\u{202e}Second",
+      "First\u{2066}Second\u{2069}",
+    ] {
+      XCTAssertThrowsError(try decodeSessionTitle(Array(title.utf8)), title)
+    }
+  }
+
+  func testDecoderRejectsNoncanonicalSessionTitleWhitespace() {
+    for title in [" Leading", "Trailing ", "Repeated  space", "Nonbreaking\u{00a0}space"] {
+      XCTAssertThrowsError(try decodeSessionTitle(Array(title.utf8)), title)
+    }
+  }
+
   func testDecoderRejectsUnknownAdvertisedReasoning() {
     let bytes = Array("copilot/gpt-5GPT-5".utf8)
     var event = vivi_backend_event_t()
@@ -442,6 +481,15 @@ final class ViviBackendRuntimeTests: XCTestCase {
           result: .running,
           output: nil,
           outputPresentation: nil)))
+  }
+
+  private func decodeSessionTitle(_ bytes: [UInt8]) throws -> ChatEvent {
+    var event = vivi_backend_event_t()
+    event.kind = VIVI_BACKEND_EVENT_SESSION_TITLE
+    event.content_kind = VIVI_BACKEND_CONTENT_TEXT
+    event.byte_count = UInt32(bytes.count)
+    event.content = vivi_backend_span_t(offset: 0, length: UInt32(bytes.count))
+    return try NativeEventDecoder.decode(event, bytes: bytes, models: [])
   }
 
   func testClosedStoreIgnoresLateReadyEvent() {
