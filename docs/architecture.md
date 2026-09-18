@@ -235,6 +235,13 @@ permissions; Windows creation inherits the user profile's access controls.
 Existing `~/.vivi/sessions/` data from earlier versions is ignored and left
 untouched.
 
+Ambient workspace MCP configuration remains discoverable, but its permission
+requests are rejected until Vivi exposes an explicit approval boundary. The
+permission handler automatically approves only the built-in GitHub
+`web_search` MCP tool; it also rejects extension management, hooks, factories,
+and extension environment or permission access instead of inheriting the SDK's
+approve-all behavior.
+
 `/resume` is a first-class broker control operation rather than an SDK slash
 command. It uses the SDK's process-wide `listSessions(null)` catalog, projects
 display-ready titles and working directories, and gives the terminal

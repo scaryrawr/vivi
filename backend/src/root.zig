@@ -256,6 +256,42 @@ const MinimalCodingAgent = struct {
 
     const sdk_tools = makeSdkTools();
 
+    fn handlePermission(
+        request: copilot.PermissionRequested,
+        invocation: copilot.PermissionInvocation,
+        _: ?*anyopaque,
+    ) anyerror!copilot.PermissionDecision {
+        if (invocation.managed_settings_enabled) {
+            return error.AutomaticApprovalWithManagedSettings;
+        }
+        if (request.managed_approval_required) return .no_result;
+        const parsed = request.permission_request orelse
+            return .{ .reject = "Vivi does not auto-approve unknown permission requests." };
+        return switch (parsed) {
+            .mcp => |mcp| if (std.mem.eql(
+                u8,
+                mcp.server_name,
+                "github-mcp-server",
+            ) and std.mem.eql(u8, mcp.tool_name, "web_search"))
+                .approve_once
+            else
+                .{ .reject = "Workspace MCP tools require an explicit approval boundary." },
+            .hook,
+            .extension_management,
+            .factory,
+            .extension_permission_access,
+            .extension_env_access,
+            => .{ .reject = "Extension capabilities require an explicit approval boundary." },
+            .shell,
+            .write,
+            .read,
+            .url,
+            .memory,
+            .custom_tool,
+            => .approve_once,
+        };
+    }
+
     fn clientOptions(
         working_directory: []const u8,
         launch: CopilotCliLaunch,
@@ -318,7 +354,7 @@ const MinimalCodingAgent = struct {
                 .mode = .append,
                 .content = prompt,
             },
-            .on_permission_request = copilot.approveAll,
+            .on_permission_request = handlePermission,
         };
     }
 
@@ -3568,7 +3604,9 @@ test "minimal coding agent appends Vivi tools to discovered instructions" {
     try std.testing.expect(config.model_capabilities == null);
     try std.testing.expectEqual(@as(usize, 4), config.tools.len);
     try std.testing.expect(!config.request_permission);
-    try std.testing.expect(config.on_permission_request.? == copilot.approveAll);
+    try std.testing.expect(
+        config.on_permission_request.? == MinimalCodingAgent.handlePermission,
+    );
     const names = [_][]const u8{
         "read",
         "bash",
@@ -3613,6 +3651,48 @@ test "minimal coding agent appends Vivi tools to discovered instructions" {
         "minimal system prompt",
         config.system_message.?.content,
     );
+}
+
+test "minimal coding agent only auto-approves GitHub web search MCP requests" {
+    const invocation: copilot.PermissionInvocation = .{
+        .session_id = "session",
+        .managed_settings_enabled = false,
+    };
+    const web_search: copilot.PermissionRequested = .{
+        .request_id = "web",
+        .permission_request_json = undefined,
+        .permission_request = .{ .mcp = .{
+            .kind = "mcp",
+            .server_name = "github-mcp-server",
+            .tool_name = "web_search",
+            .tool_title = "Web search",
+            .read_only = true,
+        } },
+    };
+    try std.testing.expectEqual(
+        copilot.PermissionDecision.approve_once,
+        try MinimalCodingAgent.handlePermission(web_search, invocation, null),
+    );
+
+    const workspace_tool: copilot.PermissionRequested = .{
+        .request_id = "workspace",
+        .permission_request_json = undefined,
+        .permission_request = .{ .mcp = .{
+            .kind = "mcp",
+            .server_name = "workspace-server",
+            .tool_name = "mutate",
+            .tool_title = "Mutate workspace",
+            .read_only = false,
+        } },
+    };
+    switch (try MinimalCodingAgent.handlePermission(
+        workspace_tool,
+        invocation,
+        null,
+    )) {
+        .reject => {},
+        else => return error.ExpectedRejectedPermission,
+    }
 }
 
 test "workspace customization uses explicit absolute directories" {

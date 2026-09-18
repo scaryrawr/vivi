@@ -62,8 +62,13 @@ doctor() {
     require_command script
     require_command expect
     require_command copilot
+    require_command gh
     require_command ffmpeg
     require_command ffprobe
+    gh auth token >/dev/null || {
+        printf 'gh must be authenticated for isolated Vivi verification homes\n' >&2
+        exit 1
+    }
     build_vivi
 
     "$binary" --version

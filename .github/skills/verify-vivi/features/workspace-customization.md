@@ -39,6 +39,8 @@ slash menu, and the response produced by invoking it.
 - Vivi enables ambient workspace configuration discovery, including workspace
   MCP configuration and project skill directories. The built-in GitHub MCP
   server is limited to `web_search`.
+- Workspace MCP tools are discoverable but their permission requests are
+  rejected until Vivi provides an explicit user-approval flow.
 - Personal extensions and plugin state are isolated under
   `~/.vivi/copilot/`; Vivi does not inherit them from `~/.copilot/`.
 - The isolated verification home receives `gh auth token` through the process

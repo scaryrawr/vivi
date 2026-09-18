@@ -138,7 +138,10 @@ stored preference.
 Vivi launches Copilot CLI with a private home at `~/.vivi/copilot/`. This keeps
 Copilot sessions, installed extensions, plugin state, and related runtime
 configuration separate from the user's normal `~/.copilot/` installation while
-still allowing ambient configuration from the active workspace.
+still allowing ambient configuration from the active workspace. Workspace MCP
+tools are discovered but denied when they request permission until Vivi has an
+explicit user-approval flow; the built-in GitHub `web_search` tool is the only
+MCP tool automatically approved.
 
 During an active chat, type `/` to open Vivi's slash-command menu. The menu
 refreshes the Copilot SDK command catalog each time it opens so commands from
