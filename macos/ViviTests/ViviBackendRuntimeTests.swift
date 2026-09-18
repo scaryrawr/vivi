@@ -5,6 +5,18 @@ import XCTest
 
 @MainActor
 final class ViviBackendRuntimeTests: XCTestCase {
+  func testInvalidArgumentIsRejectedOnlyForUserInputResponses() {
+    XCTAssertEqual(
+      ViviConversationDriver.operationResult(VIVI_BACKEND_INVALID_ARGUMENT),
+      .failed)
+    XCTAssertEqual(
+      ViviConversationDriver.userInputOperationResult(VIVI_BACKEND_INVALID_ARGUMENT),
+      .rejected)
+    XCTAssertEqual(
+      ViviConversationDriver.userInputOperationResult(VIVI_BACKEND_BUSY),
+      .busy)
+  }
+
   func testReducerCreatesAssistantLazilyAfterReasoning() {
     let driver = FakeConversationDriver()
     let store = NativeChatStore(workspace: "/tmp/Vivi chat", driver: driver)

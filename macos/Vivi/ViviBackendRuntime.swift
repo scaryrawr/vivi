@@ -1789,7 +1789,7 @@ final class ViviConversationDriver: ViviConversationDriving, @unchecked Sendable
         answerBytes.withUnsafeBufferPointer { answerBuffer in
           response.request_id = requestBuffer.baseAddress
           response.answer = answerBuffer.baseAddress
-          return Self.operationResult(
+          return Self.userInputOperationResult(
             vivi_backend_respond_to_user_input(handle, &response))
         }
       }
@@ -1933,16 +1933,24 @@ final class ViviConversationDriver: ViviConversationDriving, @unchecked Sendable
     }
   }
 
-  private static func operationResult(
+  static func operationResult(
     _ result: vivi_backend_result_t
   ) -> ConversationOperationResult {
     switch result {
     case VIVI_BACKEND_OK: .accepted
-    case VIVI_BACKEND_INVALID_ARGUMENT: .rejected
     case VIVI_BACKEND_BUSY: .busy
     case VIVI_BACKEND_STOPPING: .stopping
     case VIVI_BACKEND_CLOSED: .closed
     default: .failed
     }
+  }
+
+  static func userInputOperationResult(
+    _ result: vivi_backend_result_t
+  ) -> ConversationOperationResult {
+    if result == VIVI_BACKEND_INVALID_ARGUMENT {
+      return .rejected
+    }
+    return operationResult(result)
   }
 }

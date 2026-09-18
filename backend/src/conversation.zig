@@ -1021,7 +1021,8 @@ pub const Worker = struct {
             choices,
             allow_freeform,
         );
-        errdefer request.deinit();
+        var request_owned = true;
+        defer if (request_owned) request.deinit();
         {
             var pending = try request.clone(self.core.allocator);
             errdefer pending.deinit();
@@ -1038,6 +1039,7 @@ pub const Worker = struct {
             self.core.state = .awaiting_user_input;
             self.core.mutex.unlock(self.core.io);
         }
+        request_owned = false;
         self.publish(.{ .user_input_requested = request }) catch |err| {
             try self.core.mutex.lock(self.core.io);
             if (self.core.pending_user_input) |*active| active.deinit();
