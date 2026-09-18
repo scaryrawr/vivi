@@ -91,19 +91,25 @@ Windows loop adapter. All other events still use libvaxis's generic forwarding;
 input failures are delivered to the app for normal terminal cleanup.
 
 The initial coding-agent policy is private to `backend/src/root.zig`. Hosted
-Copilot sessions enable the SDK's curated session-isolated built-ins for
-planning and subagent coordination. OMLX sessions omit the entire task and
-agent-orchestration built-in family because Vivi owns one local model at a
-time, retaining only `ask_user` and `skill`. Built-in MCP servers and ambient
-workspace configuration discovery remain disabled for both. Vivi explicitly
-supplies the workspace root for instructions and `.github/skills`,
-`.agents/skills`, and `.claude/skills` for skills. The SDK provides its typed `ask_user` callback; the session registers exactly
-four Vivi-owned tools: `read`, `bash`, `edit`, and `write`. The `bash` tool
+Copilot and OMLX sessions retain only the `ask_user` and `skill` built-ins
+plus `web_fetch`, alongside custom tools and tools from configured MCP servers.
+The built-in GitHub MCP server is not enabled by default, and workspace MCP
+permission requests remain denied until Vivi has an explicit approval flow.
+Ambient workspace configuration discovery admits workspace MCP configuration
+and project skill directories. The SDK provides its typed `ask_user` callback;
+the session registers exactly four Vivi-owned tools: `read`, `bash`, `edit`,
+and `write`. The `bash` tool
 dispatches synchronous `run` plus persistent PTY `start`, `list`, `read`,
 `write`, and `stop` actions. Vivi appends its concise workspace-aware prompt to
 Copilot's system message. Provider-specific
 session-level source-qualified allowlists admit custom and extension tools
 while limiting Copilot's built-ins to the applicable reviewed set.
+
+Each session sets Copilot's runtime configuration directory to
+`~/.vivi/copilot/`, derived from Vivi's settings path. This isolates personal
+extensions, installed plugins, enablement state, MCP configuration, and other
+Copilot customization from the user's standalone `~/.copilot/` installation.
+Workspace customization remains discoverable from the active repository.
 
 `backend/src/tools.zig` owns SDK-free tool behavior: JSON argument validation,
 workspace-relative path resolution, text/image reads, synchronous Bash
@@ -219,35 +225,32 @@ same model value appearing again, or mistake a legacy writer's field-dropping
 rewrite for its own write. Hosts resolve the user's home directory and pass the
 settings path into conversation options; they do not parse the document or
 coordinate model-switch persistence. Copilot CLI continues to own its session
-storage. The SDK can create or join sessions by ID, but does not expose a
-custom session-storage backend.
+storage. Every production SDK client is launched with
+`ClientOptions.base_directory` set to `~/.vivi/copilot/`, making that private
+Copilot home the single authority for sessions, extensions, plugin state, and
+administrative APIs such as session listing. Session create and resume requests
+do not set a separate `config_directory`, so they cannot diverge from the
+process-level home. Hosts create the private home before initializing the SDK.
+On POSIX systems Vivi creates and tightens that directory to owner-only
+permissions; Windows creation inherits the user profile's access controls.
+Existing `~/.vivi/sessions/` data from earlier versions is ignored and left
+untouched.
 
-`backend/src/session_store.zig` owns Vivi's durable index of sessions it
-created. Processes coordinate through an advisory `.lock` file under
-`~/.vivi/sessions/`. While holding that lock, each read or write merges valid
-versioned JSON shards by SDK session ID, incrementally bounds the catalog,
-atomically writes the merged catalog to the current process's shard, and
-best-effort removes sibling shards after that commit. Malformed shards are
-skipped and then removed during compaction. An unsupported document version or
-an oversized shard aborts the operation before compaction so an older Vivi
-binary cannot delete a newer catalog it cannot safely inspect. On POSIX
-systems, the directory, lock, and shards use owner-only permissions; Windows
-creation inherits the user profile's access-controlled directory permissions.
-The store records only the session ID, generated title, working directory,
-model identity, and recency, refreshing recency after each completed response;
-Copilot CLI remains the sole transcript/history store.
+Ambient workspace MCP configuration remains discoverable, but its permission
+requests are rejected until Vivi exposes an explicit approval boundary. The
+built-in GitHub MCP server is not enabled by default. The permission handler
+also rejects extension management, hooks, factories, and extension environment
+or permission access instead of inheriting the SDK's approve-all behavior.
 
 `/resume` is a first-class broker control operation rather than an SDK slash
-command. Bare `/resume` lists only Vivi's private local index. `/resume all`
-uses the SDK's cwd-filtered session listing and discards rows without the exact
-active working-directory context; it neither merges those rows into the local
-catalog nor persists them merely for display. The terminal receives
-display-ready summaries with refresh-scoped opaque generation-and-slot keys,
-while `backend/src/root.zig` privately resolves SDK IDs and calls
-`Client.joinSession`. Joining fetches and projects the owned message history
-before durable recency update, active-session commit, and previous-session
-cleanup. Candidate tools and the system prompt are rebuilt for the recorded
-working directory; any failure before commit disconnects the candidate and
+command. It uses the SDK's process-wide `listSessions(null)` catalog, projects
+display-ready titles and working directories, and gives the terminal
+refresh-scoped opaque generation-and-slot keys. `backend/src/root.zig`
+privately resolves those keys to SDK session IDs and calls
+`Client.resumeSession`. Candidate tools and the system prompt are rebuilt for
+the recorded working directory using the currently selected model and reasoning
+effort. The candidate history is fetched and projected before the active
+session is replaced; any failure before commit disconnects the candidate and
 leaves the current session and visible transcript active. A successful resume,
 including a same-session selection, atomically replaces the terminal transcript
 from the owned snapshot before reporting success.
@@ -276,10 +279,10 @@ unchanged until a native caller defines its callback and ownership contract.
 The minimal agent configuration stays private to the SDK-owning root module
 rather than becoming caller-supplied conversation options. This keeps tool
 availability and prompt policy consistent across every host. The session-level
-allowlist is authoritative for model-visible capabilities, while the process
-flag prevents built-in MCP servers from starting. The SDK declarations use the
-same four descriptors that drive the SDK-free dispatcher, and permission
-requests remain fail-closed because Vivi has no approval UI yet.
+allowlist is authoritative for model-visible capabilities. The SDK declarations
+use the same four descriptors that drive the SDK-free dispatcher. MCP and
+extension permission requests remain fail-closed because Vivi has no approval
+UI yet.
 
 ## Tradeoffs accepted
 
@@ -298,8 +301,8 @@ requests remain fail-closed because Vivi has no approval UI yet.
   the backend worker and terminal thread.
 - We accept cooperative cancellation in exchange for never calling the
   single-threaded SDK concurrently.
-- We accept a CLI launch flag alongside SDK session configuration because
-  built-in MCP startup remains a process-level concern.
+- We accept limiting default web access to `web_fetch` until Vivi can safely
+  expose an explicit approval flow for MCP tools.
 - We accept unbounded in-memory tool results in exchange for leaving
   truncation and large-result transport to Copilot.
 - We accept synchronous tool execution on the SDK worker in exchange for one

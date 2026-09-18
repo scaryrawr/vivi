@@ -41,6 +41,11 @@ pub fn build(b: *std.Build) void {
         .lua = b.dependency("tree_sitter_lua", .{}),
         .python = b.dependency("tree_sitter_python", .{}),
     };
+    const tree_sitter = b.createModule(.{
+        .root_source_file = b.path("cli/src/tree_sitter.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const version = b.option(
         []const u8,
         "version",
@@ -96,6 +101,7 @@ pub fn build(b: *std.Build) void {
     });
     cli_module.addImport("vivi_backend", backend);
     cli_module.addImport("vaxis", vaxis.module("vaxis"));
+    cli_module.addImport("tree-sitter", tree_sitter);
     addClipboard(b, cli_module, target, macos_sdk);
     cli_module.addIncludePath(b.path("third_party/md4c"));
     cli_module.addCSourceFile(.{
@@ -137,6 +143,7 @@ pub fn build(b: *std.Build) void {
     });
     chat_tests_module.addImport("vivi_backend", backend);
     chat_tests_module.addImport("vaxis", vaxis.module("vaxis"));
+    chat_tests_module.addImport("tree-sitter", tree_sitter);
     addClipboard(b, chat_tests_module, target, macos_sdk);
     chat_tests_module.addIncludePath(b.path("third_party/md4c"));
     chat_tests_module.addCSourceFile(.{

@@ -1,7 +1,8 @@
 const std = @import("std");
 const backend = @import("vivi_backend");
-const highlight = backend.syntax;
+const highlight = @import("highlight.zig");
 const markdown = @import("markdown.zig");
+const tool_output = @import("tool_output.zig");
 const tool_renderer = @import("tool_renderer.zig");
 const clipboard = @import("clipboard.zig");
 const images = @import("images.zig");
@@ -43,16 +44,6 @@ const AppEvent = union(enum) {
 fn isMouseWheel(mouse: vaxis.Mouse) bool {
     return mouse.type == .press and
         (mouse.button == .wheel_up or mouse.button == .wheel_down);
-}
-
-fn resumeCatalogRequest(input: []const u8) backend.SessionCatalogRequest {
-    const suffix = std.mem.trim(u8, commandArgumentSuffix(input), " \t\r\n");
-    if (std.ascii.eqlIgnoreCase(suffix, "all") or
-        std.ascii.eqlIgnoreCase(suffix, "--all"))
-    {
-        return .all;
-    }
-    return .local;
 }
 
 const Role = enum {
@@ -315,7 +306,7 @@ const ToolEntry = struct {
     preview: ?image_preview.Preview = null,
     input_highlights: []highlight.Span,
     output_highlights: ?[]highlight.Span = null,
-    output_markdown: bool = false,
+    output_plan: tool_output.OutputPlan,
     output_markdown_cache: markdown.HighlightCache = .{},
     expanded: bool = false,
     layout_width: u16 = 0,
@@ -369,27 +360,12 @@ const ToolEntry = struct {
         errdefer allocator.free(input);
         const input_display = try tool_renderer.renderArguments(allocator, input);
         errdefer allocator.free(input_display);
-        const input_highlights = switch (started.input_presentation.content) {
-            .source => |source| switch (started.invocation.summary) {
-                .bash => |summary| if (bashSummaryCommand(summary)) |command|
-                    if (std.mem.eql(
-                        u8,
-                        started.input_presentation.text,
-                        command,
-                    ))
-                        try mapBashInputHighlights(
-                            allocator,
-                            input_display,
-                            command,
-                            source.tokens,
-                        )
-                    else
-                        try allocator.alloc(highlight.Span, 0)
-                else
-                    try allocator.alloc(highlight.Span, 0),
-                else => try allocator.alloc(highlight.Span, 0),
-            },
-            .literal, .markdown => try allocator.alloc(highlight.Span, 0),
+        const input_highlights = switch (started.invocation.summary) {
+            .bash => |summary| if (bashSummaryCommand(summary)) |command|
+                try highlightBashInput(allocator, input_display, command)
+            else
+                try allocator.alloc(highlight.Span, 0),
+            else => try allocator.alloc(highlight.Span, 0),
         };
         errdefer allocator.free(input_highlights);
         return .{
@@ -397,6 +373,10 @@ const ToolEntry = struct {
             .input = input,
             .input_display = input_display,
             .input_highlights = input_highlights,
+            .output_plan = try tool_output.OutputPlan.fromInvocation(
+                allocator,
+                started.invocation.summary,
+            ),
             .invocation_hash = hashToolInvocation(started),
             .compact = try tool_renderer.renderCompact(
                 allocator,
@@ -462,28 +442,18 @@ const ToolEntry = struct {
         };
         const output = try allocator.dupe(u8, text);
         errdefer allocator.free(output);
-        const output_display = try allocator.dupe(
-            u8,
-            finished.output_presentation.text,
+        const output_display = try self.output_plan.render(
+            allocator,
+            completionOutcome(completion),
+            output,
         );
         errdefer allocator.free(output_display);
-        const output_highlights = switch (finished.output_presentation.content) {
-            .source => |source| try allocator.dupe(
-                highlight.Span,
-                source.tokens,
-            ),
-            .literal, .markdown => try allocator.alloc(highlight.Span, 0),
-        };
-        errdefer allocator.free(output_highlights);
         const preview = if (finished.result == .image)
             try image_preview.Preview.init(allocator, finished.result.image.bytes)
         else
             null;
         self.output = output;
         self.output_display = output_display;
-        self.output_highlights = output_highlights;
-        self.output_markdown =
-            std.meta.activeTag(finished.output_presentation.content) == .markdown;
         self.preview = preview;
         self.completion = completion;
         self.layout_valid = false;
@@ -493,6 +463,34 @@ const ToolEntry = struct {
         };
         std.debug.assert(std.mem.startsWith(u8, self.compact, "◌"));
         @memcpy(self.compact[0..marker.len], marker);
+    }
+
+    fn ensureOutputHighlights(
+        self: *ToolEntry,
+        allocator: std.mem.Allocator,
+    ) !void {
+        if (self.output_highlights != null) return;
+        const output = self.output_display orelse return;
+        const completion = self.completion orelse return;
+        const spans = try self.output_plan.spans(
+            allocator,
+            completionOutcome(completion),
+            output,
+        );
+        if (spans) |highlighted| {
+            self.output_highlights = highlighted;
+            return;
+        }
+
+        const raw = self.output orelse return;
+        const literal = try tool_renderer.renderOutput(allocator, raw);
+        errdefer allocator.free(literal);
+        const empty = try allocator.alloc(highlight.Span, 0);
+        allocator.free(output);
+        self.output_display = literal;
+        self.output_highlights = empty;
+        self.output_plan = .literal;
+        self.layout_valid = false;
     }
 
     fn deinit(self: *ToolEntry, allocator: std.mem.Allocator) void {
@@ -510,17 +508,26 @@ const ToolEntry = struct {
     }
 };
 
-fn mapBashInputHighlights(
+fn completionOutcome(completion: ToolEntry.Completion) tool_output.Outcome {
+    return switch (completion) {
+        .succeeded => .succeeded,
+        .failed => .failed,
+        .image => .image,
+    };
+}
+
+fn highlightBashInput(
     allocator: std.mem.Allocator,
     display: []const u8,
     command: []const u8,
-    command_spans: []const highlight.Span,
 ) ![]highlight.Span {
     const prefix = "Command: ";
     const label_start = topLevelLabelStart(display, prefix) orelse {
         return allocator.alloc(highlight.Span, 0);
     };
     const command_start = label_start + prefix.len;
+    const command_spans = try highlight.spans(allocator, .bash, command);
+    defer allocator.free(command_spans);
     const result = try allocator.alloc(highlight.Span, command_spans.len);
     for (command_spans, result) |span, *mapped| {
         mapped.* = .{
@@ -713,6 +720,10 @@ const Entry = union(enum) {
             .tool => |*tool| {
                 tool.output_markdown_cache.deinit(allocator);
                 tool.output_markdown_cache = .{};
+                if (tool.output_highlights) |spans| {
+                    allocator.free(spans);
+                    tool.output_highlights = null;
+                }
             },
         }
     }
@@ -1625,6 +1636,15 @@ const Projection = struct {
         spool: ?*TranscriptSpool,
         show_role: bool,
     ) !usize {
+        if (entry.* == .tool and
+            entry.tool.expanded and
+            switch (entry.tool.output_plan) {
+                .syntax, .syntax_document => true,
+                else => false,
+            })
+        {
+            try entry.tool.ensureOutputHighlights(allocators.persistent);
+        }
         switch (entry.*) {
             .message => |*message| if (message.layout_valid and
                 message.layout_width == window.width and
@@ -1697,6 +1717,7 @@ const Projection = struct {
                     &entry.tool,
                     entry_index,
                     window,
+                    false,
                     0,
                     0,
                 );
@@ -1784,6 +1805,7 @@ const Projection = struct {
                 tool,
                 entry_index,
                 window,
+                cache_highlights,
                 0,
                 std.math.maxInt(usize),
             ),
@@ -1796,6 +1818,7 @@ const Projection = struct {
         tool: *ToolEntry,
         entry_index: usize,
         window: vaxis.Window,
+        cache_highlights: bool,
         first: usize,
         last: usize,
     ) !usize {
@@ -1808,6 +1831,7 @@ const Projection = struct {
             tool,
             entry_index,
             window,
+            cache_highlights,
             first,
             last,
         );
@@ -1819,6 +1843,7 @@ const Projection = struct {
         tool: *ToolEntry,
         entry_index: usize,
         window: vaxis.Window,
+        cache_highlights: bool,
         first: usize,
         last: usize,
     ) !usize {
@@ -1835,11 +1860,15 @@ const Projection = struct {
         );
         if (!tool.expanded) return row;
         const render_markdown =
-            tool.output_markdown and
+            std.meta.activeTag(tool.output_plan) == .markdown and
             if (tool.completion) |completion|
                 std.meta.activeTag(completion) == .succeeded
             else
                 false;
+        if (cache_highlights and !render_markdown) {
+            try tool.ensureOutputHighlights(allocators.persistent);
+        }
+
         if (row >= first and row < last) {
             try self.lines.append(allocators.result, .{
                 .kind = .tool_input_label,
@@ -1954,6 +1983,7 @@ const Projection = struct {
                 &entry.tool,
                 entry_index,
                 window,
+                true,
                 first,
                 last,
             );
@@ -2267,7 +2297,7 @@ const MenuIdentity = union(enum) {
             .resume_key => |value| switch (right) {
                 .text, .model_selection => false,
                 .resume_key => |other| value.generation == other.generation and
-                    value.slot == other.slot and value.scope == other.scope,
+                    value.slot == other.slot,
             },
         };
     }
@@ -3306,15 +3336,9 @@ const ChatUi = struct {
                 const catalog = self.commands orelse return;
                 const command = catalog.commands[selected.source_index];
                 if (std.ascii.eqlIgnoreCase(command.name, "resume")) {
-                    const contents = try self.input.toOwnedContents(
-                        self.allocator,
-                    );
-                    defer self.allocator.free(contents);
                     self.input.clearRetainingCapacity();
                     self.menu_mode = .loading_sessions;
-                    conversation.refreshSessions(
-                        resumeCatalogRequest(contents),
-                    ) catch |err| switch (err) {
+                    conversation.refreshSessions() catch |err| switch (err) {
                         error.Busy => {
                             self.menu_mode = .closed;
                             return;
@@ -3532,24 +3556,11 @@ const ChatUi = struct {
                 if (self.menu_mode == .loading_sessions) {
                     self.menu_mode = .sessions;
                     try self.rebuildSessionMenu();
-                    const message = try std.fmt.allocPrint(
-                        self.allocator,
-                        "Showing {s}.",
-                        .{catalog.label},
-                    );
-                    defer self.allocator.free(message);
                     try self.transcript.append(
                         self.allocator,
                         .status,
-                        message,
+                        "Showing saved Vivi sessions.",
                     );
-                    if (catalog.skipped_invalid_shards) {
-                        try self.transcript.append(
-                            self.allocator,
-                            .status,
-                            "Some saved sessions could not be listed.",
-                        );
-                    }
                 }
             },
             .session_catalog_failed => |failure| {
@@ -3565,13 +3576,7 @@ const ChatUi = struct {
                     failure.bytes,
                 );
             },
-            .session_tracking_failed => |failure| {
-                try self.transcript.append(
-                    self.allocator,
-                    .status,
-                    failure.bytes,
-                );
-            },
+
             .status => |message| try self.transcript.append(
                 self.allocator,
                 .status,
@@ -3622,10 +3627,6 @@ const ChatUi = struct {
                             .status,
                             message,
                         );
-                        try self.updateSelectedModel(.{
-                            .model_id = success.session.model_id,
-                            .reasoning = success.session.reasoning,
-                        });
                         self.clearToolFocus();
                         self.tool_anchor = null;
                         try self.closeFilePicker();
@@ -4911,8 +4912,7 @@ const App = struct {
         model: ?[]const u8,
         reasoning: ?backend.ReasoningEffort,
         working_directory: []const u8,
-        settings_path: ?[]const u8,
-        sessions_directory: ?[]const u8,
+        settings_path: []const u8,
     ) !void {
         self.allocator = init_args.gpa;
         self.io = init_args.io;
@@ -4970,7 +4970,6 @@ const App = struct {
                 .model = model,
                 .reasoning = reasoning,
                 .settings_path = settings_path,
-                .sessions_directory = sessions_directory,
                 .omlx = .{
                     .base_url = init_args.environ_map.get("OMLX_BASE_URL") orelse
                         backend.default_omlx_base_url,
@@ -5241,8 +5240,7 @@ pub fn run(
     model: ?[]const u8,
     reasoning: ?backend.ReasoningEffort,
     working_directory: []const u8,
-    settings_path: ?[]const u8,
-    sessions_directory: ?[]const u8,
+    settings_path: []const u8,
 ) !void {
     const app = try init.gpa.create(App);
     defer init.gpa.destroy(app);
@@ -5252,7 +5250,6 @@ pub fn run(
         reasoning,
         working_directory,
         settings_path,
-        sessions_directory,
     );
     defer app.deinit();
     try app.run();
@@ -5292,19 +5289,6 @@ fn toolFinished(
     };
 }
 
-fn toolFinishedPresented(
-    call_id: []const u8,
-    summary: backend.ToolSummary,
-    result: backend.ToolFinished.ResultInput,
-) !backend.ToolFinished {
-    return backend.ToolFinished.initPresented(
-        std.testing.allocator,
-        call_id,
-        summary,
-        result,
-    );
-}
-
 test "tool details highlight shell input and supported read output" {
     var bash_started = try toolStarted(
         "bash-highlight",
@@ -5338,26 +5322,10 @@ test "tool details highlight shell input and supported read output" {
         reordered_entry.input_display[reordered_command.start..reordered_command.end],
     );
 
-    var sanitized_started = try toolStarted(
-        "bash-highlight-sanitized",
-        "{\"command\":\"printf \\u001b\"}",
-        .{ .bash = .{ .run = .{ .command = "printf \x1b" } } },
-    );
-    defer sanitized_started.deinit();
-    var sanitized_entry = try ToolEntry.init(
-        std.testing.allocator,
-        &sanitized_started,
-    );
-    defer sanitized_entry.deinit(std.testing.allocator);
-    try std.testing.expectEqual(
-        @as(usize, 0),
-        sanitized_entry.input_highlights.len,
-    );
-
     var read_started = try toolStarted(
         "read-highlight",
         "{\"path\":\"sample.zig\"}",
-        backend.ToolSummary{ .read = .{
+        .{ .read = .{
             .path = "sample.zig",
             .offset = null,
             .limit = null,
@@ -5366,19 +5334,20 @@ test "tool details highlight shell input and supported read output" {
     defer read_started.deinit();
     var read_entry = try ToolEntry.init(std.testing.allocator, &read_started);
     defer read_entry.deinit(std.testing.allocator);
-    var finished = try toolFinishedPresented(
+    var finished = try toolFinished(
         "read-highlight",
-        read_started.invocation.summary,
         .{ .succeeded = "const answer = 42;" },
     );
     defer finished.deinit();
     try read_entry.finish(std.testing.allocator, &finished);
+    try std.testing.expect(read_entry.output_highlights == null);
+    try read_entry.ensureOutputHighlights(std.testing.allocator);
     try std.testing.expect(read_entry.output_highlights.?.len > 0);
 
     var failed_started = try toolStarted(
         "read-highlight-failed",
         "{\"path\":\"missing.zig\"}",
-        backend.ToolSummary{ .read = .{
+        .{ .read = .{
             .path = "missing.zig",
             .offset = null,
             .limit = null,
@@ -5390,13 +5359,13 @@ test "tool details highlight shell input and supported read output" {
         &failed_started,
     );
     defer failed_entry.deinit(std.testing.allocator);
-    var failed = try toolFinishedPresented(
+    var failed = try toolFinished(
         "read-highlight-failed",
-        failed_started.invocation.summary,
         .{ .failed = "read failed: FileNotFound" },
     );
     defer failed.deinit();
     try failed_entry.finish(std.testing.allocator, &failed);
+    try failed_entry.ensureOutputHighlights(std.testing.allocator);
     try std.testing.expectEqual(
         @as(usize, 0),
         failed_entry.output_highlights.?.len,
@@ -5414,10 +5383,13 @@ test "bash output plans highlight YAML and diff through the ToolEntry lifecycle"
     defer yaml_started.deinit();
     var yaml_entry = try ToolEntry.init(std.testing.allocator, &yaml_started);
     defer yaml_entry.deinit(std.testing.allocator);
+    try std.testing.expectEqual(
+        tool_output.OutputPlan{ .syntax = .yaml },
+        yaml_entry.output_plan,
+    );
     const yaml_raw = "name: CI\r\nready: true\nunsafe: \xff\u{202e}\n";
-    var yaml_finished = try toolFinishedPresented(
+    var yaml_finished = try toolFinished(
         "yaml-output",
-        yaml_started.invocation.summary,
         .{ .succeeded = yaml_raw },
     );
     defer yaml_finished.deinit();
@@ -5426,6 +5398,8 @@ test "bash output plans highlight YAML and diff through the ToolEntry lifecycle"
         "name: CI\nready: true\nunsafe: \\xff\\xe2\\x80\\xae\n",
         yaml_entry.output_display.?,
     );
+    try std.testing.expect(yaml_entry.output_highlights == null);
+    try yaml_entry.ensureOutputHighlights(std.testing.allocator);
     const yaml_spans = yaml_entry.output_highlights.?;
     var saw_name = false;
     var saw_true = false;
@@ -5459,13 +5433,14 @@ test "bash output plans highlight YAML and diff through the ToolEntry lifecycle"
         \\-old
         \\+new
     ++ "\n";
-    var diff_finished = try toolFinishedPresented(
+    var diff_finished = try toolFinished(
         "diff-output",
-        diff_started.invocation.summary,
         .{ .succeeded = diff_text },
     );
     defer diff_finished.deinit();
     try diff_entry.finish(std.testing.allocator, &diff_finished);
+    try std.testing.expect(diff_entry.output_highlights == null);
+    try diff_entry.ensureOutputHighlights(std.testing.allocator);
     var saw_inserted = false;
     var saw_deleted = false;
     var saw_meta = false;
@@ -5494,9 +5469,8 @@ test "strict syntax rejection restores literal output rendering" {
         std.testing.allocator,
         &.{ .started = started },
     );
-    var finished = try toolFinishedPresented(
+    var finished = try toolFinished(
         "external-diff-output",
-        started.invocation.summary,
         .{ .succeeded = "external diff:\tchanged\r\n" },
     );
     defer finished.deinit();
@@ -5507,7 +5481,7 @@ test "strict syntax rejection restores literal output rendering" {
     const entry = &transcript.entries.items[0].tool;
     entry.expanded = true;
     try std.testing.expectEqualStrings(
-        "external diff:\\x09changed\\x0d\n",
+        "external diff:\tchanged\n",
         entry.output_display.?,
     );
 
@@ -5543,8 +5517,12 @@ test "strict syntax rejection restores literal output rendering" {
         @as(usize, 0),
         entry.output_highlights.?.len,
     );
-    try std.testing.expect(!entry.output_markdown);
+    try std.testing.expectEqual(
+        tool_output.OutputPlan.literal,
+        entry.output_plan,
+    );
     transcript.entries.items[0].releaseRenderCaches(std.testing.allocator);
+    try entry.ensureOutputHighlights(std.testing.allocator);
     try std.testing.expectEqualStrings(
         "external diff:\\x09changed\\x0d\n",
         entry.output_display.?,
@@ -5608,19 +5586,18 @@ test "bash output plans fall back to literal for unsafe lifecycle cases" {
         var entry = try ToolEntry.init(std.testing.allocator, &started);
         defer entry.deinit(std.testing.allocator);
         var finished = switch (case.result) {
-            .succeeded => |text| try toolFinishedPresented(
+            .succeeded => |text| try toolFinished(
                 case.id,
-                case.summary,
                 .{ .succeeded = text },
             ),
-            .failed => |text| try toolFinishedPresented(
+            .failed => |text| try toolFinished(
                 case.id,
-                case.summary,
                 .{ .failed = text },
             ),
         };
         defer finished.deinit();
         try entry.finish(std.testing.allocator, &finished);
+        try entry.ensureOutputHighlights(std.testing.allocator);
         try std.testing.expectEqual(
             @as(usize, 0),
             entry.output_highlights.?.len,
@@ -5672,13 +5649,8 @@ test "expanded tool rows draw syntax colors across wrapping" {
         &.{ .started = read_started },
     );
     read_started.deinit();
-    var read_finished = try toolFinishedPresented(
+    var read_finished = try toolFinished(
         "read-render",
-        .{ .read = .{
-            .path = "sample.zig",
-            .offset = null,
-            .limit = null,
-        } },
         .{ .succeeded = "const answer = 42;" },
     );
     try ui.transcript.applyToolActivity(
@@ -5698,9 +5670,8 @@ test "expanded tool rows draw syntax colors across wrapping" {
         &.{ .started = diff_started },
     );
     diff_started.deinit();
-    var diff_finished = try toolFinishedPresented(
+    var diff_finished = try toolFinished(
         "diff-render",
-        .{ .bash = .{ .run = .{ .command = "git diff" } } },
         .{ .succeeded = "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n" ++
             "@@ -1 +1 @@\n-old\n+new\n" },
     );
@@ -6135,17 +6106,11 @@ test "resuming replaces the visible transcript with the owned history snapshot" 
         .resumed = .{
             .session = .{
                 .allocator = std.testing.allocator,
-                .key = .{ .generation = 2, .slot = 0, .scope = .local },
+                .key = .{ .generation = 2, .slot = 0 },
                 .working_directory = try std.testing.allocator.dupe(
                     u8,
                     "/saved",
                 ),
-                .model_id = try std.testing.allocator.dupe(
-                    u8,
-                    "copilot/default",
-                ),
-                .reasoning = .off,
-                .last_used_unix_ms = 1,
                 .current = true,
             },
             .transcript = .{
@@ -6716,6 +6681,7 @@ fn toolAllocationLifecycle(allocator: std.mem.Allocator) !void {
         return err;
     };
     try std.testing.expect(tool.expanded);
+    try tool.ensureOutputHighlights(allocator);
 }
 
 test "tool owned payload lifecycle is atomic under allocation failure" {
@@ -7280,13 +7246,8 @@ test "successful Markdown reads use the transcript Markdown renderer" {
         std.testing.allocator,
         &.{ .started = started },
     );
-    var finished = try toolFinishedPresented(
+    var finished = try toolFinished(
         "markdown-read",
-        .{ .read = .{
-            .path = "README.md",
-            .offset = null,
-            .limit = null,
-        } },
         .{ .succeeded = "# Rendered Heading\r\n\r\n**bold text** and [docs](https://example.com)\r\n\r\n" ++
             "| Feature | Status |\r\n| --- | --- |\r\n| Markdown | Rich |\r\n\r\n\tcode" },
     );
@@ -7446,34 +7407,24 @@ test "expanded tool viewport retains only visible Markdown rows" {
 }
 
 test "Markdown read plans are extension based and case insensitive" {
-    var markdown_presentation = try backend.presentToolResult(
+    const markdown_plan = try tool_output.OutputPlan.fromInvocation(
         std.testing.allocator,
-        backend.ToolSummary{ .read = .{
+        .{ .read = .{
             .path = "docs/GUIDE.MARKDOWN",
             .offset = null,
             .limit = null,
         } },
-        .succeeded,
-        "# Guide",
     );
-    defer markdown_presentation.deinit();
-    try std.testing.expect(
-        std.meta.activeTag(markdown_presentation.content) == .markdown,
-    );
-    var literal_presentation = try backend.presentToolResult(
+    try std.testing.expectEqual(tool_output.OutputPlan.markdown, markdown_plan);
+    const literal_plan = try tool_output.OutputPlan.fromInvocation(
         std.testing.allocator,
-        backend.ToolSummary{ .read = .{
+        .{ .read = .{
             .path = "notes.md.txt",
             .offset = null,
             .limit = null,
         } },
-        .succeeded,
-        "# Guide",
     );
-    defer literal_presentation.deinit();
-    try std.testing.expect(
-        std.meta.activeTag(literal_presentation.content) == .literal,
-    );
+    try std.testing.expectEqual(tool_output.OutputPlan.literal, literal_plan);
 }
 
 test "failed Markdown reads remain literal tool output" {
@@ -7976,6 +7927,7 @@ test "image tool previews retain read bytes and reserve rows only when expanded"
     const tool = &ui.transcript.entries.items[0].tool;
     try std.testing.expectEqualStrings("snapshot", tool.preview.?.state.pending);
     try std.testing.expectEqualStrings("Image: image.png", tool.output_display.?);
+    try tool.ensureOutputHighlights(allocator);
     try std.testing.expectEqual(@as(usize, 0), tool.output_highlights.?.len);
     tool.preview.?.deinit(allocator);
     tool.preview = .{ .state = .{ .ready = vaxis.Image.init(9, 320, 160) } };
@@ -8042,18 +7994,6 @@ test "slash command parsing preserves argument suffixes" {
     try std.testing.expectEqualStrings("autopilot thorough", command_input);
     try std.testing.expectEqualStrings("", slashCommandQuery("/").?);
     try std.testing.expect(slashCommandQuery("not-a-command") == null);
-    try std.testing.expectEqual(
-        backend.SessionCatalogRequest.all,
-        resumeCatalogRequest("/resume all"),
-    );
-    try std.testing.expectEqual(
-        backend.SessionCatalogRequest.all,
-        resumeCatalogRequest("/resume --all"),
-    );
-    try std.testing.expectEqual(
-        backend.SessionCatalogRequest.local,
-        resumeCatalogRequest("/resume"),
-    );
 }
 
 test "file reference query follows the active composer token" {
@@ -8349,7 +8289,6 @@ test "session menu preserves duplicate workspace selection by session key" {
             .identity = .{ .resume_key = .{
                 .generation = 1,
                 .slot = 41,
-                .scope = .local,
             } },
             .key = "/work/project",
             .primary = "project",
@@ -8362,7 +8301,6 @@ test "session menu preserves duplicate workspace selection by session key" {
             .identity = .{ .resume_key = .{
                 .generation = 1,
                 .slot = 42,
-                .scope = .local,
             } },
             .key = "/work/project",
             .primary = "project",
@@ -8385,27 +8323,19 @@ test "session menu preserves duplicate workspace selection by session key" {
 test "session menu filters by title and directory without exposing model" {
     var titled_path = "/work/titled".*;
     var fallback_path = "/work/untitled".*;
-    var titled_model = "copilot/hidden-model".*;
-    var fallback_model = "copilot/other-model".*;
     var title = "Fix resume picker".*;
     const sessions = [_]backend.SessionSummary{
         .{
             .allocator = undefined,
-            .key = .{ .generation = 1, .slot = 0, .scope = .local },
+            .key = .{ .generation = 1, .slot = 0 },
             .working_directory = &titled_path,
-            .model_id = &titled_model,
-            .reasoning = .off,
             .title = &title,
-            .last_used_unix_ms = 20,
             .current = false,
         },
         .{
             .allocator = undefined,
-            .key = .{ .generation = 1, .slot = 1, .scope = .local },
+            .key = .{ .generation = 1, .slot = 1 },
             .working_directory = &fallback_path,
-            .model_id = &fallback_model,
-            .reasoning = .off,
-            .last_used_unix_ms = 10,
             .current = false,
         },
     };
@@ -8435,35 +8365,23 @@ test "session menu labels colliding workspaces with unique path suffixes" {
     var first_path = "/teams/a/project".*;
     var second_path = "/teams/b/project".*;
     var unique_path = "/other/unique".*;
-    var first_model = "copilot/first".*;
-    var second_model = "copilot/second".*;
-    var third_model = "copilot/third".*;
     const sessions = [_]backend.SessionSummary{
         .{
             .allocator = undefined,
-            .key = .{ .generation = 1, .slot = 0, .scope = .local },
+            .key = .{ .generation = 1, .slot = 0 },
             .working_directory = &first_path,
-            .model_id = &first_model,
-            .reasoning = .off,
-            .last_used_unix_ms = 20,
             .current = false,
         },
         .{
             .allocator = undefined,
-            .key = .{ .generation = 1, .slot = 1, .scope = .local },
+            .key = .{ .generation = 1, .slot = 1 },
             .working_directory = &second_path,
-            .model_id = &second_model,
-            .reasoning = .medium,
-            .last_used_unix_ms = 10,
             .current = false,
         },
         .{
             .allocator = undefined,
-            .key = .{ .generation = 1, .slot = 2, .scope = .local },
+            .key = .{ .generation = 1, .slot = 2 },
             .working_directory = &unique_path,
-            .model_id = &third_model,
-            .reasoning = .high,
-            .last_used_unix_ms = 5,
             .current = false,
         },
     };
@@ -8495,13 +8413,10 @@ test "session catalog failure closes stale cached finder" {
     ui.menu_mode = .loading_sessions;
     ui.sessions = .{
         .allocator = std.testing.allocator,
-        .scope = .local,
-        .label = try std.testing.allocator.dupe(u8, "Saved Vivi sessions"),
         .sessions = try std.testing.allocator.alloc(
             backend.SessionSummary,
             0,
         ),
-        .skipped_invalid_shards = false,
     };
 
     var event: backend.ConversationEvent = .{
@@ -8523,35 +8438,6 @@ test "session catalog failure closes stale cached finder" {
     );
 }
 
-test "session tracking failure preserves conversation state" {
-    var environment = std.process.Environ.Map.init(std.testing.allocator);
-    defer environment.deinit();
-    var ui = try ChatUi.init(
-        std.testing.allocator,
-        std.testing.io,
-        &environment,
-    );
-    defer ui.deinit();
-    ui.phase = .ready;
-
-    var event: backend.ConversationEvent = .{
-        .session_tracking_failed = try backend.OwnedText.init(
-            std.testing.allocator,
-            "Session tracking disabled: AccessDenied",
-        ),
-    };
-    defer event.deinit();
-    try std.testing.expectEqual(
-        ConversationOutcome.keep_running,
-        try ui.applyConversationEvent(&event),
-    );
-    try std.testing.expectEqual(UiPhase.ready, ui.phase);
-    try std.testing.expectEqualStrings(
-        "Session tracking disabled: AccessDenied",
-        ui.transcript.messageAt(0).text.items,
-    );
-}
-
 test "session catalog completion restores ready after finder dismissal" {
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
@@ -8567,16 +8453,10 @@ test "session catalog completion restores ready after finder dismissal" {
     var event: backend.ConversationEvent = .{
         .session_catalog = .{
             .allocator = std.testing.allocator,
-            .scope = .local,
-            .label = try std.testing.allocator.dupe(
-                u8,
-                backend.SessionCatalogScope.local.label(),
-            ),
             .sessions = try std.testing.allocator.alloc(
                 backend.SessionSummary,
                 0,
             ),
-            .skipped_invalid_shards = false,
         },
     };
     defer event.deinit();
@@ -8603,16 +8483,10 @@ test "late session catalog preserves stopping phase" {
     var event: backend.ConversationEvent = .{
         .session_catalog = .{
             .allocator = std.testing.allocator,
-            .scope = .local,
-            .label = try std.testing.allocator.dupe(
-                u8,
-                backend.SessionCatalogScope.local.label(),
-            ),
             .sessions = try std.testing.allocator.alloc(
                 backend.SessionSummary,
                 0,
             ),
-            .skipped_invalid_shards = false,
         },
     };
     defer event.deinit();

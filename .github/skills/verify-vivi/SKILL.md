@@ -43,14 +43,15 @@ looks questionable:
 .github/skills/verify-vivi/bin/verify-vivi doctor
 ```
 
-It requires Zig, VHS, `script`, Expect, FFmpeg/FFprobe, and GitHub Copilot CLI;
-builds Vivi; checks the installed Vivi and Copilot versions; records a
-temporary VHS smoke GIF; and sends a no-tools Copilot prompt that must return
-`VIVI_DOCTOR_OK`. A failure means the instance is not worth driving. VHS
-0.12.0 can exit successfully without writing its recording; use a working
-release such as 0.11.0 with `VIVI_VHS=/path/to/vhs` when the smoke check
-reports that failure. Copilot CLI does not expose a standalone authenticated
-status command, so the minimal prompt is the authentication check.
+It requires Zig, VHS, `script`, Expect, FFmpeg/FFprobe, GitHub CLI with an
+available `gh auth token`, and GitHub Copilot CLI; builds Vivi; checks the
+installed Vivi and Copilot versions; records a temporary VHS smoke GIF; and
+sends a no-tools Copilot prompt that must return `VIVI_DOCTOR_OK`. A failure
+means the instance is not worth driving. VHS 0.12.0 can exit successfully
+without writing its recording; use a working release such as 0.11.0 with
+`VIVI_VHS=/path/to/vhs` when the smoke check reports that failure. Copilot CLI
+does not expose a standalone authenticated status command, so the minimal
+prompt is the authentication check.
 
 ## Drive
 
@@ -77,6 +78,12 @@ Each command writes to `.verify/vivi/<run-id>/`, so concurrent runs do not
 share PTYs or evidence. Multiple Vivi processes may run side by side because
 each owns its own Copilot child and session, but they share the user's Copilot
 credential store. Never automate two instances against the same terminal.
+
+Recipes that replace `HOME` must pass an authenticated `gh auth token` through
+`GH_TOKEN` and `GITHUB_TOKEN`. Do not symlink the user's `~/.copilot` directory:
+Vivi sets Copilot's process home to `$HOME/.vivi/copilot`, so that symlink
+neither authenticates the isolated process nor preserves plugin/session
+isolation.
 
 The stable user handles are:
 
