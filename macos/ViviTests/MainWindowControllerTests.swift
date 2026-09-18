@@ -119,13 +119,48 @@ final class MainWindowControllerTests: XCTestCase {
       ProjectSidebarPresentation(
         name: "app",
         visiblePath: "/one/app",
-        accessibilityLabel: "app, /one/app, project"))
+        help: "/one/app",
+        accessibilityLabel: "app, /one/app, project",
+        accessibilityIdentifier: "project-/one/app"))
     XCTAssertEqual(
       projectSidebarPresentation(workspace: unique, allWorkspaces: [first, second, unique]),
       ProjectSidebarPresentation(
         name: "other",
         visiblePath: nil,
-        accessibilityLabel: "other, /work/other, project"))
+        help: "/work/other",
+        accessibilityLabel: "other, /work/other, project",
+        accessibilityIdentifier: "project-/work/other"))
+  }
+
+  func testProjectExpansionDefaultsOpenAndPersistsIndependentlyOfSelection() {
+    let first = WorkspaceIdentity(absolutePath: "/one/app")!
+    let second = WorkspaceIdentity(absolutePath: "/two/app")!
+    var expansion = ProjectExpansionState()
+
+    XCTAssertTrue(expansion.isExpanded(first))
+    XCTAssertTrue(expansion.isExpanded(second))
+
+    expansion.setExpanded(false, for: first)
+
+    XCTAssertFalse(expansion.isExpanded(first))
+    XCTAssertTrue(expansion.isExpanded(second))
+
+    let conversations = ConversationCollection()
+    let record = ConversationRecord(
+      id: ConversationID(rawValue: UUID()),
+      launchWorkspace: first,
+      store: NativeChatStore(
+        workspace: first.canonicalPath,
+        driver: ControllableConversationDriver()))
+    conversations.appendAndSelect(record)
+    conversations.select(record.id)
+
+    XCTAssertFalse(expansion.isExpanded(first))
+    XCTAssertEqual(conversations.selectedConversation?.id, record.id)
+
+    expansion.setExpanded(true, for: first)
+
+    XCTAssertTrue(expansion.isExpanded(first))
   }
 
   func testProjectSessionHistoryFiltersWorkspaceAndCurrentSession() {

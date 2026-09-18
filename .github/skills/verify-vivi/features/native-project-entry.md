@@ -13,10 +13,11 @@ project catalog.
 - Cancelling the chooser leaves the roster and selection unchanged.
 - Invalid, missing, or non-directory selections show an app-shell alert without
   adding transcript content or silently choosing another workspace.
-- Project headers remain visible with one project, identify the canonical launch
-  workspace through help and accessibility, show paths only for duplicate
-  project names, and contain title-only live conversation children with
-  active-workspace ordinals.
+- Project headers remain visible with one project, provide a comfortably sized
+  native disclosure target, identify the canonical launch workspace through
+  help and accessibility, show paths only for duplicate project names, and
+  contain indented title-only live conversation children with active-workspace
+  ordinals.
 - Cross-workspace resume preserves the existing conversation identity and launch
   project while updating its live title, workspace, and duplicate ordinal.
 

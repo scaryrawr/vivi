@@ -6,9 +6,11 @@ projects in the native sidebar.
 ## Sub-features
 
 - Each canonical workspace launched during the app lifetime has one project
-  section with a stable live-conversation catalog owner.
+  disclosure section with a stable live-conversation catalog owner.
 - Live conversation rows appear first, followed directly by resumable sessions
   saved for that project; there is no redundant nested history submenu.
+- Collapsing the project hides live and saved rows without changing their
+  ordering, selection, or catalog state.
 - Loading, compact failure with retry, and resuming states remain inline in the
   project section; an empty catalog adds no placeholder row.
 - Persisted rows are accessibly identified as saved sessions, and only the

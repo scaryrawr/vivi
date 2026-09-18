@@ -213,9 +213,10 @@ final class NativeApplicationCoordinatorTests: XCTestCase {
     XCTAssertEqual(harness.coordinator.conversations.selectedID, record.id)
   }
 
-  func testProjectCatalogOwnerAndRosterOrderStayStableAcrossSelectionAndTitles() {
+  func testProjectCatalogOwnerAndRosterOrderStayStableAcrossRepeatedSelectionAndTitles() {
     let harness = CoordinatorHarness()
     harness.coordinator.open([
+      URL(string: "vivi://chat?workspace=/tmp/project")!,
       URL(string: "vivi://chat?workspace=/tmp/project")!,
       URL(string: "vivi://chat?workspace=/tmp/other")!,
       URL(string: "vivi://chat?workspace=/tmp/project")!,
@@ -224,19 +225,40 @@ final class NativeApplicationCoordinatorTests: XCTestCase {
     let project = WorkspaceIdentity(absolutePath: "/tmp/project")!
     let projectRecords = conversations.records(launchedFrom: project)
 
-    XCTAssertEqual(projectRecords.count, 2)
+    XCTAssertEqual(projectRecords.count, 3)
     XCTAssertTrue(conversations.catalogConversation(launchedFrom: project) === projectRecords[0])
     let initialRecordOrder = conversations.records.map(\.id)
     let initialWorkspaceOrder = conversations.launchWorkspaces
+    let initialProjectOrder = projectRecords.map(\.id)
 
-    conversations.select(projectRecords[0].id)
-    harness.drivers[0].send(.sessionTitle("Renamed first"))
-    conversations.select(projectRecords[1].id)
+    for record in [projectRecords[2], projectRecords[1], projectRecords[0], projectRecords[2]] {
+      conversations.select(record.id)
+      XCTAssertEqual(conversations.records.map(\.id), initialRecordOrder)
+      XCTAssertEqual(
+        conversations.records(launchedFrom: project).map(\.id),
+        initialProjectOrder)
+    }
+    harness.drivers[1].send(.sessionTitle("Renamed middle"))
 
     XCTAssertTrue(conversations.catalogConversation(launchedFrom: project) === projectRecords[0])
     XCTAssertEqual(conversations.records.map(\.id), initialRecordOrder)
     XCTAssertEqual(conversations.launchWorkspaces, initialWorkspaceOrder)
-    XCTAssertEqual(conversations.selectedID, projectRecords[1].id)
+    XCTAssertEqual(
+      conversations.records(launchedFrom: project).map(\.id),
+      initialProjectOrder)
+    XCTAssertEqual(conversations.selectedID, projectRecords[2].id)
+    XCTAssertEqual(
+      sidebarProjectRosters(
+        records: conversations.records,
+        launchWorkspaces: conversations.launchWorkspaces),
+      [
+        SidebarProjectRoster(
+          workspace: project,
+          conversationIDs: initialProjectOrder),
+        SidebarProjectRoster(
+          workspace: WorkspaceIdentity(absolutePath: "/tmp/other")!,
+          conversationIDs: [conversations.records[2].id]),
+      ])
   }
 
   func testSavedSessionResumeSelectsStableCatalogConversation() {
@@ -261,11 +283,19 @@ final class NativeApplicationCoordinatorTests: XCTestCase {
     harness.drivers[0].send(.sessionCatalog(SessionCatalog(sessions: [summary])))
 
     XCTAssertEqual(conversations.selectedID, records[1].id)
+    let initialRoster = sidebarProjectRosters(
+      records: conversations.records,
+      launchWorkspaces: conversations.launchWorkspaces)
     conversations.resume(key, launchedFrom: catalogRecord.launchWorkspace)
 
     XCTAssertEqual(conversations.selectedID, catalogRecord.id)
     XCTAssertEqual(harness.drivers[0].resumeKeys, [key])
     XCTAssertEqual(conversations.records.map(\.id), records.map(\.id))
+    XCTAssertEqual(
+      sidebarProjectRosters(
+        records: conversations.records,
+        launchWorkspaces: conversations.launchWorkspaces),
+      initialRoster)
   }
 
   func testCrossWorkspaceResumeKeepsConversationIdentitySelectionAndUpdatesDuplicates() {

@@ -155,6 +155,10 @@ final class ConversationCollection: ObservableObject {
     records.filter { $0.launchWorkspace == workspace }
   }
 
+  func conversation(_ id: ConversationID) -> ConversationRecord? {
+    records.first { $0.id == id }
+  }
+
   func catalogConversation(launchedFrom workspace: WorkspaceIdentity) -> ConversationRecord? {
     records.first { $0.launchWorkspace == workspace }
   }
