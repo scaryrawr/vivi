@@ -1,16 +1,12 @@
 import AppKit
-import Combine
 import SwiftUI
 
 @MainActor
 final class MainWindowController: NSWindowController, NSWindowDelegate, MainWindowControlling {
   let identity: MainWindowIdentity
 
-  private let conversations: ConversationCollection
   private let activate: @MainActor () -> Void
   private let onClosed: @MainActor (MainWindowIdentity) -> Void
-  private var selectionObservation: AnyCancellable?
-  private var titleObservation: AnyCancellable?
   private var closingForTermination = false
 
   init(
@@ -23,7 +19,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, MainWind
     onClosed: @escaping @MainActor (MainWindowIdentity) -> Void
   ) {
     self.identity = identity
-    conversations = applicationCoordinator.conversations
+    let conversations = applicationCoordinator.conversations
     self.activate = activate
     self.onClosed = onClosed
     super.init(window: window)
@@ -41,11 +37,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, MainWind
         }))
     window.delegate = self
     window.setFrameAutosaveName("ViviMainWindow")
-    selectionObservation = conversations.$selectedID
-      .removeDuplicates()
-      .sink { [weak self] selectedID in
-        self?.bindSelectedTitle(selectedID)
-      }
   }
 
   @available(*, unavailable)
@@ -71,23 +62,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, MainWind
     closingForTermination = true
     window?.orderOut(nil)
     close()
-  }
-
-  private func bindSelectedTitle(_ selectedID: ConversationID?) {
-    titleObservation = nil
-    guard let selectedID,
-      let conversation = conversations.records.first(where: { $0.id == selectedID })
-    else {
-      window?.title = "Vivi"
-      return
-    }
-    window?.title = conversation.navigation.title
-    titleObservation = conversation.$navigation
-      .map(\.title)
-      .removeDuplicates()
-      .sink { [weak window] title in
-        window?.title = title
-      }
   }
 
   private static func makeWindow() -> NSWindow {

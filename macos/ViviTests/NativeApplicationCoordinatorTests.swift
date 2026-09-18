@@ -232,6 +232,27 @@ final class NativeApplicationCoordinatorTests: XCTestCase {
     XCTAssertTrue(conversations.historyConversation(launchedFrom: project) === projectRecords[0])
   }
 
+  func testSelectingConversationsPreservesRosterAndProjectOrder() {
+    let harness = CoordinatorHarness()
+    harness.coordinator.open([
+      URL(string: "vivi://chat?workspace=/tmp/project")!,
+      URL(string: "vivi://chat?workspace=/tmp/other")!,
+      URL(string: "vivi://chat?workspace=/tmp/project")!,
+    ])
+    let conversations = harness.coordinator.conversations
+    let roster = conversations.records.map(\.id)
+    let project = WorkspaceIdentity(absolutePath: "/tmp/project")!
+    let projectRoster = conversations.records(launchedFrom: project).map(\.id)
+
+    for id in roster.reversed() {
+      conversations.select(id)
+
+      XCTAssertEqual(conversations.selectedID, id)
+      XCTAssertEqual(conversations.records.map(\.id), roster)
+      XCTAssertEqual(conversations.records(launchedFrom: project).map(\.id), projectRoster)
+    }
+  }
+
   func testCrossWorkspaceResumeKeepsConversationIdentitySelectionAndUpdatesDuplicates() {
     let harness = CoordinatorHarness()
     harness.coordinator.open([

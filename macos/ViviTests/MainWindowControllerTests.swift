@@ -5,7 +5,7 @@ import XCTest
 
 @MainActor
 final class MainWindowControllerTests: XCTestCase {
-  func testSelectedStoreAloneDrivesWindowTitle() {
+  func testWindowTitleRemainsAppIdentityAcrossConversationChanges() {
     let firstDriver = ControllableConversationDriver()
     let secondDriver = ControllableConversationDriver()
     let first = ConversationRecord(
@@ -28,14 +28,39 @@ final class MainWindowControllerTests: XCTestCase {
       activate: {},
       onClosed: { _ in })
 
-    XCTAssertEqual(window.title, "second")
+    XCTAssertEqual(window.title, "Vivi")
     firstDriver.send(.sessionTitle("First renamed"))
-    XCTAssertEqual(window.title, "second")
+    XCTAssertEqual(window.title, "Vivi")
     conversations.select(first.id)
-    XCTAssertEqual(window.title, "First renamed")
+    XCTAssertEqual(window.title, "Vivi")
     firstDriver.send(.sessionTitle("First final"))
-    XCTAssertEqual(window.title, "First final")
+    XCTAssertEqual(window.title, "Vivi")
     _ = controller
+  }
+
+  func testWindowToolbarTitleComposesAppIdentityAndConversationTitle() {
+    let presentation = MainWindowTitlePresentation(conversationTitle: "Conversation title")
+
+    XCTAssertEqual(presentation.appName, "Vivi")
+    XCTAssertEqual(presentation.conversationTitle, "Conversation title")
+    XCTAssertEqual(presentation.accessibilityLabel, "Vivi, Conversation title")
+  }
+
+  func testWindowToolbarTitlePreservesLongTitlesForViewTruncation() {
+    let title = String(repeating: "Long conversation title ", count: 20)
+
+    XCTAssertEqual(
+      MainWindowTitlePresentation(conversationTitle: title).conversationTitle,
+      title)
+  }
+
+  func testWindowToolbarTitleUsesUntitledFallback() {
+    XCTAssertEqual(
+      MainWindowTitlePresentation(conversationTitle: "").conversationTitle,
+      "Untitled Session")
+    XCTAssertEqual(
+      MainWindowTitlePresentation(conversationTitle: nil).accessibilityLabel,
+      "Vivi, Untitled Session")
   }
 
   func testNormalWindowCloseReleasesPresentationWithoutClosingStore() {
@@ -110,6 +135,15 @@ final class MainWindowControllerTests: XCTestCase {
     XCTAssertNotEqual(
       projectAccessibilityLabel(name: "app", path: "/one/app"),
       projectAccessibilityLabel(name: "app", path: "/two/app"))
+  }
+
+  func testProjectHeaderPresentsNamePathAndAccessibilityHierarchy() {
+    let presentation = ProjectSidebarHeaderPresentation(
+      workspace: WorkspaceIdentity(absolutePath: "/work/vivi")!)
+
+    XCTAssertEqual(presentation.name, "vivi")
+    XCTAssertEqual(presentation.path, "/work/vivi")
+    XCTAssertEqual(presentation.accessibilityLabel, "vivi, /work/vivi, project")
   }
 
   func testProjectSessionHistoryFiltersWorkspaceAndCurrentSession() {

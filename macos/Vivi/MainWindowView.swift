@@ -1,5 +1,20 @@
+import AppKit
 import Foundation
 import SwiftUI
+
+struct MainWindowTitlePresentation: Equatable {
+  let appName: String
+  let conversationTitle: String
+
+  init(conversationTitle: String?) {
+    appName = "Vivi"
+    self.conversationTitle = conversationTitle?.nilIfEmpty ?? "Untitled Session"
+  }
+
+  var accessibilityLabel: String {
+    "\(appName), \(conversationTitle)"
+  }
+}
 
 struct SidebarRowPresentation: Equatable {
   let title: String
@@ -27,6 +42,18 @@ func sidebarRowPresentation(
 
 func projectAccessibilityLabel(name: String, path: String) -> String {
   "\(name), \(path), project"
+}
+
+struct ProjectSidebarHeaderPresentation: Equatable {
+  let name: String
+  let path: String
+  let accessibilityLabel: String
+
+  init(workspace: WorkspaceIdentity) {
+    path = workspace.canonicalPath
+    name = URL(fileURLWithPath: path).lastPathComponent.nilIfEmpty ?? "/"
+    accessibilityLabel = projectAccessibilityLabel(name: name, path: path)
+  }
 }
 
 struct SessionHistoryRowPresentation: Equatable, Identifiable {
@@ -64,9 +91,31 @@ struct MainWindowView: View {
     NavigationSplitView {
       List(selection: selection) {
         ForEach(conversations.launchWorkspaces, id: \.self) { workspace in
-          ProjectSidebarSection(
-            conversations: conversations,
-            workspace: workspace)
+          Section {
+            ForEach(conversations.records(launchedFrom: workspace)) { conversation in
+              ConversationSidebarRow(
+                conversation: conversation,
+                duplicate: conversations.duplicatePosition(for: conversation.id)
+              )
+              .padding(.leading, 12)
+              .tag(conversation.id)
+            }
+            if let historyConversation = conversations.historyConversation(
+              launchedFrom: workspace)
+            {
+              ProjectSessionHistory(
+                store: historyConversation.store,
+                projectWorkspace: workspace.canonicalPath
+              ) { key in
+                conversations.select(historyConversation.id)
+                historyConversation.store.resumeSession(key)
+              }
+              .padding(.leading, 12)
+              .id(historyConversation.id)
+            }
+          } header: {
+            ProjectSidebarHeader(workspace: workspace)
+          }
         }
       }
       .listStyle(.sidebar)
@@ -96,6 +145,12 @@ struct MainWindowView: View {
     }
     .navigationSplitViewStyle(.balanced)
     .frame(minWidth: 760, minHeight: 500)
+    .toolbar(removing: .sidebarToggle)
+    .toolbar {
+      ToolbarItem(placement: .navigation) {
+        MainWindowToolbar(conversations: conversations)
+      }
+    }
     .alert(
       "Can’t Start Conversation",
       isPresented: workspaceChoiceFailureIsPresented
@@ -155,50 +210,88 @@ struct MainWindowView: View {
   }
 }
 
-private struct ProjectSidebarSection: View {
+private struct MainWindowToolbar: View {
   @ObservedObject var conversations: ConversationCollection
-  let workspace: WorkspaceIdentity
-  @State private var isExpanded = true
 
-  private var records: [ConversationRecord] {
-    conversations.records(launchedFrom: workspace)
+  var body: some View {
+    HStack(spacing: 8) {
+      Button {
+        NSApp.sendAction(
+          #selector(NSSplitViewController.toggleSidebar(_:)),
+          to: nil,
+          from: nil)
+      } label: {
+        Image(systemName: "sidebar.left")
+      }
+      .buttonStyle(.borderless)
+      .help("Toggle Sidebar")
+      .accessibilityLabel("Toggle Sidebar")
+      .accessibilityIdentifier("toggle-sidebar")
+
+      if let conversation = conversations.selectedConversation {
+        SelectedConversationToolbarTitle(conversation: conversation)
+      } else {
+        MainWindowToolbarTitle(presentation: MainWindowTitlePresentation(conversationTitle: nil))
+      }
+    }
+    .frame(minWidth: 280, idealWidth: 520, maxWidth: .infinity, alignment: .leading)
   }
+}
 
-  private var historyConversation: ConversationRecord? {
-    conversations.historyConversation(launchedFrom: workspace)
+private struct SelectedConversationToolbarTitle: View {
+  @ObservedObject var conversation: ConversationRecord
+
+  var body: some View {
+    MainWindowToolbarTitle(
+      presentation: MainWindowTitlePresentation(
+        conversationTitle: conversation.navigation.title))
+  }
+}
+
+private struct MainWindowToolbarTitle: View {
+  let presentation: MainWindowTitlePresentation
+
+  var body: some View {
+    HStack(spacing: 8) {
+      Text(presentation.appName)
+        .fontWeight(.semibold)
+        .fixedSize()
+      Divider()
+        .frame(height: 14)
+      Text(presentation.conversationTitle)
+        .foregroundStyle(.secondary)
+        .lineLimit(1)
+        .truncationMode(.tail)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+    .accessibilityElement(children: .ignore)
+    .accessibilityLabel(presentation.accessibilityLabel)
+    .accessibilityIdentifier("window-title")
+  }
+}
+
+private struct ProjectSidebarHeader: View {
+  let workspace: WorkspaceIdentity
+
+  private var presentation: ProjectSidebarHeaderPresentation {
+    ProjectSidebarHeaderPresentation(workspace: workspace)
   }
 
   var body: some View {
-    Section(isExpanded: $isExpanded) {
-      ForEach(records) { conversation in
-        ConversationSidebarRow(
-          conversation: conversation,
-          duplicate: conversations.duplicatePosition(for: conversation.id)
-        )
-        .tag(conversation.id)
-      }
-      if let historyConversation {
-        ProjectSessionHistory(
-          store: historyConversation.store,
-          projectWorkspace: workspace.canonicalPath
-        ) { key in
-          conversations.select(historyConversation.id)
-          historyConversation.store.resumeSession(key)
-        }
-        .id(historyConversation.id)
-      }
-    } header: {
-      Label(projectName, systemImage: "folder")
-        .help(workspace.canonicalPath)
-        .accessibilityLabel(
-          projectAccessibilityLabel(name: projectName, path: workspace.canonicalPath)
-        )
-        .accessibilityIdentifier("project-\(workspace.canonicalPath)")
+    VStack(alignment: .leading, spacing: 2) {
+      Label(presentation.name, systemImage: "folder")
+        .fontWeight(.semibold)
+      Text(presentation.path)
+        .font(.caption2)
+        .foregroundStyle(.secondary)
+        .lineLimit(1)
+        .truncationMode(.middle)
     }
-  }
-
-  private var projectName: String {
-    URL(fileURLWithPath: workspace.canonicalPath).lastPathComponent.nilIfEmpty ?? "/"
+    .help(presentation.path)
+    .accessibilityElement(children: .ignore)
+    .accessibilityAddTraits(.isHeader)
+    .accessibilityLabel(presentation.accessibilityLabel)
+    .accessibilityIdentifier("project-\(presentation.path)")
   }
 }
 
@@ -206,25 +299,31 @@ private struct ProjectSessionHistory: View {
   @ObservedObject var store: NativeChatStore
   let projectWorkspace: String
   let resume: (ResumeKey) -> Void
+  @State private var isExpanded = false
 
   var body: some View {
-    historyContent
-      .accessibilityIdentifier("session-history-\(projectWorkspace)")
-      .onAppear {
-        loadIfNeeded()
+    DisclosureGroup(isExpanded: $isExpanded) {
+      historyContent
+    } label: {
+      Label("History", systemImage: "clock.arrow.circlepath")
+        .foregroundStyle(.secondary)
+    }
+    .accessibilityIdentifier("session-history-\(projectWorkspace)")
+    .onAppear {
+      loadIfNeeded()
+    }
+    .onChange(of: store.lifecycle) {
+      loadIfNeeded()
+    }
+    .onChange(of: store.modelState) {
+      loadIfNeeded()
+    }
+    .onChange(of: store.sessionState) { previous, current in
+      guard case .resuming = previous, current == .ready, store.sessionCatalog == nil else {
+        return
       }
-      .onChange(of: store.lifecycle) {
-        loadIfNeeded()
-      }
-      .onChange(of: store.modelState) {
-        loadIfNeeded()
-      }
-      .onChange(of: store.sessionState) { previous, current in
-        guard case .resuming = previous, current == .ready, store.sessionCatalog == nil else {
-          return
-        }
-        store.refreshSessions()
-      }
+      store.refreshSessions()
+    }
   }
 
   @ViewBuilder
