@@ -11,8 +11,10 @@ away from each conversation store.
   including repeated launches from the same workspace.
 - Each canonical launch workspace gets one stable project section for the app
   lifetime, with the canonical path shown as project context.
-- Sidebar rows show the live conversation title and active workspace path;
+- Sidebar rows show the conversation title without repeating the project path;
   repeated workspaces receive stable numeric disambiguation.
+- Saved sessions follow live conversations directly in backend order without a
+  separate History disclosure or empty-state row.
 - Selecting a row moves one native selection highlight without reordering the
   roster, swaps the detail, and updates the leading toolbar conversation title
   without stopping other conversations.

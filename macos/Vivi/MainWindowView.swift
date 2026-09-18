@@ -43,6 +43,14 @@ func projectAccessibilityLabel(name: String, path: String) -> String {
   "\(name), \(path), project"
 }
 
+func conversationSidebarTitle(title: String, launchWorkspace: String) -> String {
+  let title = title.nilIfEmpty ?? "Untitled Session"
+  let projectName =
+    URL(fileURLWithPath: launchWorkspace).lastPathComponent.nilIfEmpty
+    ?? "/"
+  return title == projectName ? "New conversation" : title
+}
+
 struct ProjectSidebarHeaderPresentation: Equatable {
   let name: String
   let path: String
@@ -63,6 +71,23 @@ struct SessionHistoryRowPresentation: Equatable, Identifiable {
   var id: ResumeKey { key }
 }
 
+enum SidebarSelection: Hashable {
+  case conversation(ConversationID)
+  case savedSession(ConversationID, ResumeKey)
+}
+
+func resolvedSidebarSelection(
+  selectedConversationID: ConversationID?,
+  savedSelection: SidebarSelection?
+) -> SidebarSelection? {
+  if case .savedSession(let conversationID, _) = savedSelection,
+    selectedConversationID == conversationID
+  {
+    return savedSelection
+  }
+  return selectedConversationID.map(SidebarSelection.conversation)
+}
+
 func projectSessionHistoryPresentation(
   catalog: SessionCatalog,
   projectWorkspace: String
@@ -71,7 +96,6 @@ func projectSessionHistoryPresentation(
     guard !session.isCurrent, session.workingDirectory == projectWorkspace else { return nil }
     let title =
       session.title?.nilIfEmpty
-      ?? URL(fileURLWithPath: session.workingDirectory).lastPathComponent.nilIfEmpty
       ?? "Untitled Session"
     return SessionHistoryRowPresentation(
       key: session.key,
@@ -85,10 +109,11 @@ struct MainWindowView: View {
   @ObservedObject var applicationPresentation: NativeApplicationPresentation
   let requestNewConversation: () -> Void
   let dismissWorkspaceChoiceFailure: () -> Void
+  @State private var sidebarSelection: SidebarSelection?
 
   var body: some View {
     NavigationSplitView {
-      List(selection: selection) {
+      List(selection: selectionBinding) {
         ForEach(conversations.launchWorkspaces, id: \.self) { workspace in
           Section {
             ForEach(conversations.records(launchedFrom: workspace)) { conversation in
@@ -97,21 +122,17 @@ struct MainWindowView: View {
                 duplicate: conversations.duplicatePosition(for: conversation.id)
               )
               .padding(.leading, 12)
-              .tag(conversation.id)
+              .tag(SidebarSelection.conversation(conversation.id))
             }
             if let historyConversation = conversations.historyConversation(
               launchedFrom: workspace)
             {
-              ProjectSessionHistory(
+              ProjectSavedSessionRows(
                 store: historyConversation.store,
-                projectWorkspace: workspace.canonicalPath
-              ) { key in
-                conversations.select(historyConversation.id)
-                historyConversation.store.resumeSession(key)
-              }
+                projectWorkspace: workspace.canonicalPath,
+                conversationID: historyConversation.id
+              )
               .padding(.leading, 12)
-              .selectionDisabled()
-              .listRowBackground(Color.clear)
             }
           } header: {
             ProjectSidebarHeader(workspace: workspace)
@@ -193,12 +214,27 @@ struct MainWindowView: View {
       })
   }
 
-  private var selection: Binding<ConversationID?> {
+  private var selectionBinding: Binding<SidebarSelection?> {
     Binding(
-      get: { conversations.selectedID },
-      set: { id in
-        if let id {
+      get: {
+        resolvedSidebarSelection(
+          selectedConversationID: conversations.selectedID,
+          savedSelection: sidebarSelection)
+      },
+      set: { selection in
+        guard let selection else { return }
+        sidebarSelection = selection
+        switch selection {
+        case .conversation(let id):
           conversations.select(id)
+        case .savedSession(let conversationID, let key):
+          guard
+            let conversation = conversations.records.first(where: { $0.id == conversationID })
+          else {
+            return
+          }
+          conversations.select(conversationID)
+          conversation.store.resumeSession(key)
         }
       })
   }
@@ -232,90 +268,66 @@ private struct ProjectSidebarHeader: View {
   }
 }
 
-private struct ProjectSessionHistory: View {
+private struct ProjectSavedSessionRows: View {
   @ObservedObject var store: NativeChatStore
   let projectWorkspace: String
-  let resume: (ResumeKey) -> Void
-  @State private var isExpanded = false
+  let conversationID: ConversationID
 
   var body: some View {
-    DisclosureGroup(isExpanded: $isExpanded) {
-      historyContent
-    } label: {
-      Label("History", systemImage: "clock.arrow.circlepath")
-        .foregroundStyle(.secondary)
-    }
-    .accessibilityIdentifier("session-history-\(projectWorkspace)")
-    .onAppear {
-      loadIfNeeded()
-    }
-    .onChange(of: store.lifecycle) {
-      loadIfNeeded()
-    }
-    .onChange(of: store.modelState) {
-      loadIfNeeded()
-    }
-    .onChange(of: store.sessionState) { previous, current in
-      guard case .resuming = previous, current == .ready, store.sessionCatalog == nil else {
-        return
+    historyContent
+      .onAppear {
+        loadIfNeeded()
       }
-      store.refreshSessions()
-    }
+      .onChange(of: store.lifecycle) {
+        loadIfNeeded()
+      }
+      .onChange(of: store.modelState) {
+        loadIfNeeded()
+      }
+      .onChange(of: store.sessionState) { previous, current in
+        guard case .resuming = previous, current == .ready, store.sessionCatalog == nil else {
+          return
+        }
+        store.refreshSessions()
+      }
   }
 
   @ViewBuilder
   private var historyContent: some View {
     switch store.sessionState {
     case .refreshing:
-      loadingState
+      EmptyView()
     case .ready, .resuming:
       if let failure = store.sessionCatalogFailure {
-        VStack(alignment: .leading, spacing: 6) {
+        HStack(spacing: 8) {
           Label(failure, systemImage: "exclamationmark.triangle")
             .foregroundStyle(.secondary)
-          Button("Try Again") {
+            .lineLimit(2)
+          Spacer(minLength: 4)
+          Button("Retry") {
             store.refreshSessions()
           }
           .disabled(isOperating)
         }
+        .selectionDisabled()
+        .listRowBackground(Color.clear)
         .accessibilityIdentifier("session-history-failure")
       } else if let catalog = store.sessionCatalog {
         let rows = projectSessionHistoryPresentation(
           catalog: catalog,
           projectWorkspace: projectWorkspace)
-        if rows.isEmpty {
-          emptyState
-        } else {
-          ForEach(rows) { row in
-            SessionHistoryRow(
-              presentation: row,
-              isResuming: resumingKey == row.key
-            ) {
-              resume(row.key)
-            }
-            .disabled(isOperating)
-          }
+        ForEach(rows) { row in
+          SessionHistoryRow(
+            presentation: row,
+            isResuming: resumingKey == row.key
+          )
+          .disabled(isOperating)
+          .tag(SidebarSelection.savedSession(conversationID, row.key))
         }
       } else {
-        loadingState
+        EmptyView()
       }
     }
-  }
-
-  private var loadingState: some View {
-    Label("Loading sessions…", systemImage: "clock")
-      .foregroundStyle(.secondary)
-      .overlay(alignment: .trailing) {
-        ProgressView()
-          .controlSize(.small)
-      }
-      .accessibilityIdentifier("session-history-loading")
-  }
-
-  private var emptyState: some View {
-    Label("No saved sessions", systemImage: "clock")
-      .foregroundStyle(.secondary)
-      .accessibilityIdentifier("session-history-empty")
   }
 
   private var shouldLoad: Bool {
@@ -340,27 +352,21 @@ private struct ProjectSessionHistory: View {
 private struct SessionHistoryRow: View {
   let presentation: SessionHistoryRowPresentation
   let isResuming: Bool
-  let action: () -> Void
 
   var body: some View {
-    Button(action: action) {
-      HStack(spacing: 8) {
-        Image(systemName: "clock")
-          .foregroundStyle(.secondary)
-        VStack(alignment: .leading, spacing: 2) {
-          Text(presentation.title)
-            .lineLimit(1)
-        }
-        Spacer(minLength: 4)
-        if isResuming {
-          ProgressView()
-            .controlSize(.small)
-            .accessibilityLabel("Resuming")
-        }
+    HStack(spacing: 8) {
+      VStack(alignment: .leading, spacing: 2) {
+        Text(presentation.title)
+          .lineLimit(1)
       }
-      .contentShape(Rectangle())
+      Spacer(minLength: 4)
+      if isResuming {
+        ProgressView()
+          .controlSize(.small)
+          .accessibilityLabel("Resuming")
+      }
     }
-    .buttonStyle(.plain)
+    .contentShape(Rectangle())
     .accessibilityLabel(presentation.accessibilityLabel)
     .accessibilityIdentifier(
       "session-history-row-\(presentation.key.generation)-\(presentation.key.slot)")
@@ -373,9 +379,15 @@ private struct ConversationSidebarRow: View {
 
   private var presentation: SidebarRowPresentation {
     sidebarRowPresentation(
-      title: conversation.navigation.title,
+      title: conversationTitle,
       workspace: conversation.navigation.workspace.canonicalPath,
       duplicate: duplicate)
+  }
+
+  private var conversationTitle: String {
+    conversationSidebarTitle(
+      title: conversation.navigation.title,
+      launchWorkspace: conversation.launchWorkspace.canonicalPath)
   }
 
   var body: some View {
@@ -383,12 +395,6 @@ private struct ConversationSidebarRow: View {
       VStack(alignment: .leading, spacing: 2) {
         Text(presentation.title)
           .lineLimit(1)
-        Text(presentation.workspace)
-          .font(.caption)
-          .foregroundStyle(.secondary)
-          .lineLimit(1)
-          .truncationMode(.middle)
-          .help(presentation.workspace)
       }
       Spacer(minLength: 4)
       if let badge = presentation.duplicateBadge {

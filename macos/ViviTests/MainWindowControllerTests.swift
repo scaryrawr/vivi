@@ -287,6 +287,31 @@ final class MainWindowControllerTests: XCTestCase {
       projectAccessibilityLabel(name: "app", path: "/two/app"))
   }
 
+  func testConversationTitleDoesNotRepeatProjectIdentity() {
+    XCTAssertEqual(
+      conversationSidebarTitle(title: "project", launchWorkspace: "/work/project"),
+      "New conversation")
+    XCTAssertEqual(
+      conversationSidebarTitle(title: "Generated title", launchWorkspace: "/work/project"),
+      "Generated title")
+    XCTAssertEqual(
+      conversationSidebarTitle(title: "", launchWorkspace: "/work/project"),
+      "Untitled Session")
+  }
+
+  func testSavedSessionSelectionIsExclusiveToItsOwningConversation() {
+    let firstID = ConversationID(rawValue: UUID())
+    let secondID = ConversationID(rawValue: UUID())
+    let saved = SidebarSelection.savedSession(firstID, ResumeKey(generation: 4, slot: 2))
+
+    XCTAssertEqual(
+      resolvedSidebarSelection(selectedConversationID: firstID, savedSelection: saved),
+      saved)
+    XCTAssertEqual(
+      resolvedSidebarSelection(selectedConversationID: secondID, savedSelection: saved),
+      .conversation(secondID))
+  }
+
   func testProjectHeaderPresentsNamePathAndAccessibilityHierarchy() {
     let presentation = ProjectSidebarHeaderPresentation(
       workspace: WorkspaceIdentity(absolutePath: "/work/vivi")!)
@@ -309,10 +334,10 @@ final class MainWindowControllerTests: XCTestCase {
       catalog: catalog,
       projectWorkspace: "/work/current")
 
-    XCTAssertEqual(rows.map(\.title), ["current"])
+    XCTAssertEqual(rows.map(\.title), ["Untitled Session"])
     XCTAssertEqual(
       rows[0].accessibilityLabel,
-      "current, /work/current, saved session")
+      "Untitled Session, /work/current, saved session")
   }
 
   func testProjectSessionHistoryPreservesBackendOrder() {
