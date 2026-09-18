@@ -2046,7 +2046,7 @@ fn streamSessionResponse(
                     return .failed;
                 };
                 defer result.deinit(worker.allocator());
-                const finished = tool_activity.ToolFinished.init(
+                const finished = prepared.finished(
                     worker.allocator(),
                     request.tool_call_id,
                     switch (result) {

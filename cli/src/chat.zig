@@ -1,8 +1,6 @@
 const std = @import("std");
 const backend = @import("vivi_backend");
-const highlight = @import("highlight.zig");
 const markdown = @import("markdown.zig");
-const tool_output = @import("tool_output.zig");
 const tool_renderer = @import("tool_renderer.zig");
 const clipboard = @import("clipboard.zig");
 const images = @import("images.zig");
@@ -304,9 +302,9 @@ const ToolEntry = struct {
     output: ?[]u8 = null,
     output_display: ?[]u8 = null,
     preview: ?image_preview.Preview = null,
-    input_highlights: []highlight.Span,
-    output_highlights: ?[]highlight.Span = null,
-    output_plan: tool_output.OutputPlan,
+    input_highlights: []backend.SemanticSpan,
+    output_highlights: ?[]backend.SemanticSpan = null,
+    output_kind: ?backend.PresentationKind = null,
     output_markdown_cache: markdown.HighlightCache = .{},
     expanded: bool = false,
     layout_width: u16 = 0,
@@ -360,23 +358,17 @@ const ToolEntry = struct {
         errdefer allocator.free(input);
         const input_display = try tool_renderer.renderArguments(allocator, input);
         errdefer allocator.free(input_display);
-        const input_highlights = switch (started.invocation.summary) {
-            .bash => |summary| if (bashSummaryCommand(summary)) |command|
-                try highlightBashInput(allocator, input_display, command)
-            else
-                try allocator.alloc(highlight.Span, 0),
-            else => try allocator.alloc(highlight.Span, 0),
-        };
+        const input_highlights = try mapInputHighlights(
+            allocator,
+            input_display,
+            started,
+        );
         errdefer allocator.free(input_highlights);
         return .{
             .call_id = call_id,
             .input = input,
             .input_display = input_display,
             .input_highlights = input_highlights,
-            .output_plan = try tool_output.OutputPlan.fromInvocation(
-                allocator,
-                started.invocation.summary,
-            ),
             .invocation_hash = hashToolInvocation(started),
             .compact = try tool_renderer.renderCompact(
                 allocator,
@@ -442,18 +434,25 @@ const ToolEntry = struct {
         };
         const output = try allocator.dupe(u8, text);
         errdefer allocator.free(output);
-        const output_display = try self.output_plan.render(
-            allocator,
-            completionOutcome(completion),
-            output,
+        const output_display = try allocator.dupe(
+            u8,
+            finished.output_presentation.text,
         );
         errdefer allocator.free(output_display);
+        const output_highlights = try mapPresentationHighlights(
+            allocator,
+            finished.output_presentation,
+            0,
+        );
+        errdefer allocator.free(output_highlights);
         const preview = if (finished.result == .image)
             try image_preview.Preview.init(allocator, finished.result.image.bytes)
         else
             null;
         self.output = output;
         self.output_display = output_display;
+        self.output_highlights = output_highlights;
+        self.output_kind = finished.output_presentation.kind();
         self.preview = preview;
         self.completion = completion;
         self.layout_valid = false;
@@ -463,34 +462,6 @@ const ToolEntry = struct {
         };
         std.debug.assert(std.mem.startsWith(u8, self.compact, "◌"));
         @memcpy(self.compact[0..marker.len], marker);
-    }
-
-    fn ensureOutputHighlights(
-        self: *ToolEntry,
-        allocator: std.mem.Allocator,
-    ) !void {
-        if (self.output_highlights != null) return;
-        const output = self.output_display orelse return;
-        const completion = self.completion orelse return;
-        const spans = try self.output_plan.spans(
-            allocator,
-            completionOutcome(completion),
-            output,
-        );
-        if (spans) |highlighted| {
-            self.output_highlights = highlighted;
-            return;
-        }
-
-        const raw = self.output orelse return;
-        const literal = try tool_renderer.renderOutput(allocator, raw);
-        errdefer allocator.free(literal);
-        const empty = try allocator.alloc(highlight.Span, 0);
-        allocator.free(output);
-        self.output_display = literal;
-        self.output_highlights = empty;
-        self.output_plan = .literal;
-        self.layout_valid = false;
     }
 
     fn deinit(self: *ToolEntry, allocator: std.mem.Allocator) void {
@@ -508,31 +479,55 @@ const ToolEntry = struct {
     }
 };
 
-fn completionOutcome(completion: ToolEntry.Completion) tool_output.Outcome {
-    return switch (completion) {
-        .succeeded => .succeeded,
-        .failed => .failed,
-        .image => .image,
-    };
-}
-
-fn highlightBashInput(
+fn mapInputHighlights(
     allocator: std.mem.Allocator,
     display: []const u8,
-    command: []const u8,
-) ![]highlight.Span {
+    started: *const backend.ToolStarted,
+) ![]backend.SemanticSpan {
+    const command = switch (started.invocation.summary) {
+        .bash => |summary| ToolEntry.bashSummaryCommand(summary) orelse
+            return allocator.alloc(backend.SemanticSpan, 0),
+        else => return allocator.alloc(backend.SemanticSpan, 0),
+    };
+    const source = switch (started.input_presentation.content) {
+        .source => |value| value,
+        .literal, .markdown => return allocator.alloc(backend.SemanticSpan, 0),
+    };
+    if (source.language != .bash or
+        !std.mem.eql(u8, started.input_presentation.text, command))
+    {
+        return allocator.alloc(backend.SemanticSpan, 0);
+    }
     const prefix = "Command: ";
     const label_start = topLevelLabelStart(display, prefix) orelse {
-        return allocator.alloc(highlight.Span, 0);
+        return allocator.alloc(backend.SemanticSpan, 0);
     };
     const command_start = label_start + prefix.len;
-    const command_spans = try highlight.spans(allocator, .bash, command);
-    defer allocator.free(command_spans);
-    const result = try allocator.alloc(highlight.Span, command_spans.len);
-    for (command_spans, result) |span, *mapped| {
+    const result = try allocator.alloc(backend.SemanticSpan, source.tokens.len);
+    for (source.tokens, result) |span, *mapped| {
         mapped.* = .{
             .start = command_start + commandDisplayOffset(command, span.start),
             .end = command_start + commandDisplayOffset(command, span.end),
+            .token = span.token,
+        };
+    }
+    return result;
+}
+
+fn mapPresentationHighlights(
+    allocator: std.mem.Allocator,
+    value: backend.Presentation,
+    offset: usize,
+) ![]backend.SemanticSpan {
+    const source = switch (value.content) {
+        .source => |source| source,
+        .literal, .markdown => return allocator.alloc(backend.SemanticSpan, 0),
+    };
+    const result = try allocator.alloc(backend.SemanticSpan, source.tokens.len);
+    for (source.tokens, result) |span, *mapped| {
+        mapped.* = .{
+            .start = offset + span.start,
+            .end = offset + span.end,
             .token = span.token,
         };
     }
@@ -609,7 +604,7 @@ fn hashToolPayload(payload: []const u8) [std.crypto.hash.sha2.Sha256.digest_leng
     return digest;
 }
 
-fn syntaxStyle(base: vaxis.Style, token: highlight.Token) vaxis.Style {
+fn syntaxStyle(base: vaxis.Style, token: backend.SemanticToken) vaxis.Style {
     var style = base;
     style.fg = switch (token) {
         .comment => syntax_comment,
@@ -633,7 +628,7 @@ fn drawHighlightedRange(
     text: []const u8,
     start: usize,
     end: usize,
-    highlights: []const highlight.Span,
+    highlights: []const backend.SemanticSpan,
     base_style: vaxis.Style,
 ) void {
     var offset = start;
@@ -720,10 +715,6 @@ const Entry = union(enum) {
             .tool => |*tool| {
                 tool.output_markdown_cache.deinit(allocator);
                 tool.output_markdown_cache = .{};
-                if (tool.output_highlights) |spans| {
-                    allocator.free(spans);
-                    tool.output_highlights = null;
-                }
             },
         }
     }
@@ -1636,15 +1627,6 @@ const Projection = struct {
         spool: ?*TranscriptSpool,
         show_role: bool,
     ) !usize {
-        if (entry.* == .tool and
-            entry.tool.expanded and
-            switch (entry.tool.output_plan) {
-                .syntax, .syntax_document => true,
-                else => false,
-            })
-        {
-            try entry.tool.ensureOutputHighlights(allocators.persistent);
-        }
         switch (entry.*) {
             .message => |*message| if (message.layout_valid and
                 message.layout_width == window.width and
@@ -1843,7 +1825,7 @@ const Projection = struct {
         tool: *ToolEntry,
         entry_index: usize,
         window: vaxis.Window,
-        cache_highlights: bool,
+        _: bool,
         first: usize,
         last: usize,
     ) !usize {
@@ -1860,14 +1842,11 @@ const Projection = struct {
         );
         if (!tool.expanded) return row;
         const render_markdown =
-            std.meta.activeTag(tool.output_plan) == .markdown and
+            tool.output_kind == .markdown and
             if (tool.completion) |completion|
                 std.meta.activeTag(completion) == .succeeded
             else
                 false;
-        if (cache_highlights and !render_markdown) {
-            try tool.ensureOutputHighlights(allocators.persistent);
-        }
 
         if (row >= first and row < last) {
             try self.lines.append(allocators.result, .{
@@ -5289,6 +5268,30 @@ fn toolFinished(
     };
 }
 
+fn toolFinishedPresented(
+    call_id: []const u8,
+    summary: backend.ToolSummary,
+    result: union(enum) {
+        succeeded: []const u8,
+        failed: []const u8,
+    },
+) !backend.ToolFinished {
+    return switch (result) {
+        .succeeded => |value| backend.ToolFinished.initPresented(
+            std.testing.allocator,
+            call_id,
+            summary,
+            .{ .succeeded = value },
+        ),
+        .failed => |value| backend.ToolFinished.initPresented(
+            std.testing.allocator,
+            call_id,
+            summary,
+            .{ .failed = value },
+        ),
+    };
+}
+
 test "tool details highlight shell input and supported read output" {
     var bash_started = try toolStarted(
         "bash-highlight",
@@ -5334,14 +5337,13 @@ test "tool details highlight shell input and supported read output" {
     defer read_started.deinit();
     var read_entry = try ToolEntry.init(std.testing.allocator, &read_started);
     defer read_entry.deinit(std.testing.allocator);
-    var finished = try toolFinished(
+    var finished = try toolFinishedPresented(
         "read-highlight",
+        read_started.invocation.summary,
         .{ .succeeded = "const answer = 42;" },
     );
     defer finished.deinit();
     try read_entry.finish(std.testing.allocator, &finished);
-    try std.testing.expect(read_entry.output_highlights == null);
-    try read_entry.ensureOutputHighlights(std.testing.allocator);
     try std.testing.expect(read_entry.output_highlights.?.len > 0);
 
     var failed_started = try toolStarted(
@@ -5365,14 +5367,13 @@ test "tool details highlight shell input and supported read output" {
     );
     defer failed.deinit();
     try failed_entry.finish(std.testing.allocator, &failed);
-    try failed_entry.ensureOutputHighlights(std.testing.allocator);
     try std.testing.expectEqual(
         @as(usize, 0),
         failed_entry.output_highlights.?.len,
     );
 }
 
-test "bash output plans highlight YAML and diff through the ToolEntry lifecycle" {
+test "ToolEntry consumes backend YAML and diff presentations" {
     var yaml_started = try toolStarted(
         "yaml-output",
         "{\"command\":\"cat .github/workflows/ci.yml\"}",
@@ -5383,13 +5384,10 @@ test "bash output plans highlight YAML and diff through the ToolEntry lifecycle"
     defer yaml_started.deinit();
     var yaml_entry = try ToolEntry.init(std.testing.allocator, &yaml_started);
     defer yaml_entry.deinit(std.testing.allocator);
-    try std.testing.expectEqual(
-        tool_output.OutputPlan{ .syntax = .yaml },
-        yaml_entry.output_plan,
-    );
     const yaml_raw = "name: CI\r\nready: true\nunsafe: \xff\u{202e}\n";
-    var yaml_finished = try toolFinished(
+    var yaml_finished = try toolFinishedPresented(
         "yaml-output",
+        yaml_started.invocation.summary,
         .{ .succeeded = yaml_raw },
     );
     defer yaml_finished.deinit();
@@ -5398,8 +5396,10 @@ test "bash output plans highlight YAML and diff through the ToolEntry lifecycle"
         "name: CI\nready: true\nunsafe: \\xff\\xe2\\x80\\xae\n",
         yaml_entry.output_display.?,
     );
-    try std.testing.expect(yaml_entry.output_highlights == null);
-    try yaml_entry.ensureOutputHighlights(std.testing.allocator);
+    try std.testing.expectEqual(
+        backend.PresentationKind.source,
+        yaml_entry.output_kind.?,
+    );
     const yaml_spans = yaml_entry.output_highlights.?;
     var saw_name = false;
     var saw_true = false;
@@ -5433,14 +5433,13 @@ test "bash output plans highlight YAML and diff through the ToolEntry lifecycle"
         \\-old
         \\+new
     ++ "\n";
-    var diff_finished = try toolFinished(
+    var diff_finished = try toolFinishedPresented(
         "diff-output",
+        diff_started.invocation.summary,
         .{ .succeeded = diff_text },
     );
     defer diff_finished.deinit();
     try diff_entry.finish(std.testing.allocator, &diff_finished);
-    try std.testing.expect(diff_entry.output_highlights == null);
-    try diff_entry.ensureOutputHighlights(std.testing.allocator);
     var saw_inserted = false;
     var saw_deleted = false;
     var saw_meta = false;
@@ -5469,8 +5468,9 @@ test "strict syntax rejection restores literal output rendering" {
         std.testing.allocator,
         &.{ .started = started },
     );
-    var finished = try toolFinished(
+    var finished = try toolFinishedPresented(
         "external-diff-output",
+        started.invocation.summary,
         .{ .succeeded = "external diff:\tchanged\r\n" },
     );
     defer finished.deinit();
@@ -5481,7 +5481,7 @@ test "strict syntax rejection restores literal output rendering" {
     const entry = &transcript.entries.items[0].tool;
     entry.expanded = true;
     try std.testing.expectEqualStrings(
-        "external diff:\tchanged\n",
+        "external diff:\\x09changed\\x0d\n",
         entry.output_display.?,
     );
 
@@ -5517,12 +5517,8 @@ test "strict syntax rejection restores literal output rendering" {
         @as(usize, 0),
         entry.output_highlights.?.len,
     );
-    try std.testing.expectEqual(
-        tool_output.OutputPlan.literal,
-        entry.output_plan,
-    );
+    try std.testing.expectEqual(backend.PresentationKind.literal, entry.output_kind.?);
     transcript.entries.items[0].releaseRenderCaches(std.testing.allocator);
-    try entry.ensureOutputHighlights(std.testing.allocator);
     try std.testing.expectEqualStrings(
         "external diff:\\x09changed\\x0d\n",
         entry.output_display.?,
@@ -5586,18 +5582,19 @@ test "bash output plans fall back to literal for unsafe lifecycle cases" {
         var entry = try ToolEntry.init(std.testing.allocator, &started);
         defer entry.deinit(std.testing.allocator);
         var finished = switch (case.result) {
-            .succeeded => |text| try toolFinished(
+            .succeeded => |text| try toolFinishedPresented(
                 case.id,
+                case.summary,
                 .{ .succeeded = text },
             ),
-            .failed => |text| try toolFinished(
+            .failed => |text| try toolFinishedPresented(
                 case.id,
+                case.summary,
                 .{ .failed = text },
             ),
         };
         defer finished.deinit();
         try entry.finish(std.testing.allocator, &finished);
-        try entry.ensureOutputHighlights(std.testing.allocator);
         try std.testing.expectEqual(
             @as(usize, 0),
             entry.output_highlights.?.len,
@@ -5624,8 +5621,9 @@ test "expanded tool rows draw syntax colors across wrapping" {
         &.{ .started = bash_started },
     );
     bash_started.deinit();
-    var bash_finished = try toolFinished(
+    var bash_finished = try toolFinishedPresented(
         "bash-render",
+        .{ .bash = .{ .run = .{ .command = "printf 'abcdefghijklmnop'" } } },
         .{ .succeeded = "done" },
     );
     try ui.transcript.applyToolActivity(
@@ -5649,8 +5647,13 @@ test "expanded tool rows draw syntax colors across wrapping" {
         &.{ .started = read_started },
     );
     read_started.deinit();
-    var read_finished = try toolFinished(
+    var read_finished = try toolFinishedPresented(
         "read-render",
+        .{ .read = .{
+            .path = "sample.zig",
+            .offset = null,
+            .limit = null,
+        } },
         .{ .succeeded = "const answer = 42;" },
     );
     try ui.transcript.applyToolActivity(
@@ -5670,8 +5673,9 @@ test "expanded tool rows draw syntax colors across wrapping" {
         &.{ .started = diff_started },
     );
     diff_started.deinit();
-    var diff_finished = try toolFinished(
+    var diff_finished = try toolFinishedPresented(
         "diff-render",
+        .{ .bash = .{ .run = .{ .command = "git diff" } } },
         .{ .succeeded = "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n" ++
             "@@ -1 +1 @@\n-old\n+new\n" },
     );
@@ -6681,7 +6685,6 @@ fn toolAllocationLifecycle(allocator: std.mem.Allocator) !void {
         return err;
     };
     try std.testing.expect(tool.expanded);
-    try tool.ensureOutputHighlights(allocator);
 }
 
 test "tool owned payload lifecycle is atomic under allocation failure" {
@@ -7246,8 +7249,9 @@ test "successful Markdown reads use the transcript Markdown renderer" {
         std.testing.allocator,
         &.{ .started = started },
     );
-    var finished = try toolFinished(
+    var finished = try toolFinishedPresented(
         "markdown-read",
+        started.invocation.summary,
         .{ .succeeded = "# Rendered Heading\r\n\r\n**bold text** and [docs](https://example.com)\r\n\r\n" ++
             "| Feature | Status |\r\n| --- | --- |\r\n| Markdown | Rich |\r\n\r\n\tcode" },
     );
@@ -7406,25 +7410,37 @@ test "expanded tool viewport retains only visible Markdown rows" {
     );
 }
 
-test "Markdown read plans are extension based and case insensitive" {
-    const markdown_plan = try tool_output.OutputPlan.fromInvocation(
+test "backend classifies Markdown read presentations by extension" {
+    var markdown_finished = try backend.ToolFinished.initPresented(
         std.testing.allocator,
+        "markdown",
         .{ .read = .{
             .path = "docs/GUIDE.MARKDOWN",
             .offset = null,
             .limit = null,
         } },
+        .{ .succeeded = "# Guide" },
     );
-    try std.testing.expectEqual(tool_output.OutputPlan.markdown, markdown_plan);
-    const literal_plan = try tool_output.OutputPlan.fromInvocation(
+    defer markdown_finished.deinit();
+    try std.testing.expectEqual(
+        backend.PresentationKind.markdown,
+        markdown_finished.output_presentation.kind(),
+    );
+    var literal = try backend.ToolFinished.initPresented(
         std.testing.allocator,
+        "literal",
         .{ .read = .{
             .path = "notes.md.txt",
             .offset = null,
             .limit = null,
         } },
+        .{ .succeeded = "# Literal" },
     );
-    try std.testing.expectEqual(tool_output.OutputPlan.literal, literal_plan);
+    defer literal.deinit();
+    try std.testing.expectEqual(
+        backend.PresentationKind.literal,
+        literal.output_presentation.kind(),
+    );
 }
 
 test "failed Markdown reads remain literal tool output" {
@@ -7927,7 +7943,6 @@ test "image tool previews retain read bytes and reserve rows only when expanded"
     const tool = &ui.transcript.entries.items[0].tool;
     try std.testing.expectEqualStrings("snapshot", tool.preview.?.state.pending);
     try std.testing.expectEqualStrings("Image: image.png", tool.output_display.?);
-    try tool.ensureOutputHighlights(allocator);
     try std.testing.expectEqual(@as(usize, 0), tool.output_highlights.?.len);
     tool.preview.?.deinit(allocator);
     tool.preview = .{ .state = .{ .ready = vaxis.Image.init(9, 320, 160) } };
