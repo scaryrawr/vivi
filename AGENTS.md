@@ -96,6 +96,11 @@ explicit macOS target must pass both `--sysroot` and `-Dmacos-sdk` from
 No commit convention exists yet. Keep changes narrowly scoped and include the
 relevant command output in PR descriptions.
 
+When retargeting a stacked PR, fetch the live target and verify commit ancestry;
+do not assume a merged lower PR is present on `main` when its base was another
+feature branch. Merge the live target without rebasing, preserving the stacked
+delta while resolving newer target-branch behavior explicitly.
+
 Every PR that changes user-visible CLI, TUI, or native app behavior must include
 a reviewer-facing demo in its description. Use a short GIF or video when the
 behavior changes over time. Use before-and-after screenshots when a static

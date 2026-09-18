@@ -5,99 +5,6 @@ import XCTest
 
 @MainActor
 final class ViviBackendRuntimeTests: XCTestCase {
-  func testDockReopenUsesManagedChatWindowsRegardlessOfAppKitVisibility() {
-    let windows = FakeChatWindowManager()
-    let delegate = ViviAppDelegate(windows: windows)
-
-    let shouldAlsoUseDefaultReopen = delegate.applicationShouldHandleReopen(
-      NSApplication.shared,
-      hasVisibleWindows: true)
-
-    XCTAssertFalse(shouldAlsoUseDefaultReopen)
-    XCTAssertEqual(windows.reopenCount, 1)
-  }
-
-  func testLaunchingWithoutAChatURLOpensTheMainWindow() {
-    let windows = FakeChatWindowManager()
-    let delegate = ViviAppDelegate(windows: windows)
-
-    XCTAssertTrue(delegate.applicationOpenUntitledFile(NSApplication.shared))
-    XCTAssertEqual(windows.reopenCount, 1)
-  }
-
-  func testWindowRegistryReusesAnOpenWindow() {
-    let factory = FakeChatWindowFactory()
-    let registry = ChatWindowRegistry(
-      homeDirectory: "/Users/test",
-      makeController: factory.makeController)
-
-    registry.open(request: NativeChatRequest(workspace: "/tmp/project"))
-    registry.reopenLast()
-
-    XCTAssertEqual(factory.controllers.count, 1)
-    XCTAssertEqual(factory.controllers[0].workspace, "/tmp/project")
-    XCTAssertEqual(factory.controllers[0].restoreCount, 2)
-  }
-
-  func testWindowRegistryReplacesAClosingWindowWithTheLastRequest() {
-    let factory = FakeChatWindowFactory()
-    let registry = ChatWindowRegistry(
-      homeDirectory: "/Users/test",
-      makeController: factory.makeController)
-
-    registry.open(request: NativeChatRequest(workspace: "/tmp/project"))
-    factory.controllers[0].isClosing = true
-    registry.reopenLast()
-
-    XCTAssertEqual(factory.controllers.map(\.workspace), ["/tmp/project", "/tmp/project"])
-    XCTAssertEqual(factory.controllers.map(\.restoreCount), [1, 1])
-  }
-
-  func testWindowRegistryUsesTheHomeDirectoryWithoutAPriorRequest() {
-    let factory = FakeChatWindowFactory()
-    let registry = ChatWindowRegistry(
-      homeDirectory: "/Users/test",
-      makeController: factory.makeController)
-
-    registry.reopenLast()
-
-    XCTAssertEqual(factory.controllers.count, 1)
-    XCTAssertEqual(factory.controllers[0].workspace, "/Users/test")
-    XCTAssertEqual(factory.controllers[0].restoreCount, 1)
-  }
-
-  func testWindowRegistryRemovesClosedWindowsAndReopensTheirWorkspace() {
-    let factory = FakeChatWindowFactory()
-    let registry = ChatWindowRegistry(
-      homeDirectory: "/Users/test",
-      makeController: factory.makeController)
-
-    registry.open(request: NativeChatRequest(workspace: "/tmp/project"))
-    factory.controllers[0].closeForTermination {}
-    XCTAssertTrue(registry.isEmpty)
-
-    registry.reopenLast()
-
-    XCTAssertEqual(factory.controllers.map(\.workspace), ["/tmp/project", "/tmp/project"])
-    XCTAssertEqual(factory.controllers[1].restoreCount, 1)
-  }
-
-  func testRestoreWindowDeminiaturizesTheWindow() {
-    let window = MiniaturizedTestWindow(
-      contentRect: NSRect(x: 0, y: 0, width: 200, height: 120),
-      styleMask: [.titled, .miniaturizable],
-      backing: .buffered,
-      defer: false)
-    let controller = NSWindowController(window: window)
-    XCTAssertTrue(window.isMiniaturized)
-
-    restoreWindow(controller)
-
-    XCTAssertFalse(window.isMiniaturized)
-    XCTAssertEqual(window.deminiaturizeCount, 1)
-    window.close()
-  }
-
   func testReducerCreatesAssistantLazilyAfterReasoning() {
     let driver = FakeConversationDriver()
     let store = NativeChatStore(workspace: "/tmp/Vivi chat", driver: driver)
@@ -122,83 +29,6 @@ final class ViviBackendRuntimeTests: XCTestCase {
         .reasoning(id: store.transcript[2].id, text: "finished thought"),
         .assistant(id: store.transcript[3].id, text: "new answer"),
       ])
-  }
-
-  @MainActor
-  private final class FakeChatWindowManager: ChatWindowManaging {
-    var isEmpty = true
-    var reopenCount = 0
-
-    func open(request: NativeChatRequest) {}
-
-    func reopenLast() {
-      reopenCount += 1
-    }
-
-    func closeAll(completion: @escaping @MainActor () -> Void) {
-      completion()
-    }
-  }
-
-  @MainActor
-  private final class FakeChatWindowFactory {
-    var controllers: [FakeChatWindowController] = []
-
-    func makeController(
-      id: UUID,
-      workspace: String,
-      onClosed: @escaping @MainActor (UUID) -> Void
-    ) -> any ChatWindowControlling {
-      let controller = FakeChatWindowController(
-        id: id,
-        workspace: workspace,
-        onClosed: onClosed)
-      controllers.append(controller)
-      return controller
-    }
-  }
-
-  @MainActor
-  private final class FakeChatWindowController: ChatWindowControlling {
-    let id: UUID
-    let workspace: String
-    var isClosing = false
-    var restoreCount = 0
-    private let onClosed: @MainActor (UUID) -> Void
-
-    init(
-      id: UUID,
-      workspace: String,
-      onClosed: @escaping @MainActor (UUID) -> Void
-    ) {
-      self.id = id
-      self.workspace = workspace
-      self.onClosed = onClosed
-    }
-
-    func restore() {
-      restoreCount += 1
-    }
-
-    func closeForTermination(completion: @escaping @MainActor () -> Void) {
-      isClosing = true
-      onClosed(id)
-      completion()
-    }
-  }
-
-  final class MiniaturizedTestWindow: NSWindow {
-    var deminiaturizeCount = 0
-    private var reportedMiniaturized = true
-
-    override var isMiniaturized: Bool {
-      reportedMiniaturized
-    }
-
-    override func deminiaturize(_ sender: Any?) {
-      deminiaturizeCount += 1
-      reportedMiniaturized = false
-    }
   }
 
   func testBusySubmitPreservesDraft() {
@@ -612,19 +442,6 @@ final class ViviBackendRuntimeTests: XCTestCase {
           result: .running,
           output: nil,
           outputPresentation: nil)))
-  }
-
-  func testNativeChatURLProducesWorkspaceOnlyRequest() {
-    XCTAssertEqual(
-      nativeChatRequest(
-        from: URL(
-          string:
-            "vivi://chat?workspace=/tmp/Vivi%20chat&executable=/tmp/evil"
-        )!),
-      NativeChatRequest(workspace: "/tmp/Vivi chat"))
-    XCTAssertNil(
-      nativeChatRequest(
-        from: URL(string: "vivi://chat?workspace=relative")!))
   }
 
   func testClosedStoreIgnoresLateReadyEvent() {

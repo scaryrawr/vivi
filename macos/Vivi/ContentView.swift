@@ -19,10 +19,10 @@ func toolInputIsVisible(input: String) -> Bool {
 }
 
 struct ContentView: View {
-  @StateObject private var store: NativeChatStore
+  @ObservedObject private var store: NativeChatStore
 
   init(store: NativeChatStore) {
-    _store = StateObject(wrappedValue: store)
+    self.store = store
   }
 
   var body: some View {
@@ -47,7 +47,7 @@ struct ContentView: View {
       composer
     }
     .padding(20)
-    .frame(minWidth: 620, minHeight: 420)
+    .frame(minHeight: 420)
   }
 
   private var header: some View {
