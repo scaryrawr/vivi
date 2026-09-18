@@ -120,6 +120,34 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the vivi CLI");
     run_step.dependOn(&run_cli.step);
 
+    const build_native = b.addSystemCommand(&.{
+        "sh",
+        b.pathFromRoot("scripts/build-native.sh"),
+    });
+    const native_step = b.step(
+        "native",
+        "Build the Debug macOS Vivi app from this worktree",
+    );
+    native_step.dependOn(&build_native.step);
+
+    const run_native = b.addSystemCommand(&.{
+        b.getInstallPath(.bin, "vivi"),
+        "chat",
+        "--native",
+    });
+    run_native.setCwd(b.path("."));
+    run_native.setEnvironmentVariable(
+        "VIVI_APP_PATH",
+        b.pathFromRoot("zig-out/xcode/Debug/Vivi.app"),
+    );
+    run_native.step.dependOn(&install_cli.step);
+    run_native.step.dependOn(&build_native.step);
+    const native_run_step = b.step(
+        "native-run",
+        "Build and launch this worktree's macOS Vivi app",
+    );
+    native_run_step.dependOn(&run_native.step);
+
     const backend_tests = b.addTest(.{ .root_module = backend, .use_llvm = use_llvm });
     const run_backend_tests = b.addRunArtifact(backend_tests);
 
