@@ -28,7 +28,6 @@ func sidebarRowPresentation(
 struct SessionHistoryRowPresentation: Equatable, Identifiable {
   let key: ResumeKey
   let title: String
-  let lastUsed: String
   let accessibilityLabel: String
 
   var id: ResumeKey { key }
@@ -36,8 +35,7 @@ struct SessionHistoryRowPresentation: Equatable, Identifiable {
 
 func projectSessionHistoryPresentation(
   catalog: SessionCatalog,
-  projectWorkspace: String,
-  formatLastUsed: (Int64) -> String
+  projectWorkspace: String
 ) -> [SessionHistoryRowPresentation] {
   catalog.sessions.compactMap { session in
     guard !session.isCurrent, session.workingDirectory == projectWorkspace else { return nil }
@@ -45,19 +43,10 @@ func projectSessionHistoryPresentation(
       session.title?.nilIfEmpty
       ?? URL(fileURLWithPath: session.workingDirectory).lastPathComponent.nilIfEmpty
       ?? "Untitled Session"
-    let lastUsed = formatLastUsed(session.lastUsedUnixMilliseconds)
     return SessionHistoryRowPresentation(
       key: session.key,
       title: title,
-      lastUsed: lastUsed,
-      accessibilityLabel: [
-        title,
-        session.workingDirectory,
-        session.summary?.nilIfEmpty,
-        "Last used \(lastUsed)",
-      ]
-      .compactMap { $0 }
-      .joined(separator: ", "))
+      accessibilityLabel: "\(title), \(session.workingDirectory), saved session")
   }
 }
 
@@ -160,13 +149,13 @@ private struct ProjectSessionHistory: View {
       .accessibilityIdentifier("session-history-\(projectWorkspace)")
       .onAppear {
         guard shouldLoad else { return }
-        store.refreshSessions(.local)
+        store.refreshSessions()
       }
       .onChange(of: store.sessionState) { previous, current in
         guard case .resuming = previous, current == .ready, store.sessionCatalog == nil else {
           return
         }
-        store.refreshSessions(.local)
+        store.refreshSessions()
       }
   }
 
@@ -187,7 +176,7 @@ private struct ProjectSessionHistory: View {
           Label(failure, systemImage: "exclamationmark.triangle")
             .foregroundStyle(.secondary)
           Button("Try Again") {
-            store.refreshSessions(.local)
+            store.refreshSessions()
           }
           .disabled(isOperating)
         }
@@ -195,17 +184,10 @@ private struct ProjectSessionHistory: View {
       } else if let catalog = store.sessionCatalog {
         let rows = projectSessionHistoryPresentation(
           catalog: catalog,
-          projectWorkspace: projectWorkspace,
-          formatLastUsed: sessionHistoryLastUsed)
+          projectWorkspace: projectWorkspace)
         if rows.isEmpty {
           emptyState
         } else {
-          if catalog.skippedInvalidShards {
-            Label("Some sessions couldn’t be read.", systemImage: "exclamationmark.triangle")
-              .font(.caption)
-              .foregroundStyle(.secondary)
-              .accessibilityIdentifier("session-history-partial-warning")
-          }
           ForEach(rows) { row in
             SessionHistoryRow(
               presentation: row,
@@ -229,9 +211,7 @@ private struct ProjectSessionHistory: View {
   }
 
   private var shouldLoad: Bool {
-    guard store.sessionCatalogFailure == nil else { return false }
-    guard let catalog = store.sessionCatalog else { return true }
-    return catalog.scope != .local
+    store.sessionCatalogFailure == nil && store.sessionCatalog == nil
   }
 
   private var isOperating: Bool {
@@ -256,10 +236,6 @@ private struct SessionHistoryRow: View {
           .foregroundStyle(.secondary)
         VStack(alignment: .leading, spacing: 2) {
           Text(presentation.title)
-            .lineLimit(1)
-          Text(presentation.lastUsed)
-            .font(.caption)
-            .foregroundStyle(.secondary)
             .lineLimit(1)
         }
         Spacer(minLength: 4)
@@ -317,11 +293,6 @@ private struct ConversationSidebarRow: View {
     .accessibilityLabel(presentation.accessibilityLabel)
     .accessibilityIdentifier("conversation-row-\(conversation.id.rawValue)")
   }
-}
-
-private func sessionHistoryLastUsed(_ unixMilliseconds: Int64) -> String {
-  Date(timeIntervalSince1970: TimeInterval(unixMilliseconds) / 1_000)
-    .formatted(.relative(presentation: .named, unitsStyle: .abbreviated))
 }
 
 extension String {

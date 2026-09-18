@@ -11,8 +11,6 @@ int main(void) {
         .working_directory_length = 4,
         .settings_path = 0,
         .settings_path_length = 0,
-        .sessions_directory = 0,
-        .sessions_directory_length = 0,
         .copilot_cli_path = 0,
         .copilot_cli_path_length = 0,
         .copilot_cli_launch = VIVI_BACKEND_COPILOT_CLI_SDK_DEFAULT,
@@ -39,12 +37,12 @@ int main(void) {
     assert(VIVI_BACKEND_EVENT_TOOL_STARTED == 15);
     assert(VIVI_BACKEND_EVENT_TOOL_FINISHED == 16);
     assert(VIVI_BACKEND_EVENT_SESSION_CATALOG == 17);
-    assert(VIVI_BACKEND_EVENT_SESSION_RESUME == 20);
+    assert(VIVI_BACKEND_EVENT_SESSION_RESUME == 19);
     assert(VIVI_BACKEND_TOOL_RESULT_IMAGE == 4);
     vivi_backend_resume_key_t key = {
         .generation = 1,
         .slot = 0,
-        .scope = VIVI_BACKEND_SESSION_SCOPE_LOCAL,
+        .reserved = 0,
     };
     vivi_backend_session_summary_t session = {
         .key = key,
@@ -60,8 +58,7 @@ int main(void) {
     assert(presentation.kind == VIVI_BACKEND_PRESENTATION_LITERAL);
     assert(presentation.content.length == 4);
     assert(vivi_backend_refresh_models(0) == VIVI_BACKEND_INVALID_ARGUMENT);
-    assert(vivi_backend_refresh_sessions(0, VIVI_BACKEND_SESSION_REQUEST_LOCAL)
-        == VIVI_BACKEND_INVALID_ARGUMENT);
+    assert(vivi_backend_refresh_sessions(0) == VIVI_BACKEND_INVALID_ARGUMENT);
     assert(vivi_backend_resume_session(0, key) == VIVI_BACKEND_INVALID_ARGUMENT);
     assert(vivi_backend_close(0) == VIVI_BACKEND_INVALID_ARGUMENT);
     vivi_backend_destroy(0);

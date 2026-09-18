@@ -93,20 +93,14 @@ pub fn main(init: std.process.Init) !void {
             const settings_path = try defaultSettingsPath(
                 init.gpa,
                 init.environ_map,
-            );
-            defer if (settings_path) |path| init.gpa.free(path);
-            const sessions_directory = try defaultSessionsDirectory(
-                init.gpa,
-                init.environ_map,
-            );
-            defer if (sessions_directory) |path| init.gpa.free(path);
+            ) orelse return error.MissingHomeDirectory;
+            defer init.gpa.free(settings_path);
             return chat.run(
                 init,
                 options.model,
                 options.reasoning,
                 working_directory,
                 settings_path,
-                sessions_directory,
             );
         },
     }
@@ -158,24 +152,9 @@ fn launchNativeChat(init: std.process.Init, workspace: []const u8) !void {
         .{escaped},
     );
     defer init.gpa.free(url);
-    switch (target) {
-        .app_path => |path| {
-            const args = nativeAppPathLaunchArgs(path, url);
-            try runNativeLauncher(init, &args);
-        },
-        .bundle_identifier => |identifier| {
-            const args = nativeBundleLaunchArgs(identifier, url);
-            try runNativeLauncher(init, &args);
-        },
-    }
-}
-
-fn runNativeLauncher(
-    init: std.process.Init,
-    args: []const []const u8,
-) !void {
+    const args = nativeChatLaunchArgs(target, url);
     var child = try std.process.spawn(init.io, .{
-        .argv = args,
+        .argv = &args,
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .inherit,
@@ -211,18 +190,14 @@ fn nativeAppPathIsUsable(init: std.process.Init, path: []const u8) bool {
     return true;
 }
 
-fn nativeAppPathLaunchArgs(
-    path: []const u8,
-    url: []const u8,
-) [5][]const u8 {
-    return .{ "open", "-n", "-a", path, url };
-}
-
-fn nativeBundleLaunchArgs(
-    identifier: []const u8,
+fn nativeChatLaunchArgs(
+    target: NativeChatTarget,
     url: []const u8,
 ) [4][]const u8 {
-    return .{ "open", "-b", identifier, url };
+    return switch (target) {
+        .app_path => |path| .{ "open", "-a", path, url },
+        .bundle_identifier => |identifier| .{ "open", "-b", identifier, url },
+    };
 }
 
 fn percentEncode(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
@@ -242,21 +217,6 @@ fn percentEncode(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
         }
     }
     return output.toOwnedSlice(allocator);
-}
-
-fn defaultSessionsDirectory(
-    allocator: std.mem.Allocator,
-    environ_map: *const std.process.Environ.Map,
-) !?[]u8 {
-    const home = usableHome(environ_map.get("HOME")) orelse
-        usableHome(environ_map.get("USERPROFILE")) orelse return null;
-    return @as(
-        ?[]u8,
-        try std.fs.path.join(
-            allocator,
-            &.{ home, ".vivi", "sessions" },
-        ),
-    );
 }
 
 fn defaultSettingsPath(
@@ -293,10 +253,16 @@ fn writeHelp(writer: *std.Io.Writer) !void {
 }
 
 fn listModels(init: std.process.Init, writer: *std.Io.Writer) !void {
+    const settings_path = try defaultSettingsPath(
+        init.gpa,
+        init.environ_map,
+    ) orelse return error.MissingHomeDirectory;
+    defer init.gpa.free(settings_path);
     var catalog = try backend.discoverModels(
         init.gpa,
         init.io,
         init.environ_map.get("PWD") orelse ".",
+        settings_path,
         .{
             .base_url = init.environ_map.get("OMLX_BASE_URL") orelse
                 backend.default_omlx_base_url,
@@ -431,24 +397,23 @@ test "native chat target uses the development app before the installed bundle" {
 }
 
 test "native chat constructs app and bundle launch arguments" {
-    const app = nativeAppPathLaunchArgs(
-        "/repo/zig-out/xcode/Debug/Vivi.app",
+    const app = nativeChatLaunchArgs(
+        .{ .app_path = "/repo/zig-out/xcode/Debug/Vivi.app" },
         "vivi://chat?workspace=/tmp/Vivi",
     );
     try std.testing.expectEqualStrings("open", app[0]);
-    try std.testing.expectEqualStrings("-n", app[1]);
-    try std.testing.expectEqualStrings("-a", app[2]);
+    try std.testing.expectEqualStrings("-a", app[1]);
     try std.testing.expectEqualStrings(
         "/repo/zig-out/xcode/Debug/Vivi.app",
-        app[3],
+        app[2],
     );
     try std.testing.expectEqualStrings(
         "vivi://chat?workspace=/tmp/Vivi",
-        app[4],
+        app[3],
     );
 
-    const bundle = nativeBundleLaunchArgs(
-        "com.scaryrawr.vivi",
+    const bundle = nativeChatLaunchArgs(
+        .{ .bundle_identifier = "com.scaryrawr.vivi" },
         "vivi://chat?workspace=/tmp/Vivi",
     );
     try std.testing.expectEqualStrings("-b", bundle[1]);
@@ -472,21 +437,6 @@ test "settings persistence is optional without a home directory" {
     defer environment.deinit();
     try std.testing.expect(
         try defaultSettingsPath(std.testing.allocator, &environment) == null,
-    );
-}
-
-test "sessions directory uses the supplied home directory" {
-    var environment = std.process.Environ.Map.init(std.testing.allocator);
-    defer environment.deinit();
-    try environment.put("HOME", "/tmp/vivi-home");
-    const path = try defaultSessionsDirectory(
-        std.testing.allocator,
-        &environment,
-    );
-    defer std.testing.allocator.free(path.?);
-    try std.testing.expectEqualStrings(
-        "/tmp/vivi-home/.vivi/sessions",
-        path.?,
     );
 }
 

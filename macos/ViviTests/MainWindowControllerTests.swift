@@ -75,42 +75,35 @@ final class MainWindowControllerTests: XCTestCase {
 
   func testProjectSessionHistoryFiltersWorkspaceAndCurrentSession() {
     let catalog = SessionCatalog(
-      scope: .local,
       sessions: [
         historySummary(slot: 1, workspace: "/work/current", title: "Current", isCurrent: true),
         historySummary(slot: 2, workspace: "/work/other", title: "Earlier"),
         historySummary(slot: 3, workspace: "/work/current", title: nil),
         historySummary(slot: 4, workspace: "/work/other", title: "Oldest"),
-      ],
-      skippedInvalidShards: false)
+      ])
 
     let rows = projectSessionHistoryPresentation(
       catalog: catalog,
-      projectWorkspace: "/work/current",
-      formatLastUsed: { "\($0) ms" })
+      projectWorkspace: "/work/current")
 
     XCTAssertEqual(rows.map(\.title), ["current"])
     XCTAssertEqual(
       rows[0].accessibilityLabel,
-      "current, /work/current, Summary 3, Last used 3 ms")
+      "current, /work/current, saved session")
   }
 
   func testProjectSessionHistoryPreservesBackendOrder() {
     let catalog = SessionCatalog(
-      scope: .broader,
       sessions: [
         historySummary(slot: 7, workspace: "/work/current", title: "Recent"),
         historySummary(slot: 8, workspace: "/work/current", title: "Earlier"),
-      ],
-      skippedInvalidShards: false)
+      ])
 
     let rows = projectSessionHistoryPresentation(
       catalog: catalog,
-      projectWorkspace: "/work/current",
-      formatLastUsed: { "\($0)" })
+      projectWorkspace: "/work/current")
 
     XCTAssertEqual(rows.map(\.title), ["Recent", "Earlier"])
-    XCTAssertEqual(rows.map(\.lastUsed), ["7", "8"])
   }
 }
 
@@ -121,12 +114,8 @@ private func historySummary(
   isCurrent: Bool = false
 ) -> SessionSummary {
   SessionSummary(
-    key: ResumeKey(generation: 42, slot: slot, scope: .broader),
+    key: ResumeKey(generation: 42, slot: slot),
     workingDirectory: workspace,
-    modelID: "copilot/test",
     title: title,
-    summary: "Summary \(slot)",
-    lastUsedUnixMilliseconds: Int64(slot),
-    reasoning: .medium,
     isCurrent: isCurrent)
 }
