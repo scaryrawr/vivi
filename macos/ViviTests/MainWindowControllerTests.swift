@@ -10,9 +10,11 @@ final class MainWindowControllerTests: XCTestCase {
     let secondDriver = ControllableConversationDriver()
     let first = ConversationRecord(
       id: ConversationID(rawValue: UUID()),
+      launchWorkspace: WorkspaceIdentity(absolutePath: "/tmp/first")!,
       store: NativeChatStore(workspace: "/tmp/first", driver: firstDriver))
     let second = ConversationRecord(
       id: ConversationID(rawValue: UUID()),
+      launchWorkspace: WorkspaceIdentity(absolutePath: "/tmp/second")!,
       store: NativeChatStore(workspace: "/tmp/second", driver: secondDriver))
     let conversations = ConversationCollection()
     conversations.appendAndSelect(first)
@@ -42,6 +44,7 @@ final class MainWindowControllerTests: XCTestCase {
     conversations.appendAndSelect(
       ConversationRecord(
         id: ConversationID(rawValue: UUID()),
+        launchWorkspace: WorkspaceIdentity(absolutePath: "/tmp/project")!,
         store: NativeChatStore(workspace: "/tmp/project", driver: driver)))
     let window = NSWindow()
     var closedIdentity: MainWindowIdentity?
@@ -62,37 +65,45 @@ final class MainWindowControllerTests: XCTestCase {
   func testSidebarPresentationAlwaysGroupsProjectsAndDisambiguatesDuplicates() {
     let first = ConversationRecord(
       id: ConversationID(rawValue: UUID()),
+      launchWorkspace: WorkspaceIdentity(absolutePath: "/tmp/vivi")!,
       store: NativeChatStore(
         workspace: "/tmp/vivi",
         driver: ControllableConversationDriver()))
     let second = ConversationRecord(
       id: ConversationID(rawValue: UUID()),
+      launchWorkspace: WorkspaceIdentity(absolutePath: "/tmp/vivi")!,
       store: NativeChatStore(
         workspace: "/tmp/vivi",
         driver: ControllableConversationDriver()))
     let other = ConversationRecord(
       id: ConversationID(rawValue: UUID()),
+      launchWorkspace: WorkspaceIdentity(absolutePath: "/work/other")!,
       store: NativeChatStore(
         workspace: "/work/other",
         driver: ControllableConversationDriver()))
 
-    let projects = sidebarProjectsPresentation(records: [first, second, other])
+    let conversations = ConversationCollection()
+    conversations.appendAndSelect(first)
+    conversations.appendAndSelect(second)
+    conversations.appendAndSelect(other)
 
-    XCTAssertEqual(projects.map(\.title), ["vivi", "other"])
     XCTAssertEqual(
-      projects.map(\.workspace.canonicalPath),
+      conversations.launchWorkspaces.map(\.canonicalPath),
       ["/tmp/vivi", "/work/other"])
-    XCTAssertEqual(projects[0].accessibilityLabel, "vivi, /tmp/vivi")
     XCTAssertEqual(
-      projects[0].conversations.map(\.duplicateBadge),
-      ["1", "2"])
-    XCTAssertEqual(
-      projects[0].conversations[1].accessibilityLabel,
-      "vivi, /tmp/vivi, conversation 2 of 2")
-    XCTAssertNil(projects[1].conversations[0].duplicateBadge)
+      sidebarRowPresentation(
+        title: second.navigation.title,
+        workspace: second.navigation.workspace.canonicalPath,
+        duplicate: conversations.duplicatePosition(for: second.id)),
+      SidebarRowPresentation(
+        title: "vivi",
+        workspace: "/tmp/vivi",
+        duplicateBadge: "2",
+        accessibilityLabel: "vivi, /tmp/vivi, conversation 2 of 2"))
+    XCTAssertNil(conversations.duplicatePosition(for: other.id))
   }
 
-  func testSavedViviSessionHistoryGroupsWorkspacesAndFiltersCurrentSession() {
+  func testProjectSessionHistoryFiltersWorkspaceAndCurrentSession() {
     let catalog = SessionCatalog(
       scope: .local,
       sessions: [
@@ -103,21 +114,18 @@ final class MainWindowControllerTests: XCTestCase {
       ],
       skippedInvalidShards: false)
 
-    let groups = sessionHistoryPresentation(
+    let rows = projectSessionHistoryPresentation(
       catalog: catalog,
-      currentWorkspace: "/work/current",
+      projectWorkspace: "/work/current",
       formatLastUsed: { "\($0) ms" })
 
-    XCTAssertEqual(groups.map(\.id), ["/work/other", "/work/current"])
-    XCTAssertEqual(groups.map(\.title), ["/work/other", "This Workspace"])
-    XCTAssertEqual(groups[0].rows.map(\.title), ["Earlier", "Oldest"])
-    XCTAssertEqual(groups[1].rows.map(\.title), ["current"])
+    XCTAssertEqual(rows.map(\.title), ["current"])
     XCTAssertEqual(
-      groups[0].rows[0].accessibilityLabel,
-      "Earlier, /work/other, Summary 2, Last used 2 ms")
+      rows[0].accessibilityLabel,
+      "current, /work/current, Summary 3, Last used 3 ms")
   }
 
-  func testWorkspaceCopilotSessionHistoryPreservesBackendOrderWithoutGrouping() {
+  func testProjectSessionHistoryPreservesBackendOrder() {
     let catalog = SessionCatalog(
       scope: .broader,
       sessions: [
@@ -126,15 +134,13 @@ final class MainWindowControllerTests: XCTestCase {
       ],
       skippedInvalidShards: false)
 
-    let groups = sessionHistoryPresentation(
+    let rows = projectSessionHistoryPresentation(
       catalog: catalog,
-      currentWorkspace: "/work/current",
+      projectWorkspace: "/work/current",
       formatLastUsed: { "\($0)" })
 
-    XCTAssertEqual(groups.count, 1)
-    XCTAssertNil(groups[0].title)
-    XCTAssertEqual(groups[0].rows.map(\.title), ["Recent", "Earlier"])
-    XCTAssertEqual(groups[0].rows.map(\.lastUsed), ["7", "8"])
+    XCTAssertEqual(rows.map(\.title), ["Recent", "Earlier"])
+    XCTAssertEqual(rows.map(\.lastUsed), ["7", "8"])
   }
 }
 
@@ -148,6 +154,7 @@ private func testApplicationCoordinator(
     makeConversation: { id, workspace in
       ConversationRecord(
         id: id,
+        launchWorkspace: workspace,
         store: NativeChatStore(
           workspace: workspace.canonicalPath,
           driver: ControllableConversationDriver()))

@@ -1,64 +1,28 @@
 import Foundation
 import SwiftUI
 
-struct SidebarConversationPresentation: Equatable, Identifiable {
-  let id: ConversationID
+struct SidebarRowPresentation: Equatable {
   let title: String
+  let workspace: String
   let duplicateBadge: String?
   let accessibilityLabel: String
 }
 
-struct SidebarProjectPresentation: Equatable, Identifiable {
-  let workspace: WorkspaceIdentity
-  let title: String
-  let accessibilityLabel: String
-  let conversations: [SidebarConversationPresentation]
-
-  var id: WorkspaceIdentity { workspace }
-}
-
-@MainActor
-func sidebarProjectsPresentation(
-  records: [ConversationRecord]
-) -> [SidebarProjectPresentation] {
-  var workspaceOrder: [WorkspaceIdentity] = []
-  var recordsByWorkspace: [WorkspaceIdentity: [ConversationRecord]] = [:]
-  for record in records {
-    let workspace = record.navigation.workspace
-    if recordsByWorkspace[workspace] == nil {
-      workspaceOrder.append(workspace)
-    }
-    recordsByWorkspace[workspace, default: []].append(record)
+func sidebarRowPresentation(
+  title: String,
+  workspace: String,
+  duplicate: (ordinal: Int, total: Int)?
+) -> SidebarRowPresentation {
+  let duplicateLabel = duplicate.map {
+    "conversation \($0.ordinal) of \($0.total)"
   }
-
-  return workspaceOrder.map { workspace in
-    let records = recordsByWorkspace[workspace, default: []]
-    let path = workspace.canonicalPath
-    let projectTitle =
-      URL(fileURLWithPath: path).lastPathComponent.nilIfEmpty ?? "/"
-    return SidebarProjectPresentation(
-      workspace: workspace,
-      title: projectTitle,
-      accessibilityLabel: "\(projectTitle), \(path)",
-      conversations: records.enumerated().map { index, record in
-        let duplicate =
-          records.count > 1 ? (ordinal: index + 1, total: records.count) : nil
-        let duplicateLabel = duplicate.map {
-          "conversation \($0.ordinal) of \($0.total)"
-        }
-        return SidebarConversationPresentation(
-          id: record.id,
-          title: record.navigation.title,
-          duplicateBadge: duplicate.map { String($0.ordinal) },
-          accessibilityLabel: [
-            record.navigation.title,
-            path,
-            duplicateLabel,
-          ]
-          .compactMap { $0 }
-          .joined(separator: ", "))
-      })
-  }
+  return SidebarRowPresentation(
+    title: title,
+    workspace: workspace,
+    duplicateBadge: duplicate.map { String($0.ordinal) },
+    accessibilityLabel: [title, workspace, duplicateLabel]
+      .compactMap { $0 }
+      .joined(separator: ", "))
 }
 
 struct SessionHistoryRowPresentation: Equatable, Identifiable {
@@ -70,20 +34,13 @@ struct SessionHistoryRowPresentation: Equatable, Identifiable {
   var id: ResumeKey { key }
 }
 
-struct SessionHistoryGroupPresentation: Equatable, Identifiable {
-  let id: String
-  let title: String?
-  let rows: [SessionHistoryRowPresentation]
-}
-
-func sessionHistoryPresentation(
+func projectSessionHistoryPresentation(
   catalog: SessionCatalog,
-  currentWorkspace: String,
+  projectWorkspace: String,
   formatLastUsed: (Int64) -> String
-) -> [SessionHistoryGroupPresentation] {
-  let sessions = catalog.sessions.filter { !$0.isCurrent }
-
-  func row(for session: SessionSummary) -> SessionHistoryRowPresentation {
+) -> [SessionHistoryRowPresentation] {
+  catalog.sessions.compactMap { session in
+    guard !session.isCurrent, session.workingDirectory == projectWorkspace else { return nil }
     let title =
       session.title?.nilIfEmpty
       ?? URL(fileURLWithPath: session.workingDirectory).lastPathComponent.nilIfEmpty
@@ -102,30 +59,6 @@ func sessionHistoryPresentation(
       .compactMap { $0 }
       .joined(separator: ", "))
   }
-
-  guard catalog.scope == .local else {
-    return [
-      SessionHistoryGroupPresentation(
-        id: "local",
-        title: nil,
-        rows: sessions.map(row(for:)))
-    ]
-  }
-
-  var workspaceOrder: [String] = []
-  var sessionsByWorkspace: [String: [SessionSummary]] = [:]
-  for session in sessions {
-    if sessionsByWorkspace[session.workingDirectory] == nil {
-      workspaceOrder.append(session.workingDirectory)
-    }
-    sessionsByWorkspace[session.workingDirectory, default: []].append(session)
-  }
-  return workspaceOrder.map { workspace in
-    SessionHistoryGroupPresentation(
-      id: workspace,
-      title: workspace == currentWorkspace ? "This Workspace" : workspace,
-      rows: sessionsByWorkspace[workspace, default: []].map(row(for:)))
-  }
 }
 
 struct MainWindowView: View {
@@ -137,22 +70,10 @@ struct MainWindowView: View {
   var body: some View {
     NavigationSplitView {
       List(selection: selection) {
-        ForEach(sidebarProjectsPresentation(records: conversations.records)) { project in
-          Section {
-            ForEach(project.conversations) { conversation in
-              ConversationSidebarRow(presentation: conversation)
-                .tag(conversation.id)
-            }
-          } header: {
-            ProjectSidebarHeader(presentation: project)
-          }
-        }
-        if let conversation = conversations.selectedConversation {
-          SessionHistorySection(
-            store: conversation.store,
-            conversationTitle: conversation.navigation.title
-          )
-          .id(conversation.id)
+        ForEach(conversations.launchWorkspaces, id: \.self) { workspace in
+          ProjectSidebarSection(
+            conversations: conversations,
+            workspace: workspace)
         }
       }
       .listStyle(.sidebar)
@@ -241,73 +162,69 @@ struct MainWindowView: View {
   }
 }
 
-private struct SessionHistorySection: View {
-  @ObservedObject var store: NativeChatStore
-  let conversationTitle: String
-  @State private var isExpanded = false
-  @State private var request: SessionCatalogRequest
+private struct ProjectSidebarSection: View {
+  @ObservedObject var conversations: ConversationCollection
+  let workspace: WorkspaceIdentity
+  @State private var isExpanded = true
 
-  init(store: NativeChatStore, conversationTitle: String) {
-    self.store = store
-    self.conversationTitle = conversationTitle
-    _request = State(
-      initialValue: store.sessionCatalog?.scope == .broader ? .all : .local)
+  private var records: [ConversationRecord] {
+    conversations.records(launchedFrom: workspace)
+  }
+
+  private var historyConversation: ConversationRecord? {
+    conversations.historyConversation(launchedFrom: workspace)
   }
 
   var body: some View {
-    Section {
-      DisclosureGroup(isExpanded: $isExpanded) {
-        scopeMenu
-        historyContent
-      } label: {
-        VStack(alignment: .leading, spacing: 2) {
-          Label("History", systemImage: "clock.arrow.circlepath")
-          Text(conversationTitle)
-            .font(.caption)
-            .foregroundStyle(.secondary)
-            .lineLimit(1)
+    Section(isExpanded: $isExpanded) {
+      ForEach(records) { conversation in
+        ConversationSidebarRow(
+          conversation: conversation,
+          duplicate: conversations.duplicatePosition(for: conversation.id)
+        )
+        .tag(conversation.id)
+      }
+      if let historyConversation {
+        ProjectSessionHistory(
+          store: historyConversation.store,
+          projectWorkspace: workspace.canonicalPath
+        ) { key in
+          conversations.select(historyConversation.id)
+          historyConversation.store.resumeSession(key)
         }
+        .id(historyConversation.id)
       }
-      .accessibilityIdentifier("session-history")
-      .accessibilityLabel("History for \(conversationTitle)")
-    }
-    .onChange(of: isExpanded) {
-      guard isExpanded, shouldLoad else { return }
-      store.refreshSessions(request)
-    }
-    .onChange(of: store.sessionState) { previous, current in
-      guard case .resuming = previous, current == .ready, store.sessionCatalog == nil else {
-        return
-      }
-      isExpanded = false
+    } header: {
+      Label(projectName, systemImage: "folder")
+        .help(workspace.canonicalPath)
+        .accessibilityLabel("\(projectName), project")
+        .accessibilityIdentifier("project-\(workspace.canonicalPath)")
     }
   }
 
-  private var scopeMenu: some View {
-    Menu {
-      scopeButton("Saved Vivi Sessions", request: .local)
-      scopeButton("Copilot Sessions in This Workspace", request: .all)
-      Divider()
-      Button("Refresh", systemImage: "arrow.clockwise") {
-        store.refreshSessions(request)
+  private var projectName: String {
+    URL(fileURLWithPath: workspace.canonicalPath).lastPathComponent.nilIfEmpty ?? "/"
+  }
+}
+
+private struct ProjectSessionHistory: View {
+  @ObservedObject var store: NativeChatStore
+  let projectWorkspace: String
+  let resume: (ResumeKey) -> Void
+
+  var body: some View {
+    historyContent
+      .accessibilityIdentifier("session-history-\(projectWorkspace)")
+      .onAppear {
+        guard shouldLoad else { return }
+        store.refreshSessions(.local)
       }
-    } label: {
-      HStack {
-        Text(scopeLabel)
-          .lineLimit(1)
-        Spacer()
-        Image(systemName: "chevron.up.chevron.down")
-          .font(.caption2)
-          .foregroundStyle(.secondary)
+      .onChange(of: store.sessionState) { previous, current in
+        guard case .resuming = previous, current == .ready, store.sessionCatalog == nil else {
+          return
+        }
+        store.refreshSessions(.local)
       }
-      .contentShape(Rectangle())
-    }
-    .menuStyle(.borderlessButton)
-    .menuIndicator(.hidden)
-    .disabled(isOperating)
-    .accessibilityLabel("Session history scope")
-    .accessibilityValue(scopeAccessibilityValue)
-    .accessibilityIdentifier("session-history-scope")
   }
 
   @ViewBuilder
@@ -327,20 +244,18 @@ private struct SessionHistorySection: View {
           Label(failure, systemImage: "exclamationmark.triangle")
             .foregroundStyle(.secondary)
           Button("Try Again") {
-            store.refreshSessions(request)
+            store.refreshSessions(.local)
           }
           .disabled(isOperating)
         }
         .accessibilityIdentifier("session-history-failure")
       } else if let catalog = store.sessionCatalog {
-        let groups = sessionHistoryPresentation(
+        let rows = projectSessionHistoryPresentation(
           catalog: catalog,
-          currentWorkspace: store.workspace,
+          projectWorkspace: projectWorkspace,
           formatLastUsed: sessionHistoryLastUsed)
-        if groups.allSatisfy(\.rows.isEmpty) {
-          Label(emptyMessage, systemImage: "clock")
-            .foregroundStyle(.secondary)
-            .accessibilityIdentifier("session-history-empty")
+        if rows.isEmpty {
+          emptyState
         } else {
           if catalog.skippedInvalidShards {
             Label("Some sessions couldn’t be read.", systemImage: "exclamationmark.triangle")
@@ -348,71 +263,32 @@ private struct SessionHistorySection: View {
               .foregroundStyle(.secondary)
               .accessibilityIdentifier("session-history-partial-warning")
           }
-          ForEach(groups) { group in
-            if let title = group.title {
-              Text(title)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .help(title)
+          ForEach(rows) { row in
+            SessionHistoryRow(
+              presentation: row,
+              isResuming: resumingKey == row.key
+            ) {
+              resume(row.key)
             }
-            ForEach(group.rows) { row in
-              SessionHistoryRow(
-                presentation: row,
-                isResuming: resumingKey == row.key
-              ) {
-                store.resumeSession(row.key)
-              }
-              .disabled(isOperating)
-            }
+            .disabled(isOperating)
           }
         }
       } else {
-        Label(emptyMessage, systemImage: "clock")
-          .foregroundStyle(.secondary)
-          .accessibilityIdentifier("session-history-empty")
+        emptyState
       }
     }
   }
 
-  private func scopeButton(
-    _ title: String,
-    request selectedRequest: SessionCatalogRequest
-  ) -> some View {
-    Button {
-      request = selectedRequest
-      store.refreshSessions(selectedRequest)
-    } label: {
-      if request == selectedRequest {
-        Label(title, systemImage: "checkmark")
-      } else {
-        Text(title)
-      }
-    }
-  }
-
-  private var scopeLabel: String {
-    request == .local ? "Saved in Vivi" : "This Workspace"
-  }
-
-  private var scopeAccessibilityValue: String {
-    request == .local ? "Saved Vivi Sessions" : "Copilot Sessions in This Workspace"
-  }
-
-  private var emptyMessage: String {
-    request == .local
-      ? "No saved Vivi sessions." : "No Copilot sessions in this workspace."
+  private var emptyState: some View {
+    Label("No saved sessions for this project.", systemImage: "clock")
+      .foregroundStyle(.secondary)
+      .accessibilityIdentifier("session-history-empty")
   }
 
   private var shouldLoad: Bool {
     guard store.sessionCatalogFailure == nil else { return false }
     guard let catalog = store.sessionCatalog else { return true }
-    return catalog.scope != requestedScope
-  }
-
-  private var requestedScope: SessionCatalogScope {
-    request == .local ? .local : .broader
+    return catalog.scope != .local
   }
 
   private var isOperating: Bool {
@@ -459,34 +335,29 @@ private struct SessionHistoryRow: View {
   }
 }
 
-private struct ProjectSidebarHeader: View {
-  let presentation: SidebarProjectPresentation
-
-  var body: some View {
-    VStack(alignment: .leading, spacing: 2) {
-      Text(presentation.title)
-        .lineLimit(1)
-      Text(presentation.workspace.canonicalPath)
-        .font(.caption2)
-        .foregroundStyle(.secondary)
-        .lineLimit(1)
-        .truncationMode(.middle)
-    }
-    .help(presentation.workspace.canonicalPath)
-    .accessibilityElement(children: .ignore)
-    .accessibilityLabel(presentation.accessibilityLabel)
-    .accessibilityIdentifier(
-      "project-header-\(presentation.workspace.canonicalPath)")
-  }
-}
-
 private struct ConversationSidebarRow: View {
-  let presentation: SidebarConversationPresentation
+  @ObservedObject var conversation: ConversationRecord
+  let duplicate: (ordinal: Int, total: Int)?
+
+  private var presentation: SidebarRowPresentation {
+    sidebarRowPresentation(
+      title: conversation.navigation.title,
+      workspace: conversation.navigation.workspace.canonicalPath,
+      duplicate: duplicate)
+  }
 
   var body: some View {
     HStack(spacing: 8) {
-      Text(presentation.title)
-        .lineLimit(1)
+      VStack(alignment: .leading, spacing: 2) {
+        Text(presentation.title)
+          .lineLimit(1)
+        Text(presentation.workspace)
+          .font(.caption)
+          .foregroundStyle(.secondary)
+          .lineLimit(1)
+          .truncationMode(.middle)
+          .help(presentation.workspace)
+      }
       Spacer(minLength: 4)
       if let badge = presentation.duplicateBadge {
         Text(badge)
@@ -501,7 +372,7 @@ private struct ConversationSidebarRow: View {
 
     .accessibilityElement(children: .ignore)
     .accessibilityLabel(presentation.accessibilityLabel)
-    .accessibilityIdentifier("conversation-row-\(presentation.id.rawValue)")
+    .accessibilityIdentifier("conversation-row-\(conversation.id.rawValue)")
   }
 }
 
