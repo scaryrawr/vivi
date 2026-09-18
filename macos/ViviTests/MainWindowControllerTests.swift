@@ -310,19 +310,33 @@ final class MainWindowControllerTests: XCTestCase {
       resolvedSidebarSelection(
         selectedConversationID: firstID,
         savedSelection: saved,
-        visibleSavedSessionKeys: Set([ResumeKey(generation: 4, slot: 2)])),
+        visibleSavedSessionSelections: Set([saved])),
       saved)
     XCTAssertEqual(
       resolvedSidebarSelection(
         selectedConversationID: secondID,
         savedSelection: saved,
-        visibleSavedSessionKeys: Set([ResumeKey(generation: 4, slot: 2)])),
+        visibleSavedSessionSelections: Set([saved])),
       .conversation(secondID))
     XCTAssertEqual(
       resolvedSidebarSelection(
         selectedConversationID: firstID,
         savedSelection: saved,
-        visibleSavedSessionKeys: []),
+        visibleSavedSessionSelections: []),
+      .conversation(firstID))
+  }
+
+  func testSavedSessionSelectionRequiresRenderedOwningConversationTag() {
+    let firstID = ConversationID(rawValue: UUID())
+    let secondID = ConversationID(rawValue: UUID())
+    let key = ResumeKey(generation: 4, slot: 2)
+    let saved = SidebarSelection.savedSession(firstID, key)
+
+    XCTAssertEqual(
+      resolvedSidebarSelection(
+        selectedConversationID: firstID,
+        savedSelection: saved,
+        visibleSavedSessionSelections: Set([.savedSession(secondID, key)])),
       .conversation(firstID))
   }
 

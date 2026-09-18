@@ -83,11 +83,11 @@ enum SidebarSelection: Hashable {
 func resolvedSidebarSelection(
   selectedConversationID: ConversationID?,
   savedSelection: SidebarSelection?,
-  visibleSavedSessionKeys: Set<ResumeKey>
+  visibleSavedSessionSelections: Set<SidebarSelection>
 ) -> SidebarSelection? {
-  if case .savedSession(let conversationID, let key) = savedSelection,
+  if case .savedSession(let conversationID, _) = savedSelection,
     selectedConversationID == conversationID,
-    visibleSavedSessionKeys.contains(key)
+    visibleSavedSessionSelections.contains(savedSelection)
   {
     return savedSelection
   }
@@ -232,7 +232,7 @@ struct MainWindowView: View {
         resolvedSidebarSelection(
           selectedConversationID: conversations.selectedID,
           savedSelection: sidebarSelection,
-          visibleSavedSessionKeys: visibleSavedSessionKeys)
+          visibleSavedSessionSelections: visibleSavedSessionSelections)
       },
       set: { selection in
         guard let selection else { return }
@@ -252,9 +252,9 @@ struct MainWindowView: View {
       })
   }
 
-  private var visibleSavedSessionKeys: Set<ResumeKey> {
+  private var visibleSavedSessionSelections: Set<SidebarSelection> {
     Set(
-      conversations.launchWorkspaces.flatMap { workspace -> [ResumeKey] in
+      conversations.launchWorkspaces.flatMap { workspace -> [SidebarSelection] in
         guard let conversation = conversations.historyConversation(launchedFrom: workspace),
           let catalog = conversation.store.sessionCatalog
         else {
@@ -263,7 +263,7 @@ struct MainWindowView: View {
         return projectSessionHistoryPresentation(
           catalog: catalog,
           projectWorkspace: workspace.canonicalPath
-        ).map(\.key)
+        ).map { .savedSession(conversation.id, $0.key) }
       })
   }
 }
