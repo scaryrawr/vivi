@@ -27,8 +27,6 @@ struct ContentView: View {
 
   var body: some View {
     VStack(spacing: 14) {
-      header
-      Divider()
       ScrollViewReader { proxy in
         ScrollView {
           LazyVStack(alignment: .leading, spacing: 12) {
@@ -48,21 +46,6 @@ struct ContentView: View {
     }
     .padding(20)
     .frame(minHeight: 420)
-  }
-
-  private var header: some View {
-    VStack(alignment: .leading, spacing: 4) {
-      Text(store.sessionTitle)
-        .font(.title2.weight(.semibold))
-        .lineLimit(1)
-        .truncationMode(.tail)
-      Text(store.workspace)
-        .font(.caption)
-        .foregroundStyle(.secondary)
-        .lineLimit(1)
-        .truncationMode(.middle)
-    }
-    .frame(maxWidth: .infinity, alignment: .leading)
   }
 
   private var composer: some View {

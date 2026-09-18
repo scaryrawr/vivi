@@ -30,23 +30,23 @@ final class MainWindowControllerTests: XCTestCase {
 
     XCTAssertEqual(window.title, "Vivi")
     XCTAssertEqual(window.titleVisibility, .hidden)
-    XCTAssertEqual(window.toolbar?.items.map(\.itemIdentifier), [.viviNavigation, .flexibleSpace])
-    XCTAssertEqual(realizedSidebarToggleCount(in: window.toolbar), 1)
+    XCTAssertNil(window.toolbar)
+    XCTAssertEqual(window.titlebarAccessoryViewControllers.count, 1)
     XCTAssertEqual(
-      realizedToolbarView(in: window.toolbar)?.presentation.conversationTitle, "second")
+      titlebarAccessory(in: window)?.presentation.conversationTitle, "second")
     firstDriver.send(.sessionTitle("First renamed"))
     XCTAssertEqual(window.title, "Vivi")
     XCTAssertEqual(
-      realizedToolbarView(in: window.toolbar)?.presentation.conversationTitle, "second")
+      titlebarAccessory(in: window)?.presentation.conversationTitle, "second")
     conversations.select(first.id)
     XCTAssertEqual(window.title, "Vivi")
     XCTAssertEqual(
-      realizedToolbarView(in: window.toolbar)?.presentation.conversationTitle,
+      titlebarAccessory(in: window)?.presentation.conversationTitle,
       "First renamed")
     firstDriver.send(.sessionTitle("First final"))
     XCTAssertEqual(window.title, "Vivi")
     XCTAssertEqual(
-      realizedToolbarView(in: window.toolbar)?.presentation.conversationTitle,
+      titlebarAccessory(in: window)?.presentation.conversationTitle,
       "First final")
     _ = controller
   }
@@ -65,26 +65,21 @@ final class MainWindowControllerTests: XCTestCase {
     controller.showAndActivate()
     layoutTitlebar(in: window)
 
-    let initialToolbarIdentifiers = window.toolbar?.items.map(\.itemIdentifier)
-    assertVisibleToolbarGeometry(in: window)
-    sidebarToggleButton(in: window.toolbar)?.performClick(nil)
+    assertVisibleTitlebarGeometry(in: window)
+    titlebarAccessory(in: window)?.sidebarButton.performClick(nil)
     layoutTitlebar(in: window)
 
     XCTAssertEqual(window.title, "Vivi")
     XCTAssertEqual(window.titleVisibility, .hidden)
-    XCTAssertEqual(initialToolbarIdentifiers, [.viviNavigation, .flexibleSpace])
-    XCTAssertEqual(window.toolbar?.items.map(\.itemIdentifier), initialToolbarIdentifiers)
-    XCTAssertEqual(realizedSidebarToggleCount(in: window.toolbar), 1)
-    assertVisibleToolbarGeometry(in: window)
+    XCTAssertNil(window.toolbar)
+    XCTAssertEqual(window.titlebarAccessoryViewControllers.count, 1)
+    XCTAssertEqual(titlebarAccessory(in: window)?.layoutAttribute, .left)
+    assertVisibleTitlebarGeometry(in: window)
     XCTAssertFalse(
-      realizedToolbarView(in: window.toolbar)?.appNameLabel.isAccessibilityElement() ?? true)
+      titlebarAccessory(in: window)?.appNameLabel.isAccessibilityElement() ?? true)
     XCTAssertFalse(
-      realizedToolbarView(in: window.toolbar)?.conversationTitleLabel.isAccessibilityElement()
+      titlebarAccessory(in: window)?.conversationTitleLabel.isAccessibilityElement()
         ?? true)
-    XCTAssertFalse(
-      window.toolbar?.items.contains(where: {
-        $0.itemIdentifier == .toggleSidebar
-      }) ?? true)
     _ = controller
   }
 
@@ -97,26 +92,9 @@ final class MainWindowControllerTests: XCTestCase {
   }
 
   @MainActor
-  private func realizedSidebarToggleCount(in toolbar: NSToolbar?) -> Int {
-    toolbar?.items.reduce(into: 0) { count, item in
-      guard let view = item.view as? MainWindowToolbarView,
-        view.sidebarButton.action == #selector(NSSplitViewController.toggleSidebar(_:))
-      else {
-        return
-      }
-      count += 1
-    } ?? 0
-  }
-
-  @MainActor
-  private func sidebarToggleButton(in toolbar: NSToolbar?) -> NSButton? {
-    realizedToolbarView(in: toolbar)?.sidebarButton
-  }
-
-  @MainActor
-  private func realizedToolbarView(in toolbar: NSToolbar?) -> MainWindowToolbarView? {
-    toolbar?.items.lazy
-      .compactMap { $0.view as? MainWindowToolbarView }
+  private func titlebarAccessory(in window: NSWindow) -> MainWindowTitlebarAccessoryController? {
+    window.titlebarAccessoryViewControllers.lazy
+      .compactMap { $0 as? MainWindowTitlebarAccessoryController }
       .first
   }
 
@@ -124,33 +102,34 @@ final class MainWindowControllerTests: XCTestCase {
   private func layoutTitlebar(in window: NSWindow) {
     window.contentViewController?.view.layoutSubtreeIfNeeded()
     window.contentView?.superview?.layoutSubtreeIfNeeded()
-    realizedToolbarView(in: window.toolbar)?.layoutSubtreeIfNeeded()
+    titlebarAccessory(in: window)?.view.layoutSubtreeIfNeeded()
   }
 
   @MainActor
-  private func assertVisibleToolbarGeometry(
+  private func assertVisibleTitlebarGeometry(
     in window: NSWindow,
     file: StaticString = #filePath,
     line: UInt = #line
   ) {
-    guard let toolbarView = realizedToolbarView(in: window.toolbar) else {
-      XCTFail("Missing realized Vivi toolbar", file: file, line: line)
+    guard let accessory = titlebarAccessory(in: window) else {
+      XCTFail("Missing realized Vivi titlebar accessory", file: file, line: line)
       return
     }
-    let toggleFrame = toolbarView.convert(
-      toolbarView.sidebarButton.bounds, from: toolbarView.sidebarButton)
-    let appNameFrame = toolbarView.convert(
-      toolbarView.appNameLabel.bounds, from: toolbarView.appNameLabel)
-    let separatorFrame = toolbarView.convert(
-      toolbarView.separator.bounds, from: toolbarView.separator)
-    let titleFrame = toolbarView.convert(
-      toolbarView.conversationTitleLabel.bounds,
-      from: toolbarView.conversationTitleLabel)
+    let toggleFrame = accessory.view.convert(
+      accessory.sidebarButton.bounds, from: accessory.sidebarButton)
+    let appNameFrame = accessory.view.convert(
+      accessory.appNameLabel.bounds, from: accessory.appNameLabel)
+    let separatorFrame = accessory.view.convert(
+      accessory.separator.bounds, from: accessory.separator)
+    let titleFrame = accessory.view.convert(
+      accessory.conversationTitleLabel.bounds,
+      from: accessory.conversationTitleLabel)
 
-    XCTAssertFalse(toolbarView.sidebarButton.isHidden, file: file, line: line)
-    XCTAssertFalse(toolbarView.appNameLabel.isHidden, file: file, line: line)
-    XCTAssertFalse(toolbarView.separator.isHidden, file: file, line: line)
-    XCTAssertFalse(toolbarView.conversationTitleLabel.isHidden, file: file, line: line)
+    XCTAssertEqual(accessory.layoutAttribute, .left, file: file, line: line)
+    XCTAssertFalse(accessory.sidebarButton.isHidden, file: file, line: line)
+    XCTAssertFalse(accessory.appNameLabel.isHidden, file: file, line: line)
+    XCTAssertFalse(accessory.separator.isHidden, file: file, line: line)
+    XCTAssertFalse(accessory.conversationTitleLabel.isHidden, file: file, line: line)
     XCTAssertGreaterThan(toggleFrame.width, 0, file: file, line: line)
     XCTAssertGreaterThan(appNameFrame.width, 0, file: file, line: line)
     XCTAssertGreaterThan(separatorFrame.width, 0, file: file, line: line)
@@ -159,7 +138,7 @@ final class MainWindowControllerTests: XCTestCase {
     XCTAssertLessThan(appNameFrame.maxX, separatorFrame.minX, file: file, line: line)
     XCTAssertLessThan(separatorFrame.maxX, titleFrame.minX, file: file, line: line)
     XCTAssertEqual(visibleSidebarToggleCount(in: window), 1, file: file, line: line)
-    XCTAssertTrue(visibleNativeTitleLabels(in: window, excluding: toolbarView).isEmpty)
+    XCTAssertTrue(visibleNativeTitleLabels(in: window, excluding: accessory).isEmpty)
   }
 
   @MainActor
@@ -174,11 +153,11 @@ final class MainWindowControllerTests: XCTestCase {
   @MainActor
   private func visibleNativeTitleLabels(
     in window: NSWindow,
-    excluding toolbarView: MainWindowToolbarView
+    excluding accessory: MainWindowTitlebarAccessoryController
   ) -> [NSTextField] {
     descendantViews(of: NSTextField.self, below: window.contentView?.superview).filter {
-      $0 !== toolbarView.appNameLabel
-        && $0 !== toolbarView.conversationTitleLabel
+      $0 !== accessory.appNameLabel
+        && $0 !== accessory.conversationTitleLabel
         && !$0.isHidden
         && $0.frame.width > 0
         && $0.stringValue == "Vivi"

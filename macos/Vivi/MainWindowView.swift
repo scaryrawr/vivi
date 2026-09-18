@@ -252,11 +252,6 @@ private struct ProjectSidebarHeader: View {
       Label(presentation.name, systemImage: "folder")
         .font(.body)
         .fontWeight(.semibold)
-      Text(presentation.path)
-        .font(.caption)
-        .foregroundStyle(.secondary)
-        .lineLimit(1)
-        .truncationMode(.middle)
     }
     .padding(.top, 8)
     .padding(.bottom, 6)

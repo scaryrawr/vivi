@@ -3,14 +3,12 @@ import Combine
 import SwiftUI
 
 @MainActor
-final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolbarDelegate,
-  MainWindowControlling
-{
+final class MainWindowController: NSWindowController, NSWindowDelegate, MainWindowControlling {
   let identity: MainWindowIdentity
 
   private let activate: @MainActor () -> Void
   private let onClosed: @MainActor (MainWindowIdentity) -> Void
-  private let toolbarView = MainWindowToolbarView()
+  private let titlebarAccessory = MainWindowTitlebarAccessoryController()
   private var selectionObservation: AnyCancellable?
   private var titleObservation: AnyCancellable?
   private var closingForTermination = false
@@ -41,9 +39,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
         dismissWorkspaceChoiceFailure: { [weak applicationCoordinator] in
           applicationCoordinator?.dismissWorkspaceChoiceFailure()
         }))
-    // Realize SwiftUI's split-view toolbar before replacing it with the owned toolbar.
+    // Realize SwiftUI's split-view chrome before replacing it with the owned accessory.
     window.contentViewController?.view.layoutSubtreeIfNeeded()
-    installToolbar(in: window)
+    installTitlebarAccessory(in: window)
     window.delegate = self
     window.setFrameAutosaveName("ViviMainWindow")
     selectionObservation = conversations.$selectedID
@@ -65,10 +63,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
     showWindow(nil)
     if let window {
       window.contentViewController?.view.layoutSubtreeIfNeeded()
-      if window.toolbar?.identifier != "ViviMainToolbar" {
-        installToolbar(in: window)
-      }
-      window.titleVisibility = .hidden
+      installTitlebarAccessory(in: window)
       window.contentView?.superview?.layoutSubtreeIfNeeded()
     }
     window?.makeKeyAndOrderFront(nil)
@@ -86,37 +81,14 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
     close()
   }
 
-  func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-    [.viviNavigation, .flexibleSpace]
-  }
-
-  func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-    [.viviNavigation, .flexibleSpace]
-  }
-
-  func toolbar(
-    _ toolbar: NSToolbar,
-    itemForItemIdentifier itemIdentifier: NSToolbarItem.Identifier,
-    willBeInsertedIntoToolbar flag: Bool
-  ) -> NSToolbarItem? {
-    guard itemIdentifier == .viviNavigation else { return nil }
-    let item = NSToolbarItem(itemIdentifier: itemIdentifier)
-    item.label = "Window Navigation"
-    item.paletteLabel = "Window Navigation"
-    item.view = toolbarView
-    item.visibilityPriority = .high
-    return item
-  }
-
-  private func installToolbar(in window: NSWindow) {
-    let toolbar = NSToolbar(identifier: "ViviMainToolbar")
-    toolbar.delegate = self
-    toolbar.displayMode = .iconOnly
-    toolbar.allowsUserCustomization = false
-    toolbar.autosavesConfiguration = false
-    window.toolbar = toolbar
-    window.toolbarStyle = .unified
+  private func installTitlebarAccessory(in window: NSWindow) {
+    window.toolbar = nil
     window.titleVisibility = .hidden
+    guard !window.titlebarAccessoryViewControllers.contains(where: { $0 === titlebarAccessory })
+    else {
+      return
+    }
+    window.addTitlebarAccessoryViewController(titlebarAccessory)
   }
 
   private func bindSelectedTitle(
@@ -127,16 +99,16 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
     guard let selectedID,
       let conversation = conversations.records.first(where: { $0.id == selectedID })
     else {
-      toolbarView.presentation = MainWindowTitlePresentation(conversationTitle: nil)
+      titlebarAccessory.presentation = MainWindowTitlePresentation(conversationTitle: nil)
       return
     }
-    toolbarView.presentation = MainWindowTitlePresentation(
+    titlebarAccessory.presentation = MainWindowTitlePresentation(
       conversationTitle: conversation.navigation.title)
     titleObservation = conversation.$navigation
       .map(\.title)
       .removeDuplicates()
-      .sink { [weak toolbarView] title in
-        toolbarView?.presentation = MainWindowTitlePresentation(conversationTitle: title)
+      .sink { [weak titlebarAccessory] title in
+        titlebarAccessory?.presentation = MainWindowTitlePresentation(conversationTitle: title)
       }
   }
 
@@ -154,12 +126,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
   }
 }
 
-extension NSToolbarItem.Identifier {
-  static let viviNavigation = Self("ViviNavigation")
-}
-
 @MainActor
-final class MainWindowToolbarView: NSView {
+final class MainWindowTitlebarAccessoryController: NSTitlebarAccessoryViewController {
   let sidebarButton: NSButton
   let appNameLabel = NSTextField(labelWithString: "")
   let separator = NSBox()
@@ -172,7 +140,7 @@ final class MainWindowToolbarView: NSView {
     }
   }
 
-  override init(frame frameRect: NSRect) {
+  init() {
     sidebarButton = NSButton(
       image: NSImage(systemSymbolName: "sidebar.left", accessibilityDescription: nil)!,
       target: nil,
@@ -206,14 +174,16 @@ final class MainWindowToolbarView: NSView {
     stackView.spacing = 8
     stackView.translatesAutoresizingMaskIntoConstraints = false
 
-    super.init(frame: frameRect)
-    addSubview(stackView)
+    super.init(nibName: nil, bundle: nil)
+    layoutAttribute = .left
+    view = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 32))
+    preferredContentSize = NSSize(width: 320, height: 32)
+    view.addSubview(stackView)
     NSLayoutConstraint.activate([
-      stackView.leadingAnchor.constraint(equalTo: leadingAnchor),
-      stackView.trailingAnchor.constraint(equalTo: trailingAnchor),
-      stackView.centerYAnchor.constraint(equalTo: centerYAnchor),
-      widthAnchor.constraint(equalToConstant: 320),
-      heightAnchor.constraint(equalToConstant: 28),
+      stackView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+      stackView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+      stackView.centerYAnchor.constraint(equalTo: view.centerYAnchor),
+      view.widthAnchor.constraint(equalToConstant: 320),
     ])
     updatePresentation()
   }
@@ -221,10 +191,6 @@ final class MainWindowToolbarView: NSView {
   @available(*, unavailable)
   required init?(coder: NSCoder) {
     fatalError("init(coder:) is unavailable")
-  }
-
-  override var intrinsicContentSize: NSSize {
-    NSSize(width: 320, height: 28)
   }
 
   private func updatePresentation() {
