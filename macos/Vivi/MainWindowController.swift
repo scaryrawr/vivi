@@ -25,6 +25,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, MainWind
     super.init(window: window)
 
     window.title = "Vivi"
+    window.titleVisibility = .hidden
     window.contentViewController = NSHostingController(
       rootView: MainWindowView(
         conversations: conversations,

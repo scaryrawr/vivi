@@ -29,6 +29,7 @@ final class MainWindowControllerTests: XCTestCase {
       onClosed: { _ in })
 
     XCTAssertEqual(window.title, "Vivi")
+    XCTAssertEqual(window.titleVisibility, .hidden)
     firstDriver.send(.sessionTitle("First renamed"))
     XCTAssertEqual(window.title, "Vivi")
     conversations.select(first.id)

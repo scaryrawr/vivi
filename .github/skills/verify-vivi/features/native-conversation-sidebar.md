@@ -9,12 +9,15 @@ away from each conversation store.
 - An ordinary launch shows one empty native window.
 - Every `vivi chat --native` occurrence adds and selects a fresh conversation,
   including repeated launches from the same workspace.
-- Each canonical launch workspace gets one expandable project section for the
-  app lifetime.
+- Each canonical launch workspace gets one stable project section for the app
+  lifetime, with the canonical path shown as project context.
 - Sidebar rows show the live conversation title and active workspace path;
   repeated workspaces receive stable numeric disambiguation.
-- Selecting a row swaps the detail and native window title without stopping
-  other conversations.
+- Selecting a row moves one native selection highlight without reordering the
+  roster, swaps the detail, and updates the leading toolbar conversation title
+  without stopping other conversations.
+- The leading toolbar keeps one sidebar toggle followed by
+  `Vivi | <conversation title>` in expanded and collapsed sidebar states.
 - Closing the window keeps conversation stores and drivers alive.
 - Clicking Vivi in the Dock restores the same rows, selection, and conversation
   state.
@@ -24,16 +27,19 @@ away from each conversation store.
 
 Build Vivi, run `./zig-out/bin/vivi chat --native` from one workspace, then run
 it again from another workspace and twice from the first. Select each sidebar
-row. Close the native window with its red close control, click Vivi in the
-Dock, and finally quit the app.
+row and verify the highlight moves without changing row order. Collapse and
+show the sidebar, confirm the leading toolbar hierarchy remains fixed, then
+close the native window with its red close control, click Vivi in the Dock, and
+finally quit the app.
 
 ## Driving it with verify-vivi
 
 Build once with `zig build`, then launch only through the worktree's
 `./zig-out/bin/vivi chat --native`; do not open a bare `vivi://` URL. Retain a
 screen recording that shows the launch action and resulting native state for
-distinct and repeated workspaces, row selection, red close, Dock reopen, and
-quit. Pair the recording with the exact Xcode test command and
+distinct and repeated workspaces, exclusive row selection with stable order,
+sidebar collapse/show, long-title truncation, red close, Dock reopen, and quit.
+Pair the recording with the exact Xcode test command and
 `./scripts/check.sh`; the terminal helper does not substitute for native app
 interaction.
 

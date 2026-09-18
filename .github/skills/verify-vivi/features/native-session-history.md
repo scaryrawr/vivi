@@ -5,17 +5,18 @@ projects in the native sidebar.
 
 ## Sub-features
 
-- Each canonical workspace launched during the app lifetime has one expandable
-  project section.
-- Live conversation rows appear first, followed directly by resumable sessions
-  saved for that project; there is no redundant nested history submenu.
+- Each canonical workspace launched during the app lifetime has one stable
+  project section with its canonical path visible beneath the project name.
+- Live conversation rows appear first in roster order, followed by a nested
+  History disclosure containing resumable sessions saved for that project.
 - Loading, failure with retry, empty, and resuming states remain inline in the
   project section.
 - Persisted rows are visually and accessibly distinct from live conversation
   rows, and only the requested row shows resume progress.
 - A successful cross-workspace resume keeps the live conversation identity and
   project section and selection while atomically updating its title, active
-  workspace, transcript, native window title, and duplicate-workspace position.
+  workspace, transcript, toolbar conversation title, and duplicate-workspace
+  position.
 - Starting another `vivi chat --native` remains occurrence-based and creates a
   new live conversation rather than resuming history.
 
@@ -23,8 +24,8 @@ projects in the native sidebar.
 
 Build Vivi and run `./zig-out/bin/vivi chat --native` from a workspace that has
 earlier sessions in Vivi's isolated Copilot SDK store at
-`~/.vivi/copilot/`. Launch it again from another workspace, expand each project
-in the sidebar, and select a persisted session. Repeat with another live
+`~/.vivi/copilot/`. Launch it again from another workspace, expand History
+under each project in the sidebar, and select a persisted session. Repeat with another live
 conversation open from the resumed session's workspace so the
 duplicate-workspace badges can update.
 
@@ -32,11 +33,12 @@ duplicate-workspace badges can update.
 
 Run the doctor, build once, and launch only through the worktree's
 `./zig-out/bin/vivi chat --native`. Record the native window while expanding
-two project sections, resuming a saved Vivi session, and selecting both
-resulting duplicate-workspace rows. Attempt a second click while resume is
-pending, close and reopen the window through the Dock, then quit. Retain the
-video and representative screenshots alongside the exact Xcode and repository
-check output.
+History under two projects, resuming a saved Vivi session, and selecting both
+resulting duplicate-workspace rows. Verify one live row is highlighted at a
+time and selection does not reorder either project's roster. Attempt a second
+click while resume is pending, close and reopen the window through the Dock,
+then quit. Retain the video and representative screenshots alongside the exact
+Xcode and repository check output.
 
 The PTY recipes do not control AppKit. They establish Copilot authentication
 and can create resumable session data, but native interaction and native media
