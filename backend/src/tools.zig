@@ -307,7 +307,16 @@ pub const PreparedCall = struct {
         allocator: std.mem.Allocator,
         call_id: []const u8,
     ) !tool_activity.ToolStarted {
-        const summary: tool_activity.ToolSummary = switch (self.operation) {
+        return tool_activity.ToolStarted.init(
+            allocator,
+            call_id,
+            self.arguments_json,
+            self.summary(),
+        );
+    }
+
+    pub fn summary(self: *const PreparedCall) tool_activity.ToolSummary {
+        return switch (self.operation) {
             .read => |parsed| .{ .read = .{
                 .path = parsed.value.path,
                 .offset = parsed.value.offset,
@@ -326,11 +335,19 @@ pub const PreparedCall = struct {
                 .name = rejected_call.tool_name,
             } },
         };
-        return tool_activity.ToolStarted.init(
+    }
+
+    pub fn finished(
+        self: *const PreparedCall,
+        allocator: std.mem.Allocator,
+        call_id: []const u8,
+        result: tool_activity.ToolFinished.ResultInput,
+    ) !tool_activity.ToolFinished {
+        return tool_activity.ToolFinished.initPresented(
             allocator,
             call_id,
-            self.arguments_json,
-            summary,
+            self.summary(),
+            result,
         );
     }
 
@@ -1732,6 +1749,34 @@ test "prepare derives built-in summaries from executable arguments" {
             else => unreachable,
         }
     }
+}
+
+test "prepared built-in completion retains its backend presentation" {
+    var service = try Service.init(
+        std.testing.allocator,
+        std.testing.io,
+        ".",
+    );
+    defer service.deinit();
+
+    var prepared = try service.prepare(
+        "read",
+        "{\"path\":\"sample.zig\"}",
+    );
+    defer prepared.deinit();
+    var finished = try prepared.finished(
+        std.testing.allocator,
+        "call",
+        .{ .succeeded = "const answer = 42;" },
+    );
+    defer finished.deinit();
+
+    try std.testing.expect(
+        std.meta.activeTag(finished.output_presentation.content) == .source,
+    );
+    const source = finished.output_presentation.content.source;
+    try std.testing.expect(source.language == .zig);
+    try std.testing.expect(source.tokens.len > 0);
 }
 
 test "prepare keeps malformed and unknown tools visible and failing" {

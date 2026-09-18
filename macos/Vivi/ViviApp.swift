@@ -53,9 +53,14 @@ final class ViviAppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     applicationCoordinator.open(urls)
   }
 
+  func applicationOpenUntitledFile(_ sender: NSApplication) -> Bool {
+    applicationCoordinator.presentMainWindow()
+    return true
+  }
+
   func applicationShouldHandleReopen(
     _ sender: NSApplication,
-    hasVisibleWindows flag: Bool
+    hasVisibleWindows _: Bool
   ) -> Bool {
     applicationCoordinator.presentMainWindow()
     return false

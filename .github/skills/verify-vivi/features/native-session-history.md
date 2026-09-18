@@ -8,24 +8,24 @@ projects in the native sidebar.
 - Each canonical workspace launched during the app lifetime has one expandable
   project section.
 - Live conversation rows appear first, followed directly by resumable sessions
-  saved for that project; there is no redundant History or scope submenu.
-- Loading, failure with retry, empty, partially readable, and resuming states
-  remain inline in the project section.
+  saved for that project; there is no redundant nested history submenu.
+- Loading, failure with retry, empty, and resuming states remain inline in the
+  project section.
 - Persisted rows are visually and accessibly distinct from live conversation
   rows, and only the requested row shows resume progress.
 - A successful cross-workspace resume keeps the live conversation identity and
   project section and selection while atomically updating its title, active
-  workspace, transcript, model, native window title, and duplicate-workspace
-  position.
+  workspace, transcript, native window title, and duplicate-workspace position.
 - Starting another `vivi chat --native` remains occurrence-based and creates a
   new live conversation rather than resuming history.
 
 ## How to get to it (user POV)
 
 Build Vivi and run `./zig-out/bin/vivi chat --native` from a workspace that has
-earlier Vivi sessions. Launch it again from another workspace, expand each
-project in the sidebar, and select a persisted session. Repeat with another
-live conversation open from the resumed session's workspace so the
+earlier sessions in Vivi's isolated Copilot SDK store at
+`~/.vivi/copilot/`. Launch it again from another workspace, expand each project
+in the sidebar, and select a persisted session. Repeat with another live
+conversation open from the resumed session's workspace so the
 duplicate-workspace badges can update.
 
 ## Driving it with verify-vivi
@@ -51,8 +51,11 @@ must be captured through the actual app.
 - Remembered projects last for the app lifetime. This feature does not add a
   persisted project database or merge Git worktrees into repository identities.
 - Current catalog rows are not offered as resumable history.
-- Catalog keys are opaque and generation-scoped. Refreshing invalidates the
-  prior visible rows; do not manufacture or retain keys outside the store.
+- The backend returns one cross-workspace catalog and copied canonical working
+  directories. Swift groups those summaries without inspecting SDK storage.
+- Catalog keys are opaque, store-bound, and generation-scoped. Refreshing
+  invalidates the prior visible rows; do not manufacture, transfer, or retain
+  keys outside the store.
 - Resume failure must preserve the current presentation and visible catalog.
 - If local serializer data or Launch Services routing blocks the flow, capture
   the exact command and observed bundle/session artifacts instead of claiming

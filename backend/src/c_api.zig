@@ -110,14 +110,11 @@ export fn vivi_backend_open(
     if (!std.fs.path.isAbsolute(working_directory)) {
         return c.VIVI_BACKEND_INVALID_ARGUMENT;
     }
-    const settings_path = optionalAbsolutePath(
+    const settings_path = (optionalAbsolutePath(
         input.settings_path,
         input.settings_path_length,
-    ) catch return c.VIVI_BACKEND_INVALID_ARGUMENT;
-    const sessions_directory = optionalAbsolutePath(
-        input.sessions_directory,
-        input.sessions_directory_length,
-    ) catch return c.VIVI_BACKEND_INVALID_ARGUMENT;
+    ) catch return c.VIVI_BACKEND_INVALID_ARGUMENT) orelse
+        return c.VIVI_BACKEND_INVALID_ARGUMENT;
     const copilot_cli_path = optionalAbsolutePath(
         input.copilot_cli_path,
         input.copilot_cli_path_length,
@@ -147,7 +144,6 @@ export fn vivi_backend_open(
         .{
             .working_directory = working_directory,
             .settings_path = settings_path,
-            .sessions_directory = sessions_directory,
             .copilot_cli_path = copilot_cli_path,
             .copilot_cli_launch = launch,
         },
@@ -211,35 +207,6 @@ fn cReasoning(value: backend.ReasoningEffort) c.vivi_backend_reasoning_effort_t 
     };
 }
 
-fn sessionRequest(
-    raw: c.vivi_backend_session_request_t,
-) ?backend.SessionCatalogRequest {
-    return switch (raw) {
-        c.VIVI_BACKEND_SESSION_REQUEST_LOCAL => .local,
-        c.VIVI_BACKEND_SESSION_REQUEST_ALL => .all,
-        else => null,
-    };
-}
-
-fn sessionScope(
-    raw: c.vivi_backend_session_scope_t,
-) ?backend.SessionCatalogScope {
-    return switch (raw) {
-        c.VIVI_BACKEND_SESSION_SCOPE_LOCAL => .local,
-        c.VIVI_BACKEND_SESSION_SCOPE_BROADER => .broader,
-        else => null,
-    };
-}
-
-fn cSessionScope(
-    value: backend.SessionCatalogScope,
-) c.vivi_backend_session_scope_t {
-    return switch (value) {
-        .local => c.VIVI_BACKEND_SESSION_SCOPE_LOCAL,
-        .broader => c.VIVI_BACKEND_SESSION_SCOPE_BROADER,
-    };
-}
-
 export fn vivi_backend_refresh_models(
     conversation: ?*c.vivi_backend_conversation_t,
 ) callconv(.c) c.vivi_backend_result_t {
@@ -278,14 +245,11 @@ export fn vivi_backend_switch_model(
 
 export fn vivi_backend_refresh_sessions(
     conversation: ?*c.vivi_backend_conversation_t,
-    request_value: c.vivi_backend_session_request_t,
 ) callconv(.c) c.vivi_backend_result_t {
     const self = handle(conversation) orelse return c.VIVI_BACKEND_INVALID_ARGUMENT;
-    const request = sessionRequest(request_value) orelse
-        return c.VIVI_BACKEND_INVALID_ARGUMENT;
     if (self.control_operation != .none) return c.VIVI_BACKEND_BUSY;
     self.control_operation = .refresh_sessions;
-    self.conversation.refreshSessions(request) catch |err| {
+    self.conversation.refreshSessions() catch |err| {
         self.control_operation = .none;
         return result(err);
     };
@@ -297,15 +261,14 @@ export fn vivi_backend_resume_session(
     key: c.vivi_backend_resume_key_t,
 ) callconv(.c) c.vivi_backend_result_t {
     const self = handle(conversation) orelse return c.VIVI_BACKEND_INVALID_ARGUMENT;
-    const scope = sessionScope(key.scope) orelse
+    if (key.generation == 0 or key.reserved != 0) {
         return c.VIVI_BACKEND_INVALID_ARGUMENT;
-    if (key.generation == 0) return c.VIVI_BACKEND_INVALID_ARGUMENT;
+    }
     if (self.control_operation != .none) return c.VIVI_BACKEND_BUSY;
     self.control_operation = .resume_session;
     self.conversation.resumeSession(.{
         .generation = key.generation,
         .slot = key.slot,
-        .scope = scope,
     }) catch |err| {
         self.control_operation = .none;
         return result(err);
@@ -498,13 +461,11 @@ const Projected = struct {
     history_effect: c.vivi_backend_history_effect_t = c.VIVI_BACKEND_HISTORY_NONE,
     default_saved: bool = false,
     cleanup_failed: bool = false,
-    session_scope: c.vivi_backend_session_scope_t = c.VIVI_BACKEND_SESSION_SCOPE_NONE,
     session_resume_outcome: c.vivi_backend_session_resume_outcome_t =
         c.VIVI_BACKEND_SESSION_RESUME_NONE,
     sessions: []const backend.SessionSummary = &.{},
     resumed_session: ?*const backend.SessionSummary = null,
     transcript: []const backend.TranscriptItem = &.{},
-    skipped_invalid_shards: bool = false,
 };
 
 const ToolDisplay = struct {
@@ -537,11 +498,14 @@ fn project(event: *const backend.ConversationEvent) ?Projected {
             .content_kind = c.VIVI_BACKEND_CONTENT_TEXT,
             .text = text.bytes,
         },
-        .session_title => |text| .{
-            .kind = c.VIVI_BACKEND_EVENT_SESSION_TITLE,
-            .content_kind = c.VIVI_BACKEND_CONTENT_TEXT,
-            .text = text.bytes,
-        },
+        .session_title => |text| if (backend.isCanonicalSessionTitle(text.bytes))
+            .{
+                .kind = c.VIVI_BACKEND_EVENT_SESSION_TITLE,
+                .content_kind = c.VIVI_BACKEND_CONTENT_TEXT,
+                .text = text.bytes,
+            }
+        else
+            null,
         .assistant_started => .{ .kind = c.VIVI_BACKEND_EVENT_ASSISTANT_STARTED },
         .reasoning_delta => |text| .{
             .kind = c.VIVI_BACKEND_EVENT_REASONING_DELTA,
@@ -646,33 +610,31 @@ fn project(event: *const backend.ConversationEvent) ?Projected {
                 .switch_outcome = c.VIVI_BACKEND_MODEL_SWITCH_FAILED,
             },
         },
-        .session_catalog => |*catalog| .{
-            .kind = c.VIVI_BACKEND_EVENT_SESSION_CATALOG,
-            .content_kind = c.VIVI_BACKEND_CONTENT_SESSION_CATALOG,
-            .session_scope = cSessionScope(catalog.scope),
-            .sessions = catalog.sessions,
-            .skipped_invalid_shards = catalog.skipped_invalid_shards,
-        },
+        .session_catalog => |*catalog| if (hasCanonicalSessionTitles(catalog.sessions))
+            .{
+                .kind = c.VIVI_BACKEND_EVENT_SESSION_CATALOG,
+                .content_kind = c.VIVI_BACKEND_CONTENT_SESSION_CATALOG,
+                .sessions = catalog.sessions,
+            }
+        else
+            null,
         .session_catalog_failed => |text| .{
             .kind = c.VIVI_BACKEND_EVENT_SESSION_CATALOG_FAILURE,
             .content_kind = c.VIVI_BACKEND_CONTENT_TEXT,
             .text = text.bytes,
         },
-        .session_tracking_failed => |text| .{
-            .kind = c.VIVI_BACKEND_EVENT_SESSION_TRACKING_FAILURE,
-            .content_kind = c.VIVI_BACKEND_CONTENT_TEXT,
-            .text = text.bytes,
-        },
         .session_resume => |*resume_result| switch (resume_result.*) {
-            .resumed => |*resumed| .{
-                .kind = c.VIVI_BACKEND_EVENT_SESSION_RESUME,
-                .content_kind = c.VIVI_BACKEND_CONTENT_SESSION_RESUME,
-                .session_scope = cSessionScope(resumed.session.key.scope),
-                .session_resume_outcome = c.VIVI_BACKEND_SESSION_RESUME_RESUMED,
-                .resumed_session = &resumed.session,
-                .transcript = resumed.transcript.items,
-                .cleanup_failed = resumed.cleanup_failed,
-            },
+            .resumed => |*resumed| if (hasCanonicalSessionTitle(&resumed.session))
+                .{
+                    .kind = c.VIVI_BACKEND_EVENT_SESSION_RESUME,
+                    .content_kind = c.VIVI_BACKEND_CONTENT_SESSION_RESUME,
+                    .session_resume_outcome = c.VIVI_BACKEND_SESSION_RESUME_RESUMED,
+                    .resumed_session = &resumed.session,
+                    .transcript = resumed.transcript.items,
+                    .cleanup_failed = resumed.cleanup_failed,
+                }
+            else
+                null,
             .failed => |text| .{
                 .kind = c.VIVI_BACKEND_EVENT_SESSION_RESUME,
                 .content_kind = c.VIVI_BACKEND_CONTENT_SESSION_RESUME,
@@ -698,6 +660,18 @@ fn project(event: *const backend.ConversationEvent) ?Projected {
         .command_completed,
         => null,
     };
+}
+
+fn hasCanonicalSessionTitles(sessions: []const backend.SessionSummary) bool {
+    for (sessions) |session| {
+        if (!hasCanonicalSessionTitle(&session)) return false;
+    }
+    return true;
+}
+
+fn hasCanonicalSessionTitle(session: *const backend.SessionSummary) bool {
+    const title = session.title orelse return true;
+    return backend.isCanonicalSessionTitle(title);
 }
 
 fn byteCount(projected: Projected) !u32 {
@@ -752,14 +726,8 @@ fn addSessionBytes(total_value: u64, session: *const backend.SessionSummary) !u6
     var total = total_value;
     total = std.math.add(u64, total, session.working_directory.len) catch
         return error.EventTooLarge;
-    total = std.math.add(u64, total, session.model_id.len) catch
-        return error.EventTooLarge;
     if (session.title) |title| {
         total = std.math.add(u64, total, title.len) catch
-            return error.EventTooLarge;
-    }
-    if (session.summary) |summary| {
-        total = std.math.add(u64, total, summary.len) catch
             return error.EventTooLarge;
     }
     return total;
@@ -862,27 +830,19 @@ fn writeSessionSummary(
         flags |= @intCast(c.VIVI_BACKEND_SESSION_TITLE_PRESENT);
         break :blk appendBytes(destination, offset, value);
     } else std.mem.zeroes(c.vivi_backend_span_t);
-    const summary = if (session.summary) |value| blk: {
-        flags |= @intCast(c.VIVI_BACKEND_SESSION_SUMMARY_PRESENT);
-        break :blk appendBytes(destination, offset, value);
-    } else std.mem.zeroes(c.vivi_backend_span_t);
     if (session.current) flags |= @intCast(c.VIVI_BACKEND_SESSION_CURRENT);
     return .{
         .key = .{
             .generation = session.key.generation,
             .slot = session.key.slot,
-            .scope = cSessionScope(session.key.scope),
+            .reserved = 0,
         },
         .working_directory = appendBytes(
             destination,
             offset,
             session.working_directory,
         ),
-        .model_id = appendBytes(destination, offset, session.model_id),
         .title = title,
-        .summary = summary,
-        .last_used_unix_ms = session.last_used_unix_ms,
-        .reasoning = cReasoning(session.reasoning),
         .flags = flags,
         .reserved = 0,
     };
@@ -1004,11 +964,9 @@ fn copyProjectedFull(
         .selected_reasoning = projected.selected_reasoning,
         .switch_outcome = projected.switch_outcome,
         .history_effect = projected.history_effect,
-        .session_scope = projected.session_scope,
         .session_resume_outcome = projected.session_resume_outcome,
         .default_saved = @intFromBool(projected.default_saved),
         .cleanup_failed = @intFromBool(projected.cleanup_failed),
-        .skipped_invalid_shards = @intFromBool(projected.skipped_invalid_shards),
         .session_reserved = 0,
         .reserved = 0,
     };
@@ -1177,11 +1135,9 @@ export fn vivi_backend_next_event(
             .selected_reasoning = c.VIVI_BACKEND_REASONING_NONE,
             .switch_outcome = c.VIVI_BACKEND_MODEL_SWITCH_NONE,
             .history_effect = c.VIVI_BACKEND_HISTORY_NONE,
-            .session_scope = c.VIVI_BACKEND_SESSION_SCOPE_NONE,
             .session_resume_outcome = c.VIVI_BACKEND_SESSION_RESUME_NONE,
             .default_saved = 0,
             .cleanup_failed = 0,
-            .skipped_invalid_shards = 0,
             .session_reserved = 0,
             .reserved = 0,
         };
@@ -1628,25 +1584,30 @@ test "C session title is a distinct typed text event" {
     try std.testing.expectEqualStrings("Native title", projected.text);
 }
 
+test "C session title projection rejects noncanonical text" {
+    const allocator = std.testing.allocator;
+    var event: backend.ConversationEvent = .{
+        .session_title = try backend.OwnedText.init(
+            allocator,
+            "Native\n title",
+        ),
+    };
+    defer event.deinit();
+    try std.testing.expectEqual(null, project(&event));
+}
+
 test "C session catalog copy is atomic and preserves opaque keys" {
     const allocator = std.testing.allocator;
     var event: backend.ConversationEvent = .{ .session_catalog = .{
         .allocator = allocator,
-        .scope = .local,
-        .label = try allocator.dupe(u8, "Saved Vivi sessions"),
         .sessions = try allocator.alloc(backend.SessionSummary, 1),
-        .skipped_invalid_shards = true,
     } };
     defer event.deinit();
     event.session_catalog.sessions[0] = .{
         .allocator = allocator,
-        .key = .{ .generation = 41, .slot = 7, .scope = .local },
+        .key = .{ .generation = 41, .slot = 7 },
         .working_directory = try allocator.dupe(u8, "/tmp/other"),
-        .model_id = try allocator.dupe(u8, "copilot/gpt-5"),
-        .reasoning = .high,
         .title = try allocator.dupe(u8, "Other session"),
-        .summary = null,
-        .last_used_unix_ms = 1234,
         .current = false,
     };
 
@@ -1697,22 +1658,32 @@ test "C session catalog copy is atomic and preserves opaque keys" {
     try std.testing.expect(
         metadata.kind == c.VIVI_BACKEND_EVENT_SESSION_CATALOG,
     );
-    try std.testing.expect(
-        metadata.session_scope == c.VIVI_BACKEND_SESSION_SCOPE_LOCAL,
-    );
-    try std.testing.expectEqual(@as(u8, 1), metadata.skipped_invalid_shards);
     try std.testing.expectEqual(@as(u64, 41), sessions[0].key.generation);
     try std.testing.expectEqual(@as(u32, 7), sessions[0].key.slot);
     try std.testing.expect(
         sessions[0].flags & c.VIVI_BACKEND_SESSION_TITLE_PRESENT != 0,
     );
-    try std.testing.expect(
-        sessions[0].flags & c.VIVI_BACKEND_SESSION_SUMMARY_PRESENT == 0,
-    );
     try std.testing.expectEqualStrings(
         "/tmp/other",
         bytes[sessions[0].working_directory.offset..][0..sessions[0].working_directory.length],
     );
+}
+
+test "C session catalog projection rejects noncanonical titles" {
+    const allocator = std.testing.allocator;
+    var event: backend.ConversationEvent = .{ .session_catalog = .{
+        .allocator = allocator,
+        .sessions = try allocator.alloc(backend.SessionSummary, 1),
+    } };
+    defer event.deinit();
+    event.session_catalog.sessions[0] = .{
+        .allocator = allocator,
+        .key = .{ .generation = 41, .slot = 7 },
+        .working_directory = try allocator.dupe(u8, "/tmp/other"),
+        .title = try allocator.dupe(u8, "Other\nsession"),
+        .current = false,
+    };
+    try std.testing.expectEqual(null, project(&event));
 }
 
 test "C session resume copies summary and ordered transcript atomically" {
@@ -1724,13 +1695,9 @@ test "C session resume copies summary and ordered transcript atomically" {
     var event: backend.ConversationEvent = .{ .session_resume = .{ .resumed = .{
         .session = .{
             .allocator = allocator,
-            .key = .{ .generation = 9, .slot = 2, .scope = .broader },
+            .key = .{ .generation = 9, .slot = 2 },
             .working_directory = try allocator.dupe(u8, "/tmp/project"),
-            .model_id = try allocator.dupe(u8, "copilot/gpt-5"),
-            .reasoning = .max,
             .title = null,
-            .summary = try allocator.dupe(u8, "Updated today"),
-            .last_used_unix_ms = 0,
             .current = false,
         },
         .transcript = .{ .allocator = allocator, .items = items },
@@ -1854,14 +1821,6 @@ test "C failed session resume keeps optional metadata neutral" {
         bytes[metadata.content.offset..][0..metadata.content.length],
     );
 }
-
-test "C session controls reject unknown boundary values" {
-    const invalid_request: c.vivi_backend_session_request_t = 99;
-    const invalid_scope: c.vivi_backend_session_scope_t = 99;
-    try std.testing.expect(sessionRequest(invalid_request) == null);
-    try std.testing.expect(sessionScope(invalid_scope) == null);
-}
-
 test "C tool start copy-out is atomic and includes display fields" {
     const allocator = std.testing.allocator;
     var started = try backend.ToolStarted.init(

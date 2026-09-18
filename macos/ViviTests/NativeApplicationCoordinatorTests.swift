@@ -209,21 +209,16 @@ final class NativeApplicationCoordinatorTests: XCTestCase {
     conversations.select(record.id)
     harness.drivers[0].send(.ready)
     harness.drivers[0].send(.modelCatalog(coordinatorModelCatalog()))
-    let key = ResumeKey(generation: 9, slot: 2, scope: .local)
+    let key = ResumeKey(generation: 9, slot: 2)
     let summary = SessionSummary(
       key: key,
       workingDirectory: "/tmp/two",
-      modelID: "copilot/test",
       title: "Resumed conversation",
-      summary: nil,
-      lastUsedUnixMilliseconds: 10,
-      reasoning: .medium,
       isCurrent: false)
 
-    record.store.refreshSessions(.local)
+    record.store.refreshSessions()
     harness.drivers[0].send(
-      .sessionCatalog(
-        SessionCatalog(scope: .local, sessions: [summary], skippedInvalidShards: false)))
+      .sessionCatalog(SessionCatalog(sessions: [summary])))
     record.store.resumeSession(key)
     harness.drivers[0].send(
       .sessionResume(
@@ -246,6 +241,16 @@ final class NativeApplicationCoordinatorTests: XCTestCase {
     XCTAssertEqual(
       conversations.records(launchedFrom: record.launchWorkspace).map(\.id),
       [record.id])
+  }
+
+  func testUntitledLaunchPresentsMainWindow() {
+    let harness = CoordinatorHarness()
+    let delegate = ViviAppDelegate(applicationCoordinator: harness.coordinator)
+
+    XCTAssertTrue(delegate.applicationOpenUntitledFile(NSApplication.shared))
+
+    XCTAssertEqual(harness.windows.count, 1)
+    XCTAssertEqual(harness.windows[0].showCount, 1)
   }
 
   func testTerminationWaitsForEveryUniqueConversationAndDefersReply() async {
@@ -373,7 +378,7 @@ private final class FakeMainWindow: MainWindowControlling {
 
 final class ControllableConversationDriver: ViviConversationDriving {
   private(set) var closeCount = 0
-  private(set) var sessionRequests: [SessionCatalogRequest] = []
+  private(set) var sessionRefreshCount = 0
   private(set) var resumeKeys: [ResumeKey] = []
   private var receive: (@MainActor (ChatEvent) -> Void)?
   private var closeCompletions: [@MainActor () -> Void] = []
@@ -397,8 +402,8 @@ final class ControllableConversationDriver: ViviConversationDriving {
     .accepted
   }
 
-  func refreshSessions(_ request: SessionCatalogRequest) -> ConversationOperationResult {
-    sessionRequests.append(request)
+  func refreshSessions() -> ConversationOperationResult {
+    sessionRefreshCount += 1
     return .accepted
   }
 
