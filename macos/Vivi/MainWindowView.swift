@@ -86,6 +86,21 @@ struct ProjectExpansionState: Equatable {
       collapsed.insert(workspace)
     }
   }
+
+  mutating func toggle(_ workspace: WorkspaceIdentity) {
+    setExpanded(!isExpanded(workspace), for: workspace)
+  }
+}
+
+struct ProjectDisclosurePresentation: Equatable {
+  let systemImage: String
+  let accessibilityValue: String
+}
+
+func projectDisclosurePresentation(isExpanded: Bool) -> ProjectDisclosurePresentation {
+  ProjectDisclosurePresentation(
+    systemImage: isExpanded ? "chevron.down" : "chevron.right",
+    accessibilityValue: isExpanded ? "Expanded" : "Collapsed")
 }
 
 struct SessionHistoryRowPresentation: Equatable, Identifiable {
@@ -131,7 +146,12 @@ struct MainWindowView: View {
             conversations: conversations,
             workspace: roster.workspace,
             conversationIDs: roster.conversationIDs,
-            isExpanded: expansionBinding(for: roster.workspace))
+            isExpanded: projectExpansion.isExpanded(roster.workspace)
+          ) {
+            withAnimation {
+              projectExpansion.toggle(roster.workspace)
+            }
+          }
         }
       }
       .listStyle(.sidebar)
@@ -219,11 +239,6 @@ struct MainWindowView: View {
       })
   }
 
-  private func expansionBinding(for workspace: WorkspaceIdentity) -> Binding<Bool> {
-    Binding(
-      get: { projectExpansion.isExpanded(workspace) },
-      set: { projectExpansion.setExpanded($0, for: workspace) })
-  }
 }
 
 private struct ProjectSidebarSection: View {
@@ -231,18 +246,21 @@ private struct ProjectSidebarSection: View {
   @ObservedObject private var catalogStore: NativeChatStore
   let workspace: WorkspaceIdentity
   let conversationIDs: [ConversationID]
-  @Binding var isExpanded: Bool
+  let isExpanded: Bool
+  let toggleExpansion: () -> Void
 
   init(
     conversations: ConversationCollection,
     workspace: WorkspaceIdentity,
     conversationIDs: [ConversationID],
-    isExpanded: Binding<Bool>
+    isExpanded: Bool,
+    toggleExpansion: @escaping () -> Void
   ) {
     self.conversations = conversations
     self.workspace = workspace
     self.conversationIDs = conversationIDs
-    _isExpanded = isExpanded
+    self.isExpanded = isExpanded
+    self.toggleExpansion = toggleExpansion
     guard let catalogConversation = conversations.catalogConversation(launchedFrom: workspace)
     else {
       preconditionFailure("Project sidebar sections require a live conversation")
@@ -260,69 +278,76 @@ private struct ProjectSidebarSection: View {
       allWorkspaces: conversations.launchWorkspaces)
   }
 
+  private var disclosure: ProjectDisclosurePresentation {
+    projectDisclosurePresentation(isExpanded: isExpanded)
+  }
+
   var body: some View {
-    Section(isExpanded: $isExpanded) {
-      ForEach(records) { conversation in
-        ConversationSidebarRow(
-          conversation: conversation,
-          duplicate: conversations.duplicatePosition(for: conversation.id)
-        )
-        .tag(conversation.id)
-        .padding(.leading, 16)
-      }
-      switch catalogStore.sessionState {
-      case .refreshing:
-        loadingState
-      case .ready, .resuming:
-        if let failure = catalogStore.sessionCatalogFailure {
-          failureRow(failure)
-        } else if let catalog = catalogStore.sessionCatalog {
-          ForEach(
-            projectSessionHistoryPresentation(
-              catalog: catalog,
-              projectWorkspace: workspace.canonicalPath)
-          ) { row in
-            SessionHistoryRow(
-              presentation: row,
-              isResuming: resumingKey == row.key
-            ) {
-              conversations.resume(row.key, launchedFrom: workspace)
-            }
-            .disabled(isOperating)
-            .padding(.leading, 16)
-          }
-        } else {
+    Section {
+      if isExpanded {
+        ForEach(records) { conversation in
+          ConversationSidebarRow(
+            conversation: conversation,
+            duplicate: conversations.duplicatePosition(for: conversation.id)
+          )
+          .tag(conversation.id)
+          .padding(.leading, 16)
+        }
+        switch catalogStore.sessionState {
+        case .refreshing:
           loadingState
+        case .ready, .resuming:
+          if let failure = catalogStore.sessionCatalogFailure {
+            failureRow(failure)
+          } else if let catalog = catalogStore.sessionCatalog {
+            ForEach(
+              projectSessionHistoryPresentation(
+                catalog: catalog,
+                projectWorkspace: workspace.canonicalPath)
+            ) { row in
+              SessionHistoryRow(
+                presentation: row,
+                isResuming: resumingKey == row.key
+              ) {
+                conversations.resume(row.key, launchedFrom: workspace)
+              }
+              .disabled(isOperating)
+              .padding(.leading, 16)
+            }
+          } else {
+            loadingState
+          }
         }
       }
     } header: {
-      HStack(spacing: 7) {
-        Image(systemName: "chevron.right")
-          .font(.caption2.weight(.semibold))
-          .rotationEffect(.degrees(isExpanded ? 90 : 0))
-          .frame(width: 10)
-          .accessibilityHidden(true)
-        VStack(alignment: .leading, spacing: 2) {
-          Label(presentation.name, systemImage: "folder")
-            .font(.body)
-            .fontWeight(.semibold)
-          if let visiblePath = presentation.visiblePath {
-            Text(visiblePath)
-              .font(.caption2)
-              .foregroundStyle(.secondary)
-              .lineLimit(1)
-              .truncationMode(.middle)
+      Button(action: toggleExpansion) {
+        HStack(spacing: 7) {
+          Image(systemName: disclosure.systemImage)
+            .font(.caption2.weight(.semibold))
+            .frame(width: 10)
+          VStack(alignment: .leading, spacing: 2) {
+            Label(presentation.name, systemImage: "folder")
+              .font(.body)
+              .fontWeight(.semibold)
+            if let visiblePath = presentation.visiblePath {
+              Text(visiblePath)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            }
           }
+          Spacer(minLength: 0)
         }
+        .frame(maxWidth: .infinity, minHeight: 30, alignment: .leading)
+        .contentShape(Rectangle())
       }
-      .frame(maxWidth: .infinity, minHeight: 30, alignment: .leading)
-      .contentShape(Rectangle())
+      .buttonStyle(.plain)
       .textCase(nil)
       .help(presentation.help)
       .accessibilityElement(children: .ignore)
       .accessibilityLabel(presentation.accessibilityLabel)
-      .accessibilityValue(isExpanded ? "Expanded" : "Collapsed")
-      .accessibilityAddTraits(.isHeader)
+      .accessibilityValue(disclosure.accessibilityValue)
       .accessibilityIdentifier(presentation.accessibilityIdentifier)
     }
     .accessibilityIdentifier("session-history-\(workspace.canonicalPath)")

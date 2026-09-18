@@ -158,9 +158,24 @@ final class MainWindowControllerTests: XCTestCase {
     XCTAssertFalse(expansion.isExpanded(first))
     XCTAssertEqual(conversations.selectedConversation?.id, record.id)
 
-    expansion.setExpanded(true, for: first)
+    expansion.toggle(first)
 
     XCTAssertTrue(expansion.isExpanded(first))
+    expansion.toggle(first)
+    XCTAssertFalse(expansion.isExpanded(first))
+  }
+
+  func testProjectDisclosureUsesOneStatefulLeadingSymbol() {
+    XCTAssertEqual(
+      projectDisclosurePresentation(isExpanded: false),
+      ProjectDisclosurePresentation(
+        systemImage: "chevron.right",
+        accessibilityValue: "Collapsed"))
+    XCTAssertEqual(
+      projectDisclosurePresentation(isExpanded: true),
+      ProjectDisclosurePresentation(
+        systemImage: "chevron.down",
+        accessibilityValue: "Expanded"))
   }
 
   func testProjectSessionHistoryFiltersWorkspaceAndCurrentSession() {
