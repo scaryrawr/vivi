@@ -857,6 +857,7 @@ fn project(event: *const backend.ConversationEvent) ?Projected {
         },
         .command_catalog,
         .command_completed,
+        .new_session,
         => null,
     };
 }

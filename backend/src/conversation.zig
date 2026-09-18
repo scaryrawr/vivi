@@ -489,6 +489,22 @@ pub const SessionResumeResult = union(enum) {
     }
 };
 
+pub const NewSessionResult = union(enum) {
+    started: struct {
+        commands: CommandCatalog,
+        cleanup_failed: bool,
+    },
+    failed: OwnedText,
+
+    pub fn deinit(self: *NewSessionResult) void {
+        switch (self.*) {
+            .started => |*result| result.commands.deinit(),
+            .failed => |*message| message.deinit(),
+        }
+        self.* = undefined;
+    }
+};
+
 fn allocatorFreeModels(allocator: std.mem.Allocator, values: []ModelInfo) void {
     for (values) |*value| value.deinit();
     allocator.free(values);
@@ -740,6 +756,7 @@ pub const Event = union(enum) {
     session_catalog: SessionCatalog,
     session_catalog_failed: OwnedText,
     session_resume: SessionResumeResult,
+    new_session: NewSessionResult,
     session_title: OwnedText,
     status: OwnedText,
     assistant_started,
@@ -771,6 +788,7 @@ pub const Event = union(enum) {
             .session_catalog => |*catalog| catalog.deinit(),
             .session_catalog_failed => |*text| text.deinit(),
             .session_resume => |*result| result.deinit(),
+            .new_session => |*result| result.deinit(),
             .status => |*text| text.deinit(),
             .closed => |*closed| closed.deinit(),
             .ready, .assistant_started, .idle => {},
@@ -787,6 +805,7 @@ pub const Command = union(enum) {
     refresh_commands,
     refresh_models,
     refresh_sessions,
+    start_new_session,
     switch_model: OwnedModelSelection,
     resume_session: ResumeKey,
     execute_command: OwnedText,
@@ -802,6 +821,7 @@ pub const Command = union(enum) {
             .refresh_commands,
             .refresh_models,
             .refresh_sessions,
+            .start_new_session,
             .resume_session,
             .stop,
             => {},
@@ -940,6 +960,7 @@ pub const Worker = struct {
                 .refresh_commands,
                 .refresh_models,
                 .refresh_sessions,
+                .start_new_session,
                 .switch_model,
                 .resume_session,
                 .execute_command,
@@ -1139,6 +1160,13 @@ pub const Worker = struct {
         try self.completeControl(.{ .session_resume = result });
     }
 
+    pub fn completeNewSession(
+        self: *Worker,
+        result: NewSessionResult,
+    ) !void {
+        try self.completeControl(.{ .new_session = result });
+    }
+
     pub fn assistantComplete(self: *Worker, text: []const u8) !void {
         try self.publish(.{
             .assistant_complete = try OwnedText.init(self.core.allocator, text),
@@ -1263,6 +1291,10 @@ pub const Conversation = struct {
 
     pub fn refreshSessions(self: *Conversation) !void {
         try self.enqueueControl(.refresh_sessions);
+    }
+
+    pub fn startNewSession(self: *Conversation) !void {
+        try self.enqueueControl(.start_new_session);
     }
 
     pub fn switchModel(self: *Conversation, selection: ModelSelection) !void {
@@ -1490,6 +1522,7 @@ test "conversation transfers streamed events without SDK access" {
                 .refresh_commands,
                 .refresh_models,
                 .refresh_sessions,
+                .start_new_session,
                 .switch_model,
                 .resume_session,
                 .execute_command,

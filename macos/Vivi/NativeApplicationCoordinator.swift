@@ -190,10 +190,12 @@ protocol MainWindowControlling: AnyObject {
 
 @MainActor
 final class NativeApplicationCoordinator {
+  typealias NewConversationRequest = @MainActor (WorkspaceIdentity) -> Bool
   typealias ConversationFactory = (
     ConversationID,
     WorkspaceIdentity,
-    NativeApplicationConfiguration
+    NativeApplicationConfiguration,
+    @escaping NewConversationRequest
   ) -> ConversationRecord
   typealias WorkspaceChooserFactory = () -> any WorkspaceChoosing
   typealias WindowFactory = (
@@ -245,7 +247,7 @@ final class NativeApplicationCoordinator {
     NativeApplicationCoordinator(
       applicationConfiguration: .live,
       makeConversationID: { ConversationID(rawValue: UUID()) },
-      makeConversation: { id, workspace, configuration in
+      makeConversation: { id, workspace, configuration, requestNewConversation in
         let path = workspace.canonicalPath
         return ConversationRecord(
           id: id,
@@ -254,7 +256,8 @@ final class NativeApplicationCoordinator {
             workspace: path,
             driver: ViviConversationDriver(
               workspace: path,
-              applicationConfiguration: configuration)))
+              applicationConfiguration: configuration),
+            requestNewConversation: requestNewConversation))
       },
       makeWindow: { identity, coordinator, onClosed in
         MainWindowController(
@@ -298,7 +301,18 @@ final class NativeApplicationCoordinator {
   @discardableResult
   func createConversation(in workspace: WorkspaceIdentity) -> ConversationRecord? {
     guard state == .running else { return nil }
-    let record = makeConversation(makeConversationID(), workspace, applicationConfiguration)
+    let id = makeConversationID()
+    let record = makeConversation(
+      id,
+      workspace,
+      applicationConfiguration,
+      { [weak self] activeWorkspace in
+        guard let self,
+          self.state == .running,
+          self.conversations.selectedID == id
+        else { return false }
+        return self.createConversation(in: activeWorkspace) != nil
+      })
     conversations.appendAndSelect(record)
     return record
   }

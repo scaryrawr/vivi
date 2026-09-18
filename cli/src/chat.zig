@@ -1019,6 +1019,7 @@ const UiPhase = enum {
     awaiting_input,
     running_command,
     switching,
+    starting_new_session,
     resuming,
     stopping,
 
@@ -1031,6 +1032,7 @@ const UiPhase = enum {
             .awaiting_input => "Answer required",
             .running_command => "Running command...",
             .switching => "Switching model...",
+            .starting_new_session => "Starting new session...",
             .resuming => "Resuming session...",
             .stopping => "Stopping...",
         };
@@ -3354,6 +3356,15 @@ const ChatUi = struct {
             .commands => {
                 const catalog = self.commands orelse return;
                 const command = catalog.commands[selected.source_index];
+                if (std.ascii.eqlIgnoreCase(command.name, "new")) {
+                    self.menu_mode = .closed;
+                    conversation.startNewSession() catch |err| switch (err) {
+                        error.Busy => return,
+                        else => return err,
+                    };
+                    self.phase = .starting_new_session;
+                    return;
+                }
                 if (std.ascii.eqlIgnoreCase(command.name, "resume")) {
                     self.input.clearRetainingCapacity();
                     self.menu_mode = .loading_sessions;
@@ -3659,6 +3670,46 @@ const ChatUi = struct {
                     .failed => |failure| {
                         self.clearToolFocus();
                         self.tool_anchor = null;
+                        try self.transcript.append(
+                            self.allocator,
+                            .status,
+                            failure.bytes,
+                        );
+                    },
+                }
+            },
+            .new_session => |result| {
+                if (self.phase == .starting_new_session) self.phase = .ready;
+                self.menu_mode = .closed;
+                switch (result) {
+                    .started => |success| {
+                        const replacement_commands = try success.commands.clone(
+                            self.allocator,
+                        );
+                        if (self.commands) |*current| current.deinit();
+                        self.commands = replacement_commands;
+                        if (self.sessions) |*current| current.deinit();
+                        self.sessions = null;
+                        self.deinitTranscriptSpool();
+                        self.clearToolFocus();
+                        self.tool_anchor = null;
+                        try self.closeFilePicker();
+                        var previous = self.transcript;
+                        self.transcript = .{};
+                        previous.deinit(self.allocator);
+                        self.input.clearRetainingCapacity();
+                        self.rows_from_tail = 0;
+                        self.last_total_rows = 0;
+                        self.last_viewport_rows = 0;
+                        if (success.cleanup_failed) {
+                            try self.transcript.append(
+                                self.allocator,
+                                .status,
+                                "Started a new session. The previous session could not be detached cleanly.",
+                            );
+                        }
+                    },
+                    .failed => |failure| {
                         try self.transcript.append(
                             self.allocator,
                             .status,
@@ -4680,7 +4731,7 @@ const ChatUi = struct {
                         "↑/↓ select  ·  Enter accept  ·  Ctrl-C stop"
                 else
                     "Enter answer  ·  Wheel/PgUp/PgDn scroll  ·  Ctrl-C stop",
-                .connecting, .loading_commands, .running_command, .switching, .resuming => "Wheel/PgUp/PgDn scroll  ·  Ctrl-C stop",
+                .connecting, .loading_commands, .running_command, .switching, .starting_new_session, .resuming => "Wheel/PgUp/PgDn scroll  ·  Ctrl-C stop",
                 .stopping => "Ctrl-C again force exit",
             }
         else if (window.width >= 24)
@@ -4691,7 +4742,7 @@ const ChatUi = struct {
                     "↑/↓ select  ·  Enter accept"
                 else
                     "Enter answer  ·  Ctrl-C stop",
-                .connecting, .loading_commands, .running_command, .switching, .resuming => "Ctrl-C stop",
+                .connecting, .loading_commands, .running_command, .switching, .starting_new_session, .resuming => "Ctrl-C stop",
                 .stopping => "Ctrl-C again force exit",
             }
         else switch (self.phase) {
@@ -4701,7 +4752,7 @@ const ChatUi = struct {
                 "Enter choice"
             else
                 "Enter answer",
-            .connecting, .loading_commands, .running_command, .switching, .resuming => "Ctrl-C stop",
+            .connecting, .loading_commands, .running_command, .switching, .starting_new_session, .resuming => "Ctrl-C stop",
             .stopping => "Ctrl-C again",
         };
         const model_name = self.selectedModelDisplayName();
@@ -6430,6 +6481,46 @@ test "resuming replaces the visible transcript with the owned history snapshot" 
         "Resumed /saved. Restored persisted Copilot history.",
         ui.transcript.messageAt(2).text.items,
     );
+    try std.testing.expectEqual(@as(usize, 0), ui.rows_from_tail);
+}
+
+test "new session replaces transcript and commands while preserving cwd" {
+    var ui: ChatUi = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .input = TextInput.init(std.testing.allocator),
+        .cwd = try std.testing.allocator.dupe(u8, "/current"),
+        .phase = .starting_new_session,
+        .rows_from_tail = 3,
+    };
+    defer ui.deinit();
+    try ui.input.insertSliceAtCursor("/new");
+    try ui.transcript.append(std.testing.allocator, .user, "old prompt");
+
+    const commands = try std.testing.allocator.alloc(backend.CommandInfo, 1);
+    commands[0] = .{
+        .name = try std.testing.allocator.dupe(u8, "new"),
+        .description = try std.testing.allocator.dupe(u8, "Start fresh"),
+    };
+    var event: backend.ConversationEvent = .{ .new_session = .{
+        .started = .{
+            .commands = .{
+                .allocator = std.testing.allocator,
+                .commands = commands,
+            },
+            .cleanup_failed = false,
+        },
+    } };
+    defer event.deinit();
+
+    _ = try ui.applyConversationEvent(&event);
+    try std.testing.expectEqual(UiPhase.ready, ui.phase);
+    try std.testing.expectEqualStrings("/current", ui.cwd);
+    try std.testing.expectEqual(@as(usize, 0), ui.transcript.entries.items.len);
+    const input = try ui.input.toOwnedContents(std.testing.allocator);
+    defer std.testing.allocator.free(input);
+    try std.testing.expectEqualStrings("", input);
+    try std.testing.expectEqualStrings("new", ui.commands.?.commands[0].name);
     try std.testing.expectEqual(@as(usize, 0), ui.rows_from_tail);
 }
 

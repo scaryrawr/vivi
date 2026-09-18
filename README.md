@@ -160,7 +160,10 @@ Copilot default, authenticated Copilot models, and discovered OMLX models.
 Selecting the active pair is a no-op. A successful switch keeps the visible
 Vivi transcript but starts a fresh server-side session, so prior turns are not
 part of the replacement model's context. Vivi currently executes
-`/model` with Vivi's model picker. Select `/resume` to filter sessions stored
+`/model` with Vivi's model picker. Select `/new` to start a fresh conversation
+in the current workspace. The terminal replaces its active transcript, while
+the native app preserves the previous conversation in the sidebar and selects
+the new one. Select `/resume` to filter sessions stored
 by Copilot CLI in Vivi's private home and continue one from any workspace.
 Resume rows show the saved title and working directory without exposing
 Copilot's session IDs. A successful resume uses the currently selected model

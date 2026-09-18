@@ -169,13 +169,14 @@ private func testApplicationCoordinator(
   NativeApplicationCoordinator(
     conversations: conversations,
     makeConversationID: { ConversationID(rawValue: UUID()) },
-    makeConversation: { id, workspace, _ in
+    makeConversation: { id, workspace, _, requestNewConversation in
       ConversationRecord(
         id: id,
         launchWorkspace: workspace,
         store: NativeChatStore(
           workspace: workspace.canonicalPath,
-          driver: ControllableConversationDriver()))
+          driver: ControllableConversationDriver(),
+          requestNewConversation: requestNewConversation))
     },
     makeWindow: { _, _, _ in
       preconditionFailure("Test does not present a window")

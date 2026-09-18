@@ -40,6 +40,7 @@ pub const max_attachment_identity_bytes = @import("attachment.zig").max_identity
 pub const max_attachment_display_name_bytes = @import("attachment.zig").max_display_name_bytes;
 pub const ImageFormat = @import("image.zig").Format;
 pub const CommandCatalog = conversation.CommandCatalog;
+pub const CommandInfo = conversation.CommandInfo;
 pub const UserInputRequest = conversation.UserInputRequest;
 pub const UserInputAnswer = conversation.UserInputAnswer;
 pub const UserInputResponse = conversation.UserInputResponse;
@@ -601,6 +602,7 @@ fn forwardImmediatePrompts(
             .refresh_commands,
             .refresh_models,
             .refresh_sessions,
+            .start_new_session,
             .switch_model,
             .resume_session,
             .execute_command,
@@ -630,6 +632,7 @@ fn startNextQueuedPrompt(
         .refresh_commands,
         .refresh_models,
         .refresh_sessions,
+        .start_new_session,
         .switch_model,
         .resume_session,
         .execute_command,
@@ -1382,10 +1385,11 @@ fn buildCommandCatalog(
     defer listed.deinit();
     const sdk_commands = listed.value.commands;
 
-    var count: usize = 2;
+    var count: usize = 3;
     for (sdk_commands) |command| {
         if (!std.ascii.eqlIgnoreCase(command.name, "model") and
-            !std.ascii.eqlIgnoreCase(command.name, "resume"))
+            !std.ascii.eqlIgnoreCase(command.name, "resume") and
+            !std.ascii.eqlIgnoreCase(command.name, "new"))
         {
             count += 1;
         }
@@ -1412,13 +1416,20 @@ fn buildCommandCatalog(
     initialized += 1;
     commands[initialized] = try initCommandInfo(
         allocator,
+        "new",
+        "Start a fresh conversation in the current workspace",
+    );
+    initialized += 1;
+    commands[initialized] = try initCommandInfo(
+        allocator,
         "resume",
         "Resume a previous Vivi session",
     );
     initialized += 1;
     for (sdk_commands) |command| {
         if (std.ascii.eqlIgnoreCase(command.name, "model") or
-            std.ascii.eqlIgnoreCase(command.name, "resume"))
+            std.ascii.eqlIgnoreCase(command.name, "resume") or
+            std.ascii.eqlIgnoreCase(command.name, "new"))
         {
             continue;
         }
@@ -1435,7 +1446,7 @@ fn buildCommandCatalog(
 fn buildFallbackCommandCatalog(
     allocator: std.mem.Allocator,
 ) !conversation.CommandCatalog {
-    const commands = try allocator.alloc(conversation.CommandInfo, 2);
+    const commands = try allocator.alloc(conversation.CommandInfo, 3);
     errdefer allocator.free(commands);
     var initialized: usize = 0;
     errdefer for (commands[0..initialized]) |*command| {
@@ -1450,10 +1461,26 @@ fn buildFallbackCommandCatalog(
     initialized += 1;
     commands[initialized] = try initCommandInfo(
         allocator,
+        "new",
+        "Start a fresh conversation in the current workspace",
+    );
+    initialized += 1;
+    commands[initialized] = try initCommandInfo(
+        allocator,
         "resume",
         "Resume a previous Vivi session",
     );
     return .{ .allocator = allocator, .commands = commands };
+}
+
+test "fallback command catalog includes new session command" {
+    var catalog = try buildFallbackCommandCatalog(std.testing.allocator);
+    defer catalog.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), catalog.commands.len);
+    try std.testing.expectEqualStrings("model", catalog.commands[0].name);
+    try std.testing.expectEqualStrings("new", catalog.commands[1].name);
+    try std.testing.expectEqualStrings("resume", catalog.commands[2].name);
 }
 
 fn initCommandInfo(
@@ -2551,6 +2578,80 @@ fn runSdkConversation(
                 resume_targets = result.targets;
                 resume_generation = next_generation;
             },
+            .start_new_session => {
+                const candidate_prompt = std.fmt.allocPrint(
+                    worker.allocator(),
+                    MinimalCodingAgent.system_prompt,
+                    .{active_working_directory},
+                ) catch |err| {
+                    worker.closeFailure(.stream, @errorName(err));
+                    return;
+                };
+                defer worker.allocator().free(candidate_prompt);
+                var candidate = createSdkSession(
+                    worker,
+                    &client,
+                    candidate_prompt,
+                    active_working_directory,
+                    &active_plan,
+                    context.omlx_api_key,
+                ) catch |err| {
+                    worker.completeNewSession(.{
+                        .failed = conversation.OwnedText.init(
+                            worker.allocator(),
+                            @errorName(err),
+                        ) catch {
+                            worker.closeFailure(.stream, @errorName(err));
+                            return;
+                        },
+                    }) catch {
+                        worker.closeFailure(.stream, "Unable to report new session failure.");
+                        return;
+                    };
+                    continue;
+                };
+                const candidate_commands = buildCommandCatalog(
+                    worker.allocator(),
+                    &client,
+                    candidate,
+                ) catch buildFallbackCommandCatalog(
+                    worker.allocator(),
+                ) catch |err| {
+                    candidate.disconnect() catch {};
+                    worker.completeNewSession(.{
+                        .failed = conversation.OwnedText.init(
+                            worker.allocator(),
+                            @errorName(err),
+                        ) catch {
+                            worker.closeFailure(.stream, @errorName(err));
+                            return;
+                        },
+                    }) catch {
+                        worker.closeFailure(.stream, "Unable to report new session failure.");
+                        return;
+                    };
+                    continue;
+                };
+
+                const previous_session = session;
+                session_connected = false;
+                session = candidate;
+                session_connected = true;
+                if (resume_targets) |*targets| targets.deinit(worker.allocator());
+                resume_targets = null;
+                resume_generation = 0;
+                const cleanup_failed = if (previous_session.disconnect())
+                    false
+                else |_|
+                    true;
+                worker.completeNewSession(.{ .started = .{
+                    .commands = candidate_commands,
+                    .cleanup_failed = cleanup_failed,
+                } }) catch {
+                    worker.closeFailure(.stream, "Unable to report the new session.");
+                    return;
+                };
+            },
             .resume_session => |key| {
                 const targets = if (resume_targets) |*value| value else {
                     worker.completeSessionResume(.{
@@ -2871,6 +2972,7 @@ fn runSdkConversation(
                                 .refresh_commands,
                                 .refresh_models,
                                 .refresh_sessions,
+                                .start_new_session,
                                 .switch_model,
                                 .resume_session,
                                 .execute_command,

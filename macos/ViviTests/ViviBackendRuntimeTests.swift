@@ -62,6 +62,45 @@ final class ViviBackendRuntimeTests: XCTestCase {
       [.status(id: store.transcript[0].id, text: "Chat is busy.")])
   }
 
+  func testNewCommandCreatesConversationWithoutSubmittingPrompt() {
+    let driver = FakeConversationDriver()
+    var requestedWorkspace: WorkspaceIdentity?
+    let store = NativeChatStore(
+      workspace: "/tmp/work",
+      driver: driver,
+      requestNewConversation: { workspace in
+        requestedWorkspace = workspace
+        return true
+      })
+
+    store.reduce(.ready)
+    store.reduce(.modelCatalog(testCatalog()))
+    store.draft = " /NEW "
+    store.submit()
+
+    XCTAssertEqual(requestedWorkspace?.canonicalPath, "/tmp/work")
+    XCTAssertTrue(driver.submittedPrompts.isEmpty)
+    XCTAssertTrue(store.draft.isEmpty)
+    XCTAssertTrue(store.transcript.isEmpty)
+  }
+
+  func testRejectedNewCommandPreservesDraft() {
+    let driver = FakeConversationDriver()
+    let store = NativeChatStore(
+      workspace: "/tmp/work",
+      driver: driver,
+      requestNewConversation: { _ in false })
+
+    store.reduce(.ready)
+    store.reduce(.modelCatalog(testCatalog()))
+    store.draft = "/new"
+    store.submit()
+
+    XCTAssertTrue(driver.submittedPrompts.isEmpty)
+    XCTAssertEqual(store.draft, "/new")
+    XCTAssertTrue(store.transcript.isEmpty)
+  }
+
   func testAttachmentOnlySubmitClearsSelectionAfterAcceptance() async {
     let driver = FakeConversationDriver()
     let attachment = testAttachment(name: "diagram.png")
