@@ -1399,6 +1399,12 @@ final class ViviBackendRuntimeTests: XCTestCase {
       try NativeEventDecoder.decode(
         fixture.event, bytes: fixture.bytes, models: [], commands: mixedGeneration))
 
+    var outOfRangeSource = fixture.commands
+    outOfRangeSource[0].source = vivi_backend_command_source_t(rawValue: UInt32.max)
+    XCTAssertThrowsError(
+      try NativeEventDecoder.decode(
+        fixture.event, bytes: fixture.bytes, models: [], commands: outOfRangeSource))
+
     var badSpan = fixture.commands
     badSpan[0].description = vivi_backend_span_t(
       offset: UInt32(fixture.bytes.count), length: 1)

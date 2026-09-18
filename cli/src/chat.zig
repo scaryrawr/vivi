@@ -117,6 +117,21 @@ fn commandArgumentSuffix(input: []const u8) []const u8 {
     return if (separator) |index| input[index..] else "";
 }
 
+fn commandValidationMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.CommandTakesNoArguments => "This command does not accept arguments.",
+        error.CommandRequiresArguments => "This command requires an argument.",
+        error.CommandArgumentsTooLong => "Command arguments are too long.",
+        error.InvalidCommandArgumentsUtf8 => "Command arguments must be valid UTF-8.",
+        error.InvalidCommandKey,
+        error.StaleCommandKey,
+        => "The command catalog changed. Open the command palette and try again.",
+        error.CommandCatalogUnavailable => "Commands are not available yet. Refresh the command palette and try again.",
+        error.CommandIsNotExecutable => "This command cannot be executed from the command palette.",
+        else => "The command could not be executed.",
+    };
+}
+
 const FileReferenceQuery = struct {
     start: usize,
     end: usize,
@@ -3391,7 +3406,7 @@ const ChatUi = struct {
                                 try self.transcript.append(
                                     self.allocator,
                                     .status,
-                                    @errorName(err),
+                                    commandValidationMessage(err),
                                 );
                                 self.followTail();
                                 return;
@@ -8320,6 +8335,21 @@ test "slash command parsing preserves argument suffixes" {
     );
     try std.testing.expectEqualStrings("", slashCommandQuery("/").?);
     try std.testing.expect(slashCommandQuery("not-a-command") == null);
+}
+
+test "command validation errors are actionable" {
+    try std.testing.expectEqualStrings(
+        "This command requires an argument.",
+        commandValidationMessage(error.CommandRequiresArguments),
+    );
+    try std.testing.expectEqualStrings(
+        "The command catalog changed. Open the command palette and try again.",
+        commandValidationMessage(error.StaleCommandKey),
+    );
+    try std.testing.expectEqualStrings(
+        "Commands are not available yet. Refresh the command palette and try again.",
+        commandValidationMessage(error.CommandCatalogUnavailable),
+    );
 }
 
 test "file reference query follows the active composer token" {

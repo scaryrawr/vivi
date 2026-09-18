@@ -485,7 +485,7 @@ final class NativeChatStore: ObservableObject {
   }
 
   var canUseModelControls: Bool {
-    modelState == .ready && !isBusy
+    !isAcquiringAttachments && modelState == .ready && sessionState == .ready && !isBusy
   }
 
   var filteredCommands: [CommandInfo] {
@@ -1734,10 +1734,13 @@ enum NativeEventDecoder {
     func command(_ raw: vivi_backend_command_t) throws -> CommandInfo {
       guard raw.struct_size == MemoryLayout<vivi_backend_command_t>.size,
         raw.reserved == 0,
-        let source = CommandSource(rawValue: Int32(raw.source.rawValue)),
-        let action = CommandAction(rawValue: Int32(raw.action.rawValue)),
+        let sourceValue = Int32(exactly: raw.source.rawValue),
+        let source = CommandSource(rawValue: sourceValue),
+        let actionValue = Int32(exactly: raw.action.rawValue),
+        let action = CommandAction(rawValue: actionValue),
+        let argumentPolicyValue = Int32(exactly: raw.argument_policy.rawValue),
         let argumentPolicy = CommandArgumentPolicy(
-          rawValue: Int32(raw.argument_policy.rawValue))
+          rawValue: argumentPolicyValue)
       else { throw NativeEventDecodingError.malformed }
       let name = try text(raw.name)
       let displayName = try text(raw.display_name)
@@ -1796,13 +1799,15 @@ enum NativeEventDecoder {
         return .markdown(value)
       case VIVI_BACKEND_PRESENTATION_SOURCE:
         guard
-          let language = PresentationLanguage(rawValue: Int32(raw.language.rawValue))
+          let languageValue = Int32(exactly: raw.language.rawValue),
+          let language = PresentationLanguage(rawValue: languageValue)
         else { throw NativeEventDecodingError.malformed }
         var decoded: [SemanticSpan] = []
         var previousEnd = contentStart
         for item in semanticSpans[spanStart..<(spanStart + spanCount)] {
           guard item.reserved == 0,
-            let token = SemanticToken(rawValue: Int32(item.token.rawValue))
+            let tokenValue = Int32(exactly: item.token.rawValue),
+            let token = SemanticToken(rawValue: tokenValue)
           else { throw NativeEventDecodingError.malformed }
           let start = Int(item.bytes.offset)
           let length = Int(item.bytes.length)
@@ -2208,13 +2213,15 @@ func nativeCodePresentation(language: String, source: String) throws -> ToolPres
     return .literal(text)
   }
   guard descriptor.kind == VIVI_BACKEND_PRESENTATION_SOURCE,
-    let decodedLanguage = PresentationLanguage(rawValue: Int32(descriptor.language.rawValue))
+    let languageValue = Int32(exactly: descriptor.language.rawValue),
+    let decodedLanguage = PresentationLanguage(rawValue: languageValue)
   else { throw NativeEventDecodingError.malformed }
   var decodedSpans: [SemanticSpan] = []
   var previousEnd = 0
   for span in spans {
     guard span.reserved == 0,
-      let token = SemanticToken(rawValue: Int32(span.token.rawValue))
+      let tokenValue = Int32(exactly: span.token.rawValue),
+      let token = SemanticToken(rawValue: tokenValue)
     else { throw NativeEventDecodingError.malformed }
     let start = Int(span.bytes.offset)
     let length = Int(span.bytes.length)
