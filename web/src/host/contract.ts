@@ -101,7 +101,6 @@ export interface HostSnapshot {
   readonly schemaVersion: 1;
   readonly revision: number;
   readonly projects: readonly ProjectSnapshot[];
-  readonly selectedSessionId: SessionId | null;
   readonly selectedSession: SessionSnapshot | null;
   readonly applicationError: HostError | null;
 }

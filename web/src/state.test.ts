@@ -17,7 +17,7 @@ describe("UI state", () => {
   });
 
   it("clears only the submitted draft revision", () => {
-    const id = fixtures.one.selectedSessionId!;
+    const id = fixtures.one.selectedSession!.id;
     const typed = reduceUi(initialUiState, {
       type: "draftChanged",
       id,

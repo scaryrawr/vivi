@@ -60,7 +60,10 @@ export function ViviApp({
   );
   const selected = snapshot.selectedSession;
   const draft = selected ? selectDraft(ui, selected.id) : null;
-  const canSend = selectCanSend(snapshot, ui) && !sendPending;
+  const canSend =
+    connectionState.kind === "connected" &&
+    selectCanSend(snapshot, ui) &&
+    !sendPending;
   const sidebarRef = useRef<HTMLElement>(null);
 
   const handleResult = (result: HostCommandResult) => {
@@ -168,8 +171,7 @@ export function ViviApp({
                     aria-label={`${project.displayName} conversations`}
                   >
                     {project.sessions.map((session) => {
-                      const isSelected =
-                        session.id === snapshot.selectedSessionId;
+                      const isSelected = session.id === selected?.id;
                       return (
                         <button
                           type="button"

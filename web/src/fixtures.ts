@@ -97,7 +97,6 @@ const empty: HostSnapshot = {
   schemaVersion: 1,
   revision: 1,
   projects: [],
-  selectedSessionId: null,
   selectedSession: null,
   applicationError: null,
 };
@@ -106,7 +105,6 @@ const one: HostSnapshot = {
   schemaVersion: 1,
   revision: 1,
   projects: [project(paths.vivi, "vivi", [viviSessions[0]])],
-  selectedSessionId: ids.alpha,
   selectedSession: selectedSession(viviSessions[0]),
   applicationError: null,
 };
@@ -118,7 +116,6 @@ const multiple: HostSnapshot = {
     project(paths.vivi, "vivi", viviSessions),
     project(paths.sdk, "copilot-sdk-zig", sdkSessions),
   ],
-  selectedSessionId: ids.beta,
   selectedSession: selectedSession(viviSessions[1], []),
   applicationError: null,
 };
@@ -134,7 +131,6 @@ const longTitles: HostSnapshot = {
       ),
     ]),
   ],
-  selectedSessionId: ids.alpha,
   selectedSession: selectedSession(
     summary(
       ids.alpha,

@@ -71,7 +71,6 @@ export class MockViviHost implements ViviHostPort, ConnectedViviHost {
     this.publish({
       ...this.snapshot,
       revision: this.snapshot.revision + 1,
-      selectedSessionId: id,
       selectedSession: selected,
     });
     return { kind: "accepted" };
@@ -105,7 +104,6 @@ export class MockViviHost implements ViviHostPort, ConnectedViviHost {
       ...this.snapshot,
       revision: this.snapshot.revision + 1,
       projects,
-      selectedSessionId: id,
       selectedSession: created,
     });
     return { kind: "accepted" };
@@ -152,6 +150,7 @@ export class MockViviHost implements ViviHostPort, ConnectedViviHost {
   disconnect() {
     if (this.connectionState.kind === "disconnected") return;
     this.connectionState = { kind: "disconnected" };
+    this.listeners.forEach((listener) => listener());
     this.listeners.clear();
   }
 

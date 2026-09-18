@@ -39,7 +39,6 @@ export const SelectedBottomRow: Story = {
   args: {
     host: new MockViviHost({
       ...fixtures.multiple,
-      selectedSessionId: fixtures.multiple.projects[0]!.sessions[2]!.id,
       selectedSession: {
         ...fixtures.multiple.selectedSession!,
         ...fixtures.multiple.projects[0]!.sessions[2]!,

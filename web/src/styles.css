@@ -66,7 +66,7 @@ button {
   --tertiary: #b0b1b6;
   --line: rgb(255 255 255 / 0.1);
   --line-strong: rgb(255 255 255 / 0.18);
-  --selection: #4c9aff;
+  --selection: #0a64d8;
   --selection-soft: #16365d;
   --danger: #ffb4a9;
   --danger-soft: #4a2220;
@@ -213,6 +213,10 @@ button {
   color: white;
   background: var(--selection);
   text-shadow: 0 1px 1px rgb(0 0 0 / 0.16);
+}
+
+.session-row[aria-current="page"] .lifecycle-status {
+  color: inherit;
 }
 
 .session-title {
