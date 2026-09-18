@@ -3358,6 +3358,18 @@ const ChatUi = struct {
                 const command = catalog.commands[selected.source_index];
                 if (std.ascii.eqlIgnoreCase(command.name, "new")) {
                     self.menu_mode = .closed;
+                    const contents = try self.input.toOwnedContents(
+                        self.allocator,
+                    );
+                    defer self.allocator.free(contents);
+                    if (std.mem.trim(
+                        u8,
+                        commandArgumentSuffix(contents),
+                        " \t\r\n",
+                    ).len != 0) {
+                        try self.submitPrompt(conversation, .immediate);
+                        return;
+                    }
                     conversation.startNewSession() catch |err| switch (err) {
                         error.Busy => return,
                         else => return err,
@@ -8379,6 +8391,14 @@ test "slash command parsing preserves argument suffixes" {
     try std.testing.expectEqualStrings(
         " thorough",
         commandArgumentSuffix("/autopilot thorough"),
+    );
+    try std.testing.expectEqualStrings(
+        " extra",
+        commandArgumentSuffix("/new extra"),
+    );
+    try std.testing.expectEqualStrings(
+        " pasted-image-token",
+        commandArgumentSuffix("/new pasted-image-token"),
     );
     const command_input = try buildCommandInput(
         std.testing.allocator,
