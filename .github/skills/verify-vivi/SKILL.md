@@ -78,6 +78,12 @@ share PTYs or evidence. Multiple Vivi processes may run side by side because
 each owns its own Copilot child and session, but they share the user's Copilot
 credential store. Never automate two instances against the same terminal.
 
+Recipes that replace `HOME` must pass an authenticated `gh auth token` through
+`GH_TOKEN` and `GITHUB_TOKEN`. Do not symlink the user's `~/.copilot` directory:
+Vivi sets Copilot's process home to `$HOME/.vivi/copilot`, so that symlink
+neither authenticates the isolated process nor preserves plugin/session
+isolation.
+
 The stable user handles are:
 
 - `vivi --help` and `vivi --version` for command discovery.
