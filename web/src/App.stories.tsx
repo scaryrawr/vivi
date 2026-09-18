@@ -1,13 +1,29 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { ViviApp } from "./App";
+import { useState } from "react";
+import { ViviApp, type ViviAppProps } from "./App";
 import { fixtures } from "./fixtures";
+import type { HostSnapshot } from "./host/contract";
 import { MockViviHost } from "./host/mock";
+
+type ViviAppStoryProps = Omit<ViviAppProps, "host"> & {
+  readonly snapshot: HostSnapshot;
+};
+
+function ViviAppStory({ snapshot, ...props }: ViviAppStoryProps) {
+  const [mounted, setMounted] = useState(() => ({
+    snapshot,
+    host: new MockViviHost(snapshot),
+  }));
+  if (mounted.snapshot !== snapshot)
+    setMounted({ snapshot, host: new MockViviHost(snapshot) });
+  return <ViviApp {...props} host={mounted.host} />;
+}
 
 const meta = {
   title: "Vivi/Application",
-  component: ViviApp,
+  component: ViviAppStory,
   parameters: { layout: "fullscreen" },
-} satisfies Meta<typeof ViviApp>;
+} satisfies Meta<typeof ViviAppStory>;
 
 export default meta;
 type Story = StoryObj<typeof meta>;
@@ -20,7 +36,7 @@ const story = (
   } = {},
 ): Story => ({
   args: {
-    host: new MockViviHost(fixtures[fixture]),
+    snapshot: fixtures[fixture],
     appearance: options.appearance,
     initiallyCollapsed:
       options.collapsed && fixtures[fixture].projects[0]
@@ -37,7 +53,7 @@ export const LongTitlesAndPaths = story("longTitles");
 export const CollapsedProject = story("multiple", { collapsed: true });
 export const SelectedBottomRow: Story = {
   args: {
-    host: new MockViviHost({
+    snapshot: {
       ...fixtures.multiple,
       projects: fixtures.multiple.projects,
       selectedSession: {
@@ -46,7 +62,7 @@ export const SelectedBottomRow: Story = {
         transcript: [],
         error: null,
       },
-    }),
+    },
   },
 };
 export const StreamingResponse = story("streaming");

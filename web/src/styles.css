@@ -45,6 +45,8 @@ button {
   --danger: #b42318;
   --danger-soft: #fff0ee;
   --focus: #1473e6;
+  --responding: #8a5200;
+  --responding-soft: #fff3d6;
   display: grid;
   grid-template-columns: 268px minmax(0, 1fr);
   grid-template-rows: minmax(0, 1fr);
@@ -73,6 +75,7 @@ button {
   --danger-soft: #4a2220;
   --focus: #75b6ff;
   --responding: #f1b85b;
+  --responding-soft: #3b2c12;
 }
 
 .sidebar {
@@ -241,7 +244,7 @@ button {
 }
 
 .lifecycle-status.responding {
-  color: var(--responding, #8a5200);
+  color: var(--responding);
 }
 
 .lifecycle-status.failed {
@@ -314,8 +317,8 @@ button {
 }
 
 .lifecycle-pill.responding {
-  color: #8a5200;
-  background: #fff3d6;
+  color: var(--responding);
+  background: var(--responding-soft);
 }
 
 .application-error,
