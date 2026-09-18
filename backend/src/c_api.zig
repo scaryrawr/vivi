@@ -5,6 +5,18 @@ const c = @cImport({
 });
 
 comptime {
+    if (c.VIVI_BACKEND_ATTACHMENT_MAX_COUNT != backend.max_attachment_count or
+        c.VIVI_BACKEND_ATTACHMENT_MAX_BYTES != backend.max_attachment_bytes or
+        c.VIVI_BACKEND_ATTACHMENT_IDENTITY_MAX_BYTES !=
+            backend.max_attachment_identity_bytes or
+        c.VIVI_BACKEND_ATTACHMENT_DISPLAY_NAME_MAX_BYTES !=
+            backend.max_attachment_display_name_bytes)
+    {
+        @compileError("C attachment limits must match the backend domain");
+    }
+}
+
+comptime {
     if (c.VIVI_BACKEND_ABI_VERSION != backend.abi_version) {
         @compileError("C header and Zig backend ABI versions differ");
     }

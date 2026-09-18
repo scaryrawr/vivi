@@ -1970,7 +1970,7 @@ final class ViviConversationDriver: ViviConversationDriving, @unchecked Sendable
     Unmanaged<ViviConversationDriver>.fromOpaque(context).takeUnretainedValue().drain()
   }
 
-  private static func withSubmissionAttachments<Result>(
+  static func withSubmissionAttachments<Result>(
     _ attachments: ArraySlice<ComposerAttachment>,
     descriptors: inout [vivi_backend_submission_attachment_t],
     body: (UnsafeBufferPointer<vivi_backend_submission_attachment_t>) -> Result

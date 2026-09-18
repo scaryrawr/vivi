@@ -9,6 +9,10 @@ extern "C" {
 
 #define VIVI_BACKEND_ABI_VERSION 10
 #define VIVI_BACKEND_SESSION_TITLE_MAX_CHARACTERS 80
+#define VIVI_BACKEND_ATTACHMENT_MAX_COUNT 32
+#define VIVI_BACKEND_ATTACHMENT_MAX_BYTES 20971520
+#define VIVI_BACKEND_ATTACHMENT_IDENTITY_MAX_BYTES 256
+#define VIVI_BACKEND_ATTACHMENT_DISPLAY_NAME_MAX_BYTES 1024
 
 typedef enum vivi_backend_result {
     VIVI_BACKEND_OK = 0,
@@ -32,7 +36,13 @@ typedef enum vivi_backend_attachment_media_type {
 
 /*
  * Fixed-size ABI v10 array element. struct_size must equal sizeof this record
- * because attachment arrays use the C element stride.
+ * because attachment arrays use the C element stride. identity and display_name
+ * must be non-empty, valid UTF-8 without NUL bytes, and no longer than their
+ * published limits. Identities must be unique within one submission. bytes must
+ * be non-empty, no longer than VIVI_BACKEND_ATTACHMENT_MAX_BYTES, and match
+ * media_type by content. The attachment array and total bytes are bounded by
+ * VIVI_BACKEND_ATTACHMENT_MAX_COUNT and VIVI_BACKEND_ATTACHMENT_MAX_BYTES.
+ * All pointers are borrowed only for the duration of vivi_backend_submit.
  */
 typedef struct vivi_backend_submission_attachment {
     uint32_t struct_size;

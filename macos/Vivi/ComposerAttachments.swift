@@ -2,9 +2,11 @@ import AppKit
 import Foundation
 import ImageIO
 import UniformTypeIdentifiers
+import ViviBackend
 
-let composerAttachmentByteLimit = 20 * 1024 * 1024
-let composerAttachmentCountLimit = 32
+let composerAttachmentByteLimit = Int(VIVI_BACKEND_ATTACHMENT_MAX_BYTES)
+let composerAttachmentCountLimit = Int(VIVI_BACKEND_ATTACHMENT_MAX_COUNT)
+let composerAttachmentDecodedPixelLimit = 16 * 1024 * 1024
 
 enum ComposerAttachmentMedia: UInt32, Equatable, Sendable {
   case png = 1
@@ -80,6 +82,7 @@ enum ComposerAttachmentAcquisitionError: LocalizedError, Equatable, Sendable {
   case tooLarge(String)
   case tooMany
   case totalTooLarge
+  case dimensionsTooLarge
 
   var errorDescription: String? {
     switch self {
@@ -97,6 +100,8 @@ enum ComposerAttachmentAcquisitionError: LocalizedError, Equatable, Sendable {
       "A message can include at most \(composerAttachmentCountLimit) images."
     case .totalTooLarge:
       "Attachments for one message cannot exceed 20 MB total."
+    case .dimensionsTooLarge:
+      "The pasted image dimensions are too large to attach safely."
     }
   }
 }
@@ -254,10 +259,18 @@ final class AppKitComposerAttachmentAcquirer: ComposerAttachmentAcquiring {
 
   nonisolated static func snapshotTIFF(_ data: Data) throws -> ComposerAttachment {
     try Task.checkCancellation()
+    guard let source = CGImageSourceCreateWithData(data as CFData, nil) else {
+      throw ComposerAttachmentAcquisitionError.unsupported("Pasted image")
+    }
     guard
-      let source = CGImageSourceCreateWithData(data as CFData, nil),
-      let image = CGImageSourceCreateImageAtIndex(source, 0, nil)
+      let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+      let width = (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
+      let height = (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue
     else {
+      throw ComposerAttachmentAcquisitionError.unsupported("Pasted image")
+    }
+    try validateDecodedDimensions(width: width, height: height)
+    guard let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
       throw ComposerAttachmentAcquisitionError.unsupported("Pasted image")
     }
     try Task.checkCancellation()
@@ -279,6 +292,14 @@ final class AppKitComposerAttachmentAcquirer: ComposerAttachmentAcquiring {
     return try snapshot(
       data: encoded as Data,
       displayName: "Pasted image.png")
+  }
+
+  nonisolated static func validateDecodedDimensions(width: Int, height: Int) throws {
+    guard width > 0, height > 0,
+      width <= composerAttachmentDecodedPixelLimit / height
+    else {
+      throw ComposerAttachmentAcquisitionError.dimensionsTooLarge
+    }
   }
 
   func snapshotFiles(_ urls: [URL]) async throws -> [ComposerAttachment] {

@@ -28,6 +28,26 @@ const syntax_inserted = vaxis.Color{ .rgb = .{ 134, 239, 172 } };
 const syntax_deleted = vaxis.Color{ .rgb = .{ 251, 113, 133 } };
 const syntax_meta = vaxis.Color{ .rgb = .{ 125, 211, 252 } };
 
+fn promptSubmissionFailureReason(err: anyerror) ?[]const u8 {
+    return switch (err) {
+        error.TooManyAttachments => std.fmt.comptimePrint(
+            "a message can include at most {d} images",
+            .{backend.max_attachment_count},
+        ),
+        error.AttachmentsTooLarge => std.fmt.comptimePrint(
+            "attachments for one message cannot exceed {d} MiB total",
+            .{backend.max_attachment_bytes / (1024 * 1024)},
+        ),
+        error.AttachmentTooLarge, error.ImageTooLarge => std.fmt.comptimePrint(
+            "each image must be {d} MiB or smaller",
+            .{backend.max_attachment_bytes / (1024 * 1024)},
+        ),
+        error.UnsupportedImageFormat, error.AttachmentMediaMismatch => "only PNG, JPEG, GIF, and WebP images are supported",
+        error.FileNotFound, error.AccessDenied, error.IsDir, error.InputOutput => "a selected image could not be read",
+        else => null,
+    };
+}
+
 const AppEvent = union(enum) {
     key_press: vaxis.Key,
     mouse: vaxis.Mouse,
@@ -2828,10 +2848,11 @@ const ChatUi = struct {
     }
 
     fn reportPromptSubmissionFailure(self: *ChatUi, err: anyerror) !void {
+        const reason = promptSubmissionFailureReason(err);
         const message = try std.fmt.allocPrint(
             self.allocator,
             "Message not sent: {s}. Your draft is unchanged.",
-            .{@errorName(err)},
+            .{reason orelse @errorName(err)},
         );
         defer self.allocator.free(message);
         try self.transcript.append(self.allocator, .status, message);
@@ -8762,5 +8783,20 @@ test "session finder distinguishes empty catalog from empty filter" {
     try std.testing.expectEqualStrings(
         "No matching sessions.",
         ChatUi.sessionMenuEmptyMessage(true),
+    );
+}
+
+test "attachment submission failures explain user-facing limits" {
+    try std.testing.expectEqualStrings(
+        "a message can include at most 32 images",
+        promptSubmissionFailureReason(error.TooManyAttachments).?,
+    );
+    try std.testing.expectEqualStrings(
+        "attachments for one message cannot exceed 20 MiB total",
+        promptSubmissionFailureReason(error.AttachmentsTooLarge).?,
+    );
+    try std.testing.expectEqualStrings(
+        "only PNG, JPEG, GIF, and WebP images are supported",
+        promptSubmissionFailureReason(error.UnsupportedImageFormat).?,
     );
 }

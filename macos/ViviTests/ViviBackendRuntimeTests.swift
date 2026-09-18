@@ -252,6 +252,67 @@ final class ViviBackendRuntimeTests: XCTestCase {
     XCTAssertEqual(actual, expected)
   }
 
+  func testAppKitAttachmentRejectsExcessiveDecodedDimensions() throws {
+    XCTAssertNoThrow(
+      try AppKitComposerAttachmentAcquirer.validateDecodedDimensions(
+        width: 4_096,
+        height: 4_096))
+    XCTAssertThrowsError(
+      try AppKitComposerAttachmentAcquirer.validateDecodedDimensions(
+        width: 4_097,
+        height: 4_096)
+    ) { error in
+      XCTAssertEqual(
+        error as? ComposerAttachmentAcquisitionError,
+        .dimensionsTooLarge)
+    }
+  }
+
+  func testSubmissionAttachmentBridgeKeepsMultipleDescriptorBuffersAlive() {
+    let first = testAttachment(name: "first.png")
+    let second = ComposerAttachment(
+      id: UUID(uuidString: "00000000-0000-0000-0000-000000000002")!,
+      displayName: "second.jpg",
+      media: .jpeg,
+      data: Data([0xFF, 0xD8, 0xFF, 0x00]))
+    let attachments = [first, second]
+    var descriptors: [vivi_backend_submission_attachment_t] = []
+
+    let visited = ViviConversationDriver.withSubmissionAttachments(
+      attachments[...],
+      descriptors: &descriptors
+    ) { buffer in
+      XCTAssertEqual(buffer.count, 2)
+      for (index, descriptor) in buffer.enumerated() {
+        XCTAssertEqual(
+          descriptor.struct_size,
+          UInt32(MemoryLayout<vivi_backend_submission_attachment_t>.size))
+        XCTAssertEqual(descriptor.media_type.rawValue, attachments[index].media.rawValue)
+        XCTAssertEqual(
+          String(
+            decoding: UnsafeBufferPointer(
+              start: descriptor.identity,
+              count: Int(descriptor.identity_length)),
+            as: UTF8.self),
+          attachments[index].id.uuidString)
+        XCTAssertEqual(
+          String(
+            decoding: UnsafeBufferPointer(
+              start: descriptor.display_name,
+              count: Int(descriptor.display_name_length)),
+            as: UTF8.self),
+          attachments[index].displayName)
+        XCTAssertEqual(
+          Data(bytes: descriptor.bytes!, count: Int(descriptor.byte_length)),
+          attachments[index].data)
+      }
+      return true
+    }
+
+    XCTAssertTrue(visited)
+    XCTAssertTrue(descriptors.isEmpty)
+  }
+
   func testAppKitAttachmentSelectionEnforcesCountBeforeReadsAndAggregateWhileReading() throws {
     let missing = URL(fileURLWithPath: "/missing/image.png")
     XCTAssertThrowsError(
