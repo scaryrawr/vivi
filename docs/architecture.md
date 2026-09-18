@@ -46,11 +46,14 @@ that presentation over the same conversation collection and selection.
 Application termination closes every retained store and waits for all drivers.
 
 `NativeChatStore` remains the authoritative one-conversation aggregate. The
-application collection derives sidebar title and workspace metadata from the
-store rather than copying it. This permits a session resume to replace the
-store's active workspace, title, transcript, and model selection without
-changing application conversation identity. The sidebar does not parse session
-shards, retain backend resume keys, or own transcript and model behavior.
+application collection retains the immutable launch workspace used for project
+placement while deriving the current sidebar title and active workspace from
+the store. This permits a session resume to replace the store's active
+workspace, title, and transcript without changing application conversation or
+launch-project identity. The backend projects one cross-workspace catalog from
+Vivi's isolated Copilot SDK store with copied working-directory metadata and
+store-bound, generation-scoped opaque resume keys. The sidebar groups those
+summaries but does not inspect SDK storage, retain keys, or own resume policy.
 
 The scaffold currently verifies:
 

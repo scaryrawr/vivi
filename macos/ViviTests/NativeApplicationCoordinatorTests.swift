@@ -41,6 +41,9 @@ final class NativeApplicationCoordinatorTests: XCTestCase {
     XCTAssertEqual(
       harness.coordinator.conversations.records.map(\.navigation.workspace.canonicalPath),
       ["/tmp/project", "/tmp/project"])
+    XCTAssertEqual(
+      harness.coordinator.conversations.launchWorkspaces.map(\.canonicalPath),
+      ["/tmp/project"])
     XCTAssertNotEqual(
       harness.coordinator.conversations.records[0].id,
       harness.coordinator.conversations.records[1].id)
@@ -66,37 +69,65 @@ final class NativeApplicationCoordinatorTests: XCTestCase {
     XCTAssertEqual(harness.coordinator.conversations.selectedID, record.id)
   }
 
-  func testResumeUpdatesNavigationWithoutChangingConversationIdentity() {
+  func testProjectHistoryUsesSelectedLaunchConversationThenLatestFallback() {
     let harness = CoordinatorHarness()
-    harness.coordinator.open([URL(string: "vivi://chat?workspace=/tmp/project")!])
-    let record = harness.coordinator.conversations.records[0]
-    let key = ResumeKey(generation: 1, slot: 0)
+    harness.coordinator.open([
+      URL(string: "vivi://chat?workspace=/tmp/project")!,
+      URL(string: "vivi://chat?workspace=/tmp/other")!,
+      URL(string: "vivi://chat?workspace=/tmp/project")!,
+    ])
+    let conversations = harness.coordinator.conversations
+    let project = WorkspaceIdentity(absolutePath: "/tmp/project")!
+    let projectRecords = conversations.records(launchedFrom: project)
+
+    XCTAssertEqual(projectRecords.count, 2)
+    XCTAssertTrue(conversations.historyConversation(launchedFrom: project) === projectRecords[1])
+
+    conversations.select(projectRecords[0].id)
+
+    XCTAssertTrue(conversations.historyConversation(launchedFrom: project) === projectRecords[0])
+  }
+
+  func testCrossWorkspaceResumeKeepsConversationIdentitySelectionAndUpdatesDuplicates() {
+    let harness = CoordinatorHarness()
+    harness.coordinator.open([
+      URL(string: "vivi://chat?workspace=/tmp/one")!,
+      URL(string: "vivi://chat?workspace=/tmp/two")!,
+    ])
+    let conversations = harness.coordinator.conversations
+    let record = conversations.records[0]
+    conversations.select(record.id)
+    harness.drivers[0].send(.ready)
+    harness.drivers[0].send(.modelCatalog(coordinatorModelCatalog()))
+    let key = ResumeKey(generation: 9, slot: 2)
     let summary = SessionSummary(
       key: key,
-      workingDirectory: "/tmp/resumed",
-      title: "Resumed",
+      workingDirectory: "/tmp/two",
+      title: "Resumed conversation",
       isCurrent: false)
 
-    harness.drivers[0].send(.ready)
-    harness.drivers[0].send(
-      .modelCatalog(
-        ModelCatalog(
-          selected: ModelSelection(modelID: "copilot/test", reasoning: .off),
-          models: [])))
     record.store.refreshSessions()
-    harness.drivers[0].send(.sessionCatalog(SessionCatalog(sessions: [summary])))
+    harness.drivers[0].send(
+      .sessionCatalog(SessionCatalog(sessions: [summary])))
     record.store.resumeSession(key)
     harness.drivers[0].send(
       .sessionResume(
         .resumed(
           ResumedSession(
             summary: summary,
-            transcript: [],
+            transcript: [.assistant("restored")],
             cleanupFailed: false))))
 
-    XCTAssertTrue(harness.coordinator.conversations.records[0] === record)
-    XCTAssertEqual(record.navigation.workspace.canonicalPath, "/tmp/resumed")
-    XCTAssertEqual(record.navigation.title, "Resumed")
+    XCTAssertTrue(conversations.records[0] === record)
+    XCTAssertEqual(conversations.selectedID, record.id)
+    XCTAssertEqual(record.navigation.workspace.canonicalPath, "/tmp/two")
+    XCTAssertEqual(record.launchWorkspace.canonicalPath, "/tmp/one")
+    XCTAssertEqual(
+      conversations.launchWorkspaces.map(\.canonicalPath),
+      ["/tmp/one", "/tmp/two"])
+    XCTAssertEqual(record.navigation.title, "Resumed conversation")
+    XCTAssertEqual(conversations.duplicatePosition(for: record.id)?.ordinal, 1)
+    XCTAssertEqual(conversations.duplicatePosition(for: conversations.records[1].id)?.ordinal, 2)
   }
 
   func testUntitledLaunchPresentsMainWindow() {
@@ -163,6 +194,7 @@ private final class CoordinatorHarness {
         self?.drivers.append(driver)
         return ConversationRecord(
           id: id,
+          launchWorkspace: workspace,
           store: NativeChatStore(workspace: workspace.canonicalPath, driver: driver))
       },
       makeWindow: { [weak self] identity, _, onClosed in
@@ -204,6 +236,8 @@ private final class FakeMainWindow: MainWindowControlling {
 
 final class ControllableConversationDriver: ViviConversationDriving {
   private(set) var closeCount = 0
+  private(set) var sessionRefreshCount = 0
+  private(set) var resumeKeys: [ResumeKey] = []
   private var receive: (@MainActor (ChatEvent) -> Void)?
   private var closeCompletions: [@MainActor () -> Void] = []
 
@@ -227,11 +261,13 @@ final class ControllableConversationDriver: ViviConversationDriving {
   }
 
   func refreshSessions() -> ConversationOperationResult {
-    .accepted
+    sessionRefreshCount += 1
+    return .accepted
   }
 
   func resumeSession(_ key: ResumeKey) -> ConversationOperationResult {
-    .accepted
+    resumeKeys.append(key)
+    return .accepted
   }
 
   func close(completion: @escaping @MainActor () -> Void) {
@@ -252,4 +288,20 @@ final class ControllableConversationDriver: ViviConversationDriving {
       completion()
     }
   }
+
+}
+
+private func coordinatorModelCatalog() -> ModelCatalog {
+  ModelCatalog(
+    selected: ModelSelection(modelID: "copilot/test", reasoning: .medium),
+    models: [
+      ModelInfo(
+        id: "copilot/test",
+        displayName: "Test",
+        maxContextWindowTokens: 1,
+        maxOutputTokens: 1,
+        supportsVision: false,
+        reasoning: [.medium],
+        advertisedDefaultReasoning: .medium)
+    ])
 }

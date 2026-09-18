@@ -10,9 +10,11 @@ final class MainWindowControllerTests: XCTestCase {
     let secondDriver = ControllableConversationDriver()
     let first = ConversationRecord(
       id: ConversationID(rawValue: UUID()),
+      launchWorkspace: WorkspaceIdentity(absolutePath: "/tmp/first")!,
       store: NativeChatStore(workspace: "/tmp/first", driver: firstDriver))
     let second = ConversationRecord(
       id: ConversationID(rawValue: UUID()),
+      launchWorkspace: WorkspaceIdentity(absolutePath: "/tmp/second")!,
       store: NativeChatStore(workspace: "/tmp/second", driver: secondDriver))
     let conversations = ConversationCollection()
     conversations.appendAndSelect(first)
@@ -41,6 +43,7 @@ final class MainWindowControllerTests: XCTestCase {
     conversations.appendAndSelect(
       ConversationRecord(
         id: ConversationID(rawValue: UUID()),
+        launchWorkspace: WorkspaceIdentity(absolutePath: "/tmp/project")!,
         store: NativeChatStore(workspace: "/tmp/project", driver: driver)))
     let window = NSWindow()
     var closedIdentity: MainWindowIdentity?
@@ -69,4 +72,59 @@ final class MainWindowControllerTests: XCTestCase {
         duplicateBadge: "2",
         accessibilityLabel: "Vivi, /tmp/vivi, conversation 2 of 3"))
   }
+
+  func testProjectAccessibilityLabelDisambiguatesMatchingNames() {
+    XCTAssertEqual(
+      projectAccessibilityLabel(name: "app", path: "/one/app"),
+      "app, /one/app, project")
+    XCTAssertNotEqual(
+      projectAccessibilityLabel(name: "app", path: "/one/app"),
+      projectAccessibilityLabel(name: "app", path: "/two/app"))
+  }
+
+  func testProjectSessionHistoryFiltersWorkspaceAndCurrentSession() {
+    let catalog = SessionCatalog(
+      sessions: [
+        historySummary(slot: 1, workspace: "/work/current", title: "Current", isCurrent: true),
+        historySummary(slot: 2, workspace: "/work/other", title: "Earlier"),
+        historySummary(slot: 3, workspace: "/work/current", title: nil),
+        historySummary(slot: 4, workspace: "/work/other", title: "Oldest"),
+      ])
+
+    let rows = projectSessionHistoryPresentation(
+      catalog: catalog,
+      projectWorkspace: "/work/current")
+
+    XCTAssertEqual(rows.map(\.title), ["current"])
+    XCTAssertEqual(
+      rows[0].accessibilityLabel,
+      "current, /work/current, saved session")
+  }
+
+  func testProjectSessionHistoryPreservesBackendOrder() {
+    let catalog = SessionCatalog(
+      sessions: [
+        historySummary(slot: 7, workspace: "/work/current", title: "Recent"),
+        historySummary(slot: 8, workspace: "/work/current", title: "Earlier"),
+      ])
+
+    let rows = projectSessionHistoryPresentation(
+      catalog: catalog,
+      projectWorkspace: "/work/current")
+
+    XCTAssertEqual(rows.map(\.title), ["Recent", "Earlier"])
+  }
+}
+
+private func historySummary(
+  slot: UInt32,
+  workspace: String,
+  title: String?,
+  isCurrent: Bool = false
+) -> SessionSummary {
+  SessionSummary(
+    key: ResumeKey(generation: 42, slot: slot),
+    workingDirectory: workspace,
+    title: title,
+    isCurrent: isCurrent)
 }

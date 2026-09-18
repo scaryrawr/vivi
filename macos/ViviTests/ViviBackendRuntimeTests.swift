@@ -649,7 +649,61 @@ final class ViviBackendRuntimeTests: XCTestCase {
     store.reduce(.sessionCatalog(catalog))
     XCTAssertEqual(store.sessionCatalog, catalog)
     XCTAssertEqual(store.sessionState, .ready)
+    XCTAssertNil(store.sessionCatalogFailure)
     XCTAssertEqual(driver.sessionRefreshCount, 1)
+  }
+
+  func testSessionCatalogFailureIsVisibleUntilRetryStarts() {
+    let driver = FakeConversationDriver()
+    let store = NativeChatStore(workspace: "/work/current", driver: driver)
+    store.reduce(.ready)
+    store.reduce(.modelCatalog(testCatalog()))
+
+    store.refreshSessions()
+    store.reduce(.sessionCatalogFailure("Could not load sessions."))
+
+    XCTAssertEqual(store.sessionCatalogFailure, "Could not load sessions.")
+    XCTAssertEqual(store.sessionState, .ready)
+
+    store.refreshSessions()
+
+    XCTAssertNil(store.sessionCatalogFailure)
+    XCTAssertEqual(store.sessionState, .refreshing)
+    XCTAssertEqual(driver.sessionRefreshCount, 2)
+  }
+
+  func testImmediateSessionRefreshFailureIsVisible() {
+    let driver = FakeConversationDriver()
+    driver.refreshSessionsResult = .failed
+    let store = NativeChatStore(workspace: "/work/current", driver: driver)
+    store.reduce(.ready)
+    store.reduce(.modelCatalog(testCatalog()))
+
+    store.refreshSessions()
+
+    XCTAssertEqual(store.sessionCatalogFailure, "Could not refresh sessions.")
+    XCTAssertNil(store.sessionCatalog)
+    XCTAssertEqual(store.sessionState, .ready)
+    XCTAssertEqual(driver.sessionRefreshCount, 1)
+  }
+
+  func testResumeRejectsStaleKeyAndDuplicateRequest() {
+    let driver = FakeConversationDriver()
+    let store = NativeChatStore(workspace: "/work/current", driver: driver)
+    let catalog = swiftSessionCatalog()
+    let key = catalog.sessions[0].key
+    store.reduce(.ready)
+    store.reduce(.modelCatalog(testCatalog()))
+    store.refreshSessions()
+    store.reduce(.sessionCatalog(catalog))
+
+    store.resumeSession(
+      ResumeKey(generation: key.generation - 1, slot: key.slot))
+    store.resumeSession(key)
+    store.resumeSession(key)
+
+    XCTAssertEqual(driver.resumeKeys, [key])
+    XCTAssertEqual(store.sessionState, .resuming(key))
   }
 
   func testResumeFailurePreservesPresentationDraftAndCatalog() {

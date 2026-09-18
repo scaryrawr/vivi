@@ -293,6 +293,7 @@ final class NativeChatStore: ObservableObject {
   @Published private(set) var modelState: ModelControlState = .loading
   @Published private(set) var catalog: ModelCatalog?
   @Published private(set) var sessionCatalog: SessionCatalog?
+  @Published private(set) var sessionCatalogFailure: String?
   @Published private(set) var sessionState: SessionControlState = .ready
   @Published var draft = ""
 
@@ -401,10 +402,12 @@ final class NativeChatStore: ObservableObject {
     let result = driver.refreshSessions()
     if result == .accepted {
       sessionCatalog = nil
+      sessionCatalogFailure = nil
       sessionState = .refreshing
     } else {
-      transcript.append(
-        .failure(id: UUID(), text: message(for: result, action: "refresh sessions")))
+      let failure = message(for: result, action: "refresh sessions")
+      sessionCatalogFailure = failure
+      transcript.append(.failure(id: UUID(), text: failure))
     }
   }
 
@@ -521,15 +524,18 @@ final class NativeChatStore: ObservableObject {
       modelState = .ready
     case .sessionCatalog(let catalog):
       guard case .refreshing = sessionState else {
-        transcript.append(
-          .failure(id: UUID(), text: "The backend returned an unexpected session catalog."))
+        let message = "The backend returned an unexpected session catalog."
+        transcript.append(.failure(id: UUID(), text: message))
+        sessionCatalogFailure = message
         sessionState = .ready
         break
       }
       sessionCatalog = catalog
+      sessionCatalogFailure = nil
       sessionState = .ready
     case .sessionCatalogFailure(let message):
       transcript.append(.failure(id: UUID(), text: message))
+      sessionCatalogFailure = message
       sessionState = .ready
     case .sessionResume(let result):
       apply(result)
@@ -650,6 +656,7 @@ final class NativeChatStore: ObservableObject {
           ?? URL(fileURLWithPath: resumed.summary.workingDirectory).lastPathComponent,
         transcript: snapshot,
         confirmedSelection: confirmedSelection)
+      sessionCatalogFailure = nil
       sessionCatalog = nil
     }
   }
