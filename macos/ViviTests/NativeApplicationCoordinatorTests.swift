@@ -84,6 +84,26 @@ final class NativeApplicationCoordinatorTests: XCTestCase {
     XCTAssertEqual(harness.coordinator.presentation.workspaceChoice, .idle)
   }
 
+  func testURLAndChooserUseDifferentWorkspacesWithSameApplicationConfiguration() async {
+    let configuration = NativeApplicationConfiguration(
+      settingsPath: "/application-state/settings.json")
+    let harness = CoordinatorHarness(applicationConfiguration: configuration)
+    let chosenWorkspace = FileManager.default.temporaryDirectory
+
+    harness.coordinator.open([URL(string: "vivi://chat?workspace=/tmp/from-url")!])
+    harness.coordinator.requestNewConversation()
+    await Task.yield()
+    harness.choosers[0].finish(chosenWorkspace)
+    await Task.yield()
+
+    XCTAssertEqual(
+      harness.creationRequests.map(\.workspace.canonicalPath),
+      ["/tmp/from-url", chosenWorkspace.path])
+    XCTAssertEqual(
+      harness.creationRequests.map(\.configuration),
+      [configuration, configuration])
+  }
+
   func testWorkspaceChoiceCancellationChangesNoState() async {
     let harness = CoordinatorHarness()
 
@@ -291,19 +311,33 @@ final class NativeApplicationCoordinatorTests: XCTestCase {
 
 @MainActor
 private final class CoordinatorHarness {
+  struct CreationRequest {
+    let workspace: WorkspaceIdentity
+    let configuration: NativeApplicationConfiguration
+  }
+
+  let applicationConfiguration: NativeApplicationConfiguration
   var drivers: [ControllableConversationDriver] = []
   var choosers: [ControllableWorkspaceChooser] = []
   var windows: [FakeMainWindow] = []
+  var creationRequests: [CreationRequest] = []
+
+  init(applicationConfiguration: NativeApplicationConfiguration = .live) {
+    self.applicationConfiguration = applicationConfiguration
+  }
 
   lazy var coordinator: NativeApplicationCoordinator = {
     var nextID = 0
     return NativeApplicationCoordinator(
+      applicationConfiguration: applicationConfiguration,
       makeConversationID: {
         nextID += 1
         return ConversationID(
           rawValue: UUID(uuidString: "00000000-0000-0000-0000-\(String(format: "%012d", nextID))")!)
       },
-      makeConversation: { [weak self] id, workspace in
+      makeConversation: { [weak self] id, workspace, configuration in
+        self?.creationRequests.append(
+          CreationRequest(workspace: workspace, configuration: configuration))
         let driver = ControllableConversationDriver()
         self?.drivers.append(driver)
         return ConversationRecord(

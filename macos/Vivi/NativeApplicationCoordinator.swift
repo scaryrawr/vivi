@@ -29,6 +29,17 @@ struct ConversationID: Hashable, Sendable {
   let rawValue: UUID
 }
 
+struct NativeApplicationConfiguration: Equatable, Sendable {
+  let settingsPath: String
+
+  static var live: NativeApplicationConfiguration {
+    NativeApplicationConfiguration(
+      settingsPath:
+        FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".vivi/settings.json").path)
+  }
+}
+
 enum MainWindowIdentity: Hashable, Sendable {
   case primary
 }
@@ -179,7 +190,11 @@ protocol MainWindowControlling: AnyObject {
 
 @MainActor
 final class NativeApplicationCoordinator {
-  typealias ConversationFactory = (ConversationID, WorkspaceIdentity) -> ConversationRecord
+  typealias ConversationFactory = (
+    ConversationID,
+    WorkspaceIdentity,
+    NativeApplicationConfiguration
+  ) -> ConversationRecord
   typealias WorkspaceChooserFactory = () -> any WorkspaceChoosing
   typealias WindowFactory = (
     MainWindowIdentity,
@@ -196,6 +211,7 @@ final class NativeApplicationCoordinator {
   let conversations: ConversationCollection
   let presentation = NativeApplicationPresentation()
 
+  private let applicationConfiguration: NativeApplicationConfiguration
   private let makeConversationID: () -> ConversationID
   private let makeConversation: ConversationFactory
   private let makeWorkspaceChooser: WorkspaceChooserFactory
@@ -209,6 +225,7 @@ final class NativeApplicationCoordinator {
 
   init(
     conversations: ConversationCollection = ConversationCollection(),
+    applicationConfiguration: NativeApplicationConfiguration = .live,
     makeConversationID: @escaping () -> ConversationID,
     makeConversation: @escaping ConversationFactory,
     makeWorkspaceChooser: @escaping WorkspaceChooserFactory = {
@@ -217,6 +234,7 @@ final class NativeApplicationCoordinator {
     makeWindow: @escaping WindowFactory
   ) {
     self.conversations = conversations
+    self.applicationConfiguration = applicationConfiguration
     self.makeConversationID = makeConversationID
     self.makeConversation = makeConversation
     self.makeWorkspaceChooser = makeWorkspaceChooser
@@ -225,15 +243,18 @@ final class NativeApplicationCoordinator {
 
   static func live() -> NativeApplicationCoordinator {
     NativeApplicationCoordinator(
+      applicationConfiguration: .live,
       makeConversationID: { ConversationID(rawValue: UUID()) },
-      makeConversation: { id, workspace in
+      makeConversation: { id, workspace, configuration in
         let path = workspace.canonicalPath
         return ConversationRecord(
           id: id,
           launchWorkspace: workspace,
           store: NativeChatStore(
             workspace: path,
-            driver: ViviConversationDriver(workspace: path)))
+            driver: ViviConversationDriver(
+              workspace: path,
+              applicationConfiguration: configuration)))
       },
       makeWindow: { identity, coordinator, onClosed in
         MainWindowController(
@@ -276,7 +297,7 @@ final class NativeApplicationCoordinator {
   @discardableResult
   func createConversation(in workspace: WorkspaceIdentity) -> ConversationRecord? {
     guard state == .running else { return nil }
-    let record = makeConversation(makeConversationID(), workspace)
+    let record = makeConversation(makeConversationID(), workspace, applicationConfiguration)
     conversations.appendAndSelect(record)
     return record
   }

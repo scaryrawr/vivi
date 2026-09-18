@@ -153,7 +153,7 @@ private func testApplicationCoordinator(
   NativeApplicationCoordinator(
     conversations: conversations,
     makeConversationID: { ConversationID(rawValue: UUID()) },
-    makeConversation: { id, workspace in
+    makeConversation: { id, workspace, _ in
       ConversationRecord(
         id: id,
         launchWorkspace: workspace,
