@@ -1,6 +1,11 @@
 const std = @import("std");
 const backend = @import("vivi_backend");
 const chat = @import("chat.zig");
+const terminal_browser = @import("terminal_browser.zig");
+
+comptime {
+    _ = terminal_browser;
+}
 
 const ChatOptions = struct {
     native: bool = false,

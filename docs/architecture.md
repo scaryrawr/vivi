@@ -126,6 +126,17 @@ for cross-origin assets, WebSockets, authenticated local-server identity, or
 canvas actions is a contract blocker and must not weaken this policy
 speculatively.
 
+The CLI has a contract-only terminal-browser v0.11.1 probe. It is not wired to
+normal chat and adds no libvaxis canvas presentation. The probe uses a trusted
+absolute executable, fixed argv, bounded process output, whole-process
+timeouts, strict UTF-8/JSON decoding, and a deterministic fake executable.
+Production registry enumeration and global shutdown are forbidden. Because
+targeted final-tab close leaves a replacement browser tab and isolated
+foreground-client cleanup is not yet proven by retained real evidence, the
+current decision is probe-only no-go. A future CLI host must remain
+per-conversation, preserve the full canvas key plus backend generation and host
+epoch, and match the native origin authority before integration.
+
 Native applications are intentionally asymmetric:
 
 | Host | Native UX and build ownership | Core artifact |

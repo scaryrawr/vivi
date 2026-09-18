@@ -154,6 +154,87 @@ pub fn build(b: *std.Build) void {
     );
     canvas_contract_step.dependOn(&run_canvas_contract_tests.step);
 
+    const terminal_browser_module = b.createModule(.{
+        .root_source_file = b.path("cli/src/terminal_browser.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    const terminal_browser_fake_module = b.createModule(.{
+        .root_source_file = b.path("cli/test/terminal_browser_fake.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    const terminal_browser_fake = b.addExecutable(.{
+        .name = "vivi-terminal-browser-fake",
+        .root_module = terminal_browser_fake_module,
+    });
+    const terminal_browser_test_options = b.addOptions();
+    terminal_browser_test_options.addOptionPath(
+        "fake_executable",
+        terminal_browser_fake.getEmittedBin(),
+    );
+    const terminal_browser_contract_module = b.createModule(.{
+        .root_source_file = b.path("cli/test/terminal_browser_contract.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    terminal_browser_contract_module.addImport(
+        "terminal_browser",
+        terminal_browser_module,
+    );
+    terminal_browser_contract_module.addOptions(
+        "terminal_browser_test_options",
+        terminal_browser_test_options,
+    );
+    const terminal_browser_contract_tests = b.addTest(.{
+        .root_module = terminal_browser_contract_module,
+        .use_llvm = use_llvm,
+    });
+    const run_terminal_browser_contract_tests =
+        b.addRunArtifact(terminal_browser_contract_tests);
+    const terminal_browser_contract_step = b.step(
+        "test-terminal-browser-contract",
+        "Verify the pinned terminal-browser v0.11.1 contract",
+    );
+    terminal_browser_contract_step.dependOn(
+        &run_terminal_browser_contract_tests.step,
+    );
+
+    const terminal_browser_verify_module = b.createModule(.{
+        .root_source_file = b.path("cli/test/terminal_browser_verify.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    terminal_browser_verify_module.addImport(
+        "terminal_browser",
+        terminal_browser_module,
+    );
+    const terminal_browser_verify = b.addExecutable(.{
+        .name = "vivi-terminal-browser-verify",
+        .root_module = terminal_browser_verify_module,
+    });
+    const terminal_browser_verify_step = b.step(
+        "verify-terminal-browser-real",
+        "Verify an explicitly selected terminal-browser v0.11.1 executable",
+    );
+    if (b.option(
+        []const u8,
+        "terminal-browser",
+        "Absolute path to the terminal-browser v0.11.1 executable",
+    )) |path| {
+        const run_terminal_browser_verify = b.addRunArtifact(
+            terminal_browser_verify,
+        );
+        run_terminal_browser_verify.addArg(path);
+        terminal_browser_verify_step.dependOn(
+            &run_terminal_browser_verify.step,
+        );
+    } else {
+        terminal_browser_verify_step.dependOn(&b.addFail(
+            "verify-terminal-browser-real requires -Dterminal-browser=/absolute/path",
+        ).step);
+    }
+
     const c_api_tests = b.addTest(.{ .root_module = c_api, .use_llvm = use_llvm });
     const run_c_api_tests = b.addRunArtifact(c_api_tests);
 
@@ -239,6 +320,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_backend_tests.step);
     test_step.dependOn(&run_canvas_contract_tests.step);
+    test_step.dependOn(&run_terminal_browser_contract_tests.step);
     test_step.dependOn(&run_c_api_tests.step);
     test_step.dependOn(&run_cli_tests.step);
     test_step.dependOn(&run_chat_tests.step);

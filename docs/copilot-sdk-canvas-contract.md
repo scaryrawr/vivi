@@ -2,12 +2,12 @@
 
 ## Scope
 
-Vivi does not expose canvases to a native or CLI renderer. This note records
-the public typed canvas contract used by the SDK-free domain in
-`backend/src/canvas.zig` and the production adapter in `backend/src/root.zig`.
-Only `root.zig` imports `copilot_sdk` in production. The standalone contract
-probe and adapter fixtures require neither credentials nor a running Copilot
-CLI.
+Vivi exposes canvases to the optional macOS renderer described below, but not
+to a CLI renderer. This note records the public typed canvas contract used by
+the SDK-free domain in `backend/src/canvas.zig` and the production adapter in
+`backend/src/root.zig`. Only `root.zig` imports `copilot_sdk` in production.
+The standalone contract probe and adapter fixtures require neither credentials
+nor a running Copilot CLI.
 
 `build.zig.zon` remains the sole dependency pin. The tested revision is
 `7695c34cb0ccfc4ec09aaadf91f29e4a12f86379`. The first public
