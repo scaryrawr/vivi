@@ -73,6 +73,15 @@ final class MainWindowControllerTests: XCTestCase {
         accessibilityLabel: "Vivi, /tmp/vivi, conversation 2 of 3"))
   }
 
+  func testProjectAccessibilityLabelDisambiguatesMatchingNames() {
+    XCTAssertEqual(
+      projectAccessibilityLabel(name: "app", path: "/one/app"),
+      "app, /one/app, project")
+    XCTAssertNotEqual(
+      projectAccessibilityLabel(name: "app", path: "/one/app"),
+      projectAccessibilityLabel(name: "app", path: "/two/app"))
+  }
+
   func testProjectSessionHistoryFiltersWorkspaceAndCurrentSession() {
     let catalog = SessionCatalog(
       sessions: [

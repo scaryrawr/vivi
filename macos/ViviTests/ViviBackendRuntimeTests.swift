@@ -672,6 +672,21 @@ final class ViviBackendRuntimeTests: XCTestCase {
     XCTAssertEqual(driver.sessionRefreshCount, 2)
   }
 
+  func testImmediateSessionRefreshFailureIsVisible() {
+    let driver = FakeConversationDriver()
+    driver.refreshSessionsResult = .failed
+    let store = NativeChatStore(workspace: "/work/current", driver: driver)
+    store.reduce(.ready)
+    store.reduce(.modelCatalog(testCatalog()))
+
+    store.refreshSessions()
+
+    XCTAssertEqual(store.sessionCatalogFailure, "Could not refresh sessions.")
+    XCTAssertNil(store.sessionCatalog)
+    XCTAssertEqual(store.sessionState, .ready)
+    XCTAssertEqual(driver.sessionRefreshCount, 1)
+  }
+
   func testResumeRejectsStaleKeyAndDuplicateRequest() {
     let driver = FakeConversationDriver()
     let store = NativeChatStore(workspace: "/work/current", driver: driver)

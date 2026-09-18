@@ -25,6 +25,10 @@ func sidebarRowPresentation(
       .joined(separator: ", "))
 }
 
+func projectAccessibilityLabel(name: String, path: String) -> String {
+  "\(name), \(path), project"
+}
+
 struct SessionHistoryRowPresentation: Equatable, Identifiable {
   let key: ResumeKey
   let title: String
@@ -129,7 +133,9 @@ private struct ProjectSidebarSection: View {
     } header: {
       Label(projectName, systemImage: "folder")
         .help(workspace.canonicalPath)
-        .accessibilityLabel("\(projectName), project")
+        .accessibilityLabel(
+          projectAccessibilityLabel(name: projectName, path: workspace.canonicalPath)
+        )
         .accessibilityIdentifier("project-\(workspace.canonicalPath)")
     }
   }
@@ -168,13 +174,7 @@ private struct ProjectSessionHistory: View {
   private var historyContent: some View {
     switch store.sessionState {
     case .refreshing:
-      Label("Loading sessions…", systemImage: "clock")
-        .foregroundStyle(.secondary)
-        .overlay(alignment: .trailing) {
-          ProgressView()
-            .controlSize(.small)
-        }
-        .accessibilityIdentifier("session-history-loading")
+      loadingState
     case .ready, .resuming:
       if let failure = store.sessionCatalogFailure {
         VStack(alignment: .leading, spacing: 6) {
@@ -204,9 +204,19 @@ private struct ProjectSessionHistory: View {
           }
         }
       } else {
-        emptyState
+        loadingState
       }
     }
+  }
+
+  private var loadingState: some View {
+    Label("Loading sessions…", systemImage: "clock")
+      .foregroundStyle(.secondary)
+      .overlay(alignment: .trailing) {
+        ProgressView()
+          .controlSize(.small)
+      }
+      .accessibilityIdentifier("session-history-loading")
   }
 
   private var emptyState: some View {

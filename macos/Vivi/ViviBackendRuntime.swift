@@ -405,8 +405,9 @@ final class NativeChatStore: ObservableObject {
       sessionCatalogFailure = nil
       sessionState = .refreshing
     } else {
-      transcript.append(
-        .failure(id: UUID(), text: message(for: result, action: "refresh sessions")))
+      let failure = message(for: result, action: "refresh sessions")
+      sessionCatalogFailure = failure
+      transcript.append(.failure(id: UUID(), text: failure))
     }
   }
 
