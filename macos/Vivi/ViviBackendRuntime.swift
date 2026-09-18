@@ -1148,6 +1148,10 @@ final class NativeChatStore: ObservableObject {
     commandCatalog = nil
     pendingCommandCatalogFailure = nil
     isCommandRefreshPending = false
+    clearCommandPresentation()
+  }
+
+  private func clearCommandPresentation() {
     isCommandPalettePresented = false
     commandQuery = ""
     selectedCommandKey = nil
@@ -1278,7 +1282,7 @@ final class NativeChatStore: ObservableObject {
         confirmedSelection: confirmedSelection)
       sessionCatalogFailure = nil
       sessionCatalog = nil
-      clearCommandState()
+      clearCommandPresentation()
     }
   }
 

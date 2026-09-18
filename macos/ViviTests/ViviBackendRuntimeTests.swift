@@ -1312,6 +1312,8 @@ final class ViviBackendRuntimeTests: XCTestCase {
     store.resumeSession(key)
     XCTAssertEqual(driver.resumeKeys, [key])
     XCTAssertEqual(store.transcript.last?.text, "old transcript")
+    let resumedCommands = swiftCommandCatalog(generation: 12)
+    store.reduce(.commandCatalog(resumedCommands))
     store.reduce(
       .sessionResume(
         .resumed(
@@ -1332,6 +1334,8 @@ final class ViviBackendRuntimeTests: XCTestCase {
       ModelSelection(modelID: "copilot/gpt-5", reasoning: .off))
     XCTAssertEqual(store.draft, "keep draft")
     XCTAssertNil(store.sessionCatalog)
+    XCTAssertEqual(store.commandCatalog, resumedCommands)
+    XCTAssertEqual(store.commandCatalogState, .loaded)
     XCTAssertEqual(
       store.transcript.map(\.text), ["", "thought", "answer", "Previous session cleanup failed."])
     guard case .user = store.transcript[0],
