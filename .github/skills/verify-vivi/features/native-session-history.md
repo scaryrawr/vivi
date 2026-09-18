@@ -8,7 +8,7 @@ projects in the native sidebar.
 - Each canonical workspace launched during the app lifetime has one expandable
   project section.
 - Live conversation rows appear first, followed directly by resumable sessions
-  saved for that project; there is no redundant History or scope submenu.
+  saved for that project; there is no redundant nested history submenu.
 - Loading, failure with retry, empty, and resuming states remain inline in the
   project section.
 - Persisted rows are visually and accessibly distinct from live conversation

@@ -148,8 +148,13 @@ private struct ProjectSessionHistory: View {
     historyContent
       .accessibilityIdentifier("session-history-\(projectWorkspace)")
       .onAppear {
-        guard shouldLoad else { return }
-        store.refreshSessions()
+        loadIfNeeded()
+      }
+      .onChange(of: store.lifecycle) {
+        loadIfNeeded()
+      }
+      .onChange(of: store.modelState) {
+        loadIfNeeded()
       }
       .onChange(of: store.sessionState) { previous, current in
         guard case .resuming = previous, current == .ready, store.sessionCatalog == nil else {
@@ -212,6 +217,11 @@ private struct ProjectSessionHistory: View {
 
   private var shouldLoad: Bool {
     store.sessionCatalogFailure == nil && store.sessionCatalog == nil
+  }
+
+  private func loadIfNeeded() {
+    guard shouldLoad else { return }
+    store.refreshSessions()
   }
 
   private var isOperating: Bool {
