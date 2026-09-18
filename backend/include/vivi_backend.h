@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define VIVI_BACKEND_ABI_VERSION 7
+#define VIVI_BACKEND_ABI_VERSION 8
 
 typedef enum vivi_backend_result {
     VIVI_BACKEND_OK = 0,
@@ -61,6 +61,9 @@ typedef enum vivi_backend_event_kind {
     VIVI_BACKEND_EVENT_MODEL_SWITCH = 14,
     VIVI_BACKEND_EVENT_TOOL_STARTED = 15,
     VIVI_BACKEND_EVENT_TOOL_FINISHED = 16,
+    VIVI_BACKEND_EVENT_SESSION_CATALOG = 17,
+    VIVI_BACKEND_EVENT_SESSION_CATALOG_FAILURE = 18,
+    VIVI_BACKEND_EVENT_SESSION_RESUME = 19,
 } vivi_backend_event_kind_t;
 
 typedef enum vivi_backend_content_kind {
@@ -69,6 +72,8 @@ typedef enum vivi_backend_content_kind {
     VIVI_BACKEND_CONTENT_MODEL_CATALOG = 2,
     VIVI_BACKEND_CONTENT_MODEL_SWITCH = 3,
     VIVI_BACKEND_CONTENT_TOOL = 4,
+    VIVI_BACKEND_CONTENT_SESSION_CATALOG = 5,
+    VIVI_BACKEND_CONTENT_SESSION_RESUME = 6,
 } vivi_backend_content_kind_t;
 
 typedef enum vivi_backend_tool_result {
@@ -108,6 +113,61 @@ typedef struct vivi_backend_span {
     uint32_t length;
 } vivi_backend_span_t;
 
+typedef enum vivi_backend_presentation_kind {
+    VIVI_BACKEND_PRESENTATION_NONE = 0,
+    VIVI_BACKEND_PRESENTATION_LITERAL = 1,
+    VIVI_BACKEND_PRESENTATION_MARKDOWN = 2,
+    VIVI_BACKEND_PRESENTATION_SOURCE = 3,
+} vivi_backend_presentation_kind_t;
+
+typedef enum vivi_backend_language {
+    VIVI_BACKEND_LANGUAGE_NONE = 0,
+    VIVI_BACKEND_LANGUAGE_ZIG = 1,
+    VIVI_BACKEND_LANGUAGE_BASH = 2,
+    VIVI_BACKEND_LANGUAGE_JSON = 3,
+    VIVI_BACKEND_LANGUAGE_YAML = 4,
+    VIVI_BACKEND_LANGUAGE_DIFF = 5,
+    VIVI_BACKEND_LANGUAGE_JAVASCRIPT = 6,
+    VIVI_BACKEND_LANGUAGE_TYPESCRIPT = 7,
+    VIVI_BACKEND_LANGUAGE_TSX = 8,
+    VIVI_BACKEND_LANGUAGE_RUST = 9,
+    VIVI_BACKEND_LANGUAGE_C = 10,
+    VIVI_BACKEND_LANGUAGE_CPP = 11,
+    VIVI_BACKEND_LANGUAGE_GO = 12,
+    VIVI_BACKEND_LANGUAGE_JAVA = 13,
+    VIVI_BACKEND_LANGUAGE_LUA = 14,
+    VIVI_BACKEND_LANGUAGE_PYTHON = 15,
+} vivi_backend_language_t;
+
+typedef enum vivi_backend_semantic_token {
+    VIVI_BACKEND_TOKEN_COMMENT = 1,
+    VIVI_BACKEND_TOKEN_STRING = 2,
+    VIVI_BACKEND_TOKEN_NUMBER = 3,
+    VIVI_BACKEND_TOKEN_CONSTANT = 4,
+    VIVI_BACKEND_TOKEN_KEYWORD = 5,
+    VIVI_BACKEND_TOKEN_FUNCTION = 6,
+    VIVI_BACKEND_TOKEN_PROPERTY = 7,
+    VIVI_BACKEND_TOKEN_OPERATOR = 8,
+    VIVI_BACKEND_TOKEN_INSERTED = 9,
+    VIVI_BACKEND_TOKEN_DELETED = 10,
+    VIVI_BACKEND_TOKEN_META = 11,
+} vivi_backend_semantic_token_t;
+
+typedef struct vivi_backend_semantic_span {
+    vivi_backend_span_t bytes;
+    vivi_backend_semantic_token_t token;
+    uint32_t reserved;
+} vivi_backend_semantic_span_t;
+
+typedef struct vivi_backend_presentation {
+    vivi_backend_span_t content;
+    vivi_backend_presentation_kind_t kind;
+    vivi_backend_language_t language;
+    uint32_t semantic_span_offset;
+    uint32_t semantic_span_count;
+    uint32_t reserved;
+} vivi_backend_presentation_t;
+
 typedef struct vivi_backend_model {
     vivi_backend_span_t id;
     vivi_backend_span_t display_name;
@@ -119,23 +179,67 @@ typedef struct vivi_backend_model {
     uint8_t reserved;
 } vivi_backend_model_t;
 
+typedef enum vivi_backend_session_resume_outcome {
+    VIVI_BACKEND_SESSION_RESUME_NONE = 0,
+    VIVI_BACKEND_SESSION_RESUME_RESUMED = 1,
+    VIVI_BACKEND_SESSION_RESUME_FAILED = 2,
+} vivi_backend_session_resume_outcome_t;
+
+typedef enum vivi_backend_transcript_role {
+    VIVI_BACKEND_TRANSCRIPT_USER = 1,
+    VIVI_BACKEND_TRANSCRIPT_ASSISTANT = 2,
+    VIVI_BACKEND_TRANSCRIPT_REASONING = 3,
+} vivi_backend_transcript_role_t;
+
+typedef enum vivi_backend_session_flags {
+    VIVI_BACKEND_SESSION_TITLE_PRESENT = 1u << 0,
+    VIVI_BACKEND_SESSION_CURRENT = 1u << 1,
+} vivi_backend_session_flags_t;
+
+typedef struct vivi_backend_resume_key {
+    uint64_t generation;
+    uint32_t slot;
+    uint32_t reserved;
+} vivi_backend_resume_key_t;
+
+typedef struct vivi_backend_session_summary {
+    vivi_backend_resume_key_t key;
+    vivi_backend_span_t working_directory;
+    vivi_backend_span_t title;
+    uint32_t flags;
+    uint32_t reserved;
+} vivi_backend_session_summary_t;
+
+typedef struct vivi_backend_transcript_item {
+    vivi_backend_span_t text;
+    vivi_backend_transcript_role_t role;
+    uint32_t reserved;
+} vivi_backend_transcript_item_t;
+
 typedef struct vivi_backend_event {
     vivi_backend_event_kind_t kind;
     vivi_backend_content_kind_t content_kind;
     uint32_t byte_count;
     uint32_t model_count;
+    uint32_t semantic_span_count;
+    uint32_t session_count;
+    uint32_t transcript_item_count;
     vivi_backend_span_t content;
     vivi_backend_span_t selected_model_id;
     vivi_backend_span_t tool_call_id;
     vivi_backend_span_t tool_title;
     vivi_backend_span_t tool_detail;
     vivi_backend_span_t tool_input;
+    vivi_backend_presentation_t tool_input_presentation;
+    vivi_backend_presentation_t tool_output_presentation;
     vivi_backend_tool_result_t tool_result;
     vivi_backend_reasoning_effort_t selected_reasoning;
     vivi_backend_model_switch_outcome_t switch_outcome;
     vivi_backend_history_effect_t history_effect;
+    vivi_backend_session_resume_outcome_t session_resume_outcome;
     uint8_t default_saved;
     uint8_t cleanup_failed;
+    uint16_t session_reserved;
     uint16_t reserved;
 } vivi_backend_event_t;
 
@@ -154,6 +258,11 @@ vivi_backend_result_t vivi_backend_switch_model(
     const uint8_t *model_id,
     uint32_t model_id_length,
     vivi_backend_reasoning_effort_t reasoning);
+vivi_backend_result_t vivi_backend_refresh_sessions(
+    vivi_backend_conversation_t *conversation);
+vivi_backend_result_t vivi_backend_resume_session(
+    vivi_backend_conversation_t *conversation,
+    vivi_backend_resume_key_t key);
 /*
  * Sanitizes untrusted tool text for Markdown display. out_length always receives
  * the required byte count. A short or null output buffer does not write output.
@@ -165,9 +274,23 @@ vivi_backend_result_t vivi_backend_sanitize_tool_markdown(
     uint32_t output_capacity,
     uint32_t *out_length);
 /*
- * next_event always fills out_event for a pending event. If either caller-owned
- * buffer is too small it returns BUFFER_TOO_SMALL without writing either
- * buffer or consuming the event; byte_count and model_count report capacities.
+ * Presents one fenced code fragment. The probe reports required byte/span
+ * counts and descriptor metadata. A short buffer writes neither buffer.
+ */
+vivi_backend_result_t vivi_backend_present_code_fragment(
+    const uint8_t *language_name,
+    uint32_t language_name_length,
+    const uint8_t *input,
+    uint32_t input_length,
+    vivi_backend_presentation_t *out_presentation,
+    uint8_t *output,
+    uint32_t output_capacity,
+    vivi_backend_semantic_span_t *semantic_spans,
+    uint32_t semantic_span_capacity);
+/*
+ * next_event always fills out_event for a pending event. If any caller-owned
+ * buffer is too small it returns BUFFER_TOO_SMALL without writing any buffer
+ * or consuming the event; count fields report all required capacities.
  * Every span is relative to bytes and is valid only for the completed call.
  */
 vivi_backend_result_t vivi_backend_next_event(
@@ -176,7 +299,13 @@ vivi_backend_result_t vivi_backend_next_event(
     uint8_t *bytes,
     uint32_t byte_capacity,
     vivi_backend_model_t *models,
-    uint32_t model_capacity);
+    uint32_t model_capacity,
+    vivi_backend_semantic_span_t *semantic_spans,
+    uint32_t semantic_span_capacity,
+    vivi_backend_session_summary_t *sessions,
+    uint32_t session_capacity,
+    vivi_backend_transcript_item_t *transcript_items,
+    uint32_t transcript_item_capacity);
 vivi_backend_result_t vivi_backend_close(
     vivi_backend_conversation_t *conversation);
 /*

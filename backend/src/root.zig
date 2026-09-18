@@ -17,7 +17,7 @@ const private_directory_permissions: std.Io.Dir.Permissions =
         .fromMode(0o700);
 
 pub const version = build_options.version;
-pub const abi_version: u32 = 7;
+pub const abi_version: u32 = 8;
 pub const Conversation = conversation.Conversation;
 pub const ConversationEvent = conversation.Event;
 pub const ConversationWake = conversation.Wake;
@@ -44,6 +44,7 @@ pub const SessionSummary = conversation.SessionSummary;
 pub const ResumeKey = conversation.ResumeKey;
 pub const TranscriptSnapshot = conversation.TranscriptSnapshot;
 pub const TranscriptItem = conversation.TranscriptItem;
+pub const TranscriptRole = conversation.TranscriptRole;
 pub const ToolActivity = tool_activity.ToolActivity;
 pub const ToolActivityUpdate = tool_activity.ToolActivityUpdate;
 pub const ToolStarted = tool_activity.ToolStarted;
@@ -69,6 +70,15 @@ pub const renderLiteral = presentation.renderLiteral;
 pub const renderOutput = presentation.renderOutput;
 pub const renderSource = presentation.renderSource;
 pub const renderMarkdown = presentation.renderMarkdown;
+pub const Presentation = presentation.Presentation;
+pub const PresentationLanguage = presentation.Language;
+pub const SemanticSpan = presentation.SemanticSpan;
+pub const SemanticToken = presentation.SemanticToken;
+pub const presentCodeFragment = presentation.presentCodeFragment;
+pub const presentToolInput = presentation.presentToolInput;
+pub const presentToolResult = presentation.presentToolResult;
+pub const PresentationKind = presentation.PresentationKind;
+pub const syntax = presentation.syntax;
 
 pub const CopilotCliLaunch = enum {
     sdk_default,
@@ -2036,7 +2046,7 @@ fn streamSessionResponse(
                     return .failed;
                 };
                 defer result.deinit(worker.allocator());
-                const finished = tool_activity.ToolFinished.init(
+                const finished = prepared.finished(
                     worker.allocator(),
                     request.tool_call_id,
                     switch (result) {

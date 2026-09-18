@@ -1391,9 +1391,14 @@ test "conversation transfers owned tool lifecycle events without SDK access" {
                 } },
             ) catch return;
             worker.toolActivity(.{ .started = started }) catch return;
-            const finished = tool_activity.ToolFinished.init(
+            const finished = tool_activity.ToolFinished.initPresented(
                 worker.allocator(),
                 "call-1",
+                .{ .read = .{
+                    .path = "file.txt",
+                    .offset = null,
+                    .limit = null,
+                } },
                 .{ .succeeded = "contents" },
             ) catch return;
             worker.toolActivity(.{ .finished = finished }) catch return;

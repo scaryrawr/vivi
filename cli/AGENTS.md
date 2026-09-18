@@ -10,20 +10,15 @@ Composer-only renders must preserve the active frame. Transcript residency,
 highlight caches, tool data, UI state, backend state, and conversation state
 remain on the process allocator.
 
-Sanitize tool output with `tool_renderer.renderOutput`, `renderSource`, or
-`renderMarkdown` before Tree-sitter parses it. `renderSource` normalizes source
-line endings so syntax spans index `output_display`, not the raw payload.
-Treat `read` results with an `offset` or `limit` as fragments and use tolerant
-highlighting. Reserve complete parsing for full-file or homogeneous command
-output, and reject oversized complete sources before truncation. If complete
-parsing rejects the source, re-render the raw payload with `renderOutput` and
-persist the plan as literal; valid syntax with zero captures is not a
-rejection. Complete strict validation and any fallback before measuring
-expanded tool output so layout ranges match the final display buffer in the
-current frame.
-Keep producer-signature checks on command-derived output plans. Path-derived
-`.diff` and `.patch` documents are strict syntax, but must not require a
-`diff --git` header.
+Consume the final `ToolStarted.input_presentation` and
+`ToolFinished.output_presentation` values produced by the backend. Do not
+reclassify tool output, infer languages, parse source, or perform strict
+fallback in the CLI. Terminal argument labels, wrapping, Vaxis styles, and
+Markdown layout remain CLI-owned. Semantic spans always index the accompanying
+presentation text: map Bash spans into the terminal-formatted argument display
+only when that text exactly matches the canonical command, and render fenced
+code from the same presented text cached with its spans. Measure only the final
+presentation bytes.
 
-When adding a Tree-sitter grammar in `build.zig`, compile its generated
-`parser.c` and every generated external scanner source shipped by that grammar.
+Markdown fenced code uses `vivi_backend.presentCodeFragment`; the backend owns
+language aliases and Tree-sitter tokens while the CLI owns its highlight cache.

@@ -66,6 +66,45 @@ struct ModelCatalog: Equatable {
   let models: [ModelInfo]
 }
 
+struct ResumeKey: Equatable, Hashable {
+  let generation: UInt64
+  let slot: UInt32
+}
+
+struct SessionSummary: Equatable {
+  let key: ResumeKey
+  let workingDirectory: String
+  let title: String?
+  let isCurrent: Bool
+}
+
+struct SessionCatalog: Equatable {
+  let sessions: [SessionSummary]
+}
+
+enum TranscriptSnapshotItem: Equatable {
+  case user(String)
+  case assistant(String)
+  case reasoning(String)
+}
+
+struct ResumedSession: Equatable {
+  let summary: SessionSummary
+  let transcript: [TranscriptSnapshotItem]
+  let cleanupFailed: Bool
+}
+
+enum SessionResumeResult: Equatable {
+  case resumed(ResumedSession)
+  case failed(String)
+}
+
+enum SessionControlState: Equatable {
+  case ready
+  case refreshing
+  case resuming(ResumeKey)
+}
+
 enum ModelSwitchOutcome: Equatable {
   case unchanged(model: ModelInfo, selection: ModelSelection)
   case defaultUpdated(model: ModelInfo, selection: ModelSelection)
@@ -102,13 +141,65 @@ enum ToolResultState: Equatable {
   case image
 }
 
+enum PresentationLanguage: Int32, Equatable {
+  case zig = 1
+  case bash = 2
+  case json = 3
+  case yaml = 4
+  case diff = 5
+  case javascript = 6
+  case typescript = 7
+  case tsx = 8
+  case rust = 9
+  case c = 10
+  case cpp = 11
+  case go = 12
+  case java = 13
+  case lua = 14
+  case python = 15
+}
+
+enum SemanticToken: Int32, Equatable {
+  case comment = 1
+  case string = 2
+  case number = 3
+  case constant = 4
+  case keyword = 5
+  case function = 6
+  case property = 7
+  case `operator` = 8
+  case inserted = 9
+  case deleted = 10
+  case meta = 11
+}
+
+struct SemanticSpan: Equatable {
+  let byteRange: Range<Int>
+  let token: SemanticToken
+}
+
+enum ToolPresentation: Equatable {
+  case literal(String)
+  case markdown(String)
+  case source(text: String, language: PresentationLanguage, spans: [SemanticSpan])
+
+  var text: String {
+    switch self {
+    case .literal(let text), .markdown(let text), .source(let text, _, _):
+      text
+    }
+  }
+}
+
 struct ToolActivity: Equatable {
   let callID: String
   let title: String
   let detail: String
   let input: String
+  let inputPresentation: ToolPresentation
   var result: ToolResultState
-  var output: String
+  var output: Data?
+  var outputPresentation: ToolPresentation?
 }
 
 enum ChatItem: Identifiable, Equatable {
@@ -138,7 +229,7 @@ enum ChatItem: Identifiable, Equatable {
       .status(_, let text), .failure(_, let text):
       text
     case .tool(_, let activity):
-      activity.output
+      activity.outputPresentation?.text ?? ""
     }
   }
 }
@@ -153,10 +244,18 @@ enum ChatEvent: Equatable {
   case assistantDelta(String)
   case assistantComplete(String)
   case toolStarted(ToolActivity)
-  case toolFinished(callID: String, result: ToolResultState, output: String)
+  case toolFinished(
+    callID: String,
+    result: ToolResultState,
+    output: Data,
+    presentation: ToolPresentation
+  )
   case modelCatalog(ModelCatalog)
   case modelCatalogFailure(String)
   case modelSwitch(ModelSwitchOutcome)
+  case sessionCatalog(SessionCatalog)
+  case sessionCatalogFailure(String)
+  case sessionResume(SessionResumeResult)
   case idle
   case failure(String)
   case closed
@@ -175,29 +274,51 @@ protocol ViviConversationDriving: AnyObject {
   func submit(_ prompt: String) -> ConversationOperationResult
   func refreshModels() -> ConversationOperationResult
   func switchModel(_ selection: ModelSelection) -> ConversationOperationResult
+  func refreshSessions() -> ConversationOperationResult
+  func resumeSession(_ key: ResumeKey) -> ConversationOperationResult
   func close(completion: @escaping @MainActor () -> Void)
+}
+
+struct ActiveConversationPresentation: Equatable {
+  let workspace: String
+  let sessionTitle: String
+  let transcript: [ChatItem]
+  let confirmedSelection: ModelSelection?
 }
 
 @MainActor
 final class NativeChatStore: ObservableObject {
   @Published private(set) var lifecycle: ChatLifecycle = .starting
-  @Published private(set) var transcript: [ChatItem] = []
-  @Published private(set) var sessionTitle: String
+  @Published private(set) var activePresentation: ActiveConversationPresentation
   @Published private(set) var modelState: ModelControlState = .loading
   @Published private(set) var catalog: ModelCatalog?
-  @Published private(set) var confirmedSelection: ModelSelection?
+  @Published private(set) var sessionCatalog: SessionCatalog?
+  @Published private(set) var sessionState: SessionControlState = .ready
   @Published var draft = ""
 
-  let workspace: String
+  var workspace: String { activePresentation.workspace }
+  var sessionTitle: String { activePresentation.sessionTitle }
+  private(set) var transcript: [ChatItem] {
+    get { activePresentation.transcript }
+    set { activePresentation = replacingActive(transcript: newValue) }
+  }
+  var confirmedSelection: ModelSelection? { activePresentation.confirmedSelection }
+
   private var activeAssistant: UUID?
   private var activeReasoning: UUID?
+  private var pendingReasoningCompletion: UUID?
   private var activeReasoningPrefix = ""
+  private var responseHeaderVisible = false
   private let driver: ViviConversationDriving
   private var closeCompletions: [@MainActor () -> Void] = []
 
   init(workspace: String, driver: ViviConversationDriving) {
-    self.workspace = workspace
-    sessionTitle = URL(fileURLWithPath: workspace).lastPathComponent
+    let presentation = ActiveConversationPresentation(
+      workspace: workspace,
+      sessionTitle: URL(fileURLWithPath: workspace).lastPathComponent,
+      transcript: [],
+      confirmedSelection: nil)
+    activePresentation = presentation
     self.driver = driver
     let started = driver.start { [weak self] event in
       self?.reduce(event)
@@ -213,7 +334,7 @@ final class NativeChatStore: ObservableObject {
   }
 
   var canSubmit: Bool {
-    !isBusy && modelState == .ready
+    !isBusy && modelState == .ready && sessionState == .ready
       && !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
   }
 
@@ -259,18 +380,43 @@ final class NativeChatStore: ObservableObject {
       return
     }
     finishStreamingRows()
+    responseHeaderVisible = false
     transcript.append(.user(id: UUID(), text: prompt))
     draft = ""
     lifecycle = .responding
   }
 
   func refreshModels() {
-    guard modelState == .ready else { return }
+    guard modelState == .ready, sessionState == .ready else { return }
     let result = driver.refreshModels()
     if result == .accepted {
       modelState = .refreshing
     } else {
       transcript.append(.failure(id: UUID(), text: message(for: result, action: "refresh models")))
+    }
+  }
+
+  func refreshSessions() {
+    guard lifecycle == .idle, modelState == .ready, sessionState == .ready else { return }
+    let result = driver.refreshSessions()
+    if result == .accepted {
+      sessionCatalog = nil
+      sessionState = .refreshing
+    } else {
+      transcript.append(
+        .failure(id: UUID(), text: message(for: result, action: "refresh sessions")))
+    }
+  }
+
+  func resumeSession(_ key: ResumeKey) {
+    guard lifecycle == .idle, modelState == .ready, sessionState == .ready,
+      sessionCatalog?.sessions.contains(where: { $0.key == key }) == true
+    else { return }
+    let result = driver.resumeSession(key)
+    if result == .accepted {
+      sessionState = .resuming(key)
+    } else {
+      transcript.append(.failure(id: UUID(), text: message(for: result, action: "resume session")))
     }
   }
 
@@ -315,12 +461,13 @@ final class NativeChatStore: ObservableObject {
       finishStreamingRows()
       transcript.append(.status(id: UUID(), text: text))
     case .sessionTitle(let title):
-      sessionTitle = title
+      activePresentation = replacingActive(sessionTitle: title)
     case .assistantStarted:
       activeAssistant = nil
       activeReasoning = nil
+      pendingReasoningCompletion = nil
       activeReasoningPrefix = ""
-      transcript.append(.assistantHeader(id: UUID()))
+      responseHeaderVisible = false
       lifecycle = .responding
     case .reasoningDelta(let text):
       updateReasoning(text, append: true)
@@ -336,7 +483,9 @@ final class NativeChatStore: ObservableObject {
       }
       activeAssistant = nil
     case .toolStarted(let activity):
+      ensureResponseHeader()
       activeReasoning = nil
+      pendingReasoningCompletion = nil
       activeReasoningPrefix = ""
       activeAssistant = nil
       if let index = transcript.firstIndex(where: { item in
@@ -348,7 +497,7 @@ final class NativeChatStore: ObservableObject {
       } else {
         transcript.append(.tool(id: UUID(), activity: activity))
       }
-    case .toolFinished(let callID, let result, let output):
+    case .toolFinished(let callID, let result, let output, let presentation):
       guard
         let index = transcript.firstIndex(where: { item in
           guard case .tool(_, let activity) = item else { return false }
@@ -357,10 +506,11 @@ final class NativeChatStore: ObservableObject {
       else { break }
       activity.result = result
       activity.output = output
+      activity.outputPresentation = presentation
       transcript[index] = .tool(id: id, activity: activity)
     case .modelCatalog(let catalog):
       self.catalog = catalog
-      confirmedSelection = catalog.selected
+      activePresentation = replacingActive(confirmedSelection: catalog.selected)
       modelState = .ready
     case .modelCatalogFailure(let message):
       finishStreamingRows()
@@ -369,9 +519,25 @@ final class NativeChatStore: ObservableObject {
     case .modelSwitch(let outcome):
       apply(outcome)
       modelState = .ready
+    case .sessionCatalog(let catalog):
+      guard case .refreshing = sessionState else {
+        transcript.append(
+          .failure(id: UUID(), text: "The backend returned an unexpected session catalog."))
+        sessionState = .ready
+        break
+      }
+      sessionCatalog = catalog
+      sessionState = .ready
+    case .sessionCatalogFailure(let message):
+      transcript.append(.failure(id: UUID(), text: message))
+      sessionState = .ready
+    case .sessionResume(let result):
+      apply(result)
+      sessionState = .ready
     case .idle:
       activeAssistant = nil
       activeReasoning = nil
+      pendingReasoningCompletion = nil
       activeReasoningPrefix = ""
       lifecycle = .idle
     case .failure(let message):
@@ -380,6 +546,7 @@ final class NativeChatStore: ObservableObject {
     case .closed:
       activeAssistant = nil
       activeReasoning = nil
+      pendingReasoningCompletion = nil
       activeReasoningPrefix = ""
       finishClose()
     }
@@ -399,7 +566,9 @@ final class NativeChatStore: ObservableObject {
   }
 
   private func switchModel(_ selection: ModelSelection) {
-    guard modelState == .ready, selection != confirmedSelection else { return }
+    guard modelState == .ready, sessionState == .ready, selection != confirmedSelection else {
+      return
+    }
     let result = driver.switchModel(selection)
     if result == .accepted {
       modelState = .switching
@@ -438,7 +607,7 @@ final class NativeChatStore: ObservableObject {
   }
 
   private func confirm(model: ModelInfo, selection: ModelSelection) {
-    confirmedSelection = selection
+    activePresentation = replacingActive(confirmedSelection: selection)
     var models = catalog?.models ?? []
     if let index = models.firstIndex(where: { $0.id == model.id }) {
       models[index] = model
@@ -448,19 +617,83 @@ final class NativeChatStore: ObservableObject {
     catalog = ModelCatalog(selected: selection, models: models)
   }
 
+  private func apply(_ result: SessionResumeResult) {
+    guard case .resuming(let requestedKey) = sessionState else {
+      transcript.append(
+        .failure(id: UUID(), text: "The backend returned an unexpected session result."))
+      return
+    }
+    switch result {
+    case .failed(let message):
+      transcript.append(.failure(id: UUID(), text: message))
+    case .resumed(let resumed):
+      guard resumed.summary.key == requestedKey else {
+        transcript.append(
+          .failure(id: UUID(), text: "The backend resumed an unexpected session."))
+        return
+      }
+      finishStreamingRows()
+      responseHeaderVisible = false
+      var snapshot = resumed.transcript.map { item -> ChatItem in
+        switch item {
+        case .user(let text): .user(id: UUID(), text: text)
+        case .assistant(let text): .assistant(id: UUID(), text: text)
+        case .reasoning(let text): .reasoning(id: UUID(), text: text)
+        }
+      }
+      if resumed.cleanupFailed {
+        snapshot.append(.status(id: UUID(), text: "Previous session cleanup failed."))
+      }
+      activePresentation = ActiveConversationPresentation(
+        workspace: resumed.summary.workingDirectory,
+        sessionTitle: resumed.summary.title
+          ?? URL(fileURLWithPath: resumed.summary.workingDirectory).lastPathComponent,
+        transcript: snapshot,
+        confirmedSelection: confirmedSelection)
+      sessionCatalog = nil
+    }
+  }
+
+  private func replacingActive(
+    workspace: String? = nil,
+    sessionTitle: String? = nil,
+    transcript: [ChatItem]? = nil,
+    confirmedSelection: ModelSelection?? = nil
+  ) -> ActiveConversationPresentation {
+    ActiveConversationPresentation(
+      workspace: workspace ?? activePresentation.workspace,
+      sessionTitle: sessionTitle ?? activePresentation.sessionTitle,
+      transcript: transcript ?? activePresentation.transcript,
+      confirmedSelection: confirmedSelection ?? activePresentation.confirmedSelection)
+  }
+
   private func updateReasoning(_ text: String, append: Bool) {
+    guard activeReasoning != nil || !text.isEmpty else { return }
+    ensureResponseHeader()
     var startsNewSegment = false
     if activeReasoning == nil {
       activeAssistant = nil
       if case .reasoning(let id, let existing) = transcript.last {
         activeReasoning = id
+        pendingReasoningCompletion = id
         activeReasoningPrefix = existing.isEmpty ? "" : existing + "\n\n"
         startsNewSegment = true
+      } else if case .assistant = transcript.last,
+        let id = pendingReasoningCompletion
+      {
+        activeReasoning = id
+        activeReasoningPrefix = ""
       } else {
         let id = UUID()
         activeReasoning = id
+        pendingReasoningCompletion = id
         activeReasoningPrefix = ""
-        transcript.append(.reasoning(id: id, text: ""))
+        let item = ChatItem.reasoning(id: id, text: "")
+        if case .assistant = transcript.last {
+          transcript.insert(item, at: transcript.count - 1)
+        } else {
+          transcript.append(item)
+        }
       }
     }
     guard let id = activeReasoning,
@@ -488,12 +721,14 @@ final class NativeChatStore: ObservableObject {
   private func finishStreamingRows() {
     activeAssistant = nil
     activeReasoning = nil
+    pendingReasoningCompletion = nil
     activeReasoningPrefix = ""
   }
 
   private func replaceActiveAssistant(_ text: String, append: Bool) {
     if activeAssistant == nil {
       guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+      ensureResponseHeader()
       let id = UUID()
       activeAssistant = id
       activeReasoning = nil
@@ -504,6 +739,12 @@ final class NativeChatStore: ObservableObject {
       case .assistant(_, let existing) = transcript[index]
     else { return }
     transcript[index] = .assistant(id: id, text: append ? existing + text : text)
+  }
+
+  private func ensureResponseHeader() {
+    guard lifecycle == .responding, !responseHeaderVisible else { return }
+    responseHeaderVisible = true
+    transcript.append(.assistantHeader(id: UUID()))
   }
 
   private func message(for result: ConversationOperationResult, action: String) -> String {
@@ -530,9 +771,58 @@ enum MarkdownBlockKind: Equatable {
 struct MarkdownBlock: Equatable {
   let kind: MarkdownBlockKind
   var content: AttributedString
+  var codePresentation: ToolPresentation? = nil
 }
 
-func markdownBlocks(_ text: String) -> [MarkdownBlock] {
+@MainActor
+final class CodePresentationCache {
+  static let shared = CodePresentationCache(capacity: 128)
+
+  private struct Key: Hashable {
+    let language: String
+    let source: String
+  }
+
+  private let capacity: Int
+  private var entries: [Key: ToolPresentation] = [:]
+  private var insertionOrder: [Key] = []
+
+  init(capacity: Int) {
+    precondition(capacity > 0)
+    self.capacity = capacity
+  }
+
+  func presentation(
+    language: String,
+    source: String,
+    load: (String, String) throws -> ToolPresentation = nativeCodePresentation
+  ) rethrows -> ToolPresentation {
+    let key = Key(language: language, source: source)
+    if let cached = entries[key] {
+      return cached
+    }
+    let value = try load(language, source)
+    if entries.count == capacity, let oldest = insertionOrder.first {
+      entries.removeValue(forKey: oldest)
+      insertionOrder.removeFirst()
+    }
+    entries[key] = value
+    insertionOrder.append(key)
+    return value
+  }
+
+  func removeAll() {
+    entries.removeAll(keepingCapacity: true)
+    insertionOrder.removeAll(keepingCapacity: true)
+  }
+}
+
+@MainActor
+func markdownBlocks(
+  _ text: String,
+  codePresentationCache: CodePresentationCache = .shared,
+  loadCodePresentation: (String, String) throws -> ToolPresentation = nativeCodePresentation
+) -> [MarkdownBlock] {
   guard
     let rendered = try? AttributedString(
       markdown: text,
@@ -557,6 +847,16 @@ func markdownBlocks(_ text: String) -> [MarkdownBlock] {
 
     blockIdentity = identity
     blocks.append(.init(kind: markdownBlockKind(components), content: content))
+  }
+
+  if !blocks.isEmpty {
+    for index in blocks.indices {
+      guard case .code(let language) = blocks[index].kind else { continue }
+      blocks[index].codePresentation = try? codePresentationCache.presentation(
+        language: language ?? "",
+        source: String(blocks[index].content.characters),
+        load: loadCodePresentation)
+    }
   }
 
   return blocks.isEmpty
@@ -612,19 +912,34 @@ enum NativeEventDecoder {
   static func decode(
     _ event: vivi_backend_event_t,
     bytes: [UInt8],
-    models: [vivi_backend_model_t]
+    models: [vivi_backend_model_t],
+    semanticSpans: [vivi_backend_semantic_span_t] = [],
+    sessions: [vivi_backend_session_summary_t] = [],
+    transcriptItems: [vivi_backend_transcript_item_t] = []
   ) throws -> ChatEvent {
-    guard event.reserved == 0, bytes.count == Int(event.byte_count),
-      models.count == Int(event.model_count)
+    guard event.reserved == 0, event.session_reserved == 0,
+      bytes.count == Int(event.byte_count),
+      models.count == Int(event.model_count),
+      semanticSpans.count == Int(event.semantic_span_count),
+      sessions.count == Int(event.session_count),
+      transcriptItems.count == Int(event.transcript_item_count)
     else { throw NativeEventDecodingError.malformed }
 
     func text(_ span: vivi_backend_span_t) throws -> String {
+      let value = try data(span)
+      guard let value = String(data: value, encoding: .utf8) else {
+        throw NativeEventDecodingError.malformed
+      }
+      return value
+    }
+
+    func data(_ span: vivi_backend_span_t) throws -> Data {
       let start = Int(span.offset)
       let length = Int(span.length)
-      guard start >= 0, length >= 0, start <= bytes.count, length <= bytes.count - start,
-        let value = String(bytes: bytes[start..<(start + length)], encoding: .utf8)
-      else { throw NativeEventDecodingError.malformed }
-      return value
+      guard start <= bytes.count, length <= bytes.count - start else {
+        throw NativeEventDecodingError.malformed
+      }
+      return Data(bytes[start..<(start + length)])
     }
 
     func reasoning(_ raw: vivi_backend_reasoning_effort_t) throws -> ReasoningEffort {
@@ -640,6 +955,7 @@ enum NativeEventDecoder {
       else {
         throw NativeEventDecodingError.malformed
       }
+
       let choices = ReasoningEffort.allCases.filter {
         raw.reasoning_mask & UInt8(1 << $0.rawValue) != 0
       }
@@ -667,19 +983,162 @@ enum NativeEventDecoder {
         advertisedDefaultReasoning: advertised)
     }
 
+    func zero(_ span: vivi_backend_span_t) -> Bool {
+      span.offset == 0 && span.length == 0
+    }
+
+    func session(_ raw: vivi_backend_session_summary_t) throws -> SessionSummary {
+      let knownFlags =
+        UInt32(VIVI_BACKEND_SESSION_TITLE_PRESENT.rawValue)
+        | UInt32(VIVI_BACKEND_SESSION_CURRENT.rawValue)
+      guard raw.reserved == 0, raw.flags & ~knownFlags == 0,
+        raw.key.generation != 0, raw.key.reserved == 0
+      else { throw NativeEventDecodingError.malformed }
+      let workingDirectory = try text(raw.working_directory)
+      guard !workingDirectory.isEmpty, workingDirectory.hasPrefix("/") else {
+        throw NativeEventDecodingError.malformed
+      }
+      let hasTitle = raw.flags & UInt32(VIVI_BACKEND_SESSION_TITLE_PRESENT.rawValue) != 0
+      guard hasTitle || zero(raw.title) else {
+        throw NativeEventDecodingError.malformed
+      }
+      return SessionSummary(
+        key: ResumeKey(
+          generation: raw.key.generation,
+          slot: raw.key.slot),
+        workingDirectory: workingDirectory,
+        title: hasTitle ? try text(raw.title) : nil,
+        isCurrent: raw.flags & UInt32(VIVI_BACKEND_SESSION_CURRENT.rawValue) != 0)
+    }
+
+    func transcriptItem(_ raw: vivi_backend_transcript_item_t) throws -> TranscriptSnapshotItem {
+      guard raw.reserved == 0 else { throw NativeEventDecodingError.malformed }
+      let value = try text(raw.text)
+      switch raw.role {
+      case VIVI_BACKEND_TRANSCRIPT_USER: return .user(value)
+      case VIVI_BACKEND_TRANSCRIPT_ASSISTANT: return .assistant(value)
+      case VIVI_BACKEND_TRANSCRIPT_REASONING: return .reasoning(value)
+      default: throw NativeEventDecodingError.malformed
+      }
+    }
+
+    func presentation(
+      _ raw: vivi_backend_presentation_t,
+      required: Bool
+    ) throws -> ToolPresentation? {
+      guard raw.reserved == 0 else { throw NativeEventDecodingError.malformed }
+      if raw.kind == VIVI_BACKEND_PRESENTATION_NONE {
+        guard !required, raw.content.offset == 0, raw.content.length == 0,
+          raw.language == VIVI_BACKEND_LANGUAGE_NONE,
+          raw.semantic_span_offset == 0, raw.semantic_span_count == 0
+        else { throw NativeEventDecodingError.malformed }
+        return nil
+      }
+      guard required else { throw NativeEventDecodingError.malformed }
+      let contentStart = Int(raw.content.offset)
+      let contentLength = Int(raw.content.length)
+      let contentEnd = contentStart + contentLength
+      guard contentStart <= bytes.count, contentLength <= bytes.count - contentStart,
+        let value = String(bytes: bytes[contentStart..<contentEnd], encoding: .utf8)
+      else { throw NativeEventDecodingError.malformed }
+      let spanStart = Int(raw.semantic_span_offset)
+      let spanCount = Int(raw.semantic_span_count)
+      guard spanStart <= semanticSpans.count, spanCount <= semanticSpans.count - spanStart
+      else { throw NativeEventDecodingError.malformed }
+
+      switch raw.kind {
+      case VIVI_BACKEND_PRESENTATION_LITERAL:
+        guard raw.language == VIVI_BACKEND_LANGUAGE_NONE, spanCount == 0 else {
+          throw NativeEventDecodingError.malformed
+        }
+        return .literal(value)
+      case VIVI_BACKEND_PRESENTATION_MARKDOWN:
+        guard raw.language == VIVI_BACKEND_LANGUAGE_NONE, spanCount == 0 else {
+          throw NativeEventDecodingError.malformed
+        }
+        return .markdown(value)
+      case VIVI_BACKEND_PRESENTATION_SOURCE:
+        guard
+          let language = PresentationLanguage(rawValue: Int32(raw.language.rawValue))
+        else { throw NativeEventDecodingError.malformed }
+        var decoded: [SemanticSpan] = []
+        var previousEnd = contentStart
+        for item in semanticSpans[spanStart..<(spanStart + spanCount)] {
+          guard item.reserved == 0,
+            let token = SemanticToken(rawValue: Int32(item.token.rawValue))
+          else { throw NativeEventDecodingError.malformed }
+          let start = Int(item.bytes.offset)
+          let length = Int(item.bytes.length)
+          let end = start + length
+          guard length > 0, start >= contentStart, start >= previousEnd,
+            end <= contentEnd,
+            isUTF8Boundary(bytes, at: start),
+            isUTF8Boundary(bytes, at: end)
+          else { throw NativeEventDecodingError.malformed }
+          decoded.append(
+            SemanticSpan(
+              byteRange: (start - contentStart)..<(end - contentStart),
+              token: token))
+          previousEnd = end
+        }
+        return .source(text: value, language: language, spans: decoded)
+      default:
+        throw NativeEventDecodingError.malformed
+      }
+    }
+
     guard event.default_saved <= 1, event.cleanup_failed <= 1 else {
       throw NativeEventDecodingError.malformed
     }
-    let content = try text(event.content)
+    let isSessionPayload =
+      event.kind == VIVI_BACKEND_EVENT_SESSION_CATALOG
+      || event.kind == VIVI_BACKEND_EVENT_SESSION_RESUME
+    if !isSessionPayload {
+      guard sessions.isEmpty, transcriptItems.isEmpty,
+        event.session_resume_outcome == VIVI_BACKEND_SESSION_RESUME_NONE
+      else { throw NativeEventDecodingError.malformed }
+    }
+    func content() throws -> String {
+      try text(event.content)
+    }
+    let inputPresentation = try presentation(
+      event.tool_input_presentation,
+      required: event.kind == VIVI_BACKEND_EVENT_TOOL_STARTED)
+    let outputPresentation = try presentation(
+      event.tool_output_presentation,
+      required: event.kind == VIVI_BACKEND_EVENT_TOOL_FINISHED)
+    let hasNeutralConversationMetadata =
+      zero(event.selected_model_id)
+      && zero(event.tool_call_id)
+      && zero(event.tool_title)
+      && zero(event.tool_detail)
+      && zero(event.tool_input)
+      && event.tool_result == VIVI_BACKEND_TOOL_RESULT_NONE
+      && event.selected_reasoning == VIVI_BACKEND_REASONING_NONE
+      && event.switch_outcome == VIVI_BACKEND_MODEL_SWITCH_NONE
+      && event.history_effect == VIVI_BACKEND_HISTORY_NONE
+    if event.kind == VIVI_BACKEND_EVENT_TOOL_STARTED {
+      guard event.tool_input_presentation.semantic_span_offset == 0,
+        event.tool_input_presentation.semantic_span_count == event.semantic_span_count
+      else { throw NativeEventDecodingError.malformed }
+    } else if event.kind == VIVI_BACKEND_EVENT_TOOL_FINISHED {
+      guard event.tool_output_presentation.semantic_span_offset == 0,
+        event.tool_output_presentation.semantic_span_count == event.semantic_span_count
+      else { throw NativeEventDecodingError.malformed }
+    } else {
+      guard event.semantic_span_count == 0 else {
+        throw NativeEventDecodingError.malformed
+      }
+    }
     switch event.kind {
     case VIVI_BACKEND_EVENT_READY: return .ready
-    case VIVI_BACKEND_EVENT_STATUS: return .status(content)
-    case VIVI_BACKEND_EVENT_SESSION_TITLE: return .sessionTitle(content)
+    case VIVI_BACKEND_EVENT_STATUS: return .status(try content())
+    case VIVI_BACKEND_EVENT_SESSION_TITLE: return .sessionTitle(try content())
     case VIVI_BACKEND_EVENT_ASSISTANT_STARTED: return .assistantStarted
-    case VIVI_BACKEND_EVENT_REASONING_DELTA: return .reasoningDelta(content)
-    case VIVI_BACKEND_EVENT_REASONING_COMPLETE: return .reasoningComplete(content)
-    case VIVI_BACKEND_EVENT_ASSISTANT_DELTA: return .assistantDelta(content)
-    case VIVI_BACKEND_EVENT_ASSISTANT_COMPLETE: return .assistantComplete(content)
+    case VIVI_BACKEND_EVENT_REASONING_DELTA: return .reasoningDelta(try content())
+    case VIVI_BACKEND_EVENT_REASONING_COMPLETE: return .reasoningComplete(try content())
+    case VIVI_BACKEND_EVENT_ASSISTANT_DELTA: return .assistantDelta(try content())
+    case VIVI_BACKEND_EVENT_ASSISTANT_COMPLETE: return .assistantComplete(try content())
     case VIVI_BACKEND_EVENT_TOOL_STARTED:
       guard event.content_kind == VIVI_BACKEND_CONTENT_TOOL,
         event.tool_result == VIVI_BACKEND_TOOL_RESULT_RUNNING
@@ -695,8 +1154,10 @@ enum NativeEventDecoder {
           title: title,
           detail: try text(event.tool_detail),
           input: try text(event.tool_input),
+          inputPresentation: inputPresentation!,
           result: .running,
-          output: ""))
+          output: nil,
+          outputPresentation: nil))
     case VIVI_BACKEND_EVENT_TOOL_FINISHED:
       guard event.content_kind == VIVI_BACKEND_CONTENT_TOOL else {
         throw NativeEventDecodingError.malformed
@@ -713,7 +1174,8 @@ enum NativeEventDecoder {
       return .toolFinished(
         callID: callID,
         result: result,
-        output: try sanitizedToolMarkdown(content))
+        output: try data(event.content),
+        presentation: outputPresentation!)
     case VIVI_BACKEND_EVENT_MODEL_CATALOG:
       guard event.content_kind == VIVI_BACKEND_CONTENT_MODEL_CATALOG else {
         throw NativeEventDecodingError.malformed
@@ -732,14 +1194,14 @@ enum NativeEventDecoder {
       }
       return .modelCatalog(ModelCatalog(selected: selected, models: decoded))
     case VIVI_BACKEND_EVENT_MODEL_CATALOG_FAILURE:
-      return .modelCatalogFailure(content)
+      return .modelCatalogFailure(try content())
     case VIVI_BACKEND_EVENT_MODEL_SWITCH:
       guard event.content_kind == VIVI_BACKEND_CONTENT_MODEL_SWITCH else {
         throw NativeEventDecodingError.malformed
       }
       if event.switch_outcome == VIVI_BACKEND_MODEL_SWITCH_FAILED {
         guard models.isEmpty else { throw NativeEventDecodingError.malformed }
-        return .modelSwitch(.failed(content))
+        return .modelSwitch(.failed(try content()))
       }
       guard models.count == 1 else { throw NativeEventDecodingError.malformed }
       let selection = ModelSelection(
@@ -771,8 +1233,59 @@ enum NativeEventDecoder {
       default:
         throw NativeEventDecodingError.malformed
       }
+    case VIVI_BACKEND_EVENT_SESSION_CATALOG:
+      guard event.content_kind == VIVI_BACKEND_CONTENT_SESSION_CATALOG,
+        models.isEmpty, semanticSpans.isEmpty, transcriptItems.isEmpty,
+        event.session_resume_outcome == VIVI_BACKEND_SESSION_RESUME_NONE,
+        event.default_saved == 0, event.cleanup_failed == 0, zero(event.content),
+        hasNeutralConversationMetadata
+      else { throw NativeEventDecodingError.malformed }
+      let decoded = try sessions.map(session)
+      if let generation = decoded.first?.key.generation {
+        guard decoded.allSatisfy({ $0.key.generation == generation })
+        else { throw NativeEventDecodingError.malformed }
+      }
+      guard Set(decoded.map(\.key)).count == decoded.count else {
+        throw NativeEventDecodingError.malformed
+      }
+      return .sessionCatalog(SessionCatalog(sessions: decoded))
+    case VIVI_BACKEND_EVENT_SESSION_CATALOG_FAILURE:
+      guard event.content_kind == VIVI_BACKEND_CONTENT_TEXT,
+        models.isEmpty, semanticSpans.isEmpty,
+        event.default_saved == 0, event.cleanup_failed == 0,
+        hasNeutralConversationMetadata
+      else { throw NativeEventDecodingError.malformed }
+      let message = try content()
+      guard !message.isEmpty else { throw NativeEventDecodingError.malformed }
+      return .sessionCatalogFailure(message)
+    case VIVI_BACKEND_EVENT_SESSION_RESUME:
+      guard event.content_kind == VIVI_BACKEND_CONTENT_SESSION_RESUME,
+        models.isEmpty, semanticSpans.isEmpty,
+        event.default_saved == 0, hasNeutralConversationMetadata
+      else { throw NativeEventDecodingError.malformed }
+      switch event.session_resume_outcome {
+      case VIVI_BACKEND_SESSION_RESUME_FAILED:
+        guard sessions.isEmpty, transcriptItems.isEmpty, event.cleanup_failed == 0
+        else { throw NativeEventDecodingError.malformed }
+        let message = try content()
+        guard !message.isEmpty else { throw NativeEventDecodingError.malformed }
+        return .sessionResume(.failed(message))
+      case VIVI_BACKEND_SESSION_RESUME_RESUMED:
+        guard sessions.count == 1, zero(event.content) else {
+          throw NativeEventDecodingError.malformed
+        }
+        let summary = try session(sessions[0])
+        return .sessionResume(
+          .resumed(
+            ResumedSession(
+              summary: summary,
+              transcript: try transcriptItems.map(transcriptItem),
+              cleanupFailed: event.cleanup_failed != 0)))
+      default:
+        throw NativeEventDecodingError.malformed
+      }
     case VIVI_BACKEND_EVENT_IDLE: return .idle
-    case VIVI_BACKEND_EVENT_FAILURE: return .failure(content)
+    case VIVI_BACKEND_EVENT_FAILURE: return .failure(try content())
     case VIVI_BACKEND_EVENT_CLOSED: return .closed
     default: throw NativeEventDecodingError.malformed
     }
@@ -790,6 +1303,7 @@ func sanitizedToolMarkdown(_ text: String) throws -> String {
       0,
       &required)
   }
+
   guard probe == VIVI_BACKEND_BUFFER_TOO_SMALL || (probe == VIVI_BACKEND_OK && required == 0)
   else { throw NativeEventDecodingError.malformed }
   if required == 0 { return "" }
@@ -809,6 +1323,83 @@ func sanitizedToolMarkdown(_ text: String) throws -> String {
     let sanitized = String(bytes: output, encoding: .utf8)
   else { throw NativeEventDecodingError.malformed }
   return sanitized
+}
+
+func nativeCodePresentation(language: String, source: String) throws -> ToolPresentation {
+  let languageBytes = Array(language.utf8)
+  let sourceBytes = Array(source.utf8)
+  guard languageBytes.count <= Int(UInt32.max), sourceBytes.count <= Int(UInt32.max) else {
+    throw NativeEventDecodingError.malformed
+  }
+  var descriptor = vivi_backend_presentation_t()
+  let probe = languageBytes.withUnsafeBufferPointer { languageBuffer in
+    sourceBytes.withUnsafeBufferPointer { sourceBuffer in
+      vivi_backend_present_code_fragment(
+        languageBuffer.baseAddress, UInt32(languageBuffer.count),
+        sourceBuffer.baseAddress, UInt32(sourceBuffer.count),
+        &descriptor, nil, 0, nil, 0)
+    }
+  }
+  guard
+    probe == VIVI_BACKEND_BUFFER_TOO_SMALL
+      || (probe == VIVI_BACKEND_OK && descriptor.content.length == 0
+        && descriptor.semantic_span_count == 0)
+  else { throw NativeEventDecodingError.malformed }
+
+  var output = [UInt8](repeating: 0, count: Int(descriptor.content.length))
+  var spans = [vivi_backend_semantic_span_t](
+    repeating: vivi_backend_semantic_span_t(),
+    count: Int(descriptor.semantic_span_count))
+  let copied = languageBytes.withUnsafeBufferPointer { languageBuffer in
+    sourceBytes.withUnsafeBufferPointer { sourceBuffer in
+      output.withUnsafeMutableBufferPointer { outputBuffer in
+        spans.withUnsafeMutableBufferPointer { spanBuffer in
+          vivi_backend_present_code_fragment(
+            languageBuffer.baseAddress, UInt32(languageBuffer.count),
+            sourceBuffer.baseAddress, UInt32(sourceBuffer.count),
+            &descriptor, outputBuffer.baseAddress, UInt32(outputBuffer.count),
+            spanBuffer.baseAddress, UInt32(spanBuffer.count))
+        }
+      }
+    }
+  }
+  guard copied == VIVI_BACKEND_OK, descriptor.reserved == 0,
+    descriptor.content.offset == 0,
+    descriptor.content.length == UInt32(output.count),
+    descriptor.semantic_span_offset == 0,
+    descriptor.semantic_span_count == UInt32(spans.count),
+    let text = String(bytes: output, encoding: .utf8)
+  else { throw NativeEventDecodingError.malformed }
+  if descriptor.kind == VIVI_BACKEND_PRESENTATION_LITERAL {
+    guard descriptor.language == VIVI_BACKEND_LANGUAGE_NONE, spans.isEmpty else {
+      throw NativeEventDecodingError.malformed
+    }
+    return .literal(text)
+  }
+  guard descriptor.kind == VIVI_BACKEND_PRESENTATION_SOURCE,
+    let decodedLanguage = PresentationLanguage(rawValue: Int32(descriptor.language.rawValue))
+  else { throw NativeEventDecodingError.malformed }
+  var decodedSpans: [SemanticSpan] = []
+  var previousEnd = 0
+  for span in spans {
+    guard span.reserved == 0,
+      let token = SemanticToken(rawValue: Int32(span.token.rawValue))
+    else { throw NativeEventDecodingError.malformed }
+    let start = Int(span.bytes.offset)
+    let length = Int(span.bytes.length)
+    let end = start + length
+    guard length > 0, start >= previousEnd, end <= output.count,
+      isUTF8Boundary(output, at: start),
+      isUTF8Boundary(output, at: end)
+    else { throw NativeEventDecodingError.malformed }
+    decodedSpans.append(.init(byteRange: start..<end, token: token))
+    previousEnd = end
+  }
+  return .source(text: text, language: decodedLanguage, spans: decodedSpans)
+}
+
+private func isUTF8Boundary(_ bytes: [UInt8], at index: Int) -> Bool {
+  index == bytes.count || bytes[index] & 0xC0 != 0x80
 }
 
 func nativeCopilotExecutableCandidates(home: URL, path: String?) -> [String] {
@@ -941,6 +1532,26 @@ final class ViviConversationDriver: ViviConversationDriving, @unchecked Sendable
     }
   }
 
+  func refreshSessions() -> ConversationOperationResult {
+    queue.sync {
+      guard let handle else { return .closed }
+      return Self.operationResult(vivi_backend_refresh_sessions(handle))
+    }
+  }
+
+  func resumeSession(_ key: ResumeKey) -> ConversationOperationResult {
+    queue.sync {
+      guard let handle else { return .closed }
+      return Self.operationResult(
+        vivi_backend_resume_session(
+          handle,
+          vivi_backend_resume_key_t(
+            generation: key.generation,
+            slot: key.slot,
+            reserved: 0)))
+    }
+  }
+
   func close(completion: @escaping @MainActor () -> Void) {
     queue.async { [self] in
       if let handle {
@@ -968,7 +1579,8 @@ final class ViviConversationDriver: ViviConversationDriving, @unchecked Sendable
     var events: [ChatEvent] = []
     while true {
       var event = vivi_backend_event_t()
-      let result = vivi_backend_next_event(handle, &event, nil, 0, nil, 0)
+      let result = vivi_backend_next_event(
+        handle, &event, nil, 0, nil, 0, nil, 0, nil, 0, nil, 0)
       if result == VIVI_BACKEND_NO_EVENT {
         deliver(events)
         return
@@ -979,16 +1591,37 @@ final class ViviConversationDriver: ViviConversationDriving, @unchecked Sendable
       }
       var bytes = Array(repeating: UInt8(0), count: Int(event.byte_count))
       var models = Array(repeating: vivi_backend_model_t(), count: Int(event.model_count))
+      var semanticSpans = Array(
+        repeating: vivi_backend_semantic_span_t(),
+        count: Int(event.semantic_span_count))
+      var sessions = Array(
+        repeating: vivi_backend_session_summary_t(),
+        count: Int(event.session_count))
+      var transcriptItems = Array(
+        repeating: vivi_backend_transcript_item_t(),
+        count: Int(event.transcript_item_count))
       if result == VIVI_BACKEND_BUFFER_TOO_SMALL {
         let copied = bytes.withUnsafeMutableBufferPointer { byteBuffer in
           models.withUnsafeMutableBufferPointer { modelBuffer in
-            vivi_backend_next_event(
-              handle,
-              &event,
-              byteBuffer.baseAddress,
-              UInt32(byteBuffer.count),
-              modelBuffer.baseAddress,
-              UInt32(modelBuffer.count))
+            semanticSpans.withUnsafeMutableBufferPointer { spanBuffer in
+              sessions.withUnsafeMutableBufferPointer { sessionBuffer in
+                transcriptItems.withUnsafeMutableBufferPointer { transcriptBuffer in
+                  vivi_backend_next_event(
+                    handle,
+                    &event,
+                    byteBuffer.baseAddress,
+                    UInt32(byteBuffer.count),
+                    modelBuffer.baseAddress,
+                    UInt32(modelBuffer.count),
+                    spanBuffer.baseAddress,
+                    UInt32(spanBuffer.count),
+                    sessionBuffer.baseAddress,
+                    UInt32(sessionBuffer.count),
+                    transcriptBuffer.baseAddress,
+                    UInt32(transcriptBuffer.count))
+                }
+              }
+            }
           }
         }
         guard copied == VIVI_BACKEND_OK else {
@@ -997,7 +1630,13 @@ final class ViviConversationDriver: ViviConversationDriving, @unchecked Sendable
         }
       }
       do {
-        let decoded = try NativeEventDecoder.decode(event, bytes: bytes, models: models)
+        let decoded = try NativeEventDecoder.decode(
+          event,
+          bytes: bytes,
+          models: models,
+          semanticSpans: semanticSpans,
+          sessions: sessions,
+          transcriptItems: transcriptItems)
         events.append(decoded)
         if decoded == .closed {
           destroyLocked(handle, requestClose: false)
