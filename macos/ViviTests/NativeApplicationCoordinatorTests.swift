@@ -375,11 +375,19 @@ private final class CoordinatorHarness {
 @MainActor
 private final class ControllableWorkspaceChooser: WorkspaceChoosing {
   private var continuation: CheckedContinuation<URL?, Never>?
+  private var hasPendingResult = false
+  private var pendingResult: URL?
   private(set) var cancelCount = 0
   private(set) var chooseCount = 0
 
   func chooseWorkspace() async -> URL? {
     chooseCount += 1
+    if hasPendingResult {
+      hasPendingResult = false
+      let result = pendingResult
+      pendingResult = nil
+      return result
+    }
     return await withCheckedContinuation { continuation in
       self.continuation = continuation
     }
@@ -391,7 +399,11 @@ private final class ControllableWorkspaceChooser: WorkspaceChoosing {
   }
 
   func finish(_ url: URL?) {
-    guard let continuation else { return }
+    guard let continuation else {
+      hasPendingResult = true
+      pendingResult = url
+      return
+    }
     self.continuation = nil
     continuation.resume(returning: url)
   }
