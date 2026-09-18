@@ -1,7 +1,7 @@
 # Vivi verification map
 
 This directory is the maintained source for verifying Vivi's user-facing CLI
-and native chat behavior. Read this index before driving the application,
+and libvaxis chat behavior. Read this index before driving the application,
 then use the matching feature file as the recipe.
 
 ## Baseline preconditions
@@ -78,13 +78,13 @@ user-visible behavior. It then uses exactly four H2 sections in this order:
 - [Workspace customization](./workspace-customization.md) covers repository
   instructions, project skill discovery, slash-menu visibility, and skill
   invocation.
-- [Session resume](./session-resume.md) covers durable Vivi session indexing,
-  the `/resume` finder, and continued Copilot history across processes.
+- [Session resume](./session-resume.md) covers Copilot-owned session storage,
+  the `/resume` finder, and continued history across processes.
 - [Native conversation sidebar](./native-conversation-sidebar.md) covers
-  occurrence-based native launches, selection, window close and Dock reopen,
-  and joined application termination.
+  project-grouped occurrence-based native launches, selection, window close and
+  Dock reopen, and joined application termination.
 - [Native project entry](./native-project-entry.md) covers directory-selected
-  conversations, live project grouping, cancellation, validation, and Command-N.
+  conversations, launch-project grouping, cancellation, validation, and Command-N.
 - [Native session history](./native-session-history.md) covers selected-store
-  local and broader catalogs, persisted-session resume, and cross-workspace
+  per-project local catalogs, persisted-session resume, and cross-workspace
   navigation identity.

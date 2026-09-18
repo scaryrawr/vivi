@@ -1,7 +1,7 @@
 # Native project entry
 
 Vivi starts fresh native conversations from directory choices and groups every
-live conversation under its current canonical workspace without adding another
+live conversation under its canonical launch workspace without adding another
 project catalog.
 
 ## Sub-features
@@ -13,10 +13,11 @@ project catalog.
 - Cancelling the chooser leaves the roster and selection unchanged.
 - Invalid, missing, or non-directory selections show an app-shell alert without
   adding transcript content or silently choosing another workspace.
-- Project headers remain visible with one project, show the canonical workspace,
-  and contain live conversation-title children with workspace-local ordinals.
-- Cross-workspace resume moves the existing conversation to its new project and
-  recomputes ordinals without changing its conversation identity.
+- Project headers remain visible with one project, identify the canonical launch
+  workspace, and contain live conversation-title children with active-workspace
+  ordinals.
+- Cross-workspace resume preserves the existing conversation identity and launch
+  project while updating its live title, workspace, and duplicate ordinal.
 
 ## How to get to it (user POV)
 
@@ -30,7 +31,7 @@ saved session whose workspace differs from its current project.
 Run the doctor, build once, and launch only through the worktree's
 `./zig-out/bin/vivi chat --native`. Record the native app while exercising the
 empty-state action, chooser cancellation, duplicate workspace creation,
-multiple project sections, Command-N, and cross-workspace resume regrouping.
+multiple project sections, Command-N, and cross-workspace resume updates.
 Close the window with its red control, restore it from the Dock, confirm the
 same project hierarchy remains, and quit. Retain the native recording and
 representative screenshots with the exact Xcode and repository check output.
@@ -44,8 +45,8 @@ be driven and captured through the actual application.
 - Do not open a bare `vivi://` URL; another worktree's bundle may receive it.
 - A duplicate directory choice creates another independent conversation rather
   than selecting the existing one.
-- History remains scoped to the selected conversation, not to its project
-  section.
+- History remains scoped to each launch-workspace project and uses its selected
+  conversation, or latest conversation when that project is not selected.
 - Chooser cancellation is not an error. Quit while the chooser is open must not
   admit a late conversation.
 - If local serializer data or the computer-use serializer blocks capture,

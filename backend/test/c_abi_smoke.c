@@ -11,8 +11,6 @@ int main(void) {
         .working_directory_length = 4,
         .settings_path = 0,
         .settings_path_length = 0,
-        .sessions_directory = 0,
-        .sessions_directory_length = 0,
         .copilot_cli_path = 0,
         .copilot_cli_path_length = 0,
         .copilot_cli_launch = VIVI_BACKEND_COPILOT_CLI_SDK_DEFAULT,
@@ -31,6 +29,7 @@ int main(void) {
     assert(vivi_backend_open(&options, &conversation) == VIVI_BACKEND_INVALID_ARGUMENT);
     assert(conversation == 0);
     assert(VIVI_BACKEND_ABI_VERSION == 9);
+    assert(VIVI_BACKEND_SESSION_TITLE_MAX_CHARACTERS == 80);
     assert(VIVI_BACKEND_PRESENTATION_SOURCE == 3);
     assert(VIVI_BACKEND_LANGUAGE_PYTHON == 15);
     assert(VIVI_BACKEND_TOKEN_META == 11);
@@ -39,8 +38,8 @@ int main(void) {
     assert(VIVI_BACKEND_EVENT_TOOL_STARTED == 15);
     assert(VIVI_BACKEND_EVENT_TOOL_FINISHED == 16);
     assert(VIVI_BACKEND_EVENT_SESSION_CATALOG == 17);
-    assert(VIVI_BACKEND_EVENT_SESSION_RESUME == 20);
-    assert(VIVI_BACKEND_EVENT_USER_INPUT_REQUEST == 21);
+    assert(VIVI_BACKEND_EVENT_SESSION_RESUME == 19);
+    assert(VIVI_BACKEND_EVENT_USER_INPUT_REQUEST == 20);
     assert(VIVI_BACKEND_CONTENT_USER_INPUT_REQUEST == 7);
     assert(VIVI_BACKEND_USER_INPUT_ANSWER_CHOICE == 1);
     assert(VIVI_BACKEND_USER_INPUT_ANSWER_FREEFORM == 2);
@@ -57,7 +56,7 @@ int main(void) {
     vivi_backend_resume_key_t key = {
         .generation = 1,
         .slot = 0,
-        .scope = VIVI_BACKEND_SESSION_SCOPE_LOCAL,
+        .reserved = 0,
     };
     vivi_backend_session_summary_t session = {
         .key = key,
@@ -73,8 +72,7 @@ int main(void) {
     assert(presentation.kind == VIVI_BACKEND_PRESENTATION_LITERAL);
     assert(presentation.content.length == 4);
     assert(vivi_backend_refresh_models(0) == VIVI_BACKEND_INVALID_ARGUMENT);
-    assert(vivi_backend_refresh_sessions(0, VIVI_BACKEND_SESSION_REQUEST_LOCAL)
-        == VIVI_BACKEND_INVALID_ARGUMENT);
+    assert(vivi_backend_refresh_sessions(0) == VIVI_BACKEND_INVALID_ARGUMENT);
     assert(vivi_backend_resume_session(0, key) == VIVI_BACKEND_INVALID_ARGUMENT);
     assert(vivi_backend_respond_to_user_input(0, &response)
         == VIVI_BACKEND_INVALID_ARGUMENT);

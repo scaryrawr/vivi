@@ -67,37 +67,20 @@ struct ModelCatalog: Equatable {
   let models: [ModelInfo]
 }
 
-enum SessionCatalogRequest: Equatable {
-  case local
-  case all
-}
-
-enum SessionCatalogScope: Int32, Equatable, Hashable {
-  case local = 1
-  case broader = 2
-}
-
 struct ResumeKey: Equatable, Hashable {
   let generation: UInt64
   let slot: UInt32
-  let scope: SessionCatalogScope
 }
 
 struct SessionSummary: Equatable {
   let key: ResumeKey
   let workingDirectory: String
-  let modelID: String
   let title: String?
-  let summary: String?
-  let lastUsedUnixMilliseconds: Int64
-  let reasoning: ReasoningEffort
   let isCurrent: Bool
 }
 
 struct SessionCatalog: Equatable {
-  let scope: SessionCatalogScope
   let sessions: [SessionSummary]
-  let skippedInvalidShards: Bool
 }
 
 enum TranscriptSnapshotItem: Equatable {
@@ -119,7 +102,7 @@ enum SessionResumeResult: Equatable {
 
 enum SessionControlState: Equatable {
   case ready
-  case refreshing(SessionCatalogRequest)
+  case refreshing
   case resuming(ResumeKey)
 }
 
@@ -308,7 +291,6 @@ enum ChatEvent: Equatable {
   case modelSwitch(ModelSwitchOutcome)
   case sessionCatalog(SessionCatalog)
   case sessionCatalogFailure(String)
-  case sessionTrackingFailure(String)
   case sessionResume(SessionResumeResult)
   case userInputRequested(UserInputRequest)
   case idle
@@ -330,7 +312,7 @@ protocol ViviConversationDriving: AnyObject {
   func submit(_ prompt: String) -> ConversationOperationResult
   func refreshModels() -> ConversationOperationResult
   func switchModel(_ selection: ModelSelection) -> ConversationOperationResult
-  func refreshSessions(_ request: SessionCatalogRequest) -> ConversationOperationResult
+  func refreshSessions() -> ConversationOperationResult
   func resumeSession(_ key: ResumeKey) -> ConversationOperationResult
   func respondToUserInput(
     requestID: String,
@@ -507,16 +489,17 @@ final class NativeChatStore: ObservableObject {
     }
   }
 
-  func refreshSessions(_ request: SessionCatalogRequest) {
+  func refreshSessions() {
     guard lifecycle == .idle, modelState == .ready, sessionState == .ready else { return }
-    let result = driver.refreshSessions(request)
+    let result = driver.refreshSessions()
     if result == .accepted {
       sessionCatalog = nil
       sessionCatalogFailure = nil
-      sessionState = .refreshing(request)
+      sessionState = .refreshing
     } else {
-      transcript.append(
-        .failure(id: UUID(), text: message(for: result, action: "refresh sessions")))
+      let failure = message(for: result, action: "refresh sessions")
+      sessionCatalogFailure = failure
+      transcript.append(.failure(id: UUID(), text: failure))
     }
   }
 
@@ -632,9 +615,7 @@ final class NativeChatStore: ObservableObject {
       apply(outcome)
       modelState = .ready
     case .sessionCatalog(let catalog):
-      guard case .refreshing(let request) = sessionState,
-        catalog.scope == expectedScope(for: request)
-      else {
+      guard case .refreshing = sessionState else {
         let message = "The backend returned an unexpected session catalog."
         transcript.append(.failure(id: UUID(), text: message))
         sessionCatalogFailure = message
@@ -648,8 +629,6 @@ final class NativeChatStore: ObservableObject {
       transcript.append(.failure(id: UUID(), text: message))
       sessionCatalogFailure = message
       sessionState = .ready
-    case .sessionTrackingFailure(let message):
-      transcript.append(.failure(id: UUID(), text: message))
     case .sessionResume(let result):
       apply(result)
       sessionState = .ready
@@ -798,29 +777,14 @@ final class NativeChatStore: ObservableObject {
       if resumed.cleanupFailed {
         snapshot.append(.status(id: UUID(), text: "Previous session cleanup failed."))
       }
-      let selection = ModelSelection(
-        modelID: resumed.summary.modelID,
-        reasoning: resumed.summary.reasoning)
       activePresentation = ActiveConversationPresentation(
         workspace: resumed.summary.workingDirectory,
         sessionTitle: resumed.summary.title
           ?? URL(fileURLWithPath: resumed.summary.workingDirectory).lastPathComponent,
         transcript: snapshot,
-        confirmedSelection: selection)
+        confirmedSelection: confirmedSelection)
       sessionCatalogFailure = nil
-      if let catalog {
-        self.catalog = ModelCatalog(
-          selected: selection,
-          models: catalog.models)
-      }
       sessionCatalog = nil
-    }
-  }
-
-  private func expectedScope(for request: SessionCatalogRequest) -> SessionCatalogScope {
-    switch request {
-    case .local: .local
-    case .all: .broader
     }
   }
 
@@ -1089,7 +1053,7 @@ enum NativeEventDecoder {
     transcriptItems: [vivi_backend_transcript_item_t] = [],
     userInputChoices: [vivi_backend_user_input_choice_t] = []
   ) throws -> ChatEvent {
-    guard event.reserved == 0, event.allow_freeform <= 1,
+    guard event.reserved == 0, event.event_reserved == 0, event.allow_freeform <= 1,
       bytes.count == Int(event.byte_count),
       models.count == Int(event.model_count),
       semanticSpans.count == Int(event.semantic_span_count),
@@ -1156,48 +1120,69 @@ enum NativeEventDecoder {
         advertisedDefaultReasoning: advertised)
     }
 
-    func scope(_ raw: vivi_backend_session_scope_t) throws -> SessionCatalogScope {
-      switch raw {
-      case VIVI_BACKEND_SESSION_SCOPE_LOCAL: return .local
-      case VIVI_BACKEND_SESSION_SCOPE_BROADER: return .broader
-      default: throw NativeEventDecodingError.malformed
-      }
-    }
-
     func zero(_ span: vivi_backend_span_t) -> Bool {
       span.offset == 0 && span.length == 0
+    }
+
+    func canonicalSessionTitle(_ span: vivi_backend_span_t) throws -> String {
+      let value = try text(span)
+      let scalars = value.unicodeScalars
+      guard
+        !scalars.isEmpty,
+        scalars.count <= Int(VIVI_BACKEND_SESSION_TITLE_MAX_CHARACTERS)
+      else {
+        throw NativeEventDecodingError.malformed
+      }
+
+      var previousWasSpace = true
+      for scalar in scalars {
+        let scalarValue = scalar.value
+        guard
+          scalarValue > 0x1f,
+          scalarValue < 0x7f || scalarValue > 0x9f,
+          scalarValue != 0x061c,
+          scalarValue < 0x200e || scalarValue > 0x200f,
+          scalarValue < 0x202a || scalarValue > 0x202e,
+          scalarValue < 0x2066 || scalarValue > 0x2069
+        else {
+          throw NativeEventDecodingError.malformed
+        }
+        if scalar.properties.isWhitespace {
+          guard scalarValue == 0x20, !previousWasSpace else {
+            throw NativeEventDecodingError.malformed
+          }
+          previousWasSpace = true
+        } else {
+          previousWasSpace = false
+        }
+      }
+      guard !previousWasSpace else {
+        throw NativeEventDecodingError.malformed
+      }
+      return value
     }
 
     func session(_ raw: vivi_backend_session_summary_t) throws -> SessionSummary {
       let knownFlags =
         UInt32(VIVI_BACKEND_SESSION_TITLE_PRESENT.rawValue)
-        | UInt32(VIVI_BACKEND_SESSION_SUMMARY_PRESENT.rawValue)
         | UInt32(VIVI_BACKEND_SESSION_CURRENT.rawValue)
       guard raw.reserved == 0, raw.flags & ~knownFlags == 0,
-        raw.key.generation != 0, raw.last_used_unix_ms >= 0
+        raw.key.generation != 0, raw.key.reserved == 0
       else { throw NativeEventDecodingError.malformed }
-      let decodedScope = try scope(raw.key.scope)
       let workingDirectory = try text(raw.working_directory)
-      let modelID = try text(raw.model_id)
-      guard !workingDirectory.isEmpty, workingDirectory.hasPrefix("/"), !modelID.isEmpty else {
+      guard !workingDirectory.isEmpty, workingDirectory.hasPrefix("/") else {
         throw NativeEventDecodingError.malformed
       }
       let hasTitle = raw.flags & UInt32(VIVI_BACKEND_SESSION_TITLE_PRESENT.rawValue) != 0
-      let hasSummary = raw.flags & UInt32(VIVI_BACKEND_SESSION_SUMMARY_PRESENT.rawValue) != 0
-      guard hasTitle || zero(raw.title), hasSummary || zero(raw.summary) else {
+      guard hasTitle || zero(raw.title) else {
         throw NativeEventDecodingError.malformed
       }
       return SessionSummary(
         key: ResumeKey(
           generation: raw.key.generation,
-          slot: raw.key.slot,
-          scope: decodedScope),
+          slot: raw.key.slot),
         workingDirectory: workingDirectory,
-        modelID: modelID,
-        title: hasTitle ? try text(raw.title) : nil,
-        summary: hasSummary ? try text(raw.summary) : nil,
-        lastUsedUnixMilliseconds: raw.last_used_unix_ms,
-        reasoning: try reasoning(raw.reasoning),
+        title: hasTitle ? try canonicalSessionTitle(raw.title) : nil,
         isCurrent: raw.flags & UInt32(VIVI_BACKEND_SESSION_CURRENT.rawValue) != 0)
     }
 
@@ -1292,9 +1277,7 @@ enum NativeEventDecoder {
       || event.kind == VIVI_BACKEND_EVENT_SESSION_RESUME
     if !isSessionPayload {
       guard sessions.isEmpty, transcriptItems.isEmpty,
-        event.session_scope == VIVI_BACKEND_SESSION_SCOPE_NONE,
-        event.session_resume_outcome == VIVI_BACKEND_SESSION_RESUME_NONE,
-        event.skipped_invalid_shards == 0
+        event.session_resume_outcome == VIVI_BACKEND_SESSION_RESUME_NONE
       else { throw NativeEventDecodingError.malformed }
     }
     let isUserInputPayload = event.kind == VIVI_BACKEND_EVENT_USER_INPUT_REQUEST
@@ -1338,7 +1321,11 @@ enum NativeEventDecoder {
     switch event.kind {
     case VIVI_BACKEND_EVENT_READY: return .ready
     case VIVI_BACKEND_EVENT_STATUS: return .status(try content())
-    case VIVI_BACKEND_EVENT_SESSION_TITLE: return .sessionTitle(try content())
+    case VIVI_BACKEND_EVENT_SESSION_TITLE:
+      guard event.content_kind == VIVI_BACKEND_CONTENT_TEXT else {
+        throw NativeEventDecodingError.malformed
+      }
+      return .sessionTitle(try canonicalSessionTitle(event.content))
     case VIVI_BACKEND_EVENT_ASSISTANT_STARTED: return .assistantStarted
     case VIVI_BACKEND_EVENT_REASONING_DELTA: return .reasoningDelta(try content())
     case VIVI_BACKEND_EVENT_REASONING_COMPLETE: return .reasoningComplete(try content())
@@ -1442,30 +1429,18 @@ enum NativeEventDecoder {
       guard event.content_kind == VIVI_BACKEND_CONTENT_SESSION_CATALOG,
         models.isEmpty, semanticSpans.isEmpty, transcriptItems.isEmpty,
         event.session_resume_outcome == VIVI_BACKEND_SESSION_RESUME_NONE,
-        event.default_saved == 0, event.cleanup_failed == 0,
-        event.skipped_invalid_shards <= 1, zero(event.content),
+        event.default_saved == 0, event.cleanup_failed == 0, zero(event.content),
         hasNeutralConversationMetadata
-      else { throw NativeEventDecodingError.malformed }
-      let decodedScope = try scope(event.session_scope)
-      guard
-        decodedScope == .local || event.skipped_invalid_shards == 0
       else { throw NativeEventDecodingError.malformed }
       let decoded = try sessions.map(session)
       if let generation = decoded.first?.key.generation {
-        guard
-          decoded.allSatisfy({
-            $0.key.scope == decodedScope && $0.key.generation == generation
-          })
+        guard decoded.allSatisfy({ $0.key.generation == generation })
         else { throw NativeEventDecodingError.malformed }
       }
       guard Set(decoded.map(\.key)).count == decoded.count else {
         throw NativeEventDecodingError.malformed
       }
-      return .sessionCatalog(
-        SessionCatalog(
-          scope: decodedScope,
-          sessions: decoded,
-          skippedInvalidShards: event.skipped_invalid_shards != 0))
+      return .sessionCatalog(SessionCatalog(sessions: decoded))
     case VIVI_BACKEND_EVENT_SESSION_CATALOG_FAILURE:
       guard event.content_kind == VIVI_BACKEND_CONTENT_TEXT,
         models.isEmpty, semanticSpans.isEmpty,
@@ -1475,24 +1450,14 @@ enum NativeEventDecoder {
       let message = try content()
       guard !message.isEmpty else { throw NativeEventDecodingError.malformed }
       return .sessionCatalogFailure(message)
-    case VIVI_BACKEND_EVENT_SESSION_TRACKING_FAILURE:
-      guard event.content_kind == VIVI_BACKEND_CONTENT_TEXT,
-        models.isEmpty, semanticSpans.isEmpty,
-        event.default_saved == 0, event.cleanup_failed == 0,
-        hasNeutralConversationMetadata
-      else { throw NativeEventDecodingError.malformed }
-      let message = try content()
-      guard !message.isEmpty else { throw NativeEventDecodingError.malformed }
-      return .sessionTrackingFailure(message)
     case VIVI_BACKEND_EVENT_SESSION_RESUME:
       guard event.content_kind == VIVI_BACKEND_CONTENT_SESSION_RESUME,
-        models.isEmpty, semanticSpans.isEmpty, event.skipped_invalid_shards == 0,
+        models.isEmpty, semanticSpans.isEmpty,
         event.default_saved == 0, hasNeutralConversationMetadata
       else { throw NativeEventDecodingError.malformed }
       switch event.session_resume_outcome {
       case VIVI_BACKEND_SESSION_RESUME_FAILED:
-        guard event.session_scope == VIVI_BACKEND_SESSION_SCOPE_NONE,
-          sessions.isEmpty, transcriptItems.isEmpty, event.cleanup_failed == 0
+        guard sessions.isEmpty, transcriptItems.isEmpty, event.cleanup_failed == 0
         else { throw NativeEventDecodingError.malformed }
         let message = try content()
         guard !message.isEmpty else { throw NativeEventDecodingError.malformed }
@@ -1501,11 +1466,7 @@ enum NativeEventDecoder {
         guard sessions.count == 1, zero(event.content) else {
           throw NativeEventDecodingError.malformed
         }
-        let decodedScope = try scope(event.session_scope)
         let summary = try session(sessions[0])
-        guard summary.key.scope == decodedScope else {
-          throw NativeEventDecodingError.malformed
-        }
         return .sessionResume(
           .resumed(
             ResumedSession(
@@ -1518,8 +1479,7 @@ enum NativeEventDecoder {
     case VIVI_BACKEND_EVENT_USER_INPUT_REQUEST:
       guard event.content_kind == VIVI_BACKEND_CONTENT_USER_INPUT_REQUEST,
         models.isEmpty, semanticSpans.isEmpty, sessions.isEmpty, transcriptItems.isEmpty,
-        event.default_saved == 0, event.cleanup_failed == 0,
-        event.skipped_invalid_shards == 0, zero(event.content),
+        event.default_saved == 0, event.cleanup_failed == 0, zero(event.content),
         hasNeutralConversationMetadata
       else { throw NativeEventDecodingError.malformed }
       let requestID = try text(event.user_input_request_id)
@@ -1697,12 +1657,17 @@ func nativeCopilotExecutablePath(
 
 final class ViviConversationDriver: ViviConversationDriving, @unchecked Sendable {
   private let workspace: String
+  private let applicationConfiguration: NativeApplicationConfiguration
   private let queue = DispatchQueue(label: "com.scaryrawr.vivi.conversation")
   private var handle: OpaquePointer?
   private var receive: (@MainActor (ChatEvent) -> Void)?
 
-  init(workspace: String) {
+  init(
+    workspace: String,
+    applicationConfiguration: NativeApplicationConfiguration
+  ) {
     self.workspace = workspace
+    self.applicationConfiguration = applicationConfiguration
   }
 
   func start(
@@ -1711,18 +1676,12 @@ final class ViviConversationDriver: ViviConversationDriving, @unchecked Sendable
     queue.sync {
       self.receive = receive
       let bytes = Array(workspace.utf8)
-      let settingsPath =
-        FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent(".vivi/settings.json").path
-      let sessionsDirectory =
-        FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent(".vivi/sessions").path
+      let settingsPath = applicationConfiguration.settingsPath
       guard let copilotPath = nativeCopilotExecutablePath() else {
         self.receive = nil
         return .failed
       }
       let settingsBytes = Array(settingsPath.utf8)
-      let sessionsBytes = Array(sessionsDirectory.utf8)
       let copilotBytes = Array(copilotPath.utf8)
       var options = vivi_backend_conversation_options_t(
         abi_version: UInt32(VIVI_BACKEND_ABI_VERSION),
@@ -1731,8 +1690,6 @@ final class ViviConversationDriver: ViviConversationDriving, @unchecked Sendable
         working_directory_length: UInt32(bytes.count),
         settings_path: nil,
         settings_path_length: UInt32(settingsBytes.count),
-        sessions_directory: nil,
-        sessions_directory_length: UInt32(sessionsBytes.count),
         copilot_cli_path: nil,
         copilot_cli_path_length: UInt32(copilotBytes.count),
         copilot_cli_launch: VIVI_BACKEND_COPILOT_CLI_EXPLICIT_PATH,
@@ -1741,14 +1698,11 @@ final class ViviConversationDriver: ViviConversationDriving, @unchecked Sendable
       )
       let result = bytes.withUnsafeBufferPointer { buffer in
         settingsBytes.withUnsafeBufferPointer { settingsBuffer in
-          sessionsBytes.withUnsafeBufferPointer { sessionsBuffer in
-            copilotBytes.withUnsafeBufferPointer { copilotBuffer in
-              options.working_directory = buffer.baseAddress
-              options.settings_path = settingsBuffer.baseAddress
-              options.sessions_directory = sessionsBuffer.baseAddress
-              options.copilot_cli_path = copilotBuffer.baseAddress
-              return vivi_backend_open(&options, &handle)
-            }
+          copilotBytes.withUnsafeBufferPointer { copilotBuffer in
+            options.working_directory = buffer.baseAddress
+            options.settings_path = settingsBuffer.baseAddress
+            options.copilot_cli_path = copilotBuffer.baseAddress
+            return vivi_backend_open(&options, &handle)
           }
         }
       }
@@ -1793,33 +1747,23 @@ final class ViviConversationDriver: ViviConversationDriving, @unchecked Sendable
     }
   }
 
-  func refreshSessions(_ request: SessionCatalogRequest) -> ConversationOperationResult {
+  func refreshSessions() -> ConversationOperationResult {
     queue.sync {
       guard let handle else { return .closed }
-      let nativeRequest: vivi_backend_session_request_t =
-        switch request {
-        case .local: VIVI_BACKEND_SESSION_REQUEST_LOCAL
-        case .all: VIVI_BACKEND_SESSION_REQUEST_ALL
-        }
-      return Self.operationResult(vivi_backend_refresh_sessions(handle, nativeRequest))
+      return Self.operationResult(vivi_backend_refresh_sessions(handle))
     }
   }
 
   func resumeSession(_ key: ResumeKey) -> ConversationOperationResult {
     queue.sync {
       guard let handle else { return .closed }
-      let nativeScope: vivi_backend_session_scope_t =
-        switch key.scope {
-        case .local: VIVI_BACKEND_SESSION_SCOPE_LOCAL
-        case .broader: VIVI_BACKEND_SESSION_SCOPE_BROADER
-        }
       return Self.operationResult(
         vivi_backend_resume_session(
           handle,
           vivi_backend_resume_key_t(
             generation: key.generation,
             slot: key.slot,
-            scope: nativeScope)))
+            reserved: 0)))
     }
   }
 

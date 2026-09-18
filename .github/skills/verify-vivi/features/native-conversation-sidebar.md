@@ -1,15 +1,17 @@
 # Native conversation sidebar
 
 Vivi keeps independently running conversations in one native macOS window,
-with a sidebar for switching among them without transferring ownership away
-from each conversation store.
+grouped by their remembered launch workspaces without transferring ownership
+away from each conversation store.
 
 ## Sub-features
 
 - An ordinary launch shows one empty native window.
 - Every `vivi chat --native` occurrence adds and selects a fresh conversation,
   including repeated launches from the same workspace.
-- Sidebar sections group live conversations under their canonical workspace;
+- Each canonical launch workspace gets one expandable project section for the
+  app lifetime.
+- Sidebar rows show the live conversation title and active workspace path;
   repeated workspaces receive stable numeric disambiguation.
 - Selecting a row swaps the detail and native window title without stopping
   other conversations.
@@ -41,6 +43,8 @@ interaction.
   Services may route a bare URL to stale code.
 - A repeated workspace must create another row and driver, not activate an
   existing row.
+- A cross-workspace resume updates the active workspace but does not move the
+  conversation out of its launch-workspace project section.
 - Red close and application quit intentionally have different conversation
   lifetime effects.
 - Persisted session discovery and resume have their own

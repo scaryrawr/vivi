@@ -29,6 +29,17 @@ struct ConversationID: Hashable, Sendable {
   let rawValue: UUID
 }
 
+struct NativeApplicationConfiguration: Equatable, Sendable {
+  let settingsPath: String
+
+  static var live: NativeApplicationConfiguration {
+    NativeApplicationConfiguration(
+      settingsPath:
+        FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".vivi/settings.json").path)
+  }
+}
+
 enum MainWindowIdentity: Hashable, Sendable {
   case primary
 }
@@ -79,13 +90,15 @@ extension NativeChatStore {
 @MainActor
 final class ConversationRecord: ObservableObject, Identifiable {
   let id: ConversationID
+  let launchWorkspace: WorkspaceIdentity
   let store: NativeChatStore
   @Published private(set) var navigation: ConversationNavigation
 
   private var navigationObservation: AnyCancellable?
 
-  init(id: ConversationID, store: NativeChatStore) {
+  init(id: ConversationID, launchWorkspace: WorkspaceIdentity, store: NativeChatStore) {
     self.id = id
+    self.launchWorkspace = launchWorkspace
     self.store = store
     navigation = store.conversationNavigation
     navigationObservation = store.conversationNavigationPublisher
@@ -100,6 +113,7 @@ final class ConversationRecord: ObservableObject, Identifiable {
 final class ConversationCollection: ObservableObject {
   @Published private(set) var records: [ConversationRecord] = []
   @Published private(set) var selectedID: ConversationID?
+  @Published private(set) var launchWorkspaces: [WorkspaceIdentity] = []
 
   private var recordObservations: [ConversationID: AnyCancellable] = [:]
 
@@ -114,6 +128,9 @@ final class ConversationCollection: ObservableObject {
       .removeDuplicates()
       .dropFirst()
       .sink { [weak self] _ in self?.objectWillChange.send() }
+    if !launchWorkspaces.contains(record.launchWorkspace) {
+      launchWorkspaces.append(record.launchWorkspace)
+    }
     records.append(record)
     selectedID = record.id
   }
@@ -132,6 +149,20 @@ final class ConversationCollection: ObservableObject {
       let index = matches.firstIndex(where: { $0.id == id })
     else { return nil }
     return (index + 1, matches.count)
+  }
+
+  func records(launchedFrom workspace: WorkspaceIdentity) -> [ConversationRecord] {
+    records.filter { $0.launchWorkspace == workspace }
+  }
+
+  func historyConversation(launchedFrom workspace: WorkspaceIdentity) -> ConversationRecord? {
+    let matches = records(launchedFrom: workspace)
+    if let selectedID,
+      let selected = matches.first(where: { $0.id == selectedID })
+    {
+      return selected
+    }
+    return matches.last
   }
 }
 
@@ -159,7 +190,11 @@ protocol MainWindowControlling: AnyObject {
 
 @MainActor
 final class NativeApplicationCoordinator {
-  typealias ConversationFactory = (ConversationID, WorkspaceIdentity) -> ConversationRecord
+  typealias ConversationFactory = (
+    ConversationID,
+    WorkspaceIdentity,
+    NativeApplicationConfiguration
+  ) -> ConversationRecord
   typealias WorkspaceChooserFactory = () -> any WorkspaceChoosing
   typealias WindowFactory = (
     MainWindowIdentity,
@@ -176,6 +211,7 @@ final class NativeApplicationCoordinator {
   let conversations: ConversationCollection
   let presentation = NativeApplicationPresentation()
 
+  private let applicationConfiguration: NativeApplicationConfiguration
   private let makeConversationID: () -> ConversationID
   private let makeConversation: ConversationFactory
   private let makeWorkspaceChooser: WorkspaceChooserFactory
@@ -189,6 +225,7 @@ final class NativeApplicationCoordinator {
 
   init(
     conversations: ConversationCollection = ConversationCollection(),
+    applicationConfiguration: NativeApplicationConfiguration = .live,
     makeConversationID: @escaping () -> ConversationID,
     makeConversation: @escaping ConversationFactory,
     makeWorkspaceChooser: @escaping WorkspaceChooserFactory = {
@@ -197,6 +234,7 @@ final class NativeApplicationCoordinator {
     makeWindow: @escaping WindowFactory
   ) {
     self.conversations = conversations
+    self.applicationConfiguration = applicationConfiguration
     self.makeConversationID = makeConversationID
     self.makeConversation = makeConversation
     self.makeWorkspaceChooser = makeWorkspaceChooser
@@ -205,14 +243,18 @@ final class NativeApplicationCoordinator {
 
   static func live() -> NativeApplicationCoordinator {
     NativeApplicationCoordinator(
+      applicationConfiguration: .live,
       makeConversationID: { ConversationID(rawValue: UUID()) },
-      makeConversation: { id, workspace in
+      makeConversation: { id, workspace, configuration in
         let path = workspace.canonicalPath
         return ConversationRecord(
           id: id,
+          launchWorkspace: workspace,
           store: NativeChatStore(
             workspace: path,
-            driver: ViviConversationDriver(workspace: path)))
+            driver: ViviConversationDriver(
+              workspace: path,
+              applicationConfiguration: configuration)))
       },
       makeWindow: { identity, coordinator, onClosed in
         MainWindowController(
@@ -255,7 +297,7 @@ final class NativeApplicationCoordinator {
   @discardableResult
   func createConversation(in workspace: WorkspaceIdentity) -> ConversationRecord? {
     guard state == .running else { return nil }
-    let record = makeConversation(makeConversationID(), workspace)
+    let record = makeConversation(makeConversationID(), workspace, applicationConfiguration)
     conversations.appendAndSelect(record)
     return record
   }

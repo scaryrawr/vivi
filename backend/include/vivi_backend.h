@@ -8,6 +8,7 @@ extern "C" {
 #endif
 
 #define VIVI_BACKEND_ABI_VERSION 9
+#define VIVI_BACKEND_SESSION_TITLE_MAX_CHARACTERS 80
 
 typedef enum vivi_backend_result {
     VIVI_BACKEND_OK = 0,
@@ -37,8 +38,6 @@ typedef struct vivi_backend_conversation_options {
     uint32_t working_directory_length;
     const uint8_t *settings_path;
     uint32_t settings_path_length;
-    const uint8_t *sessions_directory;
-    uint32_t sessions_directory_length;
     const uint8_t *copilot_cli_path;
     uint32_t copilot_cli_path_length;
     vivi_backend_copilot_cli_launch_t copilot_cli_launch;
@@ -65,9 +64,8 @@ typedef enum vivi_backend_event_kind {
     VIVI_BACKEND_EVENT_TOOL_FINISHED = 16,
     VIVI_BACKEND_EVENT_SESSION_CATALOG = 17,
     VIVI_BACKEND_EVENT_SESSION_CATALOG_FAILURE = 18,
-    VIVI_BACKEND_EVENT_SESSION_TRACKING_FAILURE = 19,
-    VIVI_BACKEND_EVENT_SESSION_RESUME = 20,
-    VIVI_BACKEND_EVENT_USER_INPUT_REQUEST = 21,
+    VIVI_BACKEND_EVENT_SESSION_RESUME = 19,
+    VIVI_BACKEND_EVENT_USER_INPUT_REQUEST = 20,
 } vivi_backend_event_kind_t;
 
 typedef enum vivi_backend_content_kind {
@@ -184,17 +182,6 @@ typedef struct vivi_backend_model {
     uint8_t reserved;
 } vivi_backend_model_t;
 
-typedef enum vivi_backend_session_request {
-    VIVI_BACKEND_SESSION_REQUEST_LOCAL = 1,
-    VIVI_BACKEND_SESSION_REQUEST_ALL = 2,
-} vivi_backend_session_request_t;
-
-typedef enum vivi_backend_session_scope {
-    VIVI_BACKEND_SESSION_SCOPE_NONE = 0,
-    VIVI_BACKEND_SESSION_SCOPE_LOCAL = 1,
-    VIVI_BACKEND_SESSION_SCOPE_BROADER = 2,
-} vivi_backend_session_scope_t;
-
 typedef enum vivi_backend_session_resume_outcome {
     VIVI_BACKEND_SESSION_RESUME_NONE = 0,
     VIVI_BACKEND_SESSION_RESUME_RESUMED = 1,
@@ -209,24 +196,19 @@ typedef enum vivi_backend_transcript_role {
 
 typedef enum vivi_backend_session_flags {
     VIVI_BACKEND_SESSION_TITLE_PRESENT = 1u << 0,
-    VIVI_BACKEND_SESSION_SUMMARY_PRESENT = 1u << 1,
-    VIVI_BACKEND_SESSION_CURRENT = 1u << 2,
+    VIVI_BACKEND_SESSION_CURRENT = 1u << 1,
 } vivi_backend_session_flags_t;
 
 typedef struct vivi_backend_resume_key {
     uint64_t generation;
     uint32_t slot;
-    vivi_backend_session_scope_t scope;
+    uint32_t reserved;
 } vivi_backend_resume_key_t;
 
 typedef struct vivi_backend_session_summary {
     vivi_backend_resume_key_t key;
     vivi_backend_span_t working_directory;
-    vivi_backend_span_t model_id;
     vivi_backend_span_t title;
-    vivi_backend_span_t summary;
-    int64_t last_used_unix_ms;
-    vivi_backend_reasoning_effort_t reasoning;
     uint32_t flags;
     uint32_t reserved;
 } vivi_backend_session_summary_t;
@@ -281,12 +263,11 @@ typedef struct vivi_backend_event {
     vivi_backend_reasoning_effort_t selected_reasoning;
     vivi_backend_model_switch_outcome_t switch_outcome;
     vivi_backend_history_effect_t history_effect;
-    vivi_backend_session_scope_t session_scope;
     vivi_backend_session_resume_outcome_t session_resume_outcome;
     uint8_t default_saved;
     uint8_t cleanup_failed;
-    uint8_t skipped_invalid_shards;
     uint8_t allow_freeform;
+    uint8_t event_reserved;
     uint16_t reserved;
 } vivi_backend_event_t;
 
@@ -306,8 +287,7 @@ vivi_backend_result_t vivi_backend_switch_model(
     uint32_t model_id_length,
     vivi_backend_reasoning_effort_t reasoning);
 vivi_backend_result_t vivi_backend_refresh_sessions(
-    vivi_backend_conversation_t *conversation,
-    vivi_backend_session_request_t request);
+    vivi_backend_conversation_t *conversation);
 vivi_backend_result_t vivi_backend_resume_session(
     vivi_backend_conversation_t *conversation,
     vivi_backend_resume_key_t key);
