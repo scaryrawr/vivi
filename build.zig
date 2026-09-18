@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -120,15 +121,23 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the vivi CLI");
     run_step.dependOn(&run_cli.step);
 
-    const build_native = b.addSystemCommand(&.{
-        "sh",
-        b.pathFromRoot("scripts/build-native.sh"),
-    });
+    const build_native: *std.Build.Step = if (builtin.os.tag == .macos) build: {
+        const command = b.addSystemCommand(&.{
+            "sh",
+            b.pathFromRoot("scripts/build-native.sh"),
+        });
+        break :build &command.step;
+    } else fail: {
+        const unsupported = b.addFail(
+            "zig build native requires macOS and Xcode",
+        );
+        break :fail &unsupported.step;
+    };
     const native_step = b.step(
         "native",
         "Build the Debug macOS Vivi app from this worktree",
     );
-    native_step.dependOn(&build_native.step);
+    native_step.dependOn(build_native);
 
     const run_native = b.addSystemCommand(&.{
         b.getInstallPath(.bin, "vivi"),
@@ -141,7 +150,7 @@ pub fn build(b: *std.Build) void {
         b.pathFromRoot("zig-out/xcode/Debug/Vivi.app"),
     );
     run_native.step.dependOn(&install_cli.step);
-    run_native.step.dependOn(&build_native.step);
+    run_native.step.dependOn(build_native);
     const native_run_step = b.step(
         "native-run",
         "Build and launch this worktree's macOS Vivi app",
