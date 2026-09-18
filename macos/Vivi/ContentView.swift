@@ -388,7 +388,7 @@ private struct CommandPaletteView: View {
         session.command.argumentPolicy == .required ? "Required argument" : "Optional argument",
         text: Binding(
           get: { session.draft },
-          set: store.updateCommandArgumentDraft)
+          set: { value in store.updateCommandArgumentDraft(value) })
       )
       .textFieldStyle(.roundedBorder)
       .focused(focus, equals: .commandArgument)
