@@ -56,6 +56,9 @@ func projectSessionHistoryPresentation(
 
 struct MainWindowView: View {
   @ObservedObject var conversations: ConversationCollection
+  @ObservedObject var applicationPresentation: NativeApplicationPresentation
+  let requestNewConversation: () -> Void
+  let dismissWorkspaceChoiceFailure: () -> Void
 
   var body: some View {
     NavigationSplitView {
@@ -67,6 +70,9 @@ struct MainWindowView: View {
         }
       }
       .listStyle(.sidebar)
+      .safeAreaInset(edge: .bottom) {
+        newConversationControl
+      }
       .navigationSplitViewColumnWidth(min: 210, ideal: 250, max: 340)
       .accessibilityIdentifier("conversation-sidebar")
     } detail: {
@@ -78,13 +84,64 @@ struct MainWindowView: View {
         ContentUnavailableView {
           Label("No Conversations", systemImage: "bubble.left.and.bubble.right")
         } description: {
-          Text("Run `vivi chat --native` from a workspace to start one.")
+          Text("Choose a workspace to start a conversation.")
+        } actions: {
+          Button("New Conversation", action: requestNewConversation)
+            .buttonStyle(.borderedProminent)
+            .disabled(applicationPresentation.workspaceChoice.isChoosing)
+            .accessibilityIdentifier("new-conversation-empty-state")
         }
         .accessibilityIdentifier("conversation-empty-state")
       }
     }
     .navigationSplitViewStyle(.balanced)
     .frame(minWidth: 760, minHeight: 500)
+    .alert(
+      "Can’t Start Conversation",
+      isPresented: workspaceChoiceFailureIsPresented
+    ) {
+      Button("OK", action: dismissWorkspaceChoiceFailure)
+    } message: {
+      Text(workspaceChoiceFailure ?? "")
+    }
+  }
+
+  private var newConversationControl: some View {
+    Button(action: requestNewConversation) {
+      HStack(spacing: 8) {
+        Label("New Conversation", systemImage: "plus")
+        Spacer()
+        if applicationPresentation.workspaceChoice.isChoosing {
+          ProgressView()
+            .controlSize(.small)
+            .accessibilityLabel("Choosing workspace")
+        }
+      }
+      .contentShape(Rectangle())
+    }
+    .buttonStyle(.plain)
+    .disabled(applicationPresentation.workspaceChoice.isChoosing)
+    .padding(.horizontal, 12)
+    .padding(.vertical, 10)
+    .background(.bar)
+    .accessibilityIdentifier("new-conversation-sidebar")
+  }
+
+  private var workspaceChoiceFailure: String? {
+    guard case .failure(let message) = applicationPresentation.workspaceChoice else {
+      return nil
+    }
+    return message
+  }
+
+  private var workspaceChoiceFailureIsPresented: Binding<Bool> {
+    Binding(
+      get: { workspaceChoiceFailure != nil },
+      set: { isPresented in
+        if !isPresented {
+          dismissWorkspaceChoiceFailure()
+        }
+      })
   }
 
   private var selection: Binding<ConversationID?> {

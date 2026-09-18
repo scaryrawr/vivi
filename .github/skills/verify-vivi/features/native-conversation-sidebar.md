@@ -49,3 +49,5 @@ interaction.
   lifetime effects.
 - Persisted session discovery and resume have their own
   [native session history](./native-session-history.md) verification flow.
+- Native directory selection and project grouping have their own
+  [native project entry](./native-project-entry.md) verification flow.

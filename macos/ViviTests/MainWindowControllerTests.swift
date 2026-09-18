@@ -20,9 +20,10 @@ final class MainWindowControllerTests: XCTestCase {
     conversations.appendAndSelect(first)
     conversations.appendAndSelect(second)
     let window = NSWindow()
+    let applicationCoordinator = testApplicationCoordinator(conversations: conversations)
     let controller = MainWindowController(
       identity: .primary,
-      conversations: conversations,
+      applicationCoordinator: applicationCoordinator,
       window: window,
       activate: {},
       onClosed: { _ in })
@@ -47,9 +48,10 @@ final class MainWindowControllerTests: XCTestCase {
         store: NativeChatStore(workspace: "/tmp/project", driver: driver)))
     let window = NSWindow()
     var closedIdentity: MainWindowIdentity?
+    let applicationCoordinator = testApplicationCoordinator(conversations: conversations)
     let controller = MainWindowController(
       identity: .primary,
-      conversations: conversations,
+      applicationCoordinator: applicationCoordinator,
       window: window,
       activate: {},
       onClosed: { closedIdentity = $0 })
@@ -60,17 +62,45 @@ final class MainWindowControllerTests: XCTestCase {
     XCTAssertEqual(driver.closeCount, 0)
   }
 
-  func testSidebarPresentationDisambiguatesDuplicates() {
+  func testSidebarPresentationAlwaysGroupsProjectsAndDisambiguatesDuplicates() {
+    let first = ConversationRecord(
+      id: ConversationID(rawValue: UUID()),
+      launchWorkspace: WorkspaceIdentity(absolutePath: "/tmp/vivi")!,
+      store: NativeChatStore(
+        workspace: "/tmp/vivi",
+        driver: ControllableConversationDriver()))
+    let second = ConversationRecord(
+      id: ConversationID(rawValue: UUID()),
+      launchWorkspace: WorkspaceIdentity(absolutePath: "/tmp/vivi")!,
+      store: NativeChatStore(
+        workspace: "/tmp/vivi",
+        driver: ControllableConversationDriver()))
+    let other = ConversationRecord(
+      id: ConversationID(rawValue: UUID()),
+      launchWorkspace: WorkspaceIdentity(absolutePath: "/work/other")!,
+      store: NativeChatStore(
+        workspace: "/work/other",
+        driver: ControllableConversationDriver()))
+
+    let conversations = ConversationCollection()
+    conversations.appendAndSelect(first)
+    conversations.appendAndSelect(second)
+    conversations.appendAndSelect(other)
+
+    XCTAssertEqual(
+      conversations.launchWorkspaces.map(\.canonicalPath),
+      ["/tmp/vivi", "/work/other"])
     XCTAssertEqual(
       sidebarRowPresentation(
-        title: "Vivi",
-        workspace: "/tmp/vivi",
-        duplicate: (ordinal: 2, total: 3)),
+        title: second.navigation.title,
+        workspace: second.navigation.workspace.canonicalPath,
+        duplicate: conversations.duplicatePosition(for: second.id)),
       SidebarRowPresentation(
-        title: "Vivi",
+        title: "vivi",
         workspace: "/tmp/vivi",
         duplicateBadge: "2",
-        accessibilityLabel: "Vivi, /tmp/vivi, conversation 2 of 3"))
+        accessibilityLabel: "vivi, /tmp/vivi, conversation 2 of 2"))
+    XCTAssertNil(conversations.duplicatePosition(for: other.id))
   }
 
   func testProjectAccessibilityLabelDisambiguatesMatchingNames() {
@@ -114,6 +144,26 @@ final class MainWindowControllerTests: XCTestCase {
 
     XCTAssertEqual(rows.map(\.title), ["Recent", "Earlier"])
   }
+}
+
+@MainActor
+private func testApplicationCoordinator(
+  conversations: ConversationCollection
+) -> NativeApplicationCoordinator {
+  NativeApplicationCoordinator(
+    conversations: conversations,
+    makeConversationID: { ConversationID(rawValue: UUID()) },
+    makeConversation: { id, workspace, _ in
+      ConversationRecord(
+        id: id,
+        launchWorkspace: workspace,
+        store: NativeChatStore(
+          workspace: workspace.canonicalPath,
+          driver: ControllableConversationDriver()))
+    },
+    makeWindow: { _, _, _ in
+      preconditionFailure("Test does not present a window")
+    })
 }
 
 private func historySummary(

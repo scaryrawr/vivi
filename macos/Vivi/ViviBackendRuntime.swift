@@ -1494,12 +1494,17 @@ func nativeCopilotExecutablePath(
 
 final class ViviConversationDriver: ViviConversationDriving, @unchecked Sendable {
   private let workspace: String
+  private let applicationConfiguration: NativeApplicationConfiguration
   private let queue = DispatchQueue(label: "com.scaryrawr.vivi.conversation")
   private var handle: OpaquePointer?
   private var receive: (@MainActor (ChatEvent) -> Void)?
 
-  init(workspace: String) {
+  init(
+    workspace: String,
+    applicationConfiguration: NativeApplicationConfiguration
+  ) {
     self.workspace = workspace
+    self.applicationConfiguration = applicationConfiguration
   }
 
   func start(
@@ -1508,9 +1513,7 @@ final class ViviConversationDriver: ViviConversationDriving, @unchecked Sendable
     queue.sync {
       self.receive = receive
       let bytes = Array(workspace.utf8)
-      let settingsPath =
-        FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent(".vivi/settings.json").path
+      let settingsPath = applicationConfiguration.settingsPath
       guard let copilotPath = nativeCopilotExecutablePath() else {
         self.receive = nil
         return .failed

@@ -55,6 +55,150 @@ final class NativeApplicationCoordinatorTests: XCTestCase {
     XCTAssertEqual(harness.drivers.count, 2)
   }
 
+  func testChosenDirectoryCreatesAndSelectsFreshConversationEveryTime() async {
+    let harness = CoordinatorHarness()
+    let workspace = FileManager.default.temporaryDirectory
+
+    harness.coordinator.requestNewConversation()
+    XCTAssertEqual(harness.coordinator.presentation.workspaceChoice, .choosing)
+    XCTAssertEqual(harness.choosers.count, 1)
+    await Task.yield()
+    harness.choosers[0].finish(workspace)
+    await Task.yield()
+
+    harness.coordinator.requestNewConversation()
+    await Task.yield()
+    harness.choosers[1].finish(workspace)
+    await Task.yield()
+
+    XCTAssertEqual(harness.coordinator.conversations.records.count, 2)
+    XCTAssertEqual(Set(harness.coordinator.conversations.records.map(\.id)).count, 2)
+    XCTAssertEqual(
+      harness.coordinator.conversations.records.map(\.navigation.workspace.canonicalPath),
+      [workspace.path, workspace.path])
+    XCTAssertEqual(
+      harness.coordinator.conversations.selectedID,
+      harness.coordinator.conversations.records[1].id)
+    XCTAssertEqual(harness.windows.count, 1)
+    XCTAssertEqual(harness.windows[0].showCount, 2)
+    XCTAssertEqual(harness.coordinator.presentation.workspaceChoice, .idle)
+  }
+
+  func testURLAndChooserUseDifferentWorkspacesWithSameApplicationConfiguration() async {
+    let configuration = NativeApplicationConfiguration(
+      settingsPath: "/application-state/settings.json")
+    let harness = CoordinatorHarness(applicationConfiguration: configuration)
+    let chosenWorkspace = FileManager.default.temporaryDirectory
+
+    harness.coordinator.open([URL(string: "vivi://chat?workspace=/tmp/from-url")!])
+    harness.coordinator.requestNewConversation()
+    await Task.yield()
+    harness.choosers[0].finish(chosenWorkspace)
+    await Task.yield()
+
+    XCTAssertEqual(
+      harness.creationRequests.map(\.workspace.canonicalPath),
+      ["/tmp/from-url", chosenWorkspace.path])
+    XCTAssertEqual(
+      harness.creationRequests.map(\.configuration),
+      [configuration, configuration])
+  }
+
+  func testWorkspaceChoiceCancellationChangesNoState() async {
+    let harness = CoordinatorHarness()
+
+    harness.coordinator.requestNewConversation()
+    await Task.yield()
+    harness.choosers[0].finish(nil)
+    await Task.yield()
+
+    XCTAssertTrue(harness.coordinator.conversations.records.isEmpty)
+    XCTAssertTrue(harness.windows.isEmpty)
+    XCTAssertEqual(harness.coordinator.presentation.workspaceChoice, .idle)
+  }
+
+  func testInvalidWorkspaceChoiceFailsWithoutCreatingConversation() async throws {
+    let harness = CoordinatorHarness()
+    let file = FileManager.default.temporaryDirectory
+      .appending(path: UUID().uuidString)
+    try Data().write(to: file)
+    defer { try? FileManager.default.removeItem(at: file) }
+
+    harness.coordinator.requestNewConversation()
+    await Task.yield()
+    harness.choosers[0].finish(file)
+    await Task.yield()
+
+    XCTAssertTrue(harness.coordinator.conversations.records.isEmpty)
+    XCTAssertEqual(
+      harness.coordinator.presentation.workspaceChoice,
+      .failure("Choose an existing folder with an absolute path."))
+    XCTAssertEqual(harness.windows.count, 1)
+    harness.coordinator.dismissWorkspaceChoiceFailure()
+    XCTAssertEqual(harness.coordinator.presentation.workspaceChoice, .idle)
+  }
+
+  func testNonFileAndMissingWorkspaceChoicesFailVisibly() async {
+    let harness = CoordinatorHarness()
+    let invalidChoices = [
+      URL(string: "relative-workspace")!,
+      FileManager.default.temporaryDirectory
+        .appending(path: UUID().uuidString, directoryHint: .isDirectory),
+    ]
+
+    for invalidChoice in invalidChoices {
+      harness.coordinator.requestNewConversation()
+      await Task.yield()
+      harness.choosers.last?.finish(invalidChoice)
+      await Task.yield()
+
+      XCTAssertEqual(
+        harness.coordinator.presentation.workspaceChoice,
+        .failure("Choose an existing folder with an absolute path."))
+      XCTAssertTrue(harness.coordinator.conversations.records.isEmpty)
+      harness.coordinator.dismissWorkspaceChoiceFailure()
+    }
+  }
+
+  func testWorkspaceChoiceIsSingleFlight() {
+    let harness = CoordinatorHarness()
+
+    harness.coordinator.requestNewConversation()
+    harness.coordinator.requestNewConversation()
+
+    XCTAssertEqual(harness.choosers.count, 1)
+    XCTAssertEqual(harness.coordinator.presentation.workspaceChoice, .choosing)
+  }
+
+  func testTerminationCancelsWorkspaceChoiceAndRejectsLateResult() async {
+    let harness = CoordinatorHarness()
+    harness.coordinator.requestNewConversation()
+    await Task.yield()
+
+    let disposition = harness.coordinator.beginTermination {}
+    harness.choosers[0].finish(FileManager.default.temporaryDirectory)
+    await Task.yield()
+
+    XCTAssertEqual(disposition, .terminateNow)
+    XCTAssertEqual(harness.choosers[0].cancelCount, 1)
+    XCTAssertTrue(harness.coordinator.conversations.records.isEmpty)
+    XCTAssertEqual(harness.coordinator.presentation.workspaceChoice, .idle)
+  }
+
+  func testImmediateTerminationPreventsWorkspaceChooserFromStarting() async {
+    let harness = CoordinatorHarness()
+    harness.coordinator.requestNewConversation()
+
+    let disposition = harness.coordinator.beginTermination {}
+    await Task.yield()
+
+    XCTAssertEqual(disposition, .terminateNow)
+    XCTAssertEqual(harness.choosers[0].cancelCount, 1)
+    XCTAssertEqual(harness.choosers[0].chooseCount, 0)
+    XCTAssertTrue(harness.coordinator.conversations.records.isEmpty)
+    XCTAssertEqual(harness.coordinator.presentation.workspaceChoice, .idle)
+  }
+
   func testClosingPresentationKeepsConversationsAndReopenReusesStores() {
     let harness = CoordinatorHarness()
     harness.coordinator.open([URL(string: "vivi://chat?workspace=/tmp/project")!])
@@ -128,6 +272,9 @@ final class NativeApplicationCoordinatorTests: XCTestCase {
     XCTAssertEqual(record.navigation.title, "Resumed conversation")
     XCTAssertEqual(conversations.duplicatePosition(for: record.id)?.ordinal, 1)
     XCTAssertEqual(conversations.duplicatePosition(for: conversations.records[1].id)?.ordinal, 2)
+    XCTAssertEqual(
+      conversations.records(launchedFrom: record.launchWorkspace).map(\.id),
+      [record.id])
   }
 
   func testUntitledLaunchPresentsMainWindow() {
@@ -178,18 +325,33 @@ final class NativeApplicationCoordinatorTests: XCTestCase {
 
 @MainActor
 private final class CoordinatorHarness {
+  struct CreationRequest {
+    let workspace: WorkspaceIdentity
+    let configuration: NativeApplicationConfiguration
+  }
+
+  let applicationConfiguration: NativeApplicationConfiguration
   var drivers: [ControllableConversationDriver] = []
+  var choosers: [ControllableWorkspaceChooser] = []
   var windows: [FakeMainWindow] = []
+  var creationRequests: [CreationRequest] = []
+
+  init(applicationConfiguration: NativeApplicationConfiguration = .live) {
+    self.applicationConfiguration = applicationConfiguration
+  }
 
   lazy var coordinator: NativeApplicationCoordinator = {
     var nextID = 0
     return NativeApplicationCoordinator(
+      applicationConfiguration: applicationConfiguration,
       makeConversationID: {
         nextID += 1
         return ConversationID(
           rawValue: UUID(uuidString: "00000000-0000-0000-0000-\(String(format: "%012d", nextID))")!)
       },
-      makeConversation: { [weak self] id, workspace in
+      makeConversation: { [weak self] id, workspace, configuration in
+        self?.creationRequests.append(
+          CreationRequest(workspace: workspace, configuration: configuration))
         let driver = ControllableConversationDriver()
         self?.drivers.append(driver)
         return ConversationRecord(
@@ -197,12 +359,54 @@ private final class CoordinatorHarness {
           launchWorkspace: workspace,
           store: NativeChatStore(workspace: workspace.canonicalPath, driver: driver))
       },
+      makeWorkspaceChooser: { [weak self] in
+        let chooser = ControllableWorkspaceChooser()
+        self?.choosers.append(chooser)
+        return chooser
+      },
       makeWindow: { [weak self] identity, _, onClosed in
         let window = FakeMainWindow(identity: identity, onClosed: onClosed)
         self?.windows.append(window)
         return window
       })
   }()
+}
+
+@MainActor
+private final class ControllableWorkspaceChooser: WorkspaceChoosing {
+  private var continuation: CheckedContinuation<URL?, Never>?
+  private var hasPendingResult = false
+  private var pendingResult: URL?
+  private(set) var cancelCount = 0
+  private(set) var chooseCount = 0
+
+  func chooseWorkspace() async -> URL? {
+    chooseCount += 1
+    if hasPendingResult {
+      hasPendingResult = false
+      let result = pendingResult
+      pendingResult = nil
+      return result
+    }
+    return await withCheckedContinuation { continuation in
+      self.continuation = continuation
+    }
+  }
+
+  func cancel() {
+    cancelCount += 1
+    finish(nil)
+  }
+
+  func finish(_ url: URL?) {
+    guard let continuation else {
+      hasPendingResult = true
+      pendingResult = url
+      return
+    }
+    self.continuation = nil
+    continuation.resume(returning: url)
+  }
 }
 
 @MainActor
