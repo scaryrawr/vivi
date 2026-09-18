@@ -37,7 +37,7 @@ button {
   --surface-raised: #fbfbfc;
   --text: #202124;
   --secondary: #6e7075;
-  --tertiary: #999ba1;
+  --tertiary: #6e7075;
   --line: rgb(24 26 31 / 0.11);
   --line-strong: rgb(24 26 31 / 0.18);
   --selection: #0a64d8;
@@ -63,7 +63,7 @@ button {
   --surface-raised: #2b2c31;
   --text: #f2f2f3;
   --secondary: #b0b1b6;
-  --tertiary: #85878d;
+  --tertiary: #b0b1b6;
   --line: rgb(255 255 255 / 0.1);
   --line-strong: rgb(255 255 255 / 0.18);
   --selection: #4c9aff;
@@ -309,6 +309,7 @@ button {
 
 .application-error,
 .connection-error,
+.command-error,
 .composer-error,
 .transcript-error {
   display: flex;
@@ -326,9 +327,28 @@ button {
   border-bottom: 1px solid color-mix(in srgb, var(--danger) 22%, transparent);
 }
 
-.connection-error {
+.connection-error,
+.command-error {
   padding: 8px 20px;
   border-bottom: 1px solid color-mix(in srgb, var(--danger) 22%, transparent);
+}
+
+.startup-error {
+  display: grid;
+  width: min(480px, calc(100% - 48px));
+  margin: 15vh auto 0;
+  gap: 6px;
+  padding: 18px;
+  border: 1px solid color-mix(in srgb, #b42318 22%, transparent);
+  border-radius: 10px;
+  color: #b42318;
+  background: #fff0ee;
+  font:
+    13px/1.45 -apple-system,
+    BlinkMacSystemFont,
+    "SF Pro Text",
+    "Segoe UI",
+    sans-serif;
 }
 
 .transcript {

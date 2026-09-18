@@ -219,3 +219,9 @@ export const fixtures = {
 };
 
 export type FixtureName = keyof typeof fixtures;
+
+export function resolveFixtureName(scenario: string | null): FixtureName {
+  return scenario && Object.hasOwn(fixtures, scenario)
+    ? (scenario as FixtureName)
+    : "multiple";
+}

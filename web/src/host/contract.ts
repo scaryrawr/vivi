@@ -20,6 +20,8 @@ export const sessionId = (value: string) => value as SessionId;
 export const transcriptItemId = (value: string) => value as TranscriptItemId;
 export const clientSubmissionId = (value: string) =>
   value as ClientSubmissionId;
+export const createClientSubmissionId = () =>
+  clientSubmissionId(crypto.randomUUID());
 
 export type Appearance = "light" | "dark";
 

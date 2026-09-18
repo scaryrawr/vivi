@@ -14,7 +14,7 @@ import type {
   TranscriptItem,
   WorkspacePath,
 } from "./host/contract";
-import { nextSubmissionId } from "./host/mock";
+import { createClientSubmissionId } from "./host/contract";
 import {
   initialUiState,
   reduceUi,
@@ -88,7 +88,7 @@ export function ViviApp({
       const result = handleResult(
         await host.sendMessage({
           sessionId: selected.id,
-          submissionId: nextSubmissionId(),
+          submissionId: createClientSubmissionId(),
           text: draft.text.trim(),
         }),
       );
@@ -224,6 +224,7 @@ export function ViviApp({
         </header>
 
         {(snapshot.applicationError ||
+          commandError ||
           connectionState.kind !== "connected") && (
           <div className="status-region">
             {snapshot.applicationError && (
@@ -242,6 +243,12 @@ export function ViviApp({
                 {connectionState.kind === "failed" && (
                   <span>{connectionState.message}</span>
                 )}
+              </div>
+            )}
+            {commandError && (
+              <div className="command-error" role="alert">
+                <strong>Command not completed</strong>
+                <span>{commandError}</span>
               </div>
             )}
           </div>
@@ -281,9 +288,9 @@ export function ViviApp({
             </div>
 
             <div className="composer-zone">
-              {(selected.error || commandError) && (
+              {selected.error && (
                 <div className="composer-error" role="alert">
-                  {commandError ?? selected.error?.message}
+                  {selected.error.message}
                 </div>
               )}
               <form

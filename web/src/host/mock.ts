@@ -1,5 +1,4 @@
 import {
-  clientSubmissionId,
   sessionId,
   transcriptItemId,
   VIVI_HOST_PROTOCOL,
@@ -167,8 +166,4 @@ function rejected(
   message: string,
 ): HostCommandResult {
   return { kind: "rejected", reason, message };
-}
-
-export function nextSubmissionId() {
-  return clientSubmissionId(crypto.randomUUID());
 }
