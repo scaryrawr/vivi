@@ -159,6 +159,59 @@ final class ViviBackendRuntimeTests: XCTestCase {
     XCTAssertEqual(acquirer.cancelCount, 1)
   }
 
+  func testAttachmentAcquisitionBlocksSubmissionAndCannotAppendAfterLifecycleChanges() async {
+    let acquirer = FakeAttachmentAcquirer(chosen: [testAttachment(name: "late.png")])
+    acquirer.suspendChoose = true
+    let driver = FakeConversationDriver()
+    let store = NativeChatStore(
+      workspace: "/tmp/work",
+      driver: driver,
+      attachmentAcquirer: acquirer)
+
+    store.reduce(.ready)
+    store.reduce(.modelCatalog(testCatalog()))
+    store.draft = "Send without the pending image"
+    store.chooseAttachments()
+
+    XCTAssertTrue(store.isAcquiringAttachments)
+    XCTAssertFalse(store.canSubmit)
+    store.submit()
+    XCTAssertTrue(driver.submittedPrompts.isEmpty)
+
+    store.close()
+    await store.waitForAttachmentAcquisition()
+    XCTAssertTrue(store.attachments.isEmpty)
+    XCTAssertFalse(store.isAcquiringAttachments)
+  }
+
+  func testAppKitAttachmentAcquirerCancelsRetainedBackgroundWork() async {
+    let probe = AttachmentCancellationProbe()
+    let acquirer = AppKitComposerAttachmentAcquirer { _ in
+      probe.markStarted()
+      while !Task.isCancelled {
+        Thread.sleep(forTimeInterval: 0.001)
+      }
+      probe.markCancelled()
+      throw CancellationError()
+    }
+    let task = Task {
+      try await acquirer.snapshotFiles([URL(fileURLWithPath: "/unused.png")])
+    }
+    while !probe.started {
+      await Task.yield()
+    }
+
+    acquirer.cancel()
+    do {
+      _ = try await task.value
+      XCTFail("Expected cancelled background acquisition")
+    } catch is CancellationError {
+    } catch {
+      XCTFail("Unexpected cancellation error: \(error)")
+    }
+    XCTAssertTrue(probe.cancelled)
+  }
+
   func testAppKitAttachmentSnapshotReadsOnceAndValidatesContent() throws {
     let directory = FileManager.default.temporaryDirectory
       .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -1379,6 +1432,8 @@ private final class FakeAttachmentAcquirer: ComposerAttachmentAcquiring {
   var pasted: ComposerAttachment
   var chooseError: Error?
   var pasteError: Error?
+  var suspendChoose = false
+  private var chooseContinuation: CheckedContinuation<[ComposerAttachment], Error>?
   private(set) var cancelCount = 0
 
   init(
@@ -1391,6 +1446,11 @@ private final class FakeAttachmentAcquirer: ComposerAttachmentAcquiring {
 
   func chooseImages() async throws -> [ComposerAttachment] {
     if let chooseError { throw chooseError }
+    if suspendChoose {
+      return try await withCheckedThrowingContinuation { continuation in
+        chooseContinuation = continuation
+      }
+    }
     return chosen
   }
 
@@ -1401,6 +1461,30 @@ private final class FakeAttachmentAcquirer: ComposerAttachmentAcquiring {
 
   func cancel() {
     cancelCount += 1
+    chooseContinuation?.resume(throwing: CancellationError())
+    chooseContinuation = nil
+  }
+}
+
+private final class AttachmentCancellationProbe: @unchecked Sendable {
+  private let lock = NSLock()
+  private var didStart = false
+  private var didCancel = false
+
+  var started: Bool {
+    lock.withLock { didStart }
+  }
+
+  var cancelled: Bool {
+    lock.withLock { didCancel }
+  }
+
+  func markStarted() {
+    lock.withLock { didStart = true }
+  }
+
+  func markCancelled() {
+    lock.withLock { didCancel = true }
   }
 }
 

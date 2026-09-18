@@ -343,6 +343,7 @@ final class NativeChatStore: ObservableObject {
   @Published private(set) var activeUserInput: ActiveUserInput?
   @Published private(set) var attachments: [ComposerAttachment] = []
   @Published private(set) var attachmentError: String?
+  @Published private(set) var isAcquiringAttachments = false
   @Published var draft = ""
 
   var workspace: String { activePresentation.workspace }
@@ -390,13 +391,14 @@ final class NativeChatStore: ObservableObject {
   }
 
   var canSubmit: Bool {
-    !isBusy && modelState == .ready && sessionState == .ready
+    !isBusy && !isAcquiringAttachments && modelState == .ready && sessionState == .ready
       && (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         || !attachments.isEmpty)
   }
 
   var canAcquireAttachments: Bool {
-    lifecycle == .idle && modelState == .ready && sessionState == .ready
+    lifecycle == .idle && !isAcquiringAttachments
+      && modelState == .ready && sessionState == .ready
       && activeUserInput == nil && attachments.count < composerAttachmentCountLimit
   }
 
@@ -463,12 +465,17 @@ final class NativeChatStore: ObservableObject {
   func chooseAttachments() {
     guard canAcquireAttachments, attachmentAcquisitionTask == nil else { return }
     attachmentError = nil
+    isAcquiringAttachments = true
     attachmentAcquisitionTask = Task { [weak self] in
       guard let self else { return }
-      defer { attachmentAcquisitionTask = nil }
+      defer {
+        attachmentAcquisitionTask = nil
+        isAcquiringAttachments = false
+      }
+      guard !Task.isCancelled else { return }
       do {
         let selected = try await attachmentAcquirer.chooseImages()
-        guard !Task.isCancelled, lifecycle != .closing, lifecycle != .closed else { return }
+        guard !Task.isCancelled, lifecycle == .idle else { return }
         try appendAttachments(selected)
       } catch {
         guard !Task.isCancelled else { return }
@@ -480,12 +487,17 @@ final class NativeChatStore: ObservableObject {
   func pasteAttachment() {
     guard canAcquireAttachments, attachmentAcquisitionTask == nil else { return }
     attachmentError = nil
+    isAcquiringAttachments = true
     attachmentAcquisitionTask = Task { [weak self] in
       guard let self else { return }
-      defer { attachmentAcquisitionTask = nil }
+      defer {
+        attachmentAcquisitionTask = nil
+        isAcquiringAttachments = false
+      }
+      guard !Task.isCancelled else { return }
       do {
         let selected = try await attachmentAcquirer.pasteImage()
-        guard !Task.isCancelled, lifecycle != .closing, lifecycle != .closed else { return }
+        guard !Task.isCancelled, lifecycle == .idle else { return }
         try appendAttachments([selected])
       } catch {
         guard !Task.isCancelled else { return }
@@ -759,7 +771,6 @@ final class NativeChatStore: ObservableObject {
 
   private func clearAttachments() {
     attachmentAcquisitionTask?.cancel()
-    attachmentAcquisitionTask = nil
     attachmentAcquirer.cancel()
     attachments = []
     attachmentError = nil

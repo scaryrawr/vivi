@@ -90,15 +90,27 @@ protocol ComposerAttachmentAcquiring: AnyObject {
 
 @MainActor
 final class AppKitComposerAttachmentAcquirer: ComposerAttachmentAcquiring {
+  typealias FileSnapshotter =
+    @Sendable ([URL]) throws -> [ComposerAttachment]
+
   private var continuation: CheckedContinuation<[URL]?, Never>?
   private var panel: NSOpenPanel?
+  private var fileSnapshotTask: Task<[ComposerAttachment], Error>?
+  private var pasteSnapshotTask: Task<ComposerAttachment, Error>?
+  private let fileSnapshotter: FileSnapshotter
+
+  init(
+    fileSnapshotter: @escaping FileSnapshotter = {
+      try AppKitComposerAttachmentAcquirer.snapshots($0)
+    }
+  ) {
+    self.fileSnapshotter = fileSnapshotter
+  }
 
   func chooseImages() async throws -> [ComposerAttachment] {
     precondition(panel == nil)
     guard let urls = await chooseURLs() else { return [] }
-    return try await Task.detached {
-      try Self.snapshots(urls)
-    }.value
+    return try await snapshotFiles(urls)
   }
 
   func pasteImage() async throws -> ComposerAttachment {
@@ -110,9 +122,9 @@ final class AppKitComposerAttachmentAcquirer: ComposerAttachmentAcquiring {
 
     for type in [png, jpeg, gif, webP] {
       if let data = pasteboard.data(forType: type) {
-        return try await Task.detached {
+        return try await runPasteSnapshot {
           try Self.snapshot(data: data, displayName: "Pasted image")
-        }.value
+        }
       }
     }
     guard let data = pasteboard.data(forType: .tiff) else {
@@ -121,17 +133,20 @@ final class AppKitComposerAttachmentAcquirer: ComposerAttachmentAcquiring {
     guard data.count <= composerAttachmentByteLimit else {
       throw ComposerAttachmentAcquisitionError.tooLarge("Pasted image")
     }
-    return try await Task.detached {
+    return try await runPasteSnapshot {
       try Self.snapshotTIFF(data)
-    }.value
+    }
   }
 
   func cancel() {
     panel?.close()
+    fileSnapshotTask?.cancel()
+    pasteSnapshotTask?.cancel()
     finish(nil)
   }
 
   nonisolated static func snapshot(_ url: URL) throws -> ComposerAttachment {
+    try Task.checkCancellation()
     let name = url.lastPathComponent
     let handle: FileHandle
     do {
@@ -146,6 +161,7 @@ final class AppKitComposerAttachmentAcquirer: ComposerAttachmentAcquiring {
     } catch {
       throw ComposerAttachmentAcquisitionError.unreadable(name)
     }
+    try Task.checkCancellation()
     return try snapshot(data: data, displayName: name)
   }
 
@@ -157,6 +173,7 @@ final class AppKitComposerAttachmentAcquirer: ComposerAttachmentAcquiring {
     attachments.reserveCapacity(urls.count)
     var totalBytes = 0
     for url in urls {
+      try Task.checkCancellation()
       let attachment = try snapshot(url)
       totalBytes += attachment.data.count
       guard totalBytes <= composerAttachmentByteLimit else {
@@ -188,12 +205,14 @@ final class AppKitComposerAttachmentAcquirer: ComposerAttachmentAcquiring {
   }
 
   nonisolated static func snapshotTIFF(_ data: Data) throws -> ComposerAttachment {
+    try Task.checkCancellation()
     guard
       let source = CGImageSourceCreateWithData(data as CFData, nil),
       let image = CGImageSourceCreateImageAtIndex(source, 0, nil)
     else {
       throw ComposerAttachmentAcquisitionError.unsupported("Pasted image")
     }
+    try Task.checkCancellation()
     let encoded = NSMutableData()
     guard
       let destination = CGImageDestinationCreateWithData(
@@ -205,12 +224,50 @@ final class AppKitComposerAttachmentAcquirer: ComposerAttachmentAcquiring {
       throw ComposerAttachmentAcquisitionError.unsupported("Pasted image")
     }
     CGImageDestinationAddImage(destination, image, nil)
+    try Task.checkCancellation()
     guard CGImageDestinationFinalize(destination) else {
       throw ComposerAttachmentAcquisitionError.unsupported("Pasted image")
     }
     return try snapshot(
       data: encoded as Data,
       displayName: "Pasted image.png")
+  }
+
+  func snapshotFiles(_ urls: [URL]) async throws -> [ComposerAttachment] {
+    precondition(fileSnapshotTask == nil)
+    let snapshotter = fileSnapshotter
+    let task = Task.detached {
+      try Task.checkCancellation()
+      let attachments = try snapshotter(urls)
+      try Task.checkCancellation()
+      return attachments
+    }
+    fileSnapshotTask = task
+    defer { fileSnapshotTask = nil }
+    return try await withTaskCancellationHandler {
+      try await task.value
+    } onCancel: {
+      task.cancel()
+    }
+  }
+
+  private func runPasteSnapshot(
+    _ operation: @escaping @Sendable () throws -> ComposerAttachment
+  ) async throws -> ComposerAttachment {
+    precondition(pasteSnapshotTask == nil)
+    let task = Task.detached {
+      try Task.checkCancellation()
+      let attachment = try operation()
+      try Task.checkCancellation()
+      return attachment
+    }
+    pasteSnapshotTask = task
+    defer { pasteSnapshotTask = nil }
+    return try await withTaskCancellationHandler {
+      try await task.value
+    } onCancel: {
+      task.cancel()
+    }
   }
 
   private func chooseURLs() async -> [URL]? {
