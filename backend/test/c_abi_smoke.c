@@ -30,12 +30,23 @@ int main(void) {
     options.copilot_cli_launch = (vivi_backend_copilot_cli_launch_t)99;
     assert(vivi_backend_open(&options, &conversation) == VIVI_BACKEND_INVALID_ARGUMENT);
     assert(conversation == 0);
-    assert(VIVI_BACKEND_ABI_VERSION == 6);
+    assert(VIVI_BACKEND_ABI_VERSION == 7);
+    assert(VIVI_BACKEND_PRESENTATION_SOURCE == 3);
+    assert(VIVI_BACKEND_LANGUAGE_PYTHON == 15);
+    assert(VIVI_BACKEND_TOKEN_META == 11);
     assert(VIVI_BACKEND_EVENT_CLOSED == 8);
     assert(VIVI_BACKEND_EVENT_MODEL_SWITCH == 14);
     assert(VIVI_BACKEND_EVENT_TOOL_STARTED == 15);
     assert(VIVI_BACKEND_EVENT_TOOL_FINISHED == 16);
     assert(VIVI_BACKEND_TOOL_RESULT_IMAGE == 4);
+    vivi_backend_presentation_t presentation = {0};
+    assert(vivi_backend_present_code_fragment(
+               (const uint8_t *)"unknown", 7,
+               (const uint8_t *)"text", 4,
+               &presentation, 0, 0, 0, 0)
+        == VIVI_BACKEND_BUFFER_TOO_SMALL);
+    assert(presentation.kind == VIVI_BACKEND_PRESENTATION_LITERAL);
+    assert(presentation.content.length == 4);
     assert(vivi_backend_refresh_models(0) == VIVI_BACKEND_INVALID_ARGUMENT);
     assert(vivi_backend_close(0) == VIVI_BACKEND_INVALID_ARGUMENT);
     vivi_backend_destroy(0);

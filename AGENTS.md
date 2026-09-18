@@ -18,6 +18,15 @@ Native hosts share domain semantics through the C ABI, not widgets or view
 models. Do not add speculative sessions, generic JSON bridges, daemons, shared
 UI abstractions, or empty executable targets.
 
+Tool lifecycle events preserve rejected invocations, so canonical tool input
+may be malformed JSON. Native bindings must validate it as bounded UTF-8 text,
+not require successful JSON parsing or close the conversation solely because
+the rejected arguments are malformed.
+
+Tool starts delimit assistant reasoning segments. A late reasoning completion
+may update only reasoning streamed since the latest tool boundary; otherwise
+preserve earlier reasoning and insert the completed segment before its answer.
+
 ## Build, Test, and Development Commands
 
 Use Zig 0.16.x and Xcode 26.6.
@@ -51,6 +60,11 @@ test, and native binding/UX behavior in each platform's test framework.
 Default tests must not require Copilot credentials or a running Copilot CLI.
 Any C ABI change must update the header, Zig adapter, smoke test, and every
 implemented native binding together.
+
+Validate user-visible native app behavior by driving the worktree's
+`./zig-out/bin/vivi chat --native` and retaining a screen recording. Do not
+open a bare `vivi://` URL: multiple worktree bundles share the production
+identifier, so Launch Services may route it to stale code.
 
 `zig build test` does not compile test blocks in every imported backend module.
 When changing `backend/src/settings.zig` or `backend/src/session_store.zig`,
@@ -86,7 +100,8 @@ Every PR that changes user-visible CLI, TUI, or native app behavior must include
 a reviewer-facing demo in its description. Use a short GIF or video when the
 behavior changes over time. Use before-and-after screenshots when a static
 comparison is clearer. Exercise the built application through the same surface
-the user sees. Unit tests, terminal transcripts, and written claims do not
+the user sees; native app changes must show the native app, not substitute CLI
+or TUI media. Unit tests, terminal transcripts, and written claims do not
 replace the visual demo. If the host cannot capture or upload media, state the
 specific blocker in the PR description and do not present the PR as visually
 verified.

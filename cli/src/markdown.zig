@@ -1,5 +1,6 @@
 const std = @import("std");
-const highlight = @import("highlight.zig");
+const backend = @import("vivi_backend");
+const highlight = backend.syntax;
 const vaxis = @import("vaxis");
 const c = @cImport({
     @cInclude("md4c.h");
@@ -193,53 +194,64 @@ pub const HighlightCache = struct {
     const Block = struct {
         language: highlight.Language,
         digest: [digest_length]u8,
+        text: []u8,
         spans: []highlight.Span,
+
+        fn deinit(self: *Block, allocator: std.mem.Allocator) void {
+            allocator.free(self.text);
+            allocator.free(self.spans);
+            self.* = undefined;
+        }
+    };
+
+    const Code = struct {
+        text: []const u8,
+        spans: []const highlight.Span,
     };
 
     pub fn deinit(self: *HighlightCache, allocator: std.mem.Allocator) void {
-        for (self.blocks.items) |block| allocator.free(block.spans);
+        for (self.blocks.items) |*block| block.deinit(allocator);
         self.blocks.deinit(allocator);
         self.* = undefined;
     }
 
-    fn spansFor(
+    fn codeFor(
         self: *HighlightCache,
         allocator: std.mem.Allocator,
         index: usize,
         language: highlight.Language,
         source: []const u8,
-    ) ![]const highlight.Span {
+    ) !Code {
         var digest: [digest_length]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(
-            source[0..@min(source.len, highlight.max_source_bytes)],
-            &digest,
-            .{},
-        );
+        std.crypto.hash.sha2.Sha256.hash(source, &digest, .{});
         if (index < self.blocks.items.len) {
             const block = &self.blocks.items[index];
             if (block.language == language and
                 std.mem.eql(u8, &block.digest, &digest))
             {
-                return block.spans;
+                return .{ .text = block.text, .spans = block.spans };
             }
-            const spans = try highlight.spans(allocator, language, source);
-            allocator.free(block.spans);
+            var presented = try fragmentCode(allocator, language, source);
+            errdefer presented.deinit(allocator);
+            block.deinit(allocator);
             block.* = .{
                 .language = language,
                 .digest = digest,
-                .spans = spans,
+                .text = presented.text,
+                .spans = presented.spans,
             };
-            return block.spans;
+            return .{ .text = block.text, .spans = block.spans };
         }
         std.debug.assert(index == self.blocks.items.len);
-        const spans = try highlight.spans(allocator, language, source);
-        errdefer allocator.free(spans);
+        var presented = try fragmentCode(allocator, language, source);
+        errdefer presented.deinit(allocator);
         try self.blocks.append(allocator, .{
             .language = language,
             .digest = digest,
-            .spans = spans,
+            .text = presented.text,
+            .spans = presented.spans,
         });
-        return spans;
+        return .{ .text = presented.text, .spans = presented.spans };
     }
 
     fn truncate(
@@ -248,11 +260,42 @@ pub const HighlightCache = struct {
         count: usize,
     ) void {
         while (self.blocks.items.len > count) {
-            const block = self.blocks.pop().?;
-            allocator.free(block.spans);
+            var block = self.blocks.pop().?;
+            block.deinit(allocator);
         }
     }
 };
+
+const FragmentCode = struct {
+    text: []u8,
+    spans: []highlight.Span,
+
+    fn deinit(self: *FragmentCode, allocator: std.mem.Allocator) void {
+        allocator.free(self.text);
+        allocator.free(self.spans);
+        self.* = undefined;
+    }
+};
+
+fn fragmentCode(
+    allocator: std.mem.Allocator,
+    language: highlight.Language,
+    source: []const u8,
+) !FragmentCode {
+    var presented = try backend.presentCodeFragment(
+        allocator,
+        @tagName(language),
+        source,
+    );
+    defer presented.deinit();
+    const text = try allocator.dupe(u8, presented.text);
+    errdefer allocator.free(text);
+    const spans = switch (presented.content) {
+        .source => |value| try allocator.dupe(highlight.Span, value.tokens),
+        .literal, .markdown => try allocator.alloc(highlight.Span, 0),
+    };
+    return .{ .text = text, .spans = spans };
+}
 
 pub fn combineStyle(base: vaxis.Style, markdown: Style) vaxis.Style {
     var result = base;
@@ -443,28 +486,33 @@ const Builder = struct {
     }
 
     fn flushCodeBlock(self: *Builder) !void {
-        const source = self.code_source.items;
-        var owned_highlights: ?[]highlight.Span = null;
-        defer if (owned_highlights) |spans| self.allocator.free(spans);
-        const highlighted: []const highlight.Span =
+        const raw_source = self.code_source.items;
+        var owned_code: ?FragmentCode = null;
+        defer if (owned_code) |*code| code.deinit(self.allocator);
+        const code: HighlightCache.Code =
             if (self.code_language) |language|
                 if (self.highlight_cache) |cache|
-                    try cache.spansFor(
+                    try cache.codeFor(
                         self.cache_allocator,
                         self.current_code_block_index,
                         language,
-                        source,
+                        raw_source,
                     )
                 else blk: {
-                    owned_highlights = try highlight.spans(
+                    owned_code = try fragmentCode(
                         self.allocator,
                         language,
-                        source,
+                        raw_source,
                     );
-                    break :blk owned_highlights.?;
+                    break :blk .{
+                        .text = owned_code.?.text,
+                        .spans = owned_code.?.spans,
+                    };
                 }
             else
-                &.{};
+                .{ .text = raw_source, .spans = &.{} };
+        const source = code.text;
+        const highlighted = code.spans;
 
         var line_start: usize = 0;
         while (line_start < source.len) {
@@ -1804,6 +1852,49 @@ test "fenced code applies tree-sitter syntax styles" {
         }
     }
     try std.testing.expect(saw_keyword and saw_number and saw_comment);
+}
+
+test "cached fenced code renders sanitized presentation text" {
+    var cache: HighlightCache = .{};
+    defer cache.deinit(std.testing.allocator);
+    const code = try cache.codeFor(
+        std.testing.allocator,
+        0,
+        .zig,
+        "const \x1b[31manswer\x1b[0m = 42;\r\n",
+    );
+    try std.testing.expectEqualStrings("const answer = 42;\n", code.text);
+    for (code.spans) |span| {
+        try std.testing.expect(span.end <= code.text.len);
+    }
+}
+
+test "cached fenced code includes bytes beyond parser limit in identity" {
+    var cache: HighlightCache = .{};
+    defer cache.deinit(std.testing.allocator);
+    const source_length = highlight.max_source_bytes + 1;
+    const first = try std.testing.allocator.alloc(u8, source_length);
+    defer std.testing.allocator.free(first);
+    @memset(first, 'a');
+    const second = try std.testing.allocator.dupe(u8, first);
+    defer std.testing.allocator.free(second);
+    second[source_length - 1] = 'b';
+
+    const initial = try cache.codeFor(
+        std.testing.allocator,
+        0,
+        .zig,
+        first,
+    );
+    try std.testing.expectEqual('a', initial.text[source_length - 1]);
+
+    const updated = try cache.codeFor(
+        std.testing.allocator,
+        0,
+        .zig,
+        second,
+    );
+    try std.testing.expectEqual('b', updated.text[source_length - 1]);
 }
 
 test "fenced code parses multiline syntax as one document" {

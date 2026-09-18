@@ -5,6 +5,11 @@ import XCTest
 
 @MainActor
 final class ViviBackendRuntimeTests: XCTestCase {
+  override func setUp() {
+    super.setUp()
+    CodePresentationCache.shared.removeAll()
+  }
+
   func testReducerCreatesAssistantLazilyAfterReasoning() {
     let driver = FakeConversationDriver()
     let store = NativeChatStore(workspace: "/tmp/Vivi chat", driver: driver)
@@ -14,7 +19,7 @@ final class ViviBackendRuntimeTests: XCTestCase {
     store.draft = "Write a haiku"
     store.submit()
     store.reduce(.assistantStarted)
-    XCTAssertEqual(store.transcript.count, 2)
+    XCTAssertEqual(store.transcript.count, 1)
     store.reduce(.reasoningComplete("finished thought"))
     store.reduce(.assistantDelta("old "))
     store.reduce(.assistantComplete("new answer"))
@@ -29,6 +34,49 @@ final class ViviBackendRuntimeTests: XCTestCase {
         .reasoning(id: store.transcript[2].id, text: "finished thought"),
         .assistant(id: store.transcript[3].id, text: "new answer"),
       ])
+  }
+
+  func testAssistantHeaderWaitsForFirstStreamEventAndAppearsOnce() {
+    let store = NativeChatStore(workspace: "/tmp/work", driver: FakeConversationDriver())
+
+    store.reduce(.assistantStarted)
+    store.reduce(.reasoningDelta(""))
+    store.reduce(.assistantComplete(""))
+
+    XCTAssertTrue(store.transcript.isEmpty)
+
+    store.reduce(.reasoningDelta("thinking"))
+    store.reduce(.reasoningComplete("thinking"))
+    store.reduce(.assistantDelta("answer"))
+    store.reduce(.assistantComplete("answer"))
+
+    XCTAssertEqual(store.transcript.count, 3)
+    guard case .assistantHeader = store.transcript[0],
+      case .reasoning = store.transcript[1],
+      case .assistant = store.transcript[2]
+    else { return XCTFail("Expected one lazy header before streamed response content") }
+  }
+
+  func testToolStartRevealsAssistantHeader() {
+    let store = NativeChatStore(workspace: "/tmp/work", driver: FakeConversationDriver())
+
+    store.reduce(.assistantStarted)
+    store.reduce(
+      .toolStarted(
+        ToolActivity(
+          callID: "call-1",
+          title: "Read file",
+          detail: "README.md",
+          input: #"{"path":"README.md"}"#,
+          inputPresentation: .literal(#"{"path":"README.md"}"#),
+          result: .running,
+          output: nil,
+          outputPresentation: nil)))
+
+    XCTAssertEqual(store.transcript.count, 2)
+    guard case .assistantHeader = store.transcript[0],
+      case .tool = store.transcript[1]
+    else { return XCTFail("Expected one lazy header before the first tool event") }
   }
 
   func testBusySubmitPreservesDraft() {
@@ -107,8 +155,10 @@ final class ViviBackendRuntimeTests: XCTestCase {
       title: "Read file",
       detail: "README.md",
       input: #"{"path":"README.md"}"#,
+      inputPresentation: .literal(#"{"path":"README.md"}"#),
       result: .running,
-      output: "")
+      output: nil,
+      outputPresentation: nil)
 
     store.reduce(.assistantStarted)
     store.reduce(.reasoningComplete("before"))
@@ -126,6 +176,77 @@ final class ViviBackendRuntimeTests: XCTestCase {
     XCTAssertEqual(inserted, tool)
   }
 
+  func testLateReasoningCompletionReplacesStreamedReasoningBeforeAssistantResponse() {
+    let store = NativeChatStore(workspace: "/tmp/work", driver: FakeConversationDriver())
+
+    store.reduce(.assistantStarted)
+    store.reduce(.reasoningComplete("before tool"))
+    store.reduce(
+      .toolStarted(
+        ToolActivity(
+          callID: "call-1",
+          title: "Read file",
+          detail: "README.md",
+          input: #"{"path":"README.md"}"#,
+          inputPresentation: .literal(#"{"path":"README.md"}"#),
+          result: .running,
+          output: nil,
+          outputPresentation: nil)))
+    store.reduce(.reasoningComplete("after tool"))
+    store.reduce(.assistantComplete("answer"))
+    store.reduce(.reasoningComplete("after tool"))
+
+    XCTAssertEqual(store.transcript.count, 5)
+    guard case .assistantHeader = store.transcript[0],
+      case .reasoning(_, "before tool") = store.transcript[1],
+      case .tool = store.transcript[2],
+      case .reasoning(_, "after tool") = store.transcript[3],
+      case .assistant(_, "answer") = store.transcript[4]
+    else { return XCTFail("Expected completed reasoning to replace the streamed reasoning") }
+  }
+
+  func testLateReasoningCompletionAfterToolCreatesNewSegment() {
+    let store = NativeChatStore(workspace: "/tmp/work", driver: FakeConversationDriver())
+
+    store.reduce(.assistantStarted)
+    store.reduce(.reasoningComplete("before tool"))
+    store.reduce(
+      .toolStarted(
+        ToolActivity(
+          callID: "call-1",
+          title: "Read file",
+          detail: "README.md",
+          input: #"{"path":"README.md"}"#,
+          inputPresentation: .literal(#"{"path":"README.md"}"#),
+          result: .running,
+          output: nil,
+          outputPresentation: nil)))
+    store.reduce(.assistantComplete("answer"))
+    store.reduce(.reasoningComplete("after tool"))
+
+    XCTAssertEqual(store.transcript.count, 5)
+    guard case .assistantHeader = store.transcript[0],
+      case .reasoning(_, "before tool") = store.transcript[1],
+      case .tool = store.transcript[2],
+      case .reasoning(_, "after tool") = store.transcript[3],
+      case .assistant(_, "answer") = store.transcript[4]
+    else { return XCTFail("Expected late reasoning after the tool and before the assistant") }
+  }
+
+  func testLateFirstReasoningInsertsBeforeAssistantResponse() {
+    let store = NativeChatStore(workspace: "/tmp/work", driver: FakeConversationDriver())
+
+    store.reduce(.assistantStarted)
+    store.reduce(.assistantComplete("answer"))
+    store.reduce(.reasoningComplete("late reasoning"))
+
+    XCTAssertEqual(store.transcript.count, 3)
+    guard case .assistantHeader = store.transcript[0],
+      case .reasoning(_, "late reasoning") = store.transcript[1],
+      case .assistant(_, "answer") = store.transcript[2]
+    else { return XCTFail("Expected late reasoning before the assistant response") }
+  }
+
   func testEmptyToolRequestCompletionDoesNotCreateAssistantRow() {
     let store = NativeChatStore(workspace: "/tmp/work", driver: FakeConversationDriver())
     let tool = ToolActivity(
@@ -133,13 +254,20 @@ final class ViviBackendRuntimeTests: XCTestCase {
       title: "Read file",
       detail: "README.md",
       input: #"{"path":"README.md"}"#,
+      inputPresentation: .literal(#"{"path":"README.md"}"#),
       result: .running,
-      output: "")
+      output: nil,
+      outputPresentation: nil)
 
     store.reduce(.assistantStarted)
     store.reduce(.assistantComplete(""))
     store.reduce(.toolStarted(tool))
-    store.reduce(.toolFinished(callID: "call-1", result: .succeeded, output: "contents"))
+    store.reduce(
+      .toolFinished(
+        callID: "call-1",
+        result: .succeeded,
+        output: Data("contents".utf8),
+        presentation: .literal("contents")))
     store.reduce(.assistantDelta("done"))
     store.reduce(.assistantComplete("done"))
 
@@ -148,7 +276,8 @@ final class ViviBackendRuntimeTests: XCTestCase {
       case .tool(_, let finished) = store.transcript[1],
       case .assistant(_, "done") = store.transcript[2]
     else { return XCTFail("Expected header and tool followed by assistant without an empty row") }
-    XCTAssertEqual(finished.output, "contents")
+    XCTAssertEqual(finished.output, Data("contents".utf8))
+    XCTAssertEqual(finished.outputPresentation, .literal("contents"))
     XCTAssertEqual(finished.result, .succeeded)
   }
 
@@ -173,13 +302,20 @@ final class ViviBackendRuntimeTests: XCTestCase {
       callID: "call-1",
       title: "Run command",
       detail: "zig build test",
-      input: #"{"command":"zig build test"}"#,
+      input: #"{"command":"zig build test","timeout":300}"#,
+      inputPresentation: .source(text: "zig build test", language: .bash, spans: []),
       result: .running,
-      output: "")
+      output: nil,
+      outputPresentation: nil)
     store.reduce(.toolStarted(tool))
     let originalID = store.transcript[0].id
 
-    store.reduce(.toolFinished(callID: "call-1", result: .succeeded, output: "**passed**"))
+    store.reduce(
+      .toolFinished(
+        callID: "call-1",
+        result: .succeeded,
+        output: Data("passed".utf8),
+        presentation: .markdown("**passed**")))
 
     XCTAssertEqual(store.transcript.count, 1)
     XCTAssertEqual(store.transcript[0].id, originalID)
@@ -187,7 +323,61 @@ final class ViviBackendRuntimeTests: XCTestCase {
       return XCTFail("Expected tool row")
     }
     XCTAssertEqual(finished.result, .succeeded)
-    XCTAssertEqual(finished.output, "**passed**")
+    XCTAssertEqual(finished.output, Data("passed".utf8))
+    XCTAssertEqual(finished.outputPresentation, .markdown("**passed**"))
+  }
+
+  func testBashInputLayoutKeepsCanonicalFieldsAndStylesCommand() {
+    let presentation = ToolPresentation.source(
+      text: "zig build test",
+      language: .bash,
+      spans: [SemanticSpan(byteRange: 0..<3, token: .function)])
+    let input = #"{"command":"zig build test","timeout":300}"#
+
+    XCTAssertEqual(
+      toolInputLayout(
+        input: input,
+        presentation: presentation),
+      .presentationWithCanonicalJSON(presentation, input))
+  }
+
+  func testBashInputLayoutPreservesExactNumericLexeme() {
+    let presentation = ToolPresentation.source(
+      text: "printf value",
+      language: .bash,
+      spans: [])
+    let input =
+      #"{"command":"printf value","ratio":0.10000000000000001,"count":9223372036854775808}"#
+
+    XCTAssertEqual(
+      toolInputLayout(input: input, presentation: presentation),
+      .presentationWithCanonicalJSON(presentation, input))
+  }
+
+  func testLiteralInputLayoutDoesNotDuplicateCanonicalInput() {
+    let input = #"{"path":"README.md"}"#
+
+    XCTAssertEqual(
+      toolInputLayout(input: input, presentation: .literal(input)),
+      .presentation(.literal(input)))
+  }
+
+  func testToolInputVisibilityUsesCanonicalInput() {
+    XCTAssertTrue(toolInputIsVisible(input: #"{"command":"\u001b"}"#))
+    XCTAssertFalse(toolInputIsVisible(input: ""))
+  }
+
+  func testNonBashSourceInputKeepsExistingPresentation() {
+    let presentation = ToolPresentation.source(
+      text: "const value = 1;",
+      language: .zig,
+      spans: [])
+
+    XCTAssertEqual(
+      toolInputLayout(
+        input: #"{"source":"const value = 1;","path":"main.zig"}"#,
+        presentation: presentation),
+      .presentation(presentation))
   }
 
   func testMarkdownRendererPreservesBlockStructureAndInlineFormatting() {
@@ -207,6 +397,35 @@ final class ViviBackendRuntimeTests: XCTestCase {
       rendered.map { String($0.content.characters) },
       ["Structure", "Core", "backend/ — domain", "cli/ — terminal"])
     XCTAssertFalse(rendered.map { String($0.content.characters) }.joined().contains("**"))
+  }
+
+  func testMarkdownRendererReusesIdenticalFencePresentation() {
+    let cache = CodePresentationCache(capacity: 2)
+    var loads = 0
+    let source = """
+      ```zig
+      const answer = 42;
+      ```
+      """
+
+    func render() -> [MarkdownBlock] {
+      markdownBlocks(
+        source,
+        codePresentationCache: cache
+      ) { language, source in
+        loads += 1
+        return .source(text: source, language: language == "zig" ? .zig : .bash, spans: [])
+      }
+    }
+
+    let first = render()
+    let second = render()
+
+    XCTAssertEqual(first, second)
+    XCTAssertEqual(loads, 1)
+    XCTAssertEqual(
+      first.compactMap(\.codePresentation),
+      [.source(text: "const answer = 42;\n", language: .zig, spans: [])])
   }
 
   func testRefreshFailureRetainsCatalogAndFailedSwitchRetainsSelection() {
@@ -379,15 +598,199 @@ final class ViviBackendRuntimeTests: XCTestCase {
   }
 
   func testDecoderCopiesToolStartFields() throws {
-    let bytes = Array(#"call-1Read fileREADME.md{"path":"README.md"}"#.utf8)
+    let callID = Array("call-1".utf8)
+    let title = Array("Run command".utf8)
+    let detail = Array("zig build test".utf8)
+    let input = Array(#"{"command":"zig build test","timeout":300}"#.utf8)
+    let presentation = Array("zig build test".utf8)
+    let bytes = callID + title + detail + input + presentation
     var event = vivi_backend_event_t()
     event.kind = VIVI_BACKEND_EVENT_TOOL_STARTED
     event.content_kind = VIVI_BACKEND_CONTENT_TOOL
     event.byte_count = UInt32(bytes.count)
-    event.tool_call_id = vivi_backend_span_t(offset: 0, length: 6)
-    event.tool_title = vivi_backend_span_t(offset: 6, length: 9)
-    event.tool_detail = vivi_backend_span_t(offset: 15, length: 9)
-    event.tool_input = vivi_backend_span_t(offset: 24, length: 20)
+    event.tool_call_id = vivi_backend_span_t(offset: 0, length: UInt32(callID.count))
+    event.tool_title = vivi_backend_span_t(
+      offset: UInt32(callID.count),
+      length: UInt32(title.count))
+    event.tool_detail = vivi_backend_span_t(
+      offset: UInt32(callID.count + title.count),
+      length: UInt32(detail.count))
+    event.tool_input = vivi_backend_span_t(
+      offset: UInt32(callID.count + title.count + detail.count),
+      length: UInt32(input.count))
+    event.tool_input_presentation = vivi_backend_presentation_t(
+      content: vivi_backend_span_t(
+        offset: UInt32(callID.count + title.count + detail.count + input.count),
+        length: UInt32(presentation.count)),
+      kind: VIVI_BACKEND_PRESENTATION_SOURCE,
+      language: VIVI_BACKEND_LANGUAGE_BASH,
+      semantic_span_offset: 0,
+      semantic_span_count: 0,
+      reserved: 0)
+    event.tool_result = VIVI_BACKEND_TOOL_RESULT_RUNNING
+
+    XCTAssertEqual(
+      try NativeEventDecoder.decode(event, bytes: bytes, models: []),
+      .toolStarted(
+        ToolActivity(
+          callID: "call-1",
+          title: "Run command",
+          detail: "zig build test",
+          input: #"{"command":"zig build test","timeout":300}"#,
+          inputPresentation: .source(
+            text: "zig build test",
+            language: .bash,
+            spans: []),
+          result: .running,
+          output: nil,
+          outputPresentation: nil)))
+  }
+
+  func testMalformedToolInputDecodesAndCompletesAsFailedTool() throws {
+    let callID = Array("call-1".utf8)
+    let title = Array("Read file".utf8)
+    let detail = Array("Invalid arguments".utf8)
+    let input = Array(#"{"path":"#.utf8)
+    let inputPresentation = Array(#"{"path":"#.utf8)
+    let startBytes = callID + title + detail + input + inputPresentation
+    var start = vivi_backend_event_t()
+    start.kind = VIVI_BACKEND_EVENT_TOOL_STARTED
+    start.content_kind = VIVI_BACKEND_CONTENT_TOOL
+    start.byte_count = UInt32(startBytes.count)
+    start.tool_call_id = vivi_backend_span_t(offset: 0, length: UInt32(callID.count))
+    start.tool_title = vivi_backend_span_t(
+      offset: UInt32(callID.count),
+      length: UInt32(title.count))
+    start.tool_detail = vivi_backend_span_t(
+      offset: UInt32(callID.count + title.count),
+      length: UInt32(detail.count))
+    start.tool_input = vivi_backend_span_t(
+      offset: UInt32(callID.count + title.count + detail.count),
+      length: UInt32(input.count))
+    start.tool_input_presentation = vivi_backend_presentation_t(
+      content: vivi_backend_span_t(
+        offset: UInt32(callID.count + title.count + detail.count + input.count),
+        length: UInt32(inputPresentation.count)),
+      kind: VIVI_BACKEND_PRESENTATION_LITERAL,
+      language: VIVI_BACKEND_LANGUAGE_NONE,
+      semantic_span_offset: 0,
+      semantic_span_count: 0,
+      reserved: 0)
+    start.tool_result = VIVI_BACKEND_TOOL_RESULT_RUNNING
+
+    let failure = Array("Invalid read arguments: SyntaxError.".utf8)
+    let finishBytes = callID + failure + failure
+    var finish = vivi_backend_event_t()
+    finish.kind = VIVI_BACKEND_EVENT_TOOL_FINISHED
+    finish.content_kind = VIVI_BACKEND_CONTENT_TOOL
+    finish.byte_count = UInt32(finishBytes.count)
+    finish.tool_call_id = vivi_backend_span_t(offset: 0, length: UInt32(callID.count))
+    finish.content = vivi_backend_span_t(
+      offset: UInt32(callID.count),
+      length: UInt32(failure.count))
+    finish.tool_output_presentation = vivi_backend_presentation_t(
+      content: vivi_backend_span_t(
+        offset: UInt32(callID.count + failure.count),
+        length: UInt32(failure.count)),
+      kind: VIVI_BACKEND_PRESENTATION_LITERAL,
+      language: VIVI_BACKEND_LANGUAGE_NONE,
+      semantic_span_offset: 0,
+      semantic_span_count: 0,
+      reserved: 0)
+    finish.tool_result = VIVI_BACKEND_TOOL_RESULT_FAILED
+
+    let store = NativeChatStore(workspace: "/tmp/work", driver: FakeConversationDriver())
+    store.reduce(try NativeEventDecoder.decode(start, bytes: startBytes, models: []))
+    store.reduce(try NativeEventDecoder.decode(finish, bytes: finishBytes, models: []))
+
+    guard case .tool(_, let activity) = store.transcript.first else {
+      return XCTFail("Expected failed tool row")
+    }
+    XCTAssertEqual(activity.input, #"{"path":"#)
+    XCTAssertEqual(activity.inputPresentation, .literal(#"{"path":"#))
+    XCTAssertEqual(activity.result, .failed)
+    XCTAssertEqual(activity.output, Data(failure))
+    XCTAssertEqual(activity.outputPresentation, .literal(String(decoding: failure, as: UTF8.self)))
+    XCTAssertNotEqual(store.lifecycle, .closed)
+  }
+
+  func testDecoderCopiesUnicodeSourcePresentation() throws {
+    let callID = Array("call-1".utf8)
+    let output = Array("raw result".utf8)
+    let source = Array("const café = true;\n".utf8)
+    let bytes = callID + output + source
+    var event = vivi_backend_event_t()
+    event.kind = VIVI_BACKEND_EVENT_TOOL_FINISHED
+    event.content_kind = VIVI_BACKEND_CONTENT_TOOL
+    event.byte_count = UInt32(bytes.count)
+    event.semantic_span_count = 2
+    event.tool_call_id = vivi_backend_span_t(offset: 0, length: UInt32(callID.count))
+    event.content = vivi_backend_span_t(
+      offset: UInt32(callID.count),
+      length: UInt32(output.count))
+    event.tool_result = VIVI_BACKEND_TOOL_RESULT_SUCCEEDED
+    event.tool_output_presentation = vivi_backend_presentation_t(
+      content: vivi_backend_span_t(
+        offset: UInt32(callID.count + output.count),
+        length: UInt32(source.count)),
+      kind: VIVI_BACKEND_PRESENTATION_SOURCE,
+      language: VIVI_BACKEND_LANGUAGE_ZIG,
+      semantic_span_offset: 0,
+      semantic_span_count: 2,
+      reserved: 0)
+    let spans = [
+      vivi_backend_semantic_span_t(
+        bytes: vivi_backend_span_t(
+          offset: UInt32(callID.count + output.count),
+          length: 5),
+        token: VIVI_BACKEND_TOKEN_KEYWORD,
+        reserved: 0),
+      vivi_backend_semantic_span_t(
+        bytes: vivi_backend_span_t(
+          offset: UInt32(callID.count + output.count + 14),
+          length: 4),
+        token: VIVI_BACKEND_TOKEN_CONSTANT,
+        reserved: 0),
+    ]
+
+    XCTAssertEqual(
+      try NativeEventDecoder.decode(event, bytes: bytes, models: [], semanticSpans: spans),
+      .toolFinished(
+        callID: "call-1",
+        result: .succeeded,
+        output: Data(output),
+        presentation: .source(
+          text: "const café = true;\n",
+          language: .zig,
+          spans: [
+            .init(byteRange: 0..<5, token: .keyword),
+            .init(byteRange: 14..<18, token: .constant),
+          ])))
+  }
+
+  func testDecoderPreservesInvalidCanonicalToolInputJSON() throws {
+    let callID = Array("call-1".utf8)
+    let title = Array("Read file".utf8)
+    let input = Array(#"{"path":"README.md""#.utf8)
+    let bytes = callID + title + input
+    var event = vivi_backend_event_t()
+    event.kind = VIVI_BACKEND_EVENT_TOOL_STARTED
+    event.content_kind = VIVI_BACKEND_CONTENT_TOOL
+    event.byte_count = UInt32(bytes.count)
+    event.tool_call_id = vivi_backend_span_t(offset: 0, length: UInt32(callID.count))
+    event.tool_title = vivi_backend_span_t(
+      offset: UInt32(callID.count),
+      length: UInt32(title.count))
+    event.tool_input = vivi_backend_span_t(
+      offset: UInt32(callID.count + title.count),
+      length: UInt32(input.count))
+    event.tool_input_presentation = vivi_backend_presentation_t(
+      content: event.tool_input,
+      kind: VIVI_BACKEND_PRESENTATION_LITERAL,
+      language: VIVI_BACKEND_LANGUAGE_NONE,
+      semantic_span_offset: 0,
+      semantic_span_count: 0,
+      reserved: 0)
     event.tool_result = VIVI_BACKEND_TOOL_RESULT_RUNNING
 
     XCTAssertEqual(
@@ -396,10 +799,155 @@ final class ViviBackendRuntimeTests: XCTestCase {
         ToolActivity(
           callID: "call-1",
           title: "Read file",
-          detail: "README.md",
-          input: #"{"path":"README.md"}"#,
+          detail: "",
+          input: #"{"path":"README.md""#,
+          inputPresentation: .literal(#"{"path":"README.md""#),
           result: .running,
-          output: "")))
+          output: nil,
+          outputPresentation: nil)))
+  }
+
+  func testDecoderRejectsInvalidUTF8CanonicalToolInput() {
+    let callID = Array("call-1".utf8)
+    let title = Array("Read file".utf8)
+    let presentation = Array("{}".utf8)
+    let bytes = callID + title + [UInt8(0xff)] + presentation
+    var event = vivi_backend_event_t()
+    event.kind = VIVI_BACKEND_EVENT_TOOL_STARTED
+    event.content_kind = VIVI_BACKEND_CONTENT_TOOL
+    event.byte_count = UInt32(bytes.count)
+    event.tool_call_id = vivi_backend_span_t(offset: 0, length: UInt32(callID.count))
+    event.tool_title = vivi_backend_span_t(
+      offset: UInt32(callID.count),
+      length: UInt32(title.count))
+    event.tool_input = vivi_backend_span_t(
+      offset: UInt32(callID.count + title.count),
+      length: 1)
+    event.tool_input_presentation = vivi_backend_presentation_t(
+      content: vivi_backend_span_t(
+        offset: UInt32(callID.count + title.count + 1),
+        length: UInt32(presentation.count)),
+      kind: VIVI_BACKEND_PRESENTATION_LITERAL,
+      language: VIVI_BACKEND_LANGUAGE_NONE,
+      semantic_span_offset: 0,
+      semantic_span_count: 0,
+      reserved: 0)
+    event.tool_result = VIVI_BACKEND_TOOL_RESULT_RUNNING
+
+    XCTAssertThrowsError(try NativeEventDecoder.decode(event, bytes: bytes, models: []))
+  }
+
+  func testDecoderRejectsOutOfBoundsCanonicalToolInput() {
+    let bytes = Array(#"call-1Read file{"path":"README.md"}"#.utf8)
+    var event = vivi_backend_event_t()
+    event.kind = VIVI_BACKEND_EVENT_TOOL_STARTED
+    event.content_kind = VIVI_BACKEND_CONTENT_TOOL
+    event.byte_count = UInt32(bytes.count)
+    event.tool_call_id = vivi_backend_span_t(offset: 0, length: 6)
+    event.tool_title = vivi_backend_span_t(offset: 6, length: 9)
+    event.tool_input = vivi_backend_span_t(offset: UInt32(bytes.count), length: 1)
+    event.tool_input_presentation = vivi_backend_presentation_t(
+      content: vivi_backend_span_t(offset: 15, length: 20),
+      kind: VIVI_BACKEND_PRESENTATION_LITERAL,
+      language: VIVI_BACKEND_LANGUAGE_NONE,
+      semantic_span_offset: 0,
+      semantic_span_count: 0,
+      reserved: 0)
+    event.tool_result = VIVI_BACKEND_TOOL_RESULT_RUNNING
+
+    XCTAssertThrowsError(try NativeEventDecoder.decode(event, bytes: bytes, models: []))
+  }
+
+  func testDecoderRejectsPresentationSpanInsideUnicodeScalar() {
+    let callID = Array("call-1".utf8)
+    let source = Array("é".utf8)
+    let bytes = callID + source
+    var event = vivi_backend_event_t()
+    event.kind = VIVI_BACKEND_EVENT_TOOL_FINISHED
+    event.content_kind = VIVI_BACKEND_CONTENT_TOOL
+    event.byte_count = UInt32(bytes.count)
+    event.semantic_span_count = 1
+    event.tool_call_id = vivi_backend_span_t(offset: 0, length: UInt32(callID.count))
+    event.tool_result = VIVI_BACKEND_TOOL_RESULT_SUCCEEDED
+    event.tool_output_presentation = vivi_backend_presentation_t(
+      content: vivi_backend_span_t(offset: UInt32(callID.count), length: 2),
+      kind: VIVI_BACKEND_PRESENTATION_SOURCE,
+      language: VIVI_BACKEND_LANGUAGE_ZIG,
+      semantic_span_offset: 0,
+      semantic_span_count: 1,
+      reserved: 0)
+    let spans = [
+      vivi_backend_semantic_span_t(
+        bytes: vivi_backend_span_t(offset: UInt32(callID.count + 1), length: 1),
+        token: VIVI_BACKEND_TOKEN_STRING,
+        reserved: 0)
+    ]
+
+    XCTAssertThrowsError(
+      try NativeEventDecoder.decode(event, bytes: bytes, models: [], semanticSpans: spans))
+  }
+
+  func testDecoderUsesSafePresentationWhenCanonicalToolResultIsInvalidUTF8() throws {
+    let callID = Array("call-1".utf8)
+    let safe = Array("\\xff".utf8)
+    let bytes = [UInt8(0xff)] + callID + safe
+    var event = vivi_backend_event_t()
+    event.kind = VIVI_BACKEND_EVENT_TOOL_FINISHED
+    event.content_kind = VIVI_BACKEND_CONTENT_TOOL
+    event.byte_count = UInt32(bytes.count)
+    event.content = vivi_backend_span_t(offset: 0, length: 1)
+    event.tool_call_id = vivi_backend_span_t(offset: 1, length: UInt32(callID.count))
+    event.tool_result = VIVI_BACKEND_TOOL_RESULT_SUCCEEDED
+    event.tool_output_presentation = vivi_backend_presentation_t(
+      content: vivi_backend_span_t(
+        offset: UInt32(1 + callID.count),
+        length: UInt32(safe.count)),
+      kind: VIVI_BACKEND_PRESENTATION_LITERAL,
+      language: VIVI_BACKEND_LANGUAGE_NONE,
+      semantic_span_offset: 0,
+      semantic_span_count: 0,
+      reserved: 0)
+
+    XCTAssertEqual(
+      try NativeEventDecoder.decode(event, bytes: bytes, models: []),
+      .toolFinished(
+        callID: "call-1",
+        result: .succeeded,
+        output: Data([0xff]),
+        presentation: .literal("\\xff")))
+  }
+
+  func testDecoderRejectsOutOfBoundsCanonicalToolOutput() {
+    let bytes = Array("call-1safe".utf8)
+    var event = vivi_backend_event_t()
+    event.kind = VIVI_BACKEND_EVENT_TOOL_FINISHED
+    event.content_kind = VIVI_BACKEND_CONTENT_TOOL
+    event.byte_count = UInt32(bytes.count)
+    event.content = vivi_backend_span_t(offset: UInt32(bytes.count), length: 1)
+    event.tool_call_id = vivi_backend_span_t(offset: 0, length: 6)
+    event.tool_result = VIVI_BACKEND_TOOL_RESULT_SUCCEEDED
+    event.tool_output_presentation = vivi_backend_presentation_t(
+      content: vivi_backend_span_t(offset: 6, length: 4),
+      kind: VIVI_BACKEND_PRESENTATION_LITERAL,
+      language: VIVI_BACKEND_LANGUAGE_NONE,
+      semantic_span_offset: 0,
+      semantic_span_count: 0,
+      reserved: 0)
+
+    XCTAssertThrowsError(try NativeEventDecoder.decode(event, bytes: bytes, models: []))
+  }
+
+  func testNativeCodePresentationHighlightsKnownAndLiteralsUnknownLanguages() throws {
+    guard
+      case .source(let text, let language, let spans) =
+        try nativeCodePresentation(language: "python3", source: "return \"hi\"\n")
+    else { return XCTFail("Expected source presentation") }
+    XCTAssertEqual(text, "return \"hi\"\n")
+    XCTAssertEqual(language, .python)
+    XCTAssertFalse(spans.isEmpty)
+    XCTAssertEqual(
+      try nativeCodePresentation(language: "unknown", source: "\u{001B}[31mtext"),
+      .literal("\\x1b[31mtext"))
   }
 
   func testNativeChatURLProducesWorkspaceOnlyRequest() {

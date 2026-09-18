@@ -102,13 +102,65 @@ enum ToolResultState: Equatable {
   case image
 }
 
+enum PresentationLanguage: Int32, Equatable {
+  case zig = 1
+  case bash = 2
+  case json = 3
+  case yaml = 4
+  case diff = 5
+  case javascript = 6
+  case typescript = 7
+  case tsx = 8
+  case rust = 9
+  case c = 10
+  case cpp = 11
+  case go = 12
+  case java = 13
+  case lua = 14
+  case python = 15
+}
+
+enum SemanticToken: Int32, Equatable {
+  case comment = 1
+  case string = 2
+  case number = 3
+  case constant = 4
+  case keyword = 5
+  case function = 6
+  case property = 7
+  case `operator` = 8
+  case inserted = 9
+  case deleted = 10
+  case meta = 11
+}
+
+struct SemanticSpan: Equatable {
+  let byteRange: Range<Int>
+  let token: SemanticToken
+}
+
+enum ToolPresentation: Equatable {
+  case literal(String)
+  case markdown(String)
+  case source(text: String, language: PresentationLanguage, spans: [SemanticSpan])
+
+  var text: String {
+    switch self {
+    case .literal(let text), .markdown(let text), .source(let text, _, _):
+      text
+    }
+  }
+}
+
 struct ToolActivity: Equatable {
   let callID: String
   let title: String
   let detail: String
   let input: String
+  let inputPresentation: ToolPresentation
   var result: ToolResultState
-  var output: String
+  var output: Data?
+  var outputPresentation: ToolPresentation?
 }
 
 enum ChatItem: Identifiable, Equatable {
@@ -138,7 +190,7 @@ enum ChatItem: Identifiable, Equatable {
       .status(_, let text), .failure(_, let text):
       text
     case .tool(_, let activity):
-      activity.output
+      activity.outputPresentation?.text ?? ""
     }
   }
 }
@@ -153,7 +205,12 @@ enum ChatEvent: Equatable {
   case assistantDelta(String)
   case assistantComplete(String)
   case toolStarted(ToolActivity)
-  case toolFinished(callID: String, result: ToolResultState, output: String)
+  case toolFinished(
+    callID: String,
+    result: ToolResultState,
+    output: Data,
+    presentation: ToolPresentation
+  )
   case modelCatalog(ModelCatalog)
   case modelCatalogFailure(String)
   case modelSwitch(ModelSwitchOutcome)
@@ -191,7 +248,9 @@ final class NativeChatStore: ObservableObject {
   let workspace: String
   private var activeAssistant: UUID?
   private var activeReasoning: UUID?
+  private var pendingReasoningCompletion: UUID?
   private var activeReasoningPrefix = ""
+  private var responseHeaderVisible = false
   private let driver: ViviConversationDriving
   private var closeCompletions: [@MainActor () -> Void] = []
 
@@ -259,6 +318,7 @@ final class NativeChatStore: ObservableObject {
       return
     }
     finishStreamingRows()
+    responseHeaderVisible = false
     transcript.append(.user(id: UUID(), text: prompt))
     draft = ""
     lifecycle = .responding
@@ -319,8 +379,9 @@ final class NativeChatStore: ObservableObject {
     case .assistantStarted:
       activeAssistant = nil
       activeReasoning = nil
+      pendingReasoningCompletion = nil
       activeReasoningPrefix = ""
-      transcript.append(.assistantHeader(id: UUID()))
+      responseHeaderVisible = false
       lifecycle = .responding
     case .reasoningDelta(let text):
       updateReasoning(text, append: true)
@@ -336,7 +397,9 @@ final class NativeChatStore: ObservableObject {
       }
       activeAssistant = nil
     case .toolStarted(let activity):
+      ensureResponseHeader()
       activeReasoning = nil
+      pendingReasoningCompletion = nil
       activeReasoningPrefix = ""
       activeAssistant = nil
       if let index = transcript.firstIndex(where: { item in
@@ -348,7 +411,7 @@ final class NativeChatStore: ObservableObject {
       } else {
         transcript.append(.tool(id: UUID(), activity: activity))
       }
-    case .toolFinished(let callID, let result, let output):
+    case .toolFinished(let callID, let result, let output, let presentation):
       guard
         let index = transcript.firstIndex(where: { item in
           guard case .tool(_, let activity) = item else { return false }
@@ -357,6 +420,7 @@ final class NativeChatStore: ObservableObject {
       else { break }
       activity.result = result
       activity.output = output
+      activity.outputPresentation = presentation
       transcript[index] = .tool(id: id, activity: activity)
     case .modelCatalog(let catalog):
       self.catalog = catalog
@@ -372,6 +436,7 @@ final class NativeChatStore: ObservableObject {
     case .idle:
       activeAssistant = nil
       activeReasoning = nil
+      pendingReasoningCompletion = nil
       activeReasoningPrefix = ""
       lifecycle = .idle
     case .failure(let message):
@@ -380,6 +445,7 @@ final class NativeChatStore: ObservableObject {
     case .closed:
       activeAssistant = nil
       activeReasoning = nil
+      pendingReasoningCompletion = nil
       activeReasoningPrefix = ""
       finishClose()
     }
@@ -449,18 +515,32 @@ final class NativeChatStore: ObservableObject {
   }
 
   private func updateReasoning(_ text: String, append: Bool) {
+    guard activeReasoning != nil || !text.isEmpty else { return }
+    ensureResponseHeader()
     var startsNewSegment = false
     if activeReasoning == nil {
       activeAssistant = nil
       if case .reasoning(let id, let existing) = transcript.last {
         activeReasoning = id
+        pendingReasoningCompletion = id
         activeReasoningPrefix = existing.isEmpty ? "" : existing + "\n\n"
         startsNewSegment = true
+      } else if case .assistant = transcript.last,
+        let id = pendingReasoningCompletion
+      {
+        activeReasoning = id
+        activeReasoningPrefix = ""
       } else {
         let id = UUID()
         activeReasoning = id
+        pendingReasoningCompletion = id
         activeReasoningPrefix = ""
-        transcript.append(.reasoning(id: id, text: ""))
+        let item = ChatItem.reasoning(id: id, text: "")
+        if case .assistant = transcript.last {
+          transcript.insert(item, at: transcript.count - 1)
+        } else {
+          transcript.append(item)
+        }
       }
     }
     guard let id = activeReasoning,
@@ -488,12 +568,14 @@ final class NativeChatStore: ObservableObject {
   private func finishStreamingRows() {
     activeAssistant = nil
     activeReasoning = nil
+    pendingReasoningCompletion = nil
     activeReasoningPrefix = ""
   }
 
   private func replaceActiveAssistant(_ text: String, append: Bool) {
     if activeAssistant == nil {
       guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+      ensureResponseHeader()
       let id = UUID()
       activeAssistant = id
       activeReasoning = nil
@@ -504,6 +586,12 @@ final class NativeChatStore: ObservableObject {
       case .assistant(_, let existing) = transcript[index]
     else { return }
     transcript[index] = .assistant(id: id, text: append ? existing + text : text)
+  }
+
+  private func ensureResponseHeader() {
+    guard lifecycle == .responding, !responseHeaderVisible else { return }
+    responseHeaderVisible = true
+    transcript.append(.assistantHeader(id: UUID()))
   }
 
   private func message(for result: ConversationOperationResult, action: String) -> String {
@@ -530,9 +618,58 @@ enum MarkdownBlockKind: Equatable {
 struct MarkdownBlock: Equatable {
   let kind: MarkdownBlockKind
   var content: AttributedString
+  var codePresentation: ToolPresentation? = nil
 }
 
-func markdownBlocks(_ text: String) -> [MarkdownBlock] {
+@MainActor
+final class CodePresentationCache {
+  static let shared = CodePresentationCache(capacity: 128)
+
+  private struct Key: Hashable {
+    let language: String
+    let source: String
+  }
+
+  private let capacity: Int
+  private var entries: [Key: ToolPresentation] = [:]
+  private var insertionOrder: [Key] = []
+
+  init(capacity: Int) {
+    precondition(capacity > 0)
+    self.capacity = capacity
+  }
+
+  func presentation(
+    language: String,
+    source: String,
+    load: (String, String) throws -> ToolPresentation = nativeCodePresentation
+  ) rethrows -> ToolPresentation {
+    let key = Key(language: language, source: source)
+    if let cached = entries[key] {
+      return cached
+    }
+    let value = try load(language, source)
+    if entries.count == capacity, let oldest = insertionOrder.first {
+      entries.removeValue(forKey: oldest)
+      insertionOrder.removeFirst()
+    }
+    entries[key] = value
+    insertionOrder.append(key)
+    return value
+  }
+
+  func removeAll() {
+    entries.removeAll(keepingCapacity: true)
+    insertionOrder.removeAll(keepingCapacity: true)
+  }
+}
+
+@MainActor
+func markdownBlocks(
+  _ text: String,
+  codePresentationCache: CodePresentationCache = .shared,
+  loadCodePresentation: (String, String) throws -> ToolPresentation = nativeCodePresentation
+) -> [MarkdownBlock] {
   guard
     let rendered = try? AttributedString(
       markdown: text,
@@ -557,6 +694,16 @@ func markdownBlocks(_ text: String) -> [MarkdownBlock] {
 
     blockIdentity = identity
     blocks.append(.init(kind: markdownBlockKind(components), content: content))
+  }
+
+  if !blocks.isEmpty {
+    for index in blocks.indices {
+      guard case .code(let language) = blocks[index].kind else { continue }
+      blocks[index].codePresentation = try? codePresentationCache.presentation(
+        language: language ?? "",
+        source: String(blocks[index].content.characters),
+        load: loadCodePresentation)
+    }
   }
 
   return blocks.isEmpty
@@ -612,19 +759,29 @@ enum NativeEventDecoder {
   static func decode(
     _ event: vivi_backend_event_t,
     bytes: [UInt8],
-    models: [vivi_backend_model_t]
+    models: [vivi_backend_model_t],
+    semanticSpans: [vivi_backend_semantic_span_t] = []
   ) throws -> ChatEvent {
     guard event.reserved == 0, bytes.count == Int(event.byte_count),
-      models.count == Int(event.model_count)
+      models.count == Int(event.model_count),
+      semanticSpans.count == Int(event.semantic_span_count)
     else { throw NativeEventDecodingError.malformed }
 
     func text(_ span: vivi_backend_span_t) throws -> String {
+      let value = try data(span)
+      guard let value = String(data: value, encoding: .utf8) else {
+        throw NativeEventDecodingError.malformed
+      }
+      return value
+    }
+
+    func data(_ span: vivi_backend_span_t) throws -> Data {
       let start = Int(span.offset)
       let length = Int(span.length)
-      guard start >= 0, length >= 0, start <= bytes.count, length <= bytes.count - start,
-        let value = String(bytes: bytes[start..<(start + length)], encoding: .utf8)
-      else { throw NativeEventDecodingError.malformed }
-      return value
+      guard start <= bytes.count, length <= bytes.count - start else {
+        throw NativeEventDecodingError.malformed
+      }
+      return Data(bytes[start..<(start + length)])
     }
 
     func reasoning(_ raw: vivi_backend_reasoning_effort_t) throws -> ReasoningEffort {
@@ -640,6 +797,7 @@ enum NativeEventDecoder {
       else {
         throw NativeEventDecodingError.malformed
       }
+
       let choices = ReasoningEffort.allCases.filter {
         raw.reasoning_mask & UInt8(1 << $0.rawValue) != 0
       }
@@ -667,19 +825,105 @@ enum NativeEventDecoder {
         advertisedDefaultReasoning: advertised)
     }
 
+    func presentation(
+      _ raw: vivi_backend_presentation_t,
+      required: Bool
+    ) throws -> ToolPresentation? {
+      guard raw.reserved == 0 else { throw NativeEventDecodingError.malformed }
+      if raw.kind == VIVI_BACKEND_PRESENTATION_NONE {
+        guard !required, raw.content.offset == 0, raw.content.length == 0,
+          raw.language == VIVI_BACKEND_LANGUAGE_NONE,
+          raw.semantic_span_offset == 0, raw.semantic_span_count == 0
+        else { throw NativeEventDecodingError.malformed }
+        return nil
+      }
+      guard required else { throw NativeEventDecodingError.malformed }
+      let contentStart = Int(raw.content.offset)
+      let contentLength = Int(raw.content.length)
+      let contentEnd = contentStart + contentLength
+      guard contentStart <= bytes.count, contentLength <= bytes.count - contentStart,
+        let value = String(bytes: bytes[contentStart..<contentEnd], encoding: .utf8)
+      else { throw NativeEventDecodingError.malformed }
+      let spanStart = Int(raw.semantic_span_offset)
+      let spanCount = Int(raw.semantic_span_count)
+      guard spanStart <= semanticSpans.count, spanCount <= semanticSpans.count - spanStart
+      else { throw NativeEventDecodingError.malformed }
+
+      switch raw.kind {
+      case VIVI_BACKEND_PRESENTATION_LITERAL:
+        guard raw.language == VIVI_BACKEND_LANGUAGE_NONE, spanCount == 0 else {
+          throw NativeEventDecodingError.malformed
+        }
+        return .literal(value)
+      case VIVI_BACKEND_PRESENTATION_MARKDOWN:
+        guard raw.language == VIVI_BACKEND_LANGUAGE_NONE, spanCount == 0 else {
+          throw NativeEventDecodingError.malformed
+        }
+        return .markdown(value)
+      case VIVI_BACKEND_PRESENTATION_SOURCE:
+        guard
+          let language = PresentationLanguage(rawValue: Int32(raw.language.rawValue))
+        else { throw NativeEventDecodingError.malformed }
+        var decoded: [SemanticSpan] = []
+        var previousEnd = contentStart
+        for item in semanticSpans[spanStart..<(spanStart + spanCount)] {
+          guard item.reserved == 0,
+            let token = SemanticToken(rawValue: Int32(item.token.rawValue))
+          else { throw NativeEventDecodingError.malformed }
+          let start = Int(item.bytes.offset)
+          let length = Int(item.bytes.length)
+          let end = start + length
+          guard length > 0, start >= contentStart, start >= previousEnd,
+            end <= contentEnd,
+            isUTF8Boundary(bytes, at: start),
+            isUTF8Boundary(bytes, at: end)
+          else { throw NativeEventDecodingError.malformed }
+          decoded.append(
+            SemanticSpan(
+              byteRange: (start - contentStart)..<(end - contentStart),
+              token: token))
+          previousEnd = end
+        }
+        return .source(text: value, language: language, spans: decoded)
+      default:
+        throw NativeEventDecodingError.malformed
+      }
+    }
+
     guard event.default_saved <= 1, event.cleanup_failed <= 1 else {
       throw NativeEventDecodingError.malformed
     }
-    let content = try text(event.content)
+    func content() throws -> String {
+      try text(event.content)
+    }
+    let inputPresentation = try presentation(
+      event.tool_input_presentation,
+      required: event.kind == VIVI_BACKEND_EVENT_TOOL_STARTED)
+    let outputPresentation = try presentation(
+      event.tool_output_presentation,
+      required: event.kind == VIVI_BACKEND_EVENT_TOOL_FINISHED)
+    if event.kind == VIVI_BACKEND_EVENT_TOOL_STARTED {
+      guard event.tool_input_presentation.semantic_span_offset == 0,
+        event.tool_input_presentation.semantic_span_count == event.semantic_span_count
+      else { throw NativeEventDecodingError.malformed }
+    } else if event.kind == VIVI_BACKEND_EVENT_TOOL_FINISHED {
+      guard event.tool_output_presentation.semantic_span_offset == 0,
+        event.tool_output_presentation.semantic_span_count == event.semantic_span_count
+      else { throw NativeEventDecodingError.malformed }
+    } else {
+      guard event.semantic_span_count == 0 else {
+        throw NativeEventDecodingError.malformed
+      }
+    }
     switch event.kind {
     case VIVI_BACKEND_EVENT_READY: return .ready
-    case VIVI_BACKEND_EVENT_STATUS: return .status(content)
-    case VIVI_BACKEND_EVENT_SESSION_TITLE: return .sessionTitle(content)
+    case VIVI_BACKEND_EVENT_STATUS: return .status(try content())
+    case VIVI_BACKEND_EVENT_SESSION_TITLE: return .sessionTitle(try content())
     case VIVI_BACKEND_EVENT_ASSISTANT_STARTED: return .assistantStarted
-    case VIVI_BACKEND_EVENT_REASONING_DELTA: return .reasoningDelta(content)
-    case VIVI_BACKEND_EVENT_REASONING_COMPLETE: return .reasoningComplete(content)
-    case VIVI_BACKEND_EVENT_ASSISTANT_DELTA: return .assistantDelta(content)
-    case VIVI_BACKEND_EVENT_ASSISTANT_COMPLETE: return .assistantComplete(content)
+    case VIVI_BACKEND_EVENT_REASONING_DELTA: return .reasoningDelta(try content())
+    case VIVI_BACKEND_EVENT_REASONING_COMPLETE: return .reasoningComplete(try content())
+    case VIVI_BACKEND_EVENT_ASSISTANT_DELTA: return .assistantDelta(try content())
+    case VIVI_BACKEND_EVENT_ASSISTANT_COMPLETE: return .assistantComplete(try content())
     case VIVI_BACKEND_EVENT_TOOL_STARTED:
       guard event.content_kind == VIVI_BACKEND_CONTENT_TOOL,
         event.tool_result == VIVI_BACKEND_TOOL_RESULT_RUNNING
@@ -695,8 +939,10 @@ enum NativeEventDecoder {
           title: title,
           detail: try text(event.tool_detail),
           input: try text(event.tool_input),
+          inputPresentation: inputPresentation!,
           result: .running,
-          output: ""))
+          output: nil,
+          outputPresentation: nil))
     case VIVI_BACKEND_EVENT_TOOL_FINISHED:
       guard event.content_kind == VIVI_BACKEND_CONTENT_TOOL else {
         throw NativeEventDecodingError.malformed
@@ -713,7 +959,8 @@ enum NativeEventDecoder {
       return .toolFinished(
         callID: callID,
         result: result,
-        output: try sanitizedToolMarkdown(content))
+        output: try data(event.content),
+        presentation: outputPresentation!)
     case VIVI_BACKEND_EVENT_MODEL_CATALOG:
       guard event.content_kind == VIVI_BACKEND_CONTENT_MODEL_CATALOG else {
         throw NativeEventDecodingError.malformed
@@ -732,14 +979,14 @@ enum NativeEventDecoder {
       }
       return .modelCatalog(ModelCatalog(selected: selected, models: decoded))
     case VIVI_BACKEND_EVENT_MODEL_CATALOG_FAILURE:
-      return .modelCatalogFailure(content)
+      return .modelCatalogFailure(try content())
     case VIVI_BACKEND_EVENT_MODEL_SWITCH:
       guard event.content_kind == VIVI_BACKEND_CONTENT_MODEL_SWITCH else {
         throw NativeEventDecodingError.malformed
       }
       if event.switch_outcome == VIVI_BACKEND_MODEL_SWITCH_FAILED {
         guard models.isEmpty else { throw NativeEventDecodingError.malformed }
-        return .modelSwitch(.failed(content))
+        return .modelSwitch(.failed(try content()))
       }
       guard models.count == 1 else { throw NativeEventDecodingError.malformed }
       let selection = ModelSelection(
@@ -772,7 +1019,7 @@ enum NativeEventDecoder {
         throw NativeEventDecodingError.malformed
       }
     case VIVI_BACKEND_EVENT_IDLE: return .idle
-    case VIVI_BACKEND_EVENT_FAILURE: return .failure(content)
+    case VIVI_BACKEND_EVENT_FAILURE: return .failure(try content())
     case VIVI_BACKEND_EVENT_CLOSED: return .closed
     default: throw NativeEventDecodingError.malformed
     }
@@ -790,6 +1037,7 @@ func sanitizedToolMarkdown(_ text: String) throws -> String {
       0,
       &required)
   }
+
   guard probe == VIVI_BACKEND_BUFFER_TOO_SMALL || (probe == VIVI_BACKEND_OK && required == 0)
   else { throw NativeEventDecodingError.malformed }
   if required == 0 { return "" }
@@ -809,6 +1057,83 @@ func sanitizedToolMarkdown(_ text: String) throws -> String {
     let sanitized = String(bytes: output, encoding: .utf8)
   else { throw NativeEventDecodingError.malformed }
   return sanitized
+}
+
+func nativeCodePresentation(language: String, source: String) throws -> ToolPresentation {
+  let languageBytes = Array(language.utf8)
+  let sourceBytes = Array(source.utf8)
+  guard languageBytes.count <= Int(UInt32.max), sourceBytes.count <= Int(UInt32.max) else {
+    throw NativeEventDecodingError.malformed
+  }
+  var descriptor = vivi_backend_presentation_t()
+  let probe = languageBytes.withUnsafeBufferPointer { languageBuffer in
+    sourceBytes.withUnsafeBufferPointer { sourceBuffer in
+      vivi_backend_present_code_fragment(
+        languageBuffer.baseAddress, UInt32(languageBuffer.count),
+        sourceBuffer.baseAddress, UInt32(sourceBuffer.count),
+        &descriptor, nil, 0, nil, 0)
+    }
+  }
+  guard
+    probe == VIVI_BACKEND_BUFFER_TOO_SMALL
+      || (probe == VIVI_BACKEND_OK && descriptor.content.length == 0
+        && descriptor.semantic_span_count == 0)
+  else { throw NativeEventDecodingError.malformed }
+
+  var output = [UInt8](repeating: 0, count: Int(descriptor.content.length))
+  var spans = [vivi_backend_semantic_span_t](
+    repeating: vivi_backend_semantic_span_t(),
+    count: Int(descriptor.semantic_span_count))
+  let copied = languageBytes.withUnsafeBufferPointer { languageBuffer in
+    sourceBytes.withUnsafeBufferPointer { sourceBuffer in
+      output.withUnsafeMutableBufferPointer { outputBuffer in
+        spans.withUnsafeMutableBufferPointer { spanBuffer in
+          vivi_backend_present_code_fragment(
+            languageBuffer.baseAddress, UInt32(languageBuffer.count),
+            sourceBuffer.baseAddress, UInt32(sourceBuffer.count),
+            &descriptor, outputBuffer.baseAddress, UInt32(outputBuffer.count),
+            spanBuffer.baseAddress, UInt32(spanBuffer.count))
+        }
+      }
+    }
+  }
+  guard copied == VIVI_BACKEND_OK, descriptor.reserved == 0,
+    descriptor.content.offset == 0,
+    descriptor.content.length == UInt32(output.count),
+    descriptor.semantic_span_offset == 0,
+    descriptor.semantic_span_count == UInt32(spans.count),
+    let text = String(bytes: output, encoding: .utf8)
+  else { throw NativeEventDecodingError.malformed }
+  if descriptor.kind == VIVI_BACKEND_PRESENTATION_LITERAL {
+    guard descriptor.language == VIVI_BACKEND_LANGUAGE_NONE, spans.isEmpty else {
+      throw NativeEventDecodingError.malformed
+    }
+    return .literal(text)
+  }
+  guard descriptor.kind == VIVI_BACKEND_PRESENTATION_SOURCE,
+    let decodedLanguage = PresentationLanguage(rawValue: Int32(descriptor.language.rawValue))
+  else { throw NativeEventDecodingError.malformed }
+  var decodedSpans: [SemanticSpan] = []
+  var previousEnd = 0
+  for span in spans {
+    guard span.reserved == 0,
+      let token = SemanticToken(rawValue: Int32(span.token.rawValue))
+    else { throw NativeEventDecodingError.malformed }
+    let start = Int(span.bytes.offset)
+    let length = Int(span.bytes.length)
+    let end = start + length
+    guard length > 0, start >= previousEnd, end <= output.count,
+      isUTF8Boundary(output, at: start),
+      isUTF8Boundary(output, at: end)
+    else { throw NativeEventDecodingError.malformed }
+    decodedSpans.append(.init(byteRange: start..<end, token: token))
+    previousEnd = end
+  }
+  return .source(text: text, language: decodedLanguage, spans: decodedSpans)
+}
+
+private func isUTF8Boundary(_ bytes: [UInt8], at index: Int) -> Bool {
+  index == bytes.count || bytes[index] & 0xC0 != 0x80
 }
 
 func nativeCopilotExecutableCandidates(home: URL, path: String?) -> [String] {
@@ -977,7 +1302,7 @@ final class ViviConversationDriver: ViviConversationDriving, @unchecked Sendable
     var events: [ChatEvent] = []
     while true {
       var event = vivi_backend_event_t()
-      let result = vivi_backend_next_event(handle, &event, nil, 0, nil, 0)
+      let result = vivi_backend_next_event(handle, &event, nil, 0, nil, 0, nil, 0)
       if result == VIVI_BACKEND_NO_EVENT {
         deliver(events)
         return
@@ -988,16 +1313,23 @@ final class ViviConversationDriver: ViviConversationDriving, @unchecked Sendable
       }
       var bytes = Array(repeating: UInt8(0), count: Int(event.byte_count))
       var models = Array(repeating: vivi_backend_model_t(), count: Int(event.model_count))
+      var semanticSpans = Array(
+        repeating: vivi_backend_semantic_span_t(),
+        count: Int(event.semantic_span_count))
       if result == VIVI_BACKEND_BUFFER_TOO_SMALL {
         let copied = bytes.withUnsafeMutableBufferPointer { byteBuffer in
           models.withUnsafeMutableBufferPointer { modelBuffer in
-            vivi_backend_next_event(
-              handle,
-              &event,
-              byteBuffer.baseAddress,
-              UInt32(byteBuffer.count),
-              modelBuffer.baseAddress,
-              UInt32(modelBuffer.count))
+            semanticSpans.withUnsafeMutableBufferPointer { spanBuffer in
+              vivi_backend_next_event(
+                handle,
+                &event,
+                byteBuffer.baseAddress,
+                UInt32(byteBuffer.count),
+                modelBuffer.baseAddress,
+                UInt32(modelBuffer.count),
+                spanBuffer.baseAddress,
+                UInt32(spanBuffer.count))
+            }
           }
         }
         guard copied == VIVI_BACKEND_OK else {
@@ -1006,7 +1338,11 @@ final class ViviConversationDriver: ViviConversationDriving, @unchecked Sendable
         }
       }
       do {
-        let decoded = try NativeEventDecoder.decode(event, bytes: bytes, models: models)
+        let decoded = try NativeEventDecoder.decode(
+          event,
+          bytes: bytes,
+          models: models,
+          semanticSpans: semanticSpans)
         events.append(decoded)
         if decoded == .closed {
           destroyLocked(handle, requestClose: false)

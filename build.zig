@@ -41,12 +41,6 @@ pub fn build(b: *std.Build) void {
         .lua = b.dependency("tree_sitter_lua", .{}),
         .python = b.dependency("tree_sitter_python", .{}),
     };
-    const tree_sitter = b.createModule(.{
-        .root_source_file = b.path("cli/src/tree_sitter.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
     const version = b.option(
         []const u8,
         "version",
@@ -64,6 +58,7 @@ pub fn build(b: *std.Build) void {
     backend.addImport("copilot_sdk", sdk.module("copilot_sdk"));
     backend.addOptions("build_options", build_options);
     addPty(b, backend, target);
+    addSyntaxHighlighting(b, backend, syntax_dependencies);
 
     const c_api = b.createModule(.{
         .root_source_file = b.path("backend/src/c_api.zig"),
@@ -102,12 +97,6 @@ pub fn build(b: *std.Build) void {
     cli_module.addImport("vivi_backend", backend);
     cli_module.addImport("vaxis", vaxis.module("vaxis"));
     addClipboard(b, cli_module, target, macos_sdk);
-    addSyntaxHighlighting(
-        b,
-        cli_module,
-        tree_sitter,
-        syntax_dependencies,
-    );
     cli_module.addIncludePath(b.path("third_party/md4c"));
     cli_module.addCSourceFile(.{
         .file = b.path("third_party/md4c/md4c.c"),
@@ -149,12 +138,6 @@ pub fn build(b: *std.Build) void {
     chat_tests_module.addImport("vivi_backend", backend);
     chat_tests_module.addImport("vaxis", vaxis.module("vaxis"));
     addClipboard(b, chat_tests_module, target, macos_sdk);
-    addSyntaxHighlighting(
-        b,
-        chat_tests_module,
-        tree_sitter,
-        syntax_dependencies,
-    );
     chat_tests_module.addIncludePath(b.path("third_party/md4c"));
     chat_tests_module.addCSourceFile(.{
         .file = b.path("third_party/md4c/md4c.c"),
@@ -177,12 +160,6 @@ pub fn build(b: *std.Build) void {
     });
     tool_tests_module.addImport("vivi_backend", backend);
     tool_tests_module.addImport("vaxis", vaxis.module("vaxis"));
-    addSyntaxHighlighting(
-        b,
-        tool_tests_module,
-        tree_sitter,
-        syntax_dependencies,
-    );
     const tool_tests = b.addTest(.{ .root_module = tool_tests_module, .use_llvm = use_llvm });
     const run_tool_tests = b.addRunArtifact(tool_tests);
 
@@ -192,13 +169,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    markdown_tests_module.addImport("vivi_backend", backend);
     markdown_tests_module.addImport("vaxis", vaxis.module("vaxis"));
-    addSyntaxHighlighting(
-        b,
-        markdown_tests_module,
-        tree_sitter,
-        syntax_dependencies,
-    );
     markdown_tests_module.addIncludePath(b.path("third_party/md4c"));
     markdown_tests_module.addCSourceFile(.{
         .file = b.path("third_party/md4c/md4c.c"),
@@ -313,7 +285,6 @@ const SyntaxDependencies = struct {
 fn addSyntaxHighlighting(
     b: *std.Build,
     module: *std.Build.Module,
-    tree_sitter: *std.Build.Module,
     dependencies: SyntaxDependencies,
 ) void {
     const c_flags = &.{"-std=c11"};
@@ -322,7 +293,6 @@ fn addSyntaxHighlighting(
         "-D_POSIX_C_SOURCE=200112L",
         "-D_DEFAULT_SOURCE",
     };
-    module.addImport("tree-sitter", tree_sitter);
     module.link_libc = true;
     module.addIncludePath(dependencies.core.path("include"));
     module.addIncludePath(dependencies.core.path("src"));
