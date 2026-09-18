@@ -7,6 +7,17 @@ const config: StorybookConfig = {
     name: "@storybook/react-vite",
     options: {},
   },
+  viteFinal: async (viteConfig) => ({
+    ...viteConfig,
+    plugins: viteConfig.plugins?.filter(
+      (plugin) =>
+        !plugin ||
+        typeof plugin !== "object" ||
+        Array.isArray(plugin) ||
+        !("name" in plugin) ||
+        plugin.name !== "vivi-production-csp",
+    ),
+  }),
 };
 
 export default config;

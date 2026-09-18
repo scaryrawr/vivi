@@ -27,6 +27,7 @@ pnpm test
 pnpm build
 pnpm storybook
 pnpm storybook:build
+pnpm storybook:smoke
 pnpm playwright
 pnpm check
 ```

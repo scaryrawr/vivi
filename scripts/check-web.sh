@@ -16,4 +16,5 @@ pnpm format
 pnpm test
 pnpm build
 pnpm storybook:build
+pnpm storybook:smoke
 pnpm playwright

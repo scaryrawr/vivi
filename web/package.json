@@ -13,9 +13,10 @@
     "test": "vitest run",
     "storybook": "storybook dev -p 6006",
     "storybook:build": "storybook build",
+    "storybook:smoke": "playwright test --config playwright.storybook.config.ts",
     "playwright": "playwright test",
     "preview": "vite preview",
-    "check": "pnpm typecheck && pnpm lint && pnpm format && pnpm test && pnpm build && pnpm storybook:build && pnpm playwright"
+    "check": "pnpm typecheck && pnpm lint && pnpm format && pnpm test && pnpm build && pnpm storybook:build && pnpm storybook:smoke && pnpm playwright"
   },
   "dependencies": {
     "react": "^19.2.8",
