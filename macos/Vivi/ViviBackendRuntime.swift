@@ -914,7 +914,9 @@ enum NativeEventDecoder {
         let scalarValue = scalar.value
         guard
           scalarValue > 0x1f,
-          scalarValue < 0x7f || scalarValue > 0x9f
+          scalarValue < 0x7f || scalarValue > 0x9f,
+          scalarValue < 0x202a || scalarValue > 0x202e,
+          scalarValue < 0x2066 || scalarValue > 0x2069
         else {
           throw NativeEventDecodingError.malformed
         }

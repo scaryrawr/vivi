@@ -138,7 +138,9 @@ fn isWhitespace(codepoint: u21) bool {
 
 fn isControl(codepoint: u21) bool {
     return codepoint <= 0x001f or
-        (codepoint >= 0x007f and codepoint <= 0x009f);
+        (codepoint >= 0x007f and codepoint <= 0x009f) or
+        (codepoint >= 0x202a and codepoint <= 0x202e) or
+        (codepoint >= 0x2066 and codepoint <= 0x2069);
 }
 
 test "canonical title normalizes whitespace and controls" {
@@ -257,6 +259,19 @@ test "canonical title validation is strict" {
     try std.testing.expect(!isCanonical("two  spaces"));
     try std.testing.expect(!isCanonical("line\nbreak"));
     try std.testing.expect(!isCanonical("unicode\u{00a0}space"));
+    try std.testing.expect(!isCanonical("right\u{202e}left"));
+    try std.testing.expect(!isCanonical("isolate\u{2066}text\u{2069}"));
     const oversized = [_]u8{'x'} ** (max_characters + 1);
     try std.testing.expect(!isCanonical(&oversized));
+}
+
+test "canonical title removes bidirectional formatting controls" {
+    const title = (try canonicalize(
+        std.testing.allocator,
+        "safe\u{202a}\u{202b}\u{202c}\u{202d}\u{202e}" ++
+            "\u{2066}\u{2067}\u{2068}\u{2069} title",
+    )).?;
+    defer std.testing.allocator.free(title);
+    try std.testing.expectEqualStrings("safe title", title);
+    try std.testing.expect(isCanonical(title));
 }

@@ -28,7 +28,7 @@ int main(void) {
     options.copilot_cli_launch = (vivi_backend_copilot_cli_launch_t)99;
     assert(vivi_backend_open(&options, &conversation) == VIVI_BACKEND_INVALID_ARGUMENT);
     assert(conversation == 0);
-    assert(VIVI_BACKEND_ABI_VERSION == 7);
+    assert(VIVI_BACKEND_ABI_VERSION == 8);
     assert(VIVI_BACKEND_SESSION_TITLE_MAX_CHARACTERS == 80);
     assert(VIVI_BACKEND_PRESENTATION_SOURCE == 3);
     assert(VIVI_BACKEND_LANGUAGE_PYTHON == 15);
