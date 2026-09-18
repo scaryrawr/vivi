@@ -80,3 +80,6 @@ user-visible behavior. It then uses exactly four H2 sections in this order:
   invocation.
 - [Session resume](./session-resume.md) covers Copilot-owned session storage,
   the `/resume` finder, and continued history across processes.
+- [Native conversation sidebar](./native-conversation-sidebar.md) covers
+  occurrence-based native launches, selection, window close and Dock reopen,
+  and joined application termination.

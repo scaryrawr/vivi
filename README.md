@@ -194,6 +194,13 @@ xcodebuild \
 Opening `macos/Vivi.xcodeproj` and running the shared `Vivi` scheme invokes
 the same Zig build through an aggregate target before linking the app.
 
+The app presents live conversations in one native window. Each
+`vivi chat --native` launch adds and selects a fresh sidebar conversation for
+the invoking workspace, even when that workspace is already open. Closing the
+window keeps those conversations alive; clicking Vivi in the Dock restores the
+same conversation list and selection. Quitting Vivi waits for every live
+conversation to close.
+
 ## Native platform applications
 
 - `macos/` contains the current SwiftUI app, using AppKit where native
