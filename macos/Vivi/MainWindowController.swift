@@ -63,6 +63,14 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
       window?.deminiaturize(nil)
     }
     showWindow(nil)
+    if let window {
+      window.contentViewController?.view.layoutSubtreeIfNeeded()
+      if window.toolbar?.identifier != "ViviMainToolbar" {
+        installToolbar(in: window)
+      }
+      window.titleVisibility = .hidden
+      window.contentView?.superview?.layoutSubtreeIfNeeded()
+    }
     window?.makeKeyAndOrderFront(nil)
     activate()
   }
@@ -96,6 +104,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
     item.label = "Window Navigation"
     item.paletteLabel = "Window Navigation"
     item.view = toolbarView
+    item.visibilityPriority = .high
     return item
   }
 
@@ -153,6 +162,7 @@ extension NSToolbarItem.Identifier {
 final class MainWindowToolbarView: NSView {
   let sidebarButton: NSButton
   let appNameLabel = NSTextField(labelWithString: "")
+  let separator = NSBox()
   let conversationTitleLabel = NSTextField(labelWithString: "")
   private let stackView: NSStackView
 
@@ -176,7 +186,6 @@ final class MainWindowToolbarView: NSView {
     appNameLabel.setContentHuggingPriority(.required, for: .horizontal)
     appNameLabel.setAccessibilityElement(false)
 
-    let separator = NSBox()
     separator.boxType = .separator
     separator.translatesAutoresizingMaskIntoConstraints = false
     NSLayoutConstraint.activate([
@@ -203,8 +212,8 @@ final class MainWindowToolbarView: NSView {
       stackView.leadingAnchor.constraint(equalTo: leadingAnchor),
       stackView.trailingAnchor.constraint(equalTo: trailingAnchor),
       stackView.centerYAnchor.constraint(equalTo: centerYAnchor),
-      widthAnchor.constraint(greaterThanOrEqualToConstant: 180),
-      widthAnchor.constraint(lessThanOrEqualToConstant: 420),
+      widthAnchor.constraint(equalToConstant: 320),
+      heightAnchor.constraint(equalToConstant: 28),
     ])
     updatePresentation()
   }

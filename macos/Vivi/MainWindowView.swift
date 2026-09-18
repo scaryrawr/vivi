@@ -110,6 +110,8 @@ struct MainWindowView: View {
                 historyConversation.store.resumeSession(key)
               }
               .padding(.leading, 12)
+              .selectionDisabled()
+              .listRowBackground(Color.clear)
             }
           } header: {
             ProjectSidebarHeader(workspace: workspace)
@@ -212,13 +214,16 @@ private struct ProjectSidebarHeader: View {
   var body: some View {
     VStack(alignment: .leading, spacing: 2) {
       Label(presentation.name, systemImage: "folder")
+        .font(.body)
         .fontWeight(.semibold)
       Text(presentation.path)
-        .font(.caption2)
+        .font(.caption)
         .foregroundStyle(.secondary)
         .lineLimit(1)
         .truncationMode(.middle)
     }
+    .padding(.top, 8)
+    .padding(.bottom, 6)
     .help(presentation.path)
     .accessibilityElement(children: .ignore)
     .accessibilityAddTraits(.isHeader)
@@ -308,7 +313,7 @@ private struct ProjectSessionHistory: View {
   }
 
   private var emptyState: some View {
-    Label("No saved sessions for this project.", systemImage: "clock")
+    Label("No saved sessions", systemImage: "clock")
       .foregroundStyle(.secondary)
       .accessibilityIdentifier("session-history-empty")
   }

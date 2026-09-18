@@ -60,18 +60,22 @@ final class MainWindowControllerTests: XCTestCase {
       window: window,
       activate: {},
       onClosed: { _ in })
+    defer { window.orderOut(nil) }
 
-    window.contentViewController?.view.layoutSubtreeIfNeeded()
+    controller.showAndActivate()
+    layoutTitlebar(in: window)
 
     let initialToolbarIdentifiers = window.toolbar?.items.map(\.itemIdentifier)
+    assertVisibleToolbarGeometry(in: window)
     sidebarToggleButton(in: window.toolbar)?.performClick(nil)
-    window.contentViewController?.view.layoutSubtreeIfNeeded()
+    layoutTitlebar(in: window)
 
     XCTAssertEqual(window.title, "Vivi")
     XCTAssertEqual(window.titleVisibility, .hidden)
     XCTAssertEqual(initialToolbarIdentifiers, [.viviNavigation, .flexibleSpace])
     XCTAssertEqual(window.toolbar?.items.map(\.itemIdentifier), initialToolbarIdentifiers)
     XCTAssertEqual(realizedSidebarToggleCount(in: window.toolbar), 1)
+    assertVisibleToolbarGeometry(in: window)
     XCTAssertFalse(
       realizedToolbarView(in: window.toolbar)?.appNameLabel.isAccessibilityElement() ?? true)
     XCTAssertFalse(
@@ -114,6 +118,82 @@ final class MainWindowControllerTests: XCTestCase {
     toolbar?.items.lazy
       .compactMap { $0.view as? MainWindowToolbarView }
       .first
+  }
+
+  @MainActor
+  private func layoutTitlebar(in window: NSWindow) {
+    window.contentViewController?.view.layoutSubtreeIfNeeded()
+    window.contentView?.superview?.layoutSubtreeIfNeeded()
+    realizedToolbarView(in: window.toolbar)?.layoutSubtreeIfNeeded()
+  }
+
+  @MainActor
+  private func assertVisibleToolbarGeometry(
+    in window: NSWindow,
+    file: StaticString = #filePath,
+    line: UInt = #line
+  ) {
+    guard let toolbarView = realizedToolbarView(in: window.toolbar) else {
+      XCTFail("Missing realized Vivi toolbar", file: file, line: line)
+      return
+    }
+    let toggleFrame = toolbarView.convert(
+      toolbarView.sidebarButton.bounds, from: toolbarView.sidebarButton)
+    let appNameFrame = toolbarView.convert(
+      toolbarView.appNameLabel.bounds, from: toolbarView.appNameLabel)
+    let separatorFrame = toolbarView.convert(
+      toolbarView.separator.bounds, from: toolbarView.separator)
+    let titleFrame = toolbarView.convert(
+      toolbarView.conversationTitleLabel.bounds,
+      from: toolbarView.conversationTitleLabel)
+
+    XCTAssertFalse(toolbarView.sidebarButton.isHidden, file: file, line: line)
+    XCTAssertFalse(toolbarView.appNameLabel.isHidden, file: file, line: line)
+    XCTAssertFalse(toolbarView.separator.isHidden, file: file, line: line)
+    XCTAssertFalse(toolbarView.conversationTitleLabel.isHidden, file: file, line: line)
+    XCTAssertGreaterThan(toggleFrame.width, 0, file: file, line: line)
+    XCTAssertGreaterThan(appNameFrame.width, 0, file: file, line: line)
+    XCTAssertGreaterThan(separatorFrame.width, 0, file: file, line: line)
+    XCTAssertGreaterThan(titleFrame.width, 0, file: file, line: line)
+    XCTAssertLessThan(toggleFrame.maxX, appNameFrame.minX, file: file, line: line)
+    XCTAssertLessThan(appNameFrame.maxX, separatorFrame.minX, file: file, line: line)
+    XCTAssertLessThan(separatorFrame.maxX, titleFrame.minX, file: file, line: line)
+    XCTAssertEqual(visibleSidebarToggleCount(in: window), 1, file: file, line: line)
+    XCTAssertTrue(visibleNativeTitleLabels(in: window, excluding: toolbarView).isEmpty)
+  }
+
+  @MainActor
+  private func visibleSidebarToggleCount(in window: NSWindow) -> Int {
+    descendantViews(of: NSButton.self, below: window.contentView?.superview).count {
+      !$0.isHidden
+        && $0.frame.width > 0
+        && $0.action == #selector(NSSplitViewController.toggleSidebar(_:))
+    }
+  }
+
+  @MainActor
+  private func visibleNativeTitleLabels(
+    in window: NSWindow,
+    excluding toolbarView: MainWindowToolbarView
+  ) -> [NSTextField] {
+    descendantViews(of: NSTextField.self, below: window.contentView?.superview).filter {
+      $0 !== toolbarView.appNameLabel
+        && $0 !== toolbarView.conversationTitleLabel
+        && !$0.isHidden
+        && $0.frame.width > 0
+        && $0.stringValue == "Vivi"
+    }
+  }
+
+  private func descendantViews<View: NSView>(
+    of type: View.Type,
+    below root: NSView?
+  ) -> [View] {
+    guard let root else { return [] }
+    let matches = (root as? View).map { [$0] } ?? []
+    return root.subviews.reduce(into: matches) { result, child in
+      result.append(contentsOf: descendantViews(of: type, below: child))
+    }
   }
 
   func testWindowToolbarTitlePreservesLongTitlesForViewTruncation() {
