@@ -97,6 +97,19 @@ struct CanvasRendererGeneration: Hashable, Comparable {
   }
 }
 
+struct CanvasRendererEpoch: Hashable, Comparable {
+  let rawValue: UInt64
+
+  init?(_ rawValue: UInt64) {
+    guard rawValue != 0 else { return nil }
+    self.rawValue = rawValue
+  }
+
+  static func < (lhs: Self, rhs: Self) -> Bool {
+    lhs.rawValue < rhs.rawValue
+  }
+}
+
 enum CanvasSchemaRole {}
 enum CanvasOpenInputRole {}
 enum CanvasActionInputRole {}
@@ -259,11 +272,12 @@ enum CanvasOperationKind: Equatable {
 struct CanvasRenderLease: Hashable {
   let key: CanvasInstanceKey
   let generation: CanvasRendererGeneration
+  let epoch: CanvasRendererEpoch
 }
 
 enum CanvasCommand: Equatable {
   case open(key: CanvasInstanceKey, input: CanvasOpenInput?)
-  case close(key: CanvasInstanceKey)
+  case close(key: CanvasInstanceKey, generation: CanvasRendererGeneration)
   case action(
     key: CanvasInstanceKey,
     generation: CanvasRendererGeneration,
@@ -297,7 +311,7 @@ protocol CanvasCommandDriving: AnyObject {
     key: CanvasInstanceKey,
     input: CanvasOpenInput?
   ) -> CanvasCommandTransportResult
-  func closeCanvas(key: CanvasInstanceKey) -> CanvasCommandTransportResult
+  func closeCanvas(lease: CanvasRenderLease) -> CanvasCommandTransportResult
   func invokeCanvasAction(
     name: CanvasActionName,
     on lease: CanvasRenderLease,
@@ -390,6 +404,8 @@ final class NativeCanvasStore: ObservableObject {
   private var retainedDeclarations: [CanvasDeclarationID: CanvasDeclaration] = [:]
   private var pending: [CanvasOperationID: CanvasCommand] = [:]
   private var renderLeases: [CanvasInstanceKey: CanvasRenderLease] = [:]
+  private var revokedRendererGenerations: [CanvasInstanceKey: CanvasRendererGeneration] = [:]
+  private var nextRendererEpoch: UInt64 = 1
   private var acceptingCommands = true
   private var terminal = false
 
@@ -412,7 +428,7 @@ final class NativeCanvasStore: ObservableObject {
         let key = try CanvasInstanceKey(
           declarationID: declarationID,
           instanceID: instanceIDs.next())
-        guard !presentation.instances.contains(where: { $0.key == key }) else {
+        guard !isInstanceIDReserved(key.instanceID) else {
           return .rejected(.instanceIDCollision)
         }
         return submitOpen(key: key, input: input, sameKey: false)
@@ -428,6 +444,9 @@ final class NativeCanvasStore: ObservableObject {
     input: CanvasOpenInput?
   ) -> CanvasSubmission {
     guard let rejection = commandRejection(for: key.declarationID) else {
+      guard !hasInstanceIDCollision(for: key) else {
+        return .rejected(.instanceIDCollision)
+      }
       switch submitOpen(key: key, input: input, sameKey: true) {
       case .submitted(_, let operationID): return .submitted(operationID)
       case .rejected(let rejection): return .rejected(rejection)
@@ -436,11 +455,27 @@ final class NativeCanvasStore: ObservableObject {
     return .rejected(rejection)
   }
 
-  func close(_ key: CanvasInstanceKey) -> CanvasSubmission {
+  func close(_ lease: CanvasRenderLease) -> CanvasSubmission {
     guard acceptingCommands else { return .rejected(.shuttingDown) }
-    guard currentOpenedRuntime(for: key) != nil else { return .rejected(.notOpen) }
+    guard acceptsRendererCallback(for: lease) else {
+      return .rejected(.staleGeneration)
+    }
+    guard let opened = currentOpenedRuntime(for: lease.key) else {
+      return .rejected(.notOpen)
+    }
+    guard opened.generation == lease.generation else {
+      return .rejected(.staleGeneration)
+    }
     guard let driver else { return .rejected(.disabled) }
-    return remember(.close(key: key), result: driver.closeCanvas(key: key))
+    let submission = remember(
+      .close(key: lease.key, generation: lease.generation),
+      result: driver.closeCanvas(lease: lease))
+    if case .submitted = submission {
+      revokedRendererGenerations[lease.key] = lease.generation
+      renderLeases.removeValue(forKey: lease.key)
+      emitHostDirective(.teardown(lease, reason: .runtimeEnded))
+    }
+    return submission
   }
 
   func invoke(
@@ -449,6 +484,9 @@ final class NativeCanvasStore: ObservableObject {
     input: CanvasActionInput?
   ) -> CanvasSubmission {
     guard acceptingCommands else { return .rejected(.shuttingDown) }
+    guard acceptsRendererCallback(for: lease) else {
+      return .rejected(.staleGeneration)
+    }
     guard let opened = currentOpenedRuntime(for: lease.key) else {
       return .rejected(.notOpen)
     }
@@ -481,11 +519,12 @@ final class NativeCanvasStore: ObservableObject {
   }
 
   func resetForSuccessfulResume() {
-    emitHostDirective(.teardownAll(reason: .sessionResumed))
     currentDeclarations.removeAll(keepingCapacity: true)
     retainedDeclarations.removeAll(keepingCapacity: true)
     pending.removeAll(keepingCapacity: true)
     renderLeases.removeAll(keepingCapacity: true)
+    revokedRendererGenerations.removeAll(keepingCapacity: true)
+    emitHostDirective(.teardownAll(reason: .sessionResumed))
     terminal = false
     acceptingCommands = true
     presentation = .empty
@@ -497,11 +536,33 @@ final class NativeCanvasStore: ObservableObject {
     acceptingCommands = false
     pending.removeAll(keepingCapacity: true)
     renderLeases.removeAll(keepingCapacity: true)
+    revokedRendererGenerations.removeAll(keepingCapacity: true)
     emitHostDirective(.teardownAll(reason: reason))
   }
 
   func acceptsRendererCallback(for lease: CanvasRenderLease) -> Bool {
     renderLeases[lease.key] == lease
+  }
+
+  func renderLease(for key: CanvasInstanceKey) -> CanvasRenderLease? {
+    renderLeases[key]
+  }
+
+  func renewRendererLeasesForPresentation() {
+    guard !terminal else { return }
+    var renewed: [CanvasInstanceKey: CanvasRenderLease] = [:]
+    for lease in renderLeases.values {
+      guard
+        let replacement = takeRenderLease(
+          key: lease.key,
+          generation: lease.generation)
+      else {
+        failCanvasProtocol()
+        return
+      }
+      renewed[lease.key] = replacement
+    }
+    renderLeases = renewed
   }
 
   private func submitOpen(
@@ -566,6 +627,28 @@ final class NativeCanvasStore: ObservableObject {
     return opened
   }
 
+  private func isInstanceIDReserved(_ instanceID: CanvasInstanceID) -> Bool {
+    if presentation.instances.contains(where: { $0.key.instanceID == instanceID }) {
+      return true
+    }
+    return pending.values.contains { command in
+      guard case .open(let key, _) = command else { return false }
+      return key.instanceID == instanceID
+    }
+  }
+
+  private func hasInstanceIDCollision(for key: CanvasInstanceKey) -> Bool {
+    if presentation.instances.contains(where: {
+      $0.key.instanceID == key.instanceID && $0.key != key
+    }) {
+      return true
+    }
+    return pending.values.contains { command in
+      guard case .open(let pendingKey, _) = command else { return false }
+      return pendingKey.instanceID == key.instanceID && pendingKey != key
+    }
+  }
+
   private func apply(_ snapshot: CanvasSnapshot) {
     guard !terminal else { return }
     let declarations = Dictionary(
@@ -589,13 +672,32 @@ final class NativeCanvasStore: ObservableObject {
         record: instance.record,
         degradation: instance.degradation)
     }
-    let nextLeases = Dictionary(
-      uniqueKeysWithValues: instances.compactMap {
-        instance -> (CanvasInstanceKey, CanvasRenderLease)? in
-        guard case .opened(let opened) = instance.runtime else { return nil }
-        let lease = CanvasRenderLease(key: instance.key, generation: opened.generation)
-        return (instance.key, lease)
-      })
+    var nextLeases: [CanvasInstanceKey: CanvasRenderLease] = [:]
+    for instance in instances {
+      guard case .opened(let opened) = instance.runtime else { continue }
+      if revokedRendererGenerations[instance.key] == opened.generation {
+        continue
+      }
+      if let existing = renderLeases[instance.key],
+        existing.generation == opened.generation
+      {
+        nextLeases[instance.key] = existing
+        continue
+      }
+      guard let lease = takeRenderLease(key: instance.key, generation: opened.generation) else {
+        failCanvasProtocol()
+        return
+      }
+      nextLeases[instance.key] = lease
+    }
+    revokedRendererGenerations = revokedRendererGenerations.filter { key, generation in
+      instances.contains { instance in
+        guard instance.key == key, case .opened(let opened) = instance.runtime else {
+          return false
+        }
+        return opened.generation == generation
+      }
+    }
     if !snapshot.shutdownRequested {
       for (key, lease) in renderLeases where nextLeases[key] != lease {
         let reason: CanvasHostTeardownReason
@@ -656,6 +758,18 @@ final class NativeCanvasStore: ObservableObject {
     acceptingCommands = false
     pending.removeAll(keepingCapacity: true)
     renderLeases.removeAll(keepingCapacity: true)
+    revokedRendererGenerations.removeAll(keepingCapacity: true)
     emitHostDirective(.teardownAll(reason: .protocolFailure))
+  }
+
+  private func takeRenderLease(
+    key: CanvasInstanceKey,
+    generation: CanvasRendererGeneration
+  ) -> CanvasRenderLease? {
+    guard let epoch = CanvasRendererEpoch(nextRendererEpoch) else { return nil }
+    let (next, overflow) = nextRendererEpoch.addingReportingOverflow(1)
+    guard !overflow, next != 0 else { return nil }
+    nextRendererEpoch = next
+    return CanvasRenderLease(key: key, generation: generation, epoch: epoch)
   }
 }

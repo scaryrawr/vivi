@@ -1245,10 +1245,10 @@ pub const Conversation = struct {
                 value,
                 .{},
             ) },
-            .close => |key| .{ .close = try canvas.CloseCommand.init(
+            .close => |value| .{ .close = try canvas.CloseCommand.init(
                 self.core.allocator,
                 request_id,
-                key,
+                value,
                 .{},
             ) },
             .invoke_action => |value| .{

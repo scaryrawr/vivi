@@ -88,14 +88,43 @@ tears down and resets it before accepting the resumed conversation's
 snapshots. Application termination tears it down before closing the backend.
 The production driver continues to select `VIVI_BACKEND_CANVAS_DISABLED`.
 
-PR 6 is the earliest point at which macOS may add a canvas renderer. Its
-security gate requires a separately reviewed `WKWebView` design with a
-nonpersistent data store, no ambient network access, a deny-by-default
-navigation policy, no arbitrary host-file access, an allowlisted and
-schema-validated script-message bridge, generation checks on every callback,
-and deterministic teardown of content worlds, handlers, tasks, and web views.
-PR 5 intentionally adds no SwiftUI canvas surface, WebView, URL loading, or
-network behavior.
+The macOS PR 6 renderer is enabled only by an explicit native-host
+configuration and remains disabled by default. Each opened canvas receives a
+separate `WKWebView` with a nonpersistent data store and a lease containing the
+full canvas key, backend generation, and a native epoch that is never reused by
+that conversation store. A generation replacement, successful resume,
+conversation close, backend shutdown, protocol failure, app termination, or
+window presentation close revokes the lease before stopping and releasing the
+view. Reopening a window preserves logical canvas state but creates fresh
+renderer epochs.
+
+The current host configuration sets `VIVI_ENABLE_CANVAS=1` to request canvas
+capability. `VIVI_CANVAS_REMOTE_ORIGINS` may additionally contain a
+comma-separated list of exact HTTPS origins. Invalid remote-origin
+configuration disables canvas support and emits a native diagnostic rather
+than silently weakening policy. Loopback authorization is available only after
+the explicit canvas enablement; the remote allowlist remains empty when the
+second variable is absent.
+
+Provider URLs are parsed before WebKit objects are created. Local extension
+servers may use HTTP or HTTPS only when the URL has an explicit port and its
+literal host is exactly `localhost`, `127.0.0.1`, or `[::1]`. This does not
+authorize localhost subdomains, alternate numeric spellings, DNS names that
+resolve to loopback, RFC1918, link-local, or LAN destinations. Remote rendering
+requires HTTPS and membership in a separately injected exact-origin allowlist,
+which is empty by default. Each renderer is restricted to its one normalized
+scheme, literal host, and port across top-level navigation, redirects,
+responses, and subresources. New windows, downloads, files, custom schemes,
+cross-origin loads, cross-port loads, and WebSockets are denied.
+
+The renderer installs no script-message handler, user script, or canvas action
+bridge. This matters for loopback servers because another process can later
+reuse the same port; fresh nonpersistent views and epochs prevent stale
+callbacks from carrying authority, while the absence of a native bridge means
+new content at that origin receives no host capability. A future requirement
+for cross-origin assets, WebSockets, authenticated local-server identity, or
+canvas actions is a contract blocker and must not weaken this policy
+speculatively.
 
 Native applications are intentionally asymmetric:
 

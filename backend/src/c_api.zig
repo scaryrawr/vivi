@@ -406,7 +406,7 @@ fn decodeCanvasOperation(
 ) !canvas.CommandInput {
     if (raw.abi_version != c.VIVI_BACKEND_ABI_VERSION or
         raw.struct_size != @sizeOf(c.vivi_backend_canvas_operation_t) or
-        raw.reserved0 != 0 or raw.reserved[0] != 0 or raw.reserved[1] != 0)
+        raw.reserved0 != 0)
     {
         return error.InvalidCanvasOperation;
     }
@@ -418,6 +418,9 @@ fn decodeCanvasOperation(
     try validateCanvasKey(key);
     return switch (raw.kind) {
         c.VIVI_BACKEND_CANVAS_OPERATION_OPEN => blk: {
+            if (raw.expected_renderer_generation != 0) {
+                return error.InvalidCanvasOperation;
+            }
             try requireAbsentSpan(raw.action_name);
             try requireAbsentSpan(raw.action_input_json);
             const input = try optionalInputSpan(bytes, raw.open_input_json);
@@ -431,9 +434,20 @@ fn decodeCanvasOperation(
             try requireAbsentSpan(raw.action_name);
             try requireAbsentSpan(raw.open_input_json);
             try requireAbsentSpan(raw.action_input_json);
-            break :blk .{ .close = key };
+            if (raw.expected_renderer_generation == 0) {
+                return error.InvalidCanvasOperation;
+            }
+            break :blk .{ .close = .{
+                .key = key,
+                .expected_generation = @enumFromInt(
+                    raw.expected_renderer_generation,
+                ),
+            } };
         },
         c.VIVI_BACKEND_CANVAS_OPERATION_INVOKE_ACTION => blk: {
+            if (raw.expected_renderer_generation == 0) {
+                return error.InvalidCanvasOperation;
+            }
             try requireAbsentSpan(raw.open_input_json);
             const action_name = try requiredInputSpan(bytes, raw.action_name);
             var owned_name = canvas.ActionName.init(
@@ -446,6 +460,9 @@ fn decodeCanvasOperation(
             try validateActionInput(input);
             break :blk .{ .invoke_action = .{
                 .key = key,
+                .expected_generation = @enumFromInt(
+                    raw.expected_renderer_generation,
+                ),
                 .action_name = action_name,
                 .input_json = input,
             } };
@@ -2813,7 +2830,7 @@ test "C canvas operation decoder validates role-specific spans" {
             .length = 13,
         },
         .action_input_json = .{ .offset = 0, .length = 0 },
-        .reserved = .{ 0, 0 },
+        .expected_renderer_generation = 0,
     };
     const decoded_open = try decodeCanvasOperation(&base, input);
     try std.testing.expectEqualStrings(
@@ -2834,7 +2851,12 @@ test "C canvas operation decoder validates role-specific spans" {
         .offset = @intCast(action_json),
         .length = 15,
     };
+    invoke.expected_renderer_generation = 7;
     const decoded_action = try decodeCanvasOperation(&invoke, input);
+    try std.testing.expectEqual(
+        @as(u64, 7),
+        decoded_action.invoke_action.expected_generation.value(),
+    );
     try std.testing.expectEqualStrings(
         "{\"action\":true}",
         decoded_action.invoke_action.input_json.?,
@@ -2843,10 +2865,15 @@ test "C canvas operation decoder validates role-specific spans" {
     var close = base;
     close.kind = c.VIVI_BACKEND_CANVAS_OPERATION_CLOSE;
     close.open_input_json = .{ .offset = 0, .length = 0 };
+    close.expected_renderer_generation = 8;
     const decoded_close = try decodeCanvasOperation(&close, input);
+    try std.testing.expectEqual(
+        @as(u64, 8),
+        decoded_close.close.expected_generation.value(),
+    );
     try std.testing.expectEqualStrings(
         "fixture.extension",
-        decoded_close.close.extension_id,
+        decoded_close.close.key.extension_id,
     );
 
     var invalid = base;
@@ -2856,7 +2883,13 @@ test "C canvas operation decoder validates role-specific spans" {
         decodeCanvasOperation(&invalid, input),
     );
     invalid = base;
-    invalid.reserved[1] = 1;
+    invalid.expected_renderer_generation = 1;
+    try std.testing.expectError(
+        error.InvalidCanvasOperation,
+        decodeCanvasOperation(&invalid, input),
+    );
+    invalid = close;
+    invalid.expected_renderer_generation = 0;
     try std.testing.expectError(
         error.InvalidCanvasOperation,
         decodeCanvasOperation(&invalid, input),

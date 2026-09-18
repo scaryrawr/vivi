@@ -169,11 +169,52 @@ work. App/window coordination does not own canvas state, so selection,
 red-close, Dock reopen, and application resume preserve the existing
 per-conversation ownership rules.
 
-No renderer is introduced. PR 6 must separately pass a secure `WKWebView`
-review before canvas mode can be enabled: nonpersistent storage, denied
-ambient navigation and network access, no arbitrary file access, an
-allowlisted schema-validated message bridge, generation-checked callbacks,
-and complete handler/task/view teardown are required.
+No renderer is introduced in PR 5.
+
+## PR 6 macOS renderer decision
+
+PR 6 adds a macOS-only renderer behind an explicit native-host configuration;
+production remains disabled by default. The renderer consumes the typed ABI and
+per-conversation `NativeCanvasStore`. It does not add terminal rendering,
+process-global or workspace-keyed canvas state, a daemon, or a generic JSON
+bridge.
+
+Every renderer lease contains the full `(extensionId, canvasId, instanceId)`
+key, backend renderer generation, and a native epoch that is never reused by
+that conversation store. ABI v10 adds the expected backend generation to close
+and action operations. The SDK-free state validates it immediately before
+dispatch. Because the SDK's close and action methods accept only `instanceId`,
+the domain detects active instance-ID collisions across full keys, makes every
+collider unavailable, and refuses to call the SDK rather than choosing one.
+
+The URL policy has two non-interchangeable origin classes:
+
+- local extension servers may use HTTP or HTTPS with a required explicit port
+  only when the literal host is exactly `localhost`, `127.0.0.1`, or `[::1]`;
+- remote renderers require HTTPS and an exact origin injected by the native
+  host; the remote allowlist is empty by default.
+
+Authority is one exact normalized `(scheme, literal host, port)` per renderer.
+It does not extend to localhost subdomains or wildcards, alternate numeric
+spellings, DNS names that resolve to loopback, RFC1918, link-local, LAN, or
+other private destinations. Top-level navigation, redirects, responses, and
+subresources are constrained to that origin. WebSockets, new windows,
+downloads, file and custom schemes, and cross-origin or cross-port loads are
+denied. Each renderer uses a fresh nonpersistent website data store.
+
+No `WKScriptMessageHandler`, user script, or action bridge is installed.
+Provider page JavaScript has no native authority. This also bounds loopback
+server and port reuse: stale callbacks fail the epoch/generation lease, old
+views are destroyed, and replacement content cannot invoke the host. If a
+future renderer needs authenticated local-server identity, cross-origin
+assets, WebSockets, or actions, that requires new typed contract evidence and a
+separate security review.
+
+Renderer teardown is revocation-first and idempotent for canvas close,
+generation replacement, successful resume, conversation close, backend
+shutdown, protocol failure, app termination, and window presentation close.
+Red-close preserves the logical per-conversation canvas state but releases all
+WebKit presentation resources; reopening creates fresh native epochs.
 
 ## Synthesis decision
 

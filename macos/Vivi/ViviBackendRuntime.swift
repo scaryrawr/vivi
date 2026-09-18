@@ -316,6 +316,7 @@ final class NativeChatStore: ObservableObject {
   @Published private(set) var sessionState: SessionControlState = .ready
   @Published var draft = ""
   let canvases: NativeCanvasStore
+  let canvasRenderers: NativeCanvasRendererStore
 
   var workspace: String { activePresentation.workspace }
   var sessionTitle: String { activePresentation.sessionTitle }
@@ -336,6 +337,7 @@ final class NativeChatStore: ObservableObject {
   init(
     workspace: String,
     driver: ViviConversationDriving,
+    canvasConfiguration: NativeCanvasConfiguration = .disabled,
     canvasInstanceIDs: CanvasInstanceIDGenerator = CanvasInstanceIDGenerator(),
     canvasHostDirective: @escaping (CanvasHostDirective) -> Void = { _ in }
   ) {
@@ -346,10 +348,19 @@ final class NativeChatStore: ObservableObject {
       confirmedSelection: nil)
     activePresentation = presentation
     self.driver = driver
-    canvases = NativeCanvasStore(
+    let rendererStore = NativeCanvasRendererStore(configuration: canvasConfiguration)
+    canvasRenderers = rendererStore
+    let canvasStore = NativeCanvasStore(
       driver: driver as? any CanvasCommandDriving,
       instanceIDs: canvasInstanceIDs,
-      emitHostDirective: canvasHostDirective)
+      emitHostDirective: { directive in
+        rendererStore.handle(directive)
+        canvasHostDirective(directive)
+      })
+    canvases = canvasStore
+    rendererStore.setLeaseValidator { [weak canvasStore] lease in
+      canvasStore?.acceptsRendererCallback(for: lease) == true
+    }
     let started = driver.start { [weak self] event in
       self?.reduce(event)
     }
@@ -574,6 +585,7 @@ final class NativeChatStore: ObservableObject {
       sessionState = .ready
     case .canvas(let event):
       canvases.apply(event)
+      canvasRenderers.reconcile(canvases.presentation, canvases: canvases)
     case .idle:
       activeAssistant = nil
       activeReasoning = nil
@@ -599,12 +611,24 @@ final class NativeChatStore: ObservableObject {
       finishClose()
       return
     }
+
     guard lifecycle != .closing else { return }
     lifecycle = .closing
     canvases.shutdown(reason: .conversationClosing)
     driver.close { [self] in
       finishClose()
     }
+  }
+
+  func suspendCanvasPresentation() {
+    canvasRenderers.suspendPresentation()
+  }
+
+  func resumeCanvasPresentation() {
+    if canvasRenderers.resumePresentation() {
+      canvases.renewRendererLeasesForPresentation()
+    }
+    canvasRenderers.reconcile(canvases.presentation, canvases: canvases)
   }
 
   private func switchModel(_ selection: ModelSelection) {
@@ -1966,8 +1990,8 @@ extension ViviConversationDriver: CanvasCommandDriving {
     performCanvas(.open(key: key, input: input))
   }
 
-  func closeCanvas(key: CanvasInstanceKey) -> CanvasCommandTransportResult {
-    performCanvas(.close(key: key))
+  func closeCanvas(lease: CanvasRenderLease) -> CanvasCommandTransportResult {
+    performCanvas(.close(key: lease.key, generation: lease.generation))
   }
 
   func invokeCanvasAction(
@@ -2043,7 +2067,7 @@ enum NativeCanvasCommandEncoder {
 
     let key: CanvasInstanceKey
     switch command {
-    case .open(let value, _), .close(let value), .action(let value, _, _, _):
+    case .open(let value, _), .close(let value, _), .action(let value, _, _, _):
       key = value
     }
     var operation = vivi_backend_canvas_operation_t()
@@ -2057,10 +2081,14 @@ enum NativeCanvasCommandEncoder {
     case .open(_, let input):
       operation.kind = VIVI_BACKEND_CANVAS_OPERATION_OPEN
       operation.open_input_json = try appendJSON(input)
-    case .close:
+    case .close(_, let generation):
       operation.kind = VIVI_BACKEND_CANVAS_OPERATION_CLOSE
+      operation.expected_renderer_generation = generation.rawValue
     case .action(_, _, let name, let input):
       operation.kind = VIVI_BACKEND_CANVAS_OPERATION_INVOKE_ACTION
+      if case .action(_, let generation, _, _) = command {
+        operation.expected_renderer_generation = generation.rawValue
+      }
       operation.action_name = try append(name.rawValue)
       operation.action_input_json = try appendJSON(input)
     }

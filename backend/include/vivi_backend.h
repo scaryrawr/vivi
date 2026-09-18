@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define VIVI_BACKEND_ABI_VERSION 9
+#define VIVI_BACKEND_ABI_VERSION 10
 
 typedef enum vivi_backend_result {
     VIVI_BACKEND_OK = 0,
@@ -407,7 +407,8 @@ typedef struct vivi_backend_canvas_operation {
     vivi_backend_span_t action_name;
     vivi_backend_span_t open_input_json;
     vivi_backend_span_t action_input_json;
-    uint32_t reserved[2];
+    /* Required for close/action; must be zero for open. */
+    uint64_t expected_renderer_generation;
 } vivi_backend_canvas_operation_t;
 
 typedef struct vivi_backend_event {

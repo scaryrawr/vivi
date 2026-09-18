@@ -176,6 +176,66 @@ final class NativeApplicationCoordinatorTests: XCTestCase {
     XCTAssertEqual(harness.coordinator.conversations.selectedID, record.id)
   }
 
+  func testClosingPresentationRevokesCanvasRendererAndReopenRenewsLease() throws {
+    let configuration = NativeCanvasConfiguration(
+      enabled: true,
+      securityPolicy: try NativeCanvasSecurityPolicy(),
+      configurationFailure: nil)
+    let harness = CoordinatorHarness(canvasConfiguration: configuration)
+    harness.coordinator.open([URL(string: "vivi://chat?workspace=/tmp/project")!])
+    let store = harness.coordinator.conversations.records[0].store
+    let declarationID = try CanvasDeclarationID(
+      extensionID: "acme.preview",
+      canvasID: "diff")
+    let key = try CanvasInstanceKey(
+      declarationID: declarationID,
+      instanceID: CanvasInstanceID(validating: "instance-1"))
+    store.reduce(
+      .canvas(
+        .snapshot(
+          CanvasSnapshot(
+            capability: .supported,
+            registryDegradation: nil,
+            operationDegradation: nil,
+            shutdownRequested: false,
+            declarations: [
+              CanvasDeclaration(
+                id: declarationID,
+                extensionName: "Acme",
+                displayName: "Preview",
+                description: "Preview",
+                inputSchema: nil,
+                actions: [])
+            ],
+            instances: [
+              CanvasInstanceSnapshot(
+                key: key,
+                openInput: nil,
+                runtime: .opened(
+                  CanvasOpenedRuntime(
+                    generation: CanvasRendererGeneration(1)!,
+                    title: "Preview",
+                    url: "http://localhost:4317/canvas",
+                    status: nil)),
+                record: .removed,
+                degradation: nil)
+            ]))))
+    let oldLease = try XCTUnwrap(store.canvases.renderLease(for: key))
+    let oldRenderer = try XCTUnwrap(store.canvasRenderers.renderers.first)
+
+    harness.windows[0].simulateUserClose()
+
+    XCTAssertTrue(store.canvasRenderers.renderers.isEmpty)
+    XCTAssertEqual(oldRenderer.state, .tornDown)
+
+    harness.coordinator.presentMainWindow()
+    let replacementLease = try XCTUnwrap(store.canvases.renderLease(for: key))
+
+    XCTAssertNotEqual(oldLease.epoch, replacementLease.epoch)
+    XCTAssertFalse(store.canvases.acceptsRendererCallback(for: oldLease))
+    XCTAssertEqual(store.canvasRenderers.renderers.map(\.lease), [replacementLease])
+  }
+
   func testCrossWorkspaceResumeKeepsConversationIdentitySelectionAndUpdatesDuplicates() {
     let harness = CoordinatorHarness()
     harness.coordinator.open([
@@ -264,6 +324,11 @@ private final class CoordinatorHarness {
   var drivers: [ControllableConversationDriver] = []
   var choosers: [ControllableWorkspaceChooser] = []
   var windows: [FakeMainWindow] = []
+  let canvasConfiguration: NativeCanvasConfiguration
+
+  init(canvasConfiguration: NativeCanvasConfiguration = .disabled) {
+    self.canvasConfiguration = canvasConfiguration
+  }
 
   lazy var coordinator: NativeApplicationCoordinator = {
     var nextID = 0
@@ -278,7 +343,10 @@ private final class CoordinatorHarness {
         self?.drivers.append(driver)
         return ConversationRecord(
           id: id,
-          store: NativeChatStore(workspace: workspace.canonicalPath, driver: driver))
+          store: NativeChatStore(
+            workspace: workspace.canonicalPath,
+            driver: driver,
+            canvasConfiguration: self?.canvasConfiguration ?? .disabled))
       },
       makeWorkspaceChooser: { [weak self] in
         let chooser = ControllableWorkspaceChooser()

@@ -12,7 +12,7 @@ const tool_activity = @import("tool_activity.zig");
 const tools = @import("tools.zig");
 
 pub const version = build_options.version;
-pub const abi_version: u32 = 9;
+pub const abi_version: u32 = 10;
 pub const canvas_domain = canvas;
 pub const Conversation = conversation.Conversation;
 pub const ConversationEvent = conversation.Event;
@@ -2744,10 +2744,12 @@ fn degradationForError(err: anyerror) canvas.Degradation {
 
 fn canvasFailure(err: anyerror) canvas.OperationFailure {
     return switch (err) {
+        error.StaleRendererGeneration => .stale,
         error.CanvasUnsupported => .unsupported,
         error.CanvasUnavailable,
         error.CanvasNotOpen,
         error.ActionUnavailable,
+        error.AmbiguousCanvasInstance,
         => .unavailable,
         error.Backpressure => .backpressure,
         error.Shutdown => .shutdown,
@@ -4847,6 +4849,7 @@ test "canvas adapter executes open action and close with local correlation" {
         canvas.RuntimeTag.opened,
         adapter.state.runtimeTag(canvas_test_key).?,
     );
+    const generation = adapter.state.rendererGeneration(canvas_test_key).?;
 
     var action: canvas.Command = .{
         .invoke_action = try canvas.ActionCommand.init(
@@ -4854,6 +4857,7 @@ test "canvas adapter executes open action and close with local correlation" {
             @enumFromInt(2),
             .{
                 .key = canvas_test_key,
+                .expected_generation = generation,
                 .action_name = "refresh",
                 .input_json = "{}",
             },
@@ -4873,7 +4877,10 @@ test "canvas adapter executes open action and close with local correlation" {
     var close: canvas.Command = .{ .close = try canvas.CloseCommand.init(
         std.testing.allocator,
         @enumFromInt(3),
-        canvas_test_key,
+        .{
+            .key = canvas_test_key,
+            .expected_generation = generation,
+        },
         .{},
     ) };
     defer close.deinit();
@@ -4888,6 +4895,163 @@ test "canvas adapter executes open action and close with local correlation" {
     try std.testing.expectEqual(@as(usize, 1), session.open_calls);
     try std.testing.expectEqual(@as(usize, 1), session.action_calls);
     try std.testing.expectEqual(@as(usize, 1), session.close_calls);
+}
+
+test "canvas adapter never dispatches stale or ambiguous close and action" {
+    var adapter = try testCanvasAdapter();
+    defer adapter.deinit();
+    var session: FakeCanvasSession = .{};
+    try adapter.state.applyProviderSignal(.{
+        .opened = .{ .key = canvas_test_key },
+    });
+    const generation = adapter.state.rendererGeneration(canvas_test_key).?;
+    const stale: canvas.RendererGeneration = @enumFromInt(
+        generation.value() + 1,
+    );
+
+    var stale_action: canvas.Command = .{
+        .invoke_action = try canvas.ActionCommand.init(
+            std.testing.allocator,
+            @enumFromInt(1),
+            .{
+                .key = canvas_test_key,
+                .expected_generation = stale,
+                .action_name = "refresh",
+            },
+            .{},
+        ),
+    };
+    defer stale_action.deinit();
+    var stale_action_result = try adapter.execute(&session, &stale_action);
+    defer stale_action_result.deinit();
+    try std.testing.expectEqual(
+        canvas.OperationFailure.stale,
+        stale_action_result.result.action.failed,
+    );
+
+    var stale_close: canvas.Command = .{ .close = try canvas.CloseCommand.init(
+        std.testing.allocator,
+        @enumFromInt(2),
+        .{
+            .key = canvas_test_key,
+            .expected_generation = stale,
+        },
+        .{},
+    ) };
+    defer stale_close.deinit();
+    var stale_close_result = try adapter.execute(&session, &stale_close);
+    defer stale_close_result.deinit();
+    try std.testing.expectEqual(
+        canvas.OperationFailure.stale,
+        stale_close_result.result.close.failed,
+    );
+    try std.testing.expectEqual(@as(usize, 0), session.action_calls);
+    try std.testing.expectEqual(@as(usize, 0), session.close_calls);
+
+    const colliding_key: canvas.KeyView = .{
+        .extension_id = "other.extension",
+        .canvas_id = "preview",
+        .instance_id = canvas_test_key.instance_id,
+    };
+    try adapter.state.applyProviderSignal(.{
+        .opened = .{ .key = colliding_key },
+    });
+    var ambiguous_action: canvas.Command = .{
+        .invoke_action = try canvas.ActionCommand.init(
+            std.testing.allocator,
+            @enumFromInt(3),
+            .{
+                .key = canvas_test_key,
+                .expected_generation = generation,
+                .action_name = "refresh",
+            },
+            .{},
+        ),
+    };
+    defer ambiguous_action.deinit();
+    var ambiguous_result = try adapter.execute(&session, &ambiguous_action);
+    defer ambiguous_result.deinit();
+    try std.testing.expectEqual(
+        canvas.OperationFailure.unavailable,
+        ambiguous_result.result.action.failed,
+    );
+    try std.testing.expectEqual(@as(usize, 0), session.action_calls);
+    try std.testing.expectEqual(
+        canvas.RuntimeTag.unavailable,
+        adapter.state.runtimeTag(canvas_test_key).?,
+    );
+    try std.testing.expectEqual(
+        canvas.RuntimeTag.unavailable,
+        adapter.state.runtimeTag(colliding_key).?,
+    );
+
+    try adapter.state.applyProviderSignal(.{
+        .opened = .{ .key = canvas_test_key },
+    });
+    try adapter.state.applyProviderSignal(.{
+        .opened = .{ .key = colliding_key },
+    });
+    var ambiguous_close: canvas.Command = .{ .close = try canvas.CloseCommand.init(
+        std.testing.allocator,
+        @enumFromInt(4),
+        .{
+            .key = canvas_test_key,
+            .expected_generation = adapter.state.rendererGeneration(
+                canvas_test_key,
+            ).?,
+        },
+        .{},
+    ) };
+    defer ambiguous_close.deinit();
+    var ambiguous_close_result = try adapter.execute(&session, &ambiguous_close);
+    defer ambiguous_close_result.deinit();
+    try std.testing.expectEqual(
+        canvas.OperationFailure.unavailable,
+        ambiguous_close_result.result.close.failed,
+    );
+    try std.testing.expectEqual(@as(usize, 0), session.close_calls);
+}
+
+test "canvas adapter does not dispatch a colliding pending open" {
+    var adapter = try testCanvasAdapter();
+    defer adapter.deinit();
+    const colliding_declaration: canvas.CanvasDeclarationInput = .{
+        .extension_id = "other.extension",
+        .extension_name = "Other",
+        .canvas_id = "preview",
+        .display_name = "Preview",
+        .description = "Preview changes",
+    };
+    try adapter.state.applyRegistry(.{ .incremental = .{
+        .upserted = &.{colliding_declaration},
+    } });
+    _ = try adapter.state.beginOpen(.{ .key = canvas_test_key });
+    const colliding_key: canvas.KeyView = .{
+        .extension_id = colliding_declaration.extension_id,
+        .canvas_id = colliding_declaration.canvas_id,
+        .instance_id = canvas_test_key.instance_id,
+    };
+    var command: canvas.Command = .{ .open = try canvas.OpenCommand.init(
+        std.testing.allocator,
+        @enumFromInt(1),
+        .{ .key = colliding_key },
+        .{},
+    ) };
+    defer command.deinit();
+    var session: FakeCanvasSession = .{};
+
+    var completion = try adapter.execute(&session, &command);
+    defer completion.deinit();
+    try std.testing.expectEqual(
+        canvas.OperationFailure.unavailable,
+        completion.result.open.failed,
+    );
+    try std.testing.expectEqual(@as(usize, 0), session.open_calls);
+    try std.testing.expectEqual(
+        canvas.RuntimeTag.opening,
+        adapter.state.runtimeTag(canvas_test_key).?,
+    );
+    try std.testing.expect(adapter.state.runtimeTag(colliding_key) == null);
 }
 
 test "canvas adapter rejects mismatched and oversized SDK results locally" {
@@ -4955,7 +5119,13 @@ test "canvas adapter rejects mismatched and oversized SDK results locally" {
         .invoke_action = try canvas.ActionCommand.init(
             std.testing.allocator,
             @enumFromInt(3),
-            .{ .key = canvas_test_key, .action_name = "refresh" },
+            .{
+                .key = canvas_test_key,
+                .expected_generation = adapter.state.rendererGeneration(
+                    canvas_test_key,
+                ).?,
+                .action_name = "refresh",
+            },
             .{},
         ),
     };

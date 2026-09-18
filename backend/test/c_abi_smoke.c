@@ -31,10 +31,13 @@ _Static_assert(_Alignof(vivi_backend_canvas_completion_t) == _Alignof(uint64_t),
 _Static_assert(sizeof(vivi_backend_canvas_operation_t) == 72,
                "canvas operation layout");
 _Static_assert(_Alignof(vivi_backend_canvas_operation_t) ==
-                   _Alignof(vivi_backend_span_t),
+                   _Alignof(uint64_t),
                "canvas operation alignment");
 _Static_assert(offsetof(vivi_backend_canvas_operation_t, key) == 16,
                "canvas operation key offset");
+_Static_assert(
+    offsetof(vivi_backend_canvas_operation_t, expected_renderer_generation) == 64,
+    "canvas operation generation offset");
 _Static_assert(offsetof(vivi_backend_canvas_declaration_t, action_offset) == 48,
                "canvas action range offset");
 
@@ -75,7 +78,7 @@ int main(void) {
     assert(vivi_backend_open(&options, &conversation) == VIVI_BACKEND_INVALID_ARGUMENT);
     options.canvas_options_reserved = 0;
     assert(conversation == 0);
-    assert(VIVI_BACKEND_ABI_VERSION == 9);
+    assert(VIVI_BACKEND_ABI_VERSION == 10);
     assert(VIVI_BACKEND_PRESENTATION_SOURCE == 3);
     assert(VIVI_BACKEND_LANGUAGE_PYTHON == 15);
     assert(VIVI_BACKEND_TOKEN_META == 11);

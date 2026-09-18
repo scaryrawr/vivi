@@ -163,7 +163,7 @@ struct MainWindowView: View {
       .accessibilityIdentifier("conversation-sidebar")
     } detail: {
       if let conversation = conversations.selectedConversation {
-        ContentView(store: conversation.store)
+        ConversationDetailView(store: conversation.store)
           .id(conversation.id.rawValue)
           .accessibilityIdentifier("conversation-detail-\(conversation.id.rawValue)")
       } else {
@@ -238,6 +238,29 @@ struct MainWindowView: View {
           conversations.select(id)
         }
       })
+  }
+}
+
+private struct ConversationDetailView: View {
+  @ObservedObject var store: NativeChatStore
+  @ObservedObject private var canvasRenderers: NativeCanvasRendererStore
+
+  init(store: NativeChatStore) {
+    self.store = store
+    canvasRenderers = store.canvasRenderers
+  }
+
+  var body: some View {
+    if canvasRenderers.renderers.isEmpty {
+      ContentView(store: store)
+    } else {
+      VSplitView {
+        ContentView(store: store)
+        NativeCanvasHostView(
+          rendererStore: canvasRenderers,
+          canvases: store.canvases)
+      }
+    }
   }
 }
 

@@ -270,10 +270,10 @@ final class NativeCanvasTests: XCTestCase {
     XCTAssertEqual(text(encoded.operation.open_input_json, in: encoded.bytes), #"{"path":"a"}"#)
     XCTAssertEqual(encoded.operation.action_name.length, 0)
     XCTAssertEqual(encoded.operation.action_input_json.length, 0)
-    XCTAssertTrue(withUnsafeBytes(of: encoded.operation.reserved) { $0.allSatisfy { $0 == 0 } })
+    XCTAssertEqual(encoded.operation.expected_renderer_generation, 0)
   }
 
-  func testCommandEncoderKeepsGenerationHostSideAndUsesActionJSONRole() throws {
+  func testCommandEncoderCarriesGenerationAndUsesActionJSONRole() throws {
     let key = try canvasKey()
     let input = try CanvasActionInput(jsonUTF8: "false")
     let generation = CanvasRendererGeneration(22)!
@@ -286,9 +286,24 @@ final class NativeCanvasTests: XCTestCase {
         input: input))
 
     XCTAssertEqual(encoded.operation.kind, VIVI_BACKEND_CANVAS_OPERATION_INVOKE_ACTION)
+    XCTAssertEqual(encoded.operation.expected_renderer_generation, 22)
     XCTAssertEqual(text(encoded.operation.action_name, in: encoded.bytes), "refresh")
     XCTAssertEqual(text(encoded.operation.action_input_json, in: encoded.bytes), "false")
     XCTAssertEqual(encoded.operation.open_input_json.length, 0)
+  }
+
+  func testCommandEncoderRequiresGenerationForClose() throws {
+    let key = try canvasKey()
+    let generation = CanvasRendererGeneration(17)!
+
+    let encoded = try NativeCanvasCommandEncoder.encode(
+      .close(key: key, generation: generation))
+
+    XCTAssertEqual(encoded.operation.kind, VIVI_BACKEND_CANVAS_OPERATION_CLOSE)
+    XCTAssertEqual(encoded.operation.expected_renderer_generation, 17)
+    XCTAssertEqual(encoded.operation.action_name.length, 0)
+    XCTAssertEqual(encoded.operation.open_input_json.length, 0)
+    XCTAssertEqual(encoded.operation.action_input_json.length, 0)
   }
 
   func testStoreRetainsDeclarationForLiveInstanceAfterRegistryDisappears() throws {
@@ -304,7 +319,9 @@ final class NativeCanvasTests: XCTestCase {
     XCTAssertEqual(store.presentation.instances[0].declaration, declaration)
     let action = try CanvasActionName("refresh")
     let lease = CanvasRenderLease(
-      key: key, generation: CanvasRendererGeneration(1)!)
+      key: key,
+      generation: CanvasRendererGeneration(1)!,
+      epoch: CanvasRendererEpoch(1)!)
     XCTAssertEqual(store.invoke(action, on: lease, input: nil), .rejected(.actionUnavailable))
   }
 
@@ -325,13 +342,19 @@ final class NativeCanvasTests: XCTestCase {
       directives,
       [
         .teardown(
-          CanvasRenderLease(key: key, generation: generation1),
+          CanvasRenderLease(
+            key: key,
+            generation: generation1,
+            epoch: CanvasRendererEpoch(1)!),
           reason: .generationReplaced)
       ])
     XCTAssertEqual(
       store.invoke(
         try CanvasActionName("refresh"),
-        on: CanvasRenderLease(key: key, generation: generation1),
+        on: CanvasRenderLease(
+          key: key,
+          generation: generation1,
+          epoch: CanvasRendererEpoch(1)!),
         input: nil),
       .rejected(.staleGeneration))
 
@@ -339,13 +362,131 @@ final class NativeCanvasTests: XCTestCase {
     XCTAssertEqual(
       store.invoke(
         try CanvasActionName("refresh"),
-        on: CanvasRenderLease(key: key, generation: generation2),
+        on: CanvasRenderLease(
+          key: key,
+          generation: generation2,
+          epoch: CanvasRendererEpoch(2)!),
         input: nil),
       .submitted(CanvasOperationID(9)!))
     guard case .action(_, let generation, _, _) = driver.commands.last else {
       return XCTFail("Expected action command")
     }
     XCTAssertEqual(generation, generation2)
+  }
+
+  func testRendererEpochNeverRepeatsAcrossSuccessfulResume() throws {
+    let store = NativeCanvasStore(driver: FakeCanvasDriver())
+    let declaration = try canvasDeclaration()
+    let key = try canvasKey()
+    store.apply(.snapshot(canvasSnapshot(declarations: [declaration], key: key, generation: 1)))
+    let oldLease = try XCTUnwrap(store.renderLease(for: key))
+
+    store.resetForSuccessfulResume()
+    store.apply(.snapshot(canvasSnapshot(declarations: [declaration], key: key, generation: 1)))
+    let replacementLease = try XCTUnwrap(store.renderLease(for: key))
+
+    XCTAssertEqual(oldLease.key, replacementLease.key)
+    XCTAssertEqual(oldLease.generation, replacementLease.generation)
+    XCTAssertNotEqual(oldLease.epoch, replacementLease.epoch)
+    XCTAssertFalse(store.acceptsRendererCallback(for: oldLease))
+    XCTAssertTrue(store.acceptsRendererCallback(for: replacementLease))
+  }
+
+  func testPresentationCloseRevokesRendererAndReopenUsesFreshEpoch() throws {
+    let configuration = NativeCanvasConfiguration(
+      enabled: true,
+      securityPolicy: try NativeCanvasSecurityPolicy(),
+      configurationFailure: nil)
+    let store = NativeChatStore(
+      workspace: "/work/project",
+      driver: CanvasConversationDriver(),
+      canvasConfiguration: configuration)
+    let key = try canvasKey()
+    store.canvases.apply(
+      .snapshot(
+        canvasSnapshot(
+          declarations: [try canvasDeclaration()],
+          key: key,
+          generation: 1,
+          url: "http://localhost:4317/canvas")))
+    store.canvasRenderers.reconcile(store.canvases.presentation, canvases: store.canvases)
+    let oldLease = try XCTUnwrap(store.canvases.renderLease(for: key))
+    let oldRenderer = try XCTUnwrap(store.canvasRenderers.renderers.first)
+
+    store.suspendCanvasPresentation()
+
+    XCTAssertTrue(store.canvasRenderers.renderers.isEmpty)
+    XCTAssertEqual(oldRenderer.state, .tornDown)
+
+    store.resumeCanvasPresentation()
+    let replacementLease = try XCTUnwrap(store.canvases.renderLease(for: key))
+
+    XCTAssertNotEqual(oldLease.epoch, replacementLease.epoch)
+    XCTAssertFalse(store.canvases.acceptsRendererCallback(for: oldLease))
+    XCTAssertEqual(store.canvasRenderers.renderers.map(\.lease), [replacementLease])
+  }
+
+  func testGenerationReplacementRevokesOldWebRendererBeforePublishingNewOne() throws {
+    let configuration = NativeCanvasConfiguration(
+      enabled: true,
+      securityPolicy: try NativeCanvasSecurityPolicy(),
+      configurationFailure: nil)
+    let store = NativeChatStore(
+      workspace: "/work/project",
+      driver: CanvasConversationDriver(),
+      canvasConfiguration: configuration)
+    let key = try canvasKey()
+    let declaration = try canvasDeclaration()
+    store.reduce(
+      .canvas(
+        .snapshot(
+          canvasSnapshot(
+            declarations: [declaration],
+            key: key,
+            generation: 1,
+            url: "http://127.0.0.1:4317/canvas"))))
+    let oldRenderer = try XCTUnwrap(store.canvasRenderers.renderers.first)
+    let oldLease = oldRenderer.lease
+
+    store.reduce(
+      .canvas(
+        .snapshot(
+          canvasSnapshot(
+            declarations: [declaration],
+            key: key,
+            generation: 2,
+            url: "http://127.0.0.1:4317/canvas"))))
+    let replacement = try XCTUnwrap(store.canvasRenderers.renderers.first)
+
+    XCTAssertEqual(oldRenderer.state, .tornDown)
+    XCTAssertFalse(store.canvases.acceptsRendererCallback(for: oldLease))
+    XCTAssertNotEqual(oldLease.epoch, replacement.lease.epoch)
+    XCTAssertEqual(replacement.lease.generation, CanvasRendererGeneration(2)!)
+  }
+
+  func testCloseCarriesCurrentRendererGeneration() throws {
+    let driver = FakeCanvasDriver()
+    driver.results = [.accepted(CanvasOperationID(10)!)]
+    var directives: [CanvasHostDirective] = []
+    let store = NativeCanvasStore(
+      driver: driver,
+      emitHostDirective: { directives.append($0) })
+    let declaration = try canvasDeclaration()
+    let key = try canvasKey()
+    store.apply(.snapshot(canvasSnapshot(declarations: [declaration], key: key, generation: 7)))
+    let lease = try XCTUnwrap(store.renderLease(for: key))
+
+    XCTAssertEqual(store.close(lease), .submitted(CanvasOperationID(10)!))
+    guard case .close(let closedKey, let generation) = driver.commands.last else {
+      return XCTFail("Expected close command")
+    }
+    XCTAssertEqual(closedKey, key)
+    XCTAssertEqual(generation, CanvasRendererGeneration(7)!)
+    XCTAssertEqual(directives, [.teardown(lease, reason: .runtimeEnded)])
+    XCTAssertFalse(store.acceptsRendererCallback(for: lease))
+
+    store.apply(.snapshot(canvasSnapshot(declarations: [declaration], key: key, generation: 7)))
+    XCTAssertNil(store.renderLease(for: key))
   }
 
   func testOpenAndOpenSameKeyUseValidatedInjectedIDAndPreserveOperationIDs() throws {
@@ -388,6 +529,52 @@ final class NativeCanvasTests: XCTestCase {
     XCTAssertTrue(driver.commands.isEmpty)
   }
 
+  func testGeneratedOpenReservesInstanceIDAcrossPendingDeclarations() throws {
+    let driver = FakeCanvasDriver()
+    driver.results = [.accepted(CanvasOperationID(13)!)]
+    let store = NativeCanvasStore(
+      driver: driver,
+      instanceIDs: CanvasInstanceIDGenerator { "shared-instance" })
+    let first = try canvasDeclaration()
+    let second = CanvasDeclaration(
+      id: try CanvasDeclarationID(extensionID: "other.extension", canvasID: "other-canvas"),
+      extensionName: "Other",
+      displayName: "Other Canvas",
+      description: "Other",
+      inputSchema: nil,
+      actions: [])
+    store.apply(.snapshot(canvasSnapshot(declarations: [first, second])))
+
+    guard case .submitted = store.open(first.id, input: nil) else {
+      return XCTFail("Expected first open submission")
+    }
+
+    XCTAssertEqual(store.open(second.id, input: nil), .rejected(.instanceIDCollision))
+    let collidingKey = try CanvasInstanceKey(
+      declarationID: second.id,
+      instanceID: CanvasInstanceID(validating: "shared-instance"))
+    XCTAssertEqual(
+      store.openSameKey(collidingKey, input: nil),
+      .rejected(.instanceIDCollision))
+    XCTAssertEqual(driver.commands.count, 1)
+  }
+
+  func testActionRejectsStaleNativeEpochWithSameBackendGeneration() throws {
+    let driver = FakeCanvasDriver()
+    driver.results = [.accepted(CanvasOperationID(14)!)]
+    let store = NativeCanvasStore(driver: driver)
+    let declaration = try canvasDeclaration()
+    let key = try canvasKey()
+    store.apply(.snapshot(canvasSnapshot(declarations: [declaration], key: key, generation: 3)))
+    let oldLease = try XCTUnwrap(store.renderLease(for: key))
+    store.renewRendererLeasesForPresentation()
+
+    XCTAssertEqual(
+      store.invoke(try CanvasActionName("refresh"), on: oldLease, input: nil),
+      .rejected(.staleGeneration))
+    XCTAssertTrue(driver.commands.isEmpty)
+  }
+
   func testCompletionCorrelatesOperationAndRetainsGenerationBoundCommand() throws {
     let driver = FakeCanvasDriver()
     driver.results = [.accepted(CanvasOperationID(19)!)]
@@ -398,7 +585,10 @@ final class NativeCanvasTests: XCTestCase {
     store.apply(.snapshot(canvasSnapshot(declarations: [declaration], key: key, generation: 3)))
     _ = store.invoke(
       try CanvasActionName("refresh"),
-      on: CanvasRenderLease(key: key, generation: generation),
+      on: CanvasRenderLease(
+        key: key,
+        generation: generation,
+        epoch: CanvasRendererEpoch(1)!),
       input: nil)
 
     store.apply(
@@ -513,7 +703,10 @@ final class NativeCanvasTests: XCTestCase {
     protocolFailed.apply(.snapshot(opened))
     XCTAssertFalse(
       protocolFailed.acceptsRendererCallback(
-        for: CanvasRenderLease(key: key, generation: generation)))
+        for: CanvasRenderLease(
+          key: key,
+          generation: generation,
+          epoch: CanvasRendererEpoch(1)!)))
 
     let shutdown = NativeCanvasStore(driver: FakeCanvasDriver())
     shutdown.apply(
@@ -528,7 +721,10 @@ final class NativeCanvasTests: XCTestCase {
     shutdown.apply(.snapshot(opened))
     XCTAssertFalse(
       shutdown.acceptsRendererCallback(
-        for: CanvasRenderLease(key: key, generation: generation)))
+        for: CanvasRenderLease(
+          key: key,
+          generation: generation,
+          epoch: CanvasRendererEpoch(1)!)))
   }
 }
 
@@ -730,7 +926,8 @@ private func canvasKey() throws -> CanvasInstanceKey {
 private func canvasSnapshot(
   declarations: [CanvasDeclaration],
   key: CanvasInstanceKey? = nil,
-  generation: UInt64 = 1
+  generation: UInt64 = 1,
+  url: String? = nil
 ) -> CanvasSnapshot {
   CanvasSnapshot(
     capability: .supported,
@@ -747,7 +944,7 @@ private func canvasSnapshot(
             CanvasOpenedRuntime(
               generation: CanvasRendererGeneration(generation)!,
               title: "Preview",
-              url: nil,
+              url: url,
               status: nil)),
           record: .removed,
           degradation: nil)
@@ -783,8 +980,8 @@ private final class FakeCanvasDriver: CanvasCommandDriving {
     return nextResult()
   }
 
-  func closeCanvas(key: CanvasInstanceKey) -> CanvasCommandTransportResult {
-    commands.append(.close(key: key))
+  func closeCanvas(lease: CanvasRenderLease) -> CanvasCommandTransportResult {
+    commands.append(.close(key: lease.key, generation: lease.generation))
     return nextResult()
   }
 

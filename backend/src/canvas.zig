@@ -572,10 +572,12 @@ pub const OpenRequest = struct {
 
 pub const CloseRequest = struct {
     key: KeyView,
+    expected_generation: RendererGeneration,
 };
 
 pub const InvokeActionRequest = struct {
     key: KeyView,
+    expected_generation: RendererGeneration,
     action_name: []const u8,
     input: ?*const ActionInputDocument = null,
 };
@@ -595,13 +597,19 @@ pub const OpenCommandInput = struct {
 
 pub const ActionCommandInput = struct {
     key: KeyView,
+    expected_generation: RendererGeneration,
     action_name: []const u8,
     input_json: ?[]const u8 = null,
 };
 
+pub const CloseCommandInput = struct {
+    key: KeyView,
+    expected_generation: RendererGeneration,
+};
+
 pub const CommandInput = union(enum) {
     open: OpenCommandInput,
-    close: KeyView,
+    close: CloseCommandInput,
     invoke_action: ActionCommandInput,
 };
 
@@ -648,22 +656,27 @@ pub const CloseCommand = struct {
     allocator: std.mem.Allocator,
     request_id: RequestId,
     key: InstanceKey,
+    expected_generation: RendererGeneration,
 
     pub fn init(
         allocator: std.mem.Allocator,
         request_id: RequestId,
-        key: KeyView,
+        value: CloseCommandInput,
         limits: Limits,
     ) !CloseCommand {
         return .{
             .allocator = allocator,
             .request_id = request_id,
-            .key = try InstanceKey.init(allocator, key, limits),
+            .key = try InstanceKey.init(allocator, value.key, limits),
+            .expected_generation = value.expected_generation,
         };
     }
 
     pub fn request(self: *const CloseCommand) CloseRequest {
-        return .{ .key = self.key.view() };
+        return .{
+            .key = self.key.view(),
+            .expected_generation = self.expected_generation,
+        };
     }
 
     pub fn deinit(self: *CloseCommand) void {
@@ -676,6 +689,7 @@ pub const ActionCommand = struct {
     allocator: std.mem.Allocator,
     request_id: RequestId,
     key: InstanceKey,
+    expected_generation: RendererGeneration,
     action_name: ActionName,
     input: ?ActionInputDocument,
 
@@ -697,6 +711,7 @@ pub const ActionCommand = struct {
             .allocator = allocator,
             .request_id = request_id,
             .key = key,
+            .expected_generation = value.expected_generation,
             .action_name = action_name,
             .input = if (value.input_json) |json|
                 try ActionInputDocument.init(allocator, json, limits)
@@ -708,6 +723,7 @@ pub const ActionCommand = struct {
     pub fn request(self: *const ActionCommand) InvokeActionRequest {
         return .{
             .key = self.key.view(),
+            .expected_generation = self.expected_generation,
             .action_name = self.action_name.bytes,
             .input = if (self.input) |*input| input else null,
         };
@@ -944,6 +960,13 @@ const RuntimeState = union(RuntimeTag) {
         self.* = undefined;
     }
 };
+
+fn isActiveRuntime(runtime: RuntimeState) bool {
+    return switch (runtime) {
+        .opening, .opened, .closing => true,
+        .closed, .unavailable => false,
+    };
+}
 
 pub const RecordTag = enum {
     recorded,
@@ -1304,6 +1327,9 @@ pub const State = struct {
             request.key.extension_id,
             request.key.canvas_id,
         ) == null) return error.CanvasUnavailable;
+        if (self.hasConflictingActiveInstance(request.key)) {
+            return error.AmbiguousCanvasInstance;
+        }
         try self.requirePendingCapacity();
         var replacement_input = if (request.input) |input|
             try input.clone(self.allocator)
@@ -1412,6 +1438,12 @@ pub const State = struct {
             .opened => |opened| opened.generation,
             else => return error.CanvasNotOpen,
         };
+        if (self.failAmbiguousInstanceId(request.key.instance_id)) {
+            return error.AmbiguousCanvasInstance;
+        }
+        if (generation != request.expected_generation) {
+            return error.StaleRendererGeneration;
+        }
         const id = self.takeOperationId();
         try self.pending.append(self.allocator, .{
             .id = id,
@@ -1464,6 +1496,18 @@ pub const State = struct {
     ) !OperationToken {
         try self.requireOperational();
         if (!self.capability.supports()) return error.CanvasUnsupported;
+        const instance_index = self.findInstance(request.key) orelse
+            return error.CanvasNotOpen;
+        const generation = switch (self.instances.items[instance_index].runtime) {
+            .opened => |opened| opened.generation,
+            else => return error.CanvasNotOpen,
+        };
+        if (self.failAmbiguousInstanceId(request.key.instance_id)) {
+            return error.AmbiguousCanvasInstance;
+        }
+        if (generation != request.expected_generation) {
+            return error.StaleRendererGeneration;
+        }
         var action_name = try ActionName.init(
             self.allocator,
             request.action_name,
@@ -1477,10 +1521,6 @@ pub const State = struct {
         if (!self.registry.entries.items[declaration_index].hasAction(
             request.action_name,
         )) return error.ActionUnavailable;
-        const instance_index = self.findInstance(request.key) orelse
-            return error.CanvasNotOpen;
-        if (self.instances.items[instance_index].runtime.tag() != .opened)
-            return error.CanvasNotOpen;
         try self.requirePendingCapacity();
         const id = self.takeOperationId();
         try self.pending.append(self.allocator, .{
@@ -1827,6 +1867,17 @@ pub const State = struct {
         return self.instances.items[index].degradation;
     }
 
+    pub fn rendererGeneration(
+        self: State,
+        key: KeyView,
+    ) ?RendererGeneration {
+        const index = self.findInstance(key) orelse return null;
+        return switch (self.instances.items[index].runtime) {
+            .opened => |opened| opened.generation,
+            else => null,
+        };
+    }
+
     pub fn registryCount(self: State) usize {
         return self.registry.entries.items.len;
     }
@@ -1863,6 +1914,52 @@ pub const State = struct {
             if (instance.key.eqlView(key)) return index;
         }
         return null;
+    }
+
+    fn failAmbiguousInstanceId(
+        self: *State,
+        instance_id: []const u8,
+    ) bool {
+        var active_count: usize = 0;
+        for (self.instances.items) |instance| {
+            if (std.mem.eql(
+                u8,
+                instance.key.instance_id.bytes,
+                instance_id,
+            ) and isActiveRuntime(instance.runtime)) {
+                active_count += 1;
+            }
+        }
+        if (active_count < 2) return false;
+        for (self.instances.items, 0..) |*instance, index| {
+            if (!std.mem.eql(
+                u8,
+                instance.key.instance_id.bytes,
+                instance_id,
+            ) or !isActiveRuntime(instance.runtime)) continue;
+            self.cancelPendingForInstance(index);
+            instance.replaceRuntime(self.allocator, .unavailable);
+            instance.degradation = .invalid_signal;
+        }
+        return true;
+    }
+
+    fn hasConflictingActiveInstance(
+        self: State,
+        key: KeyView,
+    ) bool {
+        for (self.instances.items) |instance| {
+            if (std.mem.eql(
+                u8,
+                instance.key.instance_id.bytes,
+                key.instance_id,
+            ) and !instance.key.eqlView(key) and
+                isActiveRuntime(instance.runtime))
+            {
+                return true;
+            }
+        }
+        return false;
     }
 
     fn ensureInstance(
@@ -2151,6 +2248,7 @@ test "owned canvas commands validate and retain caller input" {
                 .canvas_id = "review",
                 .instance_id = "review:main",
             },
+            .expected_generation = @enumFromInt(9),
             .action_name = &action_name,
             .input_json = "{\"refresh\":true}",
         },
@@ -2352,6 +2450,7 @@ test "open same-key close and action operations are deterministic" {
 
     const action = try state.beginAction(.{
         .key = fixture_key,
+        .expected_generation = second.generation.?,
         .action_name = "refresh",
     });
     var result = try ActionResultDocument.init(
@@ -2365,7 +2464,10 @@ test "open same-key close and action operations are deterministic" {
         .{ .succeeded = &result },
     ));
 
-    const close = try state.beginClose(.{ .key = fixture_key });
+    const close = try state.beginClose(.{
+        .key = fixture_key,
+        .expected_generation = second.generation.?,
+    });
     try std.testing.expectEqual(RuntimeTag.closing, state.runtimeTag(fixture_key).?);
     try std.testing.expect(try state.completeClose(close, true));
     try std.testing.expectEqual(RuntimeTag.closed, state.runtimeTag(fixture_key).?);
@@ -2470,7 +2572,10 @@ test "closing races and stale renderer generations reject old host work" {
     defer state.deinit();
     const open = try state.beginOpen(.{ .key = fixture_key });
     try std.testing.expect(try state.completeOpen(open, .{ .succeeded = .{} }));
-    const close = try state.beginClose(.{ .key = fixture_key });
+    const close = try state.beginClose(.{
+        .key = fixture_key,
+        .expected_generation = open.generation.?,
+    });
 
     try state.applyProviderSignal(.{ .opened = .{
         .key = fixture_key,
@@ -2489,31 +2594,125 @@ test "closing races and stale renderer generations reject old host work" {
     }));
 }
 
+test "close and action require the current renderer generation" {
+    var state = try fixtureState(.{});
+    defer state.deinit();
+    const open = try state.beginOpen(.{ .key = fixture_key });
+    try std.testing.expect(try state.completeOpen(open, .{ .succeeded = .{} }));
+    const stale: RendererGeneration = @enumFromInt(
+        open.generation.?.value() + 1,
+    );
+
+    try std.testing.expectError(
+        error.StaleRendererGeneration,
+        state.beginAction(.{
+            .key = fixture_key,
+            .expected_generation = stale,
+            .action_name = "refresh",
+        }),
+    );
+    try std.testing.expectError(
+        error.StaleRendererGeneration,
+        state.beginClose(.{
+            .key = fixture_key,
+            .expected_generation = stale,
+        }),
+    );
+    try std.testing.expectEqual(RuntimeTag.opened, state.runtimeTag(fixture_key).?);
+    try std.testing.expectEqual(@as(usize, 0), state.pendingCount());
+}
+
+test "ambiguous active instance IDs fail closed for every full key" {
+    var state = try fixtureState(.{});
+    defer state.deinit();
+    const colliding_key: KeyView = .{
+        .extension_id = "other.extension",
+        .canvas_id = "preview",
+        .instance_id = fixture_key.instance_id,
+    };
+    try state.applyProviderSignal(.{ .opened = .{ .key = fixture_key } });
+    try state.applyProviderSignal(.{ .opened = .{ .key = colliding_key } });
+    const generation = state.rendererGeneration(fixture_key).?;
+
+    try std.testing.expectError(
+        error.AmbiguousCanvasInstance,
+        state.beginClose(.{
+            .key = fixture_key,
+            .expected_generation = generation,
+        }),
+    );
+    try std.testing.expectEqual(RuntimeTag.unavailable, state.runtimeTag(fixture_key).?);
+    try std.testing.expectEqual(RuntimeTag.unavailable, state.runtimeTag(colliding_key).?);
+    try std.testing.expectEqual(
+        Degradation.invalid_signal,
+        state.instanceDegradation(fixture_key).?,
+    );
+    try std.testing.expectEqual(
+        Degradation.invalid_signal,
+        state.instanceDegradation(colliding_key).?,
+    );
+}
+
+test "begin open rejects a different full key with a pending instance ID" {
+    var state = try fixtureState(.{});
+    defer state.deinit();
+    const colliding_declaration: CanvasDeclarationInput = .{
+        .extension_id = "other.extension",
+        .extension_name = "Other",
+        .canvas_id = "preview",
+        .display_name = "Preview",
+        .description = "Preview changes",
+    };
+    try state.applyRegistry(.{ .incremental = .{
+        .upserted = &.{colliding_declaration},
+    } });
+    const first = try state.beginOpen(.{ .key = fixture_key });
+    const colliding_key: KeyView = .{
+        .extension_id = colliding_declaration.extension_id,
+        .canvas_id = colliding_declaration.canvas_id,
+        .instance_id = fixture_key.instance_id,
+    };
+
+    try std.testing.expectError(
+        error.AmbiguousCanvasInstance,
+        state.beginOpen(.{ .key = colliding_key }),
+    );
+    try std.testing.expectEqual(RuntimeTag.opening, state.runtimeTag(fixture_key).?);
+    try std.testing.expect(state.runtimeTag(colliding_key) == null);
+    try std.testing.expectEqual(@as(usize, 1), state.pendingCount());
+    try std.testing.expect(try state.completeOpen(first, .{ .succeeded = .{} }));
+}
+
 test "actions fail closed when declaration or runtime availability is absent" {
     var state = try fixtureState(.{});
     defer state.deinit();
     try std.testing.expectError(error.CanvasNotOpen, state.beginAction(.{
         .key = fixture_key,
+        .expected_generation = @enumFromInt(1),
         .action_name = "refresh",
     }));
     const open = try state.beginOpen(.{ .key = fixture_key });
     _ = try state.completeOpen(open, .{ .succeeded = .{} });
     try std.testing.expectError(error.ActionUnavailable, state.beginAction(.{
         .key = fixture_key,
+        .expected_generation = open.generation.?,
         .action_name = "missing",
     }));
     state.setCapability(.unsupported);
     try std.testing.expectError(error.CanvasUnsupported, state.beginClose(.{
         .key = fixture_key,
+        .expected_generation = open.generation.?,
     }));
     try std.testing.expectError(error.CanvasUnsupported, state.beginAction(.{
         .key = fixture_key,
+        .expected_generation = open.generation.?,
         .action_name = "refresh",
     }));
     state.setCapability(.supported);
     try state.applyProviderSignal(.{ .unavailable = fixture_key });
     try std.testing.expectError(error.CanvasNotOpen, state.beginAction(.{
         .key = fixture_key,
+        .expected_generation = open.generation.?,
         .action_name = "refresh",
     }));
 }
@@ -2724,6 +2923,9 @@ test "canonical trace fixture drives the reducer to every expected state" {
             .action_invoked => {
                 const action = try state.beginAction(.{
                     .key = fixture_key,
+                    .expected_generation = state.rendererGeneration(
+                        fixture_key,
+                    ).?,
                     .action_name = "refresh",
                 });
                 try std.testing.expect(state.completeAction(
@@ -2732,7 +2934,12 @@ test "canonical trace fixture drives the reducer to every expected state" {
                 ));
             },
             .closed => {
-                const close = try state.beginClose(.{ .key = fixture_key });
+                const close = try state.beginClose(.{
+                    .key = fixture_key,
+                    .expected_generation = state.rendererGeneration(
+                        fixture_key,
+                    ).?,
+                });
                 _ = try state.completeClose(close, true);
             },
             .removed => try state.applyProviderSignal(.{

@@ -204,7 +204,11 @@ final class NativeApplicationCoordinator {
   }
 
   static func live() -> NativeApplicationCoordinator {
-    NativeApplicationCoordinator(
+    let canvasConfiguration = NativeCanvasConfiguration.live()
+    if let failure = canvasConfiguration.configurationFailure {
+      NSLog("%@", failure)
+    }
+    return NativeApplicationCoordinator(
       makeConversationID: { ConversationID(rawValue: UUID()) },
       makeConversation: { id, workspace in
         let path = workspace.canonicalPath
@@ -212,7 +216,10 @@ final class NativeApplicationCoordinator {
           id: id,
           store: NativeChatStore(
             workspace: path,
-            driver: ViviConversationDriver(workspace: path, canvasMode: .disabled)))
+            driver: ViviConversationDriver(
+              workspace: path,
+              canvasMode: canvasConfiguration.enabled ? .enabled : .disabled),
+            canvasConfiguration: canvasConfiguration))
       },
       makeWindow: { identity, coordinator, onClosed in
         MainWindowController(
@@ -266,6 +273,9 @@ final class NativeApplicationCoordinator {
       mainWindow = makeWindow(.primary, self) { [weak self] identity in
         self?.presentationDidClose(identity)
       }
+    }
+    for record in conversations.records {
+      record.store.resumeCanvasPresentation()
     }
     mainWindow?.showAndActivate()
   }
@@ -340,6 +350,9 @@ final class NativeApplicationCoordinator {
 
   private func presentationDidClose(_ identity: MainWindowIdentity) {
     guard mainWindow?.identity == identity else { return }
+    for record in conversations.records {
+      record.store.suspendCanvasPresentation()
+    }
     mainWindow = nil
   }
 
