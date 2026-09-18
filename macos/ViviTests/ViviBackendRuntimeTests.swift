@@ -561,6 +561,48 @@ final class ViviBackendRuntimeTests: XCTestCase {
         userInputChoices: [choice]))
   }
 
+  func testDecoderPreservesCanonicallyEquivalentByteDistinctChoices() throws {
+    let requestID = Array("user-input-1".utf8)
+    let question = Array("Choose".utf8)
+    let composed = Array("\u{00E9}".utf8)
+    let decomposed = Array("e\u{0301}".utf8)
+    let bytes = requestID + question + composed + decomposed
+    let choiceOffset = requestID.count + question.count
+    var event = vivi_backend_event_t()
+    event.kind = VIVI_BACKEND_EVENT_USER_INPUT_REQUEST
+    event.content_kind = VIVI_BACKEND_CONTENT_USER_INPUT_REQUEST
+    event.byte_count = UInt32(bytes.count)
+    event.user_input_choice_count = 2
+    event.user_input_request_id = vivi_backend_span_t(
+      offset: 0,
+      length: UInt32(requestID.count))
+    event.user_input_question = vivi_backend_span_t(
+      offset: UInt32(requestID.count),
+      length: UInt32(question.count))
+    event.selected_reasoning = VIVI_BACKEND_REASONING_NONE
+    let choices = [
+      vivi_backend_user_input_choice_t(
+        text: vivi_backend_span_t(
+          offset: UInt32(choiceOffset),
+          length: UInt32(composed.count)),
+        reserved: 0),
+      vivi_backend_user_input_choice_t(
+        text: vivi_backend_span_t(
+          offset: UInt32(choiceOffset + composed.count),
+          length: UInt32(decomposed.count)),
+        reserved: 0),
+    ]
+
+    guard
+      case .userInputRequested(let request) = try NativeEventDecoder.decode(
+        event,
+        bytes: bytes,
+        models: [],
+        userInputChoices: choices)
+    else { return XCTFail("Expected a user-input request") }
+    XCTAssertEqual(request.choices.map { Array($0.utf8) }, [composed, decomposed])
+  }
+
   func testDecoderRejectsOutOfBoundsModelSpan() {
     var event = vivi_backend_event_t()
     event.kind = VIVI_BACKEND_EVENT_MODEL_CATALOG

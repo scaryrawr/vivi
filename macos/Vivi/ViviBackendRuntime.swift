@@ -1197,13 +1197,6 @@ enum NativeEventDecoder {
       }
     }
 
-    func userInputChoice(_ raw: vivi_backend_user_input_choice_t) throws -> String {
-      guard raw.reserved == 0 else { throw NativeEventDecodingError.malformed }
-      let value = try text(raw.text)
-      guard !value.isEmpty else { throw NativeEventDecodingError.malformed }
-      return value
-    }
-
     func presentation(
       _ raw: vivi_backend_presentation_t,
       required: Bool
@@ -1484,10 +1477,18 @@ enum NativeEventDecoder {
       else { throw NativeEventDecodingError.malformed }
       let requestID = try text(event.user_input_request_id)
       let question = try text(event.user_input_question)
-      let choices = try userInputChoices.map(userInputChoice)
+      let choiceBytes = try userInputChoices.map { raw in
+        guard raw.reserved == 0 else { throw NativeEventDecodingError.malformed }
+        let value = try data(raw.text)
+        guard !value.isEmpty, String(data: value, encoding: .utf8) != nil else {
+          throw NativeEventDecodingError.malformed
+        }
+        return value
+      }
+      let choices = choiceBytes.map { String(decoding: $0, as: UTF8.self) }
       let allowsFreeform = event.allow_freeform != 0
       guard !requestID.isEmpty, !question.isEmpty,
-        Set(choices).count == choices.count,
+        Set(choiceBytes).count == choiceBytes.count,
         !choices.isEmpty || allowsFreeform
       else { throw NativeEventDecodingError.malformed }
       return .userInputRequested(
