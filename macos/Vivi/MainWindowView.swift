@@ -139,6 +139,7 @@ struct MainWindowView: View {
                 projectWorkspace: workspace.canonicalPath,
                 conversationID: historyConversation.id
               )
+              .id(historyConversation.id)
               .padding(.leading, 12)
             }
           } header: {

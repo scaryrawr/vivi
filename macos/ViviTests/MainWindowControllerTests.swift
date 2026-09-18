@@ -94,6 +94,47 @@ final class MainWindowControllerTests: XCTestCase {
     _ = controller
   }
 
+  func testSidebarHistoryRefreshesReplacementOwnerForSameProject() {
+    let workspace = WorkspaceIdentity(absolutePath: "/tmp/project")!
+    let firstDriver = ControllableConversationDriver()
+    let secondDriver = ControllableConversationDriver()
+    let first = ConversationRecord(
+      id: ConversationID(rawValue: UUID()),
+      launchWorkspace: workspace,
+      store: NativeChatStore(workspace: workspace.canonicalPath, driver: firstDriver))
+    let second = ConversationRecord(
+      id: ConversationID(rawValue: UUID()),
+      launchWorkspace: workspace,
+      store: NativeChatStore(workspace: workspace.canonicalPath, driver: secondDriver))
+    firstDriver.send(.ready)
+    firstDriver.send(.modelCatalog(controllerModelCatalog()))
+    secondDriver.send(.ready)
+    secondDriver.send(.modelCatalog(controllerModelCatalog()))
+    let conversations = ConversationCollection()
+    conversations.appendAndSelect(first)
+    conversations.appendAndSelect(second)
+    let window = NSWindow()
+    let controller = MainWindowController(
+      identity: .primary,
+      applicationCoordinator: testApplicationCoordinator(conversations: conversations),
+      window: window,
+      activate: {},
+      onClosed: { _ in })
+    defer { window.orderOut(nil) }
+
+    controller.showAndActivate()
+    RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.3))
+    XCTAssertEqual(secondDriver.sessionRefreshCount, 1)
+    XCTAssertEqual(firstDriver.sessionRefreshCount, 0)
+    secondDriver.send(.sessionCatalog(SessionCatalog(sessions: [])))
+
+    conversations.select(first.id)
+    RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.3))
+
+    XCTAssertEqual(firstDriver.sessionRefreshCount, 1)
+    _ = controller
+  }
+
   func testWindowToolbarTitleComposesAppIdentityAndConversationTitle() {
     let presentation = MainWindowTitlePresentation(conversationTitle: "Conversation title")
 
@@ -414,4 +455,19 @@ private func historySummary(
     workingDirectory: workspace,
     title: title,
     isCurrent: isCurrent)
+}
+
+private func controllerModelCatalog() -> ModelCatalog {
+  ModelCatalog(
+    selected: ModelSelection(modelID: "copilot/test", reasoning: .medium),
+    models: [
+      ModelInfo(
+        id: "copilot/test",
+        displayName: "Test",
+        maxContextWindowTokens: 1,
+        maxOutputTokens: 1,
+        supportsVision: false,
+        reasoning: [.medium],
+        advertisedDefaultReasoning: .medium)
+    ])
 }
