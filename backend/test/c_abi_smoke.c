@@ -29,6 +29,7 @@ int main(void) {
     assert(vivi_backend_open(&options, &conversation) == VIVI_BACKEND_INVALID_ARGUMENT);
     assert(conversation == 0);
     assert(VIVI_BACKEND_ABI_VERSION == 8);
+    assert(VIVI_BACKEND_SESSION_TITLE_MAX_CHARACTERS == 80);
     assert(VIVI_BACKEND_PRESENTATION_SOURCE == 3);
     assert(VIVI_BACKEND_LANGUAGE_PYTHON == 15);
     assert(VIVI_BACKEND_TOKEN_META == 11);

@@ -8,6 +8,7 @@ extern "C" {
 #endif
 
 #define VIVI_BACKEND_ABI_VERSION 8
+#define VIVI_BACKEND_SESSION_TITLE_MAX_CHARACTERS 80
 
 typedef enum vivi_backend_result {
     VIVI_BACKEND_OK = 0,

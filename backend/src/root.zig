@@ -6,6 +6,7 @@ const copilot = @import("copilot_sdk");
 const conversation = @import("conversation.zig");
 const file_picker = @import("file_picker.zig");
 const models = @import("models.zig");
+const session_title = @import("session_title.zig");
 const settings = @import("settings.zig");
 const tool_activity = @import("tool_activity.zig");
 const tools = @import("tools.zig");
@@ -18,6 +19,7 @@ const private_directory_permissions: std.Io.Dir.Permissions =
 
 pub const version = build_options.version;
 pub const abi_version: u32 = 8;
+pub const max_session_title_characters = session_title.max_characters;
 pub const Conversation = conversation.Conversation;
 pub const ConversationEvent = conversation.Event;
 pub const ConversationWake = conversation.Wake;
@@ -42,6 +44,7 @@ pub const ReasoningProfile = conversation.ReasoningProfile;
 pub const SessionCatalog = conversation.SessionCatalog;
 pub const SessionSummary = conversation.SessionSummary;
 pub const ResumeKey = conversation.ResumeKey;
+pub const isCanonicalSessionTitle = session_title.isCanonical;
 pub const TranscriptSnapshot = conversation.TranscriptSnapshot;
 pub const TranscriptItem = conversation.TranscriptItem;
 pub const TranscriptRole = conversation.TranscriptRole;
@@ -1465,18 +1468,12 @@ const ResumeTarget = struct {
     }
 };
 
-fn resumableSessionTitle(summary: ?[]const u8) ?[]const u8 {
+fn resumableSessionTitle(
+    allocator: std.mem.Allocator,
+    summary: ?[]const u8,
+) !?[]u8 {
     const title = summary orelse return null;
-    if (title.len == 0 or title.len > 512 or
-        !std.unicode.utf8ValidateSlice(title) or
-        std.mem.trim(u8, title, " \t\r\n").len != title.len)
-    {
-        return null;
-    }
-    for (title) |byte| {
-        if (byte < 0x20 or byte == 0x7f) return null;
-    }
-    return title;
+    return session_title.canonicalize(allocator, title);
 }
 
 const ResumeTargets = struct {
@@ -1522,9 +1519,7 @@ fn buildSessionCatalog(
                 .title = null,
             };
             errdefer value.deinit(allocator);
-            if (resumableSessionTitle(metadata.summary)) |title| {
-                value.title = try allocator.dupe(u8, title);
-            }
+            value.title = try resumableSessionTitle(allocator, metadata.summary);
             break :blk value;
         };
         errdefer target.deinit(allocator);
@@ -1715,19 +1710,46 @@ test "raw history projection ignores malformed events" {
     try std.testing.expectEqualStrings("answer", snapshot.items[1].text);
 }
 
-test "broader resume ignores invalid SDK session titles" {
+test "broader resume canonicalizes SDK session titles" {
+    const canonical = (try resumableSessionTitle(
+        std.testing.allocator,
+        "  Remote\n session  ",
+    )).?;
+    defer std.testing.allocator.free(canonical);
     try std.testing.expectEqualStrings(
         "Remote session",
-        resumableSessionTitle("Remote session").?,
+        canonical,
     );
-    try std.testing.expectEqual(null, resumableSessionTitle(null));
-    try std.testing.expectEqual(null, resumableSessionTitle(""));
-    try std.testing.expectEqual(null, resumableSessionTitle(" padded "));
-    try std.testing.expectEqual(null, resumableSessionTitle("line\nbreak"));
-    try std.testing.expectEqual(null, resumableSessionTitle("escape\x1b[2J"));
-    try std.testing.expectEqual(null, resumableSessionTitle("delete\x7fbyte"));
-    const oversized = [_]u8{'x'} ** 513;
-    try std.testing.expectEqual(null, resumableSessionTitle(&oversized));
+    try std.testing.expectEqual(
+        null,
+        try resumableSessionTitle(std.testing.allocator, null),
+    );
+    try std.testing.expectEqual(
+        null,
+        try resumableSessionTitle(std.testing.allocator, ""),
+    );
+    const sanitized = (try resumableSessionTitle(
+        std.testing.allocator,
+        "escape\x1b[2J",
+    )).?;
+    defer std.testing.allocator.free(sanitized);
+    try std.testing.expectEqualStrings("escape[2J", sanitized);
+    const bounded = [_]u8{'x'} ** session_title.max_input_bytes;
+    const truncated = (try resumableSessionTitle(
+        std.testing.allocator,
+        &bounded,
+    )).?;
+    defer std.testing.allocator.free(truncated);
+    try std.testing.expect(session_title.isCanonical(truncated));
+    try std.testing.expectEqual(
+        session_title.max_characters,
+        std.unicode.utf8CountCodepoints(truncated) catch unreachable,
+    );
+    const oversized = [_]u8{'x'} ** (session_title.max_input_bytes + 1);
+    try std.testing.expectEqual(
+        null,
+        try resumableSessionTitle(std.testing.allocator, &oversized),
+    );
 }
 
 fn sessionSummaryFromTarget(
@@ -2200,15 +2222,28 @@ fn streamSessionResponse(
                 )) return .failed;
             },
             .session_title_changed => |title| {
-                if (resumableSessionTitle(title.data.title) == null) {
+                const canonical_title = session_title.canonicalize(
+                    worker.allocator(),
+                    title.data.title,
+                ) catch {
+                    worker.closeFailure(
+                        .stream,
+                        "Unable to display session title.",
+                    );
+                    return .failed;
+                };
+                defer if (canonical_title) |value| {
+                    worker.allocator().free(value);
+                };
+                const canonical = canonical_title orelse {
                     if (!reportStreamStatus(
                         worker,
                         "Session title updated.",
                         "Unable to display session title.",
                     )) return .failed;
                     continue;
-                }
-                worker.sessionTitle(title.data.title) catch {
+                };
+                worker.sessionTitle(canonical) catch {
                     worker.closeFailure(.stream, "Unable to display session title.");
                     return .failed;
                 };
