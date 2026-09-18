@@ -1259,12 +1259,12 @@ fn copyProjectedFull(
         &offset,
         projected.tool_input,
     );
-    output.user_input_request_id = appendBytes(
+    output.user_input_request_id = appendOptionalBytes(
         byte_destination,
         &offset,
         projected.user_input_request_id,
     );
-    output.user_input_question = appendBytes(
+    output.user_input_question = appendOptionalBytes(
         byte_destination,
         &offset,
         projected.user_input_question,
@@ -1729,6 +1729,10 @@ test "C model catalog copy-out is atomic and uses checked spans" {
         "GPT-5",
         bytes[records[0].display_name.offset..][0..records[0].display_name.length],
     );
+    try std.testing.expectEqual(@as(u32, 0), metadata.user_input_request_id.offset);
+    try std.testing.expectEqual(@as(u32, 0), metadata.user_input_request_id.length);
+    try std.testing.expectEqual(@as(u32, 0), metadata.user_input_question.offset);
+    try std.testing.expectEqual(@as(u32, 0), metadata.user_input_question.length);
     try std.testing.expectEqual(@as(u8, 0b0000_1001), records[0].reasoning_mask);
     try std.testing.expectEqual(@as(u8, 1), records[0].supports_vision);
 }
@@ -2041,6 +2045,10 @@ test "C session catalog copy is atomic and preserves opaque keys" {
     try std.testing.expect(
         metadata.kind == c.VIVI_BACKEND_EVENT_SESSION_CATALOG,
     );
+    try std.testing.expectEqual(@as(u32, 0), metadata.user_input_request_id.offset);
+    try std.testing.expectEqual(@as(u32, 0), metadata.user_input_request_id.length);
+    try std.testing.expectEqual(@as(u32, 0), metadata.user_input_question.offset);
+    try std.testing.expectEqual(@as(u32, 0), metadata.user_input_question.length);
     try std.testing.expectEqual(@as(u64, 41), sessions[0].key.generation);
     try std.testing.expectEqual(@as(u32, 7), sessions[0].key.slot);
     try std.testing.expect(
@@ -2144,6 +2152,10 @@ test "C session resume copies summary and ordered transcript atomically" {
         metadata.session_resume_outcome ==
             c.VIVI_BACKEND_SESSION_RESUME_RESUMED,
     );
+    try std.testing.expectEqual(@as(u32, 0), metadata.user_input_request_id.offset);
+    try std.testing.expectEqual(@as(u32, 0), metadata.user_input_request_id.length);
+    try std.testing.expectEqual(@as(u32, 0), metadata.user_input_question.offset);
+    try std.testing.expectEqual(@as(u32, 0), metadata.user_input_question.length);
     try std.testing.expectEqual(@as(u8, 1), metadata.cleanup_failed);
     try std.testing.expectEqual(@as(u32, 3), metadata.transcript_item_count);
     try std.testing.expect(
