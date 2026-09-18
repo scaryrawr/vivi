@@ -20,5 +20,10 @@ only when that text exactly matches the canonical command, and render fenced
 code from the same presented text cached with its spans. Measure only the final
 presentation bytes.
 
+Host-owned slash commands must intercept only an exact command submission.
+When the composer contains an argument suffix or attachment token, preserve the
+input and use the normal prompt submission path rather than discarding it as
+part of a lifecycle action.
+
 Markdown fenced code uses `vivi_backend.presentCodeFragment`; the backend owns
 language aliases and Tree-sitter tokens while the CLI owns its highlight cache.
