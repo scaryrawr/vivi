@@ -1,4 +1,3 @@
-import AppKit
 import Foundation
 import SwiftUI
 
@@ -145,12 +144,6 @@ struct MainWindowView: View {
     }
     .navigationSplitViewStyle(.balanced)
     .frame(minWidth: 760, minHeight: 500)
-    .toolbar(removing: .sidebarToggle)
-    .toolbar {
-      ToolbarItem(placement: .navigation) {
-        MainWindowToolbar(conversations: conversations)
-      }
-    }
     .alert(
       "Can’t Start Conversation",
       isPresented: workspaceChoiceFailureIsPresented
@@ -207,66 +200,6 @@ struct MainWindowView: View {
           conversations.select(id)
         }
       })
-  }
-}
-
-private struct MainWindowToolbar: View {
-  @ObservedObject var conversations: ConversationCollection
-
-  var body: some View {
-    HStack(spacing: 8) {
-      Button {
-        NSApp.sendAction(
-          #selector(NSSplitViewController.toggleSidebar(_:)),
-          to: nil,
-          from: nil)
-      } label: {
-        Image(systemName: "sidebar.left")
-      }
-      .buttonStyle(.borderless)
-      .help("Toggle Sidebar")
-      .accessibilityLabel("Toggle Sidebar")
-      .accessibilityIdentifier("toggle-sidebar")
-
-      if let conversation = conversations.selectedConversation {
-        SelectedConversationToolbarTitle(conversation: conversation)
-      } else {
-        MainWindowToolbarTitle(presentation: MainWindowTitlePresentation(conversationTitle: nil))
-      }
-    }
-    .frame(minWidth: 280, idealWidth: 520, maxWidth: .infinity, alignment: .leading)
-  }
-}
-
-private struct SelectedConversationToolbarTitle: View {
-  @ObservedObject var conversation: ConversationRecord
-
-  var body: some View {
-    MainWindowToolbarTitle(
-      presentation: MainWindowTitlePresentation(
-        conversationTitle: conversation.navigation.title))
-  }
-}
-
-private struct MainWindowToolbarTitle: View {
-  let presentation: MainWindowTitlePresentation
-
-  var body: some View {
-    HStack(spacing: 8) {
-      Text(presentation.appName)
-        .fontWeight(.semibold)
-        .fixedSize()
-      Divider()
-        .frame(height: 14)
-      Text(presentation.conversationTitle)
-        .foregroundStyle(.secondary)
-        .lineLimit(1)
-        .truncationMode(.tail)
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-    .accessibilityElement(children: .ignore)
-    .accessibilityLabel(presentation.accessibilityLabel)
-    .accessibilityIdentifier("window-title")
   }
 }
 

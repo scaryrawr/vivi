@@ -30,12 +30,52 @@ final class MainWindowControllerTests: XCTestCase {
 
     XCTAssertEqual(window.title, "Vivi")
     XCTAssertEqual(window.titleVisibility, .hidden)
+    XCTAssertEqual(window.toolbar?.items.map(\.itemIdentifier), [.viviNavigation, .flexibleSpace])
+    XCTAssertEqual(realizedSidebarToggleCount(in: window.toolbar), 1)
+    XCTAssertEqual(
+      realizedToolbarView(in: window.toolbar)?.presentation.conversationTitle, "second")
     firstDriver.send(.sessionTitle("First renamed"))
     XCTAssertEqual(window.title, "Vivi")
+    XCTAssertEqual(
+      realizedToolbarView(in: window.toolbar)?.presentation.conversationTitle, "second")
     conversations.select(first.id)
     XCTAssertEqual(window.title, "Vivi")
+    XCTAssertEqual(
+      realizedToolbarView(in: window.toolbar)?.presentation.conversationTitle,
+      "First renamed")
     firstDriver.send(.sessionTitle("First final"))
     XCTAssertEqual(window.title, "Vivi")
+    XCTAssertEqual(
+      realizedToolbarView(in: window.toolbar)?.presentation.conversationTitle,
+      "First final")
+    _ = controller
+  }
+
+  func testRealizedToolbarHasOneToggleAndNoVisibleNativeTitle() {
+    let conversations = ConversationCollection()
+    let window = NSWindow()
+    let controller = MainWindowController(
+      identity: .primary,
+      applicationCoordinator: testApplicationCoordinator(conversations: conversations),
+      window: window,
+      activate: {},
+      onClosed: { _ in })
+
+    window.contentViewController?.view.layoutSubtreeIfNeeded()
+
+    let initialToolbarIdentifiers = window.toolbar?.items.map(\.itemIdentifier)
+    sidebarToggleButton(in: window.toolbar)?.performClick(nil)
+    window.contentViewController?.view.layoutSubtreeIfNeeded()
+
+    XCTAssertEqual(window.title, "Vivi")
+    XCTAssertEqual(window.titleVisibility, .hidden)
+    XCTAssertEqual(initialToolbarIdentifiers, [.viviNavigation, .flexibleSpace])
+    XCTAssertEqual(window.toolbar?.items.map(\.itemIdentifier), initialToolbarIdentifiers)
+    XCTAssertEqual(realizedSidebarToggleCount(in: window.toolbar), 1)
+    XCTAssertFalse(
+      window.toolbar?.items.contains(where: {
+        $0.itemIdentifier == .toggleSidebar
+      }) ?? true)
     _ = controller
   }
 
@@ -45,6 +85,30 @@ final class MainWindowControllerTests: XCTestCase {
     XCTAssertEqual(presentation.appName, "Vivi")
     XCTAssertEqual(presentation.conversationTitle, "Conversation title")
     XCTAssertEqual(presentation.accessibilityLabel, "Vivi, Conversation title")
+  }
+
+  @MainActor
+  private func realizedSidebarToggleCount(in toolbar: NSToolbar?) -> Int {
+    toolbar?.items.reduce(into: 0) { count, item in
+      guard let view = item.view as? MainWindowToolbarView,
+        view.sidebarButton.action == #selector(NSSplitViewController.toggleSidebar(_:))
+      else {
+        return
+      }
+      count += 1
+    } ?? 0
+  }
+
+  @MainActor
+  private func sidebarToggleButton(in toolbar: NSToolbar?) -> NSButton? {
+    realizedToolbarView(in: toolbar)?.sidebarButton
+  }
+
+  @MainActor
+  private func realizedToolbarView(in toolbar: NSToolbar?) -> MainWindowToolbarView? {
+    toolbar?.items.lazy
+      .compactMap { $0.view as? MainWindowToolbarView }
+      .first
   }
 
   func testWindowToolbarTitlePreservesLongTitlesForViewTruncation() {
