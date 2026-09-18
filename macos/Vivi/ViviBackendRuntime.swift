@@ -426,6 +426,7 @@ final class NativeChatStore: ObservableObject {
   @Published var isModelPickerPresented = false
   @Published private(set) var historyPresentationGeneration: UInt64 = 0
   @Published var draft = ""
+  private var commandPaletteConsumesDraft = false
 
   var workspace: String { activePresentation.workspace }
   var sessionTitle: String { activePresentation.sessionTitle }
@@ -679,8 +680,9 @@ final class NativeChatStore: ObservableObject {
   func composerDraftChanged() {
     guard activeUserInput == nil, draft.hasPrefix("/") else { return }
     if !isCommandPalettePresented {
-      openCommandPalette(query: String(draft.dropFirst()))
+      openCommandPalette(query: String(draft.dropFirst()), consumesDraft: true)
     } else if commandArgumentSession == nil {
+      commandPaletteConsumesDraft = true
       commandQuery = String(draft.dropFirst())
       repairCommandSelection()
     }
@@ -694,10 +696,11 @@ final class NativeChatStore: ObservableObject {
     }
   }
 
-  func openCommandPalette(query: String = "") {
+  func openCommandPalette(query: String = "", consumesDraft: Bool = false) {
     guard lifecycle != .closing, lifecycle != .closed, activeUserInput == nil else { return }
     isModelPickerPresented = false
     isCommandPalettePresented = true
+    commandPaletteConsumesDraft = consumesDraft
     commandQuery = query
     commandArgumentSession = nil
     repairCommandSelection()
@@ -708,6 +711,7 @@ final class NativeChatStore: ObservableObject {
 
   func closeCommandPalette() {
     isCommandPalettePresented = false
+    commandPaletteConsumesDraft = false
     commandQuery = ""
     if commandExecution == nil {
       commandArgumentSession = nil
@@ -1035,15 +1039,18 @@ final class NativeChatStore: ObservableObject {
     guard commandDisabledReason == nil else { return }
     switch command.action {
     case .openModelSelection:
+      consumeCommandDraftIfNeeded()
       closeCommandPalette()
       isModelPickerPresented = true
     case .openSessionHistory:
+      consumeCommandDraftIfNeeded()
       closeCommandPalette()
       historyPresentationGeneration &+= 1
     case .execute:
       if command.argumentPolicy == .none {
         executeCommand(command, arguments: "")
       } else {
+        consumeCommandDraftIfNeeded()
         commandArgumentSession = CommandArgumentSession(command: command, draft: "")
       }
     }
@@ -1070,7 +1077,14 @@ final class NativeChatStore: ObservableObject {
           text: "\(command.displayName): \(message(for: result, action: "run command"))"))
       return
     }
+    consumeCommandDraftIfNeeded()
     commandExecution = CommandExecution(command: command)
+  }
+
+  private func consumeCommandDraftIfNeeded() {
+    guard commandPaletteConsumesDraft else { return }
+    draft = ""
+    commandPaletteConsumesDraft = false
   }
 
   private func installCommandCatalog(_ catalog: CommandCatalog) {
@@ -1153,6 +1167,7 @@ final class NativeChatStore: ObservableObject {
 
   private func clearCommandPresentation() {
     isCommandPalettePresented = false
+    commandPaletteConsumesDraft = false
     commandQuery = ""
     selectedCommandKey = nil
     commandArgumentSession = nil

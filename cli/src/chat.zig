@@ -3403,6 +3403,14 @@ const ChatUi = struct {
                             error.CommandCatalogUnavailable,
                             error.CommandIsNotExecutable,
                             => {
+                                if (err == error.StaleCommandKey) {
+                                    conversation.refreshCommands() catch |refresh_err| switch (refresh_err) {
+                                        error.Busy => return,
+                                        else => return refresh_err,
+                                    };
+                                    self.phase = .loading_commands;
+                                    self.menu_mode = .commands;
+                                }
                                 try self.transcript.append(
                                     self.allocator,
                                     .status,

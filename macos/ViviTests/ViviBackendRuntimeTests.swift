@@ -1785,12 +1785,14 @@ final class ViviBackendRuntimeTests: XCTestCase {
   func testTypedCommandActionsReuseModelAndHistorySurfaces() {
     let store = readyCommandStore(driver: FakeConversationDriver())
     store.reduce(.commandCatalog(swiftCommandCatalog(generation: 5)))
+    store.draft = "keep"
 
     store.openCommandPalette(query: "model")
     store.reduce(.commandCatalog(swiftCommandCatalog(generation: 6)))
     store.activateSelectedCommand()
     XCTAssertTrue(store.isModelPickerPresented)
     XCTAssertFalse(store.isCommandPalettePresented)
+    XCTAssertEqual(store.draft, "keep")
 
     store.isModelPickerPresented = false
     store.openCommandPalette(query: "resume")
@@ -1809,6 +1811,11 @@ final class ViviBackendRuntimeTests: XCTestCase {
     XCTAssertTrue(store.isCommandPalettePresented)
     XCTAssertEqual(store.commandQuery, "dep")
     XCTAssertEqual(store.filteredCommands.map(\.name), ["deploy"])
+
+    store.reduce(.commandCatalog(swiftCommandCatalog(generation: 6)))
+    store.activateSelectedCommand()
+    XCTAssertEqual(store.draft, "")
+    XCTAssertNotNil(store.commandArgumentSession)
 
     store.commandQuery = ""
     store.moveCommandSelection(0)
