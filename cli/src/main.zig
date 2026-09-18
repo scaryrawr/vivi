@@ -15,7 +15,7 @@ const Command = union(enum) {
     chat: ChatOptions,
 
     fn parse(args: []const []const u8) error{InvalidArguments}!Command {
-        if (args.len <= 1) return .help;
+        if (args.len <= 1) return .{ .chat = .{} };
 
         if (args.len == 2 and
             (std.mem.eql(u8, args[1], "--help") or
@@ -32,35 +32,34 @@ const Command = union(enum) {
         if (args.len == 2 and std.mem.eql(u8, args[1], "models")) {
             return .models;
         }
-        if (std.mem.eql(u8, args[1], "chat")) {
-            var options: ChatOptions = .{};
-            var index: usize = 2;
-            while (index < args.len) {
-                if (std.mem.eql(u8, args[index], "--native")) {
-                    options.native = true;
-                    index += 1;
-                } else if (std.mem.eql(u8, args[index], "--model")) {
-                    if (index + 1 >= args.len) return error.InvalidArguments;
-                    options.model = args[index + 1];
-                    index += 2;
-                } else if (std.mem.eql(u8, args[index], "--reasoning")) {
-                    if (index + 1 >= args.len) return error.InvalidArguments;
-                    options.reasoning = backend.ReasoningEffort.parse(
-                        args[index + 1],
-                    ) catch return error.InvalidArguments;
-                    index += 2;
-                } else {
-                    return error.InvalidArguments;
-                }
-            }
-            if (options.native and
-                (options.model != null or options.reasoning != null))
-            {
+
+        // Implicit chat: accept chat flags with or without the "chat" word.
+        var index: usize = if (std.mem.eql(u8, args[1], "chat")) 2 else 1;
+        var options: ChatOptions = .{};
+        while (index < args.len) {
+            if (std.mem.eql(u8, args[index], "--native")) {
+                options.native = true;
+                index += 1;
+            } else if (std.mem.eql(u8, args[index], "--model")) {
+                if (index + 1 >= args.len) return error.InvalidArguments;
+                options.model = args[index + 1];
+                index += 2;
+            } else if (std.mem.eql(u8, args[index], "--reasoning")) {
+                if (index + 1 >= args.len) return error.InvalidArguments;
+                options.reasoning = backend.ReasoningEffort.parse(
+                    args[index + 1],
+                ) catch return error.InvalidArguments;
+                index += 2;
+            } else {
                 return error.InvalidArguments;
             }
-            return .{ .chat = options };
         }
-        return error.InvalidArguments;
+        if (options.native and
+            (options.model != null or options.reasoning != null))
+        {
+            return error.InvalidArguments;
+        }
+        return .{ .chat = options };
     }
 };
 
@@ -243,11 +242,11 @@ fn writeHelp(writer: *std.Io.Writer) !void {
     try writer.writeAll(
         \\Usage: vivi [--help] [--version] [models] [chat [--native] [--model MODEL] [--reasoning LEVEL]]
         \\
-        \\Vivi command-line interface.
+        \\Vivi command-line interface. Running vivi with no command starts chat.
         \\
         \\Commands:
         \\  models     List available Copilot and OMLX models.
-        \\  chat       Start an interactive streaming Vivi chat. --native opens macOS Vivi.
+        \\  chat       Start an interactive streaming Vivi chat (default). --native opens macOS Vivi.
         \\
     );
 }
@@ -301,8 +300,23 @@ fn listModels(init: std.process.Init, writer: *std.Io.Writer) !void {
 
 test "command parser accepts scaffold commands" {
     try std.testing.expectEqual(
-        Command.help,
+        Command{ .chat = .{} },
         try Command.parse(&.{"vivi"}),
+    );
+    try std.testing.expectEqual(
+        Command{ .chat = .{ .native = true } },
+        try Command.parse(&.{ "vivi", "--native" }),
+    );
+    const implicit_chat_model = try Command.parse(
+        &.{ "vivi", "--model", "copilot/model" },
+    );
+    try std.testing.expectEqualStrings(
+        "copilot/model",
+        implicit_chat_model.chat.model.?,
+    );
+    try std.testing.expectError(
+        error.InvalidArguments,
+        Command.parse(&.{ "vivi", "--reasoning" }),
     );
     try std.testing.expectEqual(
         Command.help,
