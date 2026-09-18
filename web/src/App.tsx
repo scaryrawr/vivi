@@ -199,6 +199,7 @@ export function ViviApp({
                 {!collapsed && (
                   <div
                     className="session-list"
+                    role="group"
                     aria-label={`${project.displayName} conversations`}
                   >
                     {project.sessions.map((session) => {
@@ -434,7 +435,11 @@ function TranscriptRow({
             {item.markdown}
           </Markdown>
           {item.streaming && (
-            <span className="streaming-caret" aria-label="Response streaming" />
+            <span
+              className="streaming-caret"
+              role="status"
+              aria-label="Response streaming"
+            />
           )}
         </article>
       );
