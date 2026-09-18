@@ -1420,6 +1420,18 @@ final class ViviBackendRuntimeTests: XCTestCase {
     XCTAssertThrowsError(try NativeEventDecoder.decode(event, bytes: bytes, models: []))
     event.tool_call_id = vivi_backend_span_t()
 
+    event.default_saved = 1
+    XCTAssertThrowsError(try NativeEventDecoder.decode(event, bytes: bytes, models: []))
+    event.default_saved = 0
+
+    var catalogFailure = event
+    catalogFailure.kind = VIVI_BACKEND_EVENT_COMMAND_CATALOG_FAILURE
+    catalogFailure.content_kind = VIVI_BACKEND_CONTENT_TEXT
+    catalogFailure.command_key = vivi_backend_command_key_t()
+    catalogFailure.cleanup_failed = 1
+    XCTAssertThrowsError(
+      try NativeEventDecoder.decode(catalogFailure, bytes: bytes, models: []))
+
     event.kind = VIVI_BACKEND_EVENT_COMMAND_FAILED
     event.command_key.reserved = 1
     XCTAssertThrowsError(try NativeEventDecoder.decode(event, bytes: bytes, models: []))
@@ -1438,13 +1450,14 @@ final class ViviBackendRuntimeTests: XCTestCase {
       store.commandCatalogState,
       .failed(message: "Discovery unavailable.", hasFallback: true))
     XCTAssertEqual(store.filteredCommands.map(\.name), ["deploy"])
+    store.reduce(.commandCatalog(swiftCommandCatalog(generation: 4)))
 
     store.retryCommands()
     XCTAssertEqual(store.commandCatalogState, .loading)
-    store.reduce(.commandCatalog(swiftCommandCatalog(generation: 4)))
+    store.reduce(.commandCatalog(swiftCommandCatalog(generation: 5)))
 
     XCTAssertNotEqual(store.selectedCommandKey, oldKey)
-    XCTAssertEqual(store.selectedCommandKey?.generation, 4)
+    XCTAssertEqual(store.selectedCommandKey?.generation, 5)
     XCTAssertEqual(driver.commandRefreshCount, 3)
   }
 
@@ -1458,6 +1471,33 @@ final class ViviBackendRuntimeTests: XCTestCase {
     XCTAssertEqual(driver.commandRefreshCount, 2)
     XCTAssertEqual(store.commandCatalogState, .loading)
     XCTAssertEqual(store.filteredCommands.map(\.name), ["deploy"])
+    XCTAssertEqual(store.commandDisabledReason, "Wait for command discovery to finish.")
+    store.activateSelectedCommand()
+    XCTAssertNil(store.commandArgumentSession)
+  }
+
+  func testCommandCatalogFailureKeepsCachedRowsDisabledUntilFallbackArrives() {
+    let store = readyCommandStore(driver: FakeConversationDriver())
+    store.reduce(.commandCatalog(swiftCommandCatalog(generation: 3)))
+    store.openCommandPalette(query: "deploy")
+
+    store.reduce(.commandCatalogFailure("Discovery unavailable."))
+
+    XCTAssertEqual(store.commandDisabledReason, "Wait for command discovery to finish.")
+    store.reduce(.commandCatalog(swiftCommandCatalog(generation: 4)))
+    XCTAssertNil(store.commandDisabledReason)
+  }
+
+  func testModelRefreshBlocksCachedCommandActivation() {
+    let store = readyCommandStore(driver: FakeConversationDriver())
+    store.reduce(.commandCatalog(swiftCommandCatalog(generation: 3)))
+
+    store.refreshModels()
+    store.openCommandPalette(query: "deploy")
+    store.activateSelectedCommand()
+
+    XCTAssertEqual(store.commandDisabledReason, "Wait for model controls to finish.")
+    XCTAssertNil(store.commandArgumentSession)
   }
 
   func testCommandArgumentExecutionPreservesComposerDraftAndAttachments() async {
@@ -1474,13 +1514,14 @@ final class ViviBackendRuntimeTests: XCTestCase {
     store.pasteAttachment()
     await store.waitForAttachmentAcquisition()
     store.openCommandPalette(query: "deploy")
+    store.reduce(.commandCatalog(swiftCommandCatalog(generation: 8)))
     store.activateSelectedCommand()
     store.updateCommandArgumentDraft("production")
     store.submitCommandArgument()
 
     XCTAssertEqual(
       driver.commandExecutions.first?.0,
-      CommandKey(generation: 7, slot: 3))
+      CommandKey(generation: 8, slot: 3))
     XCTAssertEqual(driver.commandExecutions.first?.1, "production")
     XCTAssertEqual(store.draft, "ordinary prompt")
     XCTAssertEqual(store.attachments, [attachment])
@@ -1526,6 +1567,7 @@ final class ViviBackendRuntimeTests: XCTestCase {
     store.pasteAttachment()
     await store.waitForAttachmentAcquisition()
     store.openCommandPalette(query: "deploy")
+    store.reduce(.commandCatalog(swiftCommandCatalog(generation: 8)))
     store.activateSelectedCommand()
     store.updateCommandArgumentDraft("production")
     store.submitCommandArgument()
@@ -1549,13 +1591,14 @@ final class ViviBackendRuntimeTests: XCTestCase {
     let store = readyCommandStore(driver: driver)
     store.reduce(.commandCatalog(swiftCommandCatalog(generation: 7)))
     store.openCommandPalette(query: "deploy")
+    store.reduce(.commandCatalog(swiftCommandCatalog(generation: 8)))
     store.activateSelectedCommand()
     store.updateCommandArgumentDraft("keep this")
     store.submitCommandArgument()
 
     store.reduce(
       .commandFailed(
-        key: CommandKey(generation: 7, slot: 3),
+        key: CommandKey(generation: 8, slot: 3),
         message: "Stale command key."))
 
     XCTAssertEqual(store.commandArgumentSession?.draft, "keep this")
@@ -1563,9 +1606,24 @@ final class ViviBackendRuntimeTests: XCTestCase {
     XCTAssertEqual(store.commandCatalogState, .loading)
     XCTAssertEqual(driver.commandRefreshCount, 3)
 
-    store.reduce(.commandCatalog(swiftCommandCatalog(generation: 8)))
-    XCTAssertEqual(store.commandArgumentSession?.command.key.generation, 8)
+    store.reduce(.commandCatalog(swiftCommandCatalog(generation: 9)))
+    XCTAssertEqual(store.commandArgumentSession?.command.key.generation, 9)
     XCTAssertEqual(store.commandArgumentSession?.draft, "keep this")
+  }
+
+  func testCatalogReplacementClearsRemovedCommandArgumentSession() {
+    let store = readyCommandStore(driver: FakeConversationDriver())
+    store.reduce(.commandCatalog(swiftCommandCatalog(generation: 7)))
+    store.openCommandPalette(query: "deploy")
+    store.reduce(.commandCatalog(swiftCommandCatalog(generation: 8)))
+    store.activateSelectedCommand()
+    store.updateCommandArgumentDraft("obsolete")
+
+    let replacement = CommandCatalog(
+      commands: swiftCommandCatalog(generation: 9).commands.filter { $0.name != "deploy" })
+    store.reduce(.commandCatalog(replacement))
+
+    XCTAssertNil(store.commandArgumentSession)
   }
 
   func testRejectedCurrentCommandIsTreatedAsStaleAndRefreshes() {
@@ -1574,6 +1632,7 @@ final class ViviBackendRuntimeTests: XCTestCase {
     let store = readyCommandStore(driver: driver)
     store.reduce(.commandCatalog(swiftCommandCatalog(generation: 7)))
     store.openCommandPalette(query: "deploy")
+    store.reduce(.commandCatalog(swiftCommandCatalog(generation: 8)))
     store.activateSelectedCommand()
     store.updateCommandArgumentDraft("keep this")
 
@@ -1592,12 +1651,13 @@ final class ViviBackendRuntimeTests: XCTestCase {
     store.reduce(.status("before"))
     store.reduce(.commandCatalog(swiftCommandCatalog(generation: 2)))
     store.openCommandPalette(query: "deploy")
+    store.reduce(.commandCatalog(swiftCommandCatalog(generation: 3)))
     store.activateSelectedCommand()
     store.updateCommandArgumentDraft("now")
     store.submitCommandArgument()
     store.reduce(
       .commandCompleted(
-        key: CommandKey(generation: 2, slot: 3),
+        key: CommandKey(generation: 3, slot: 3),
         message: "Started."))
 
     XCTAssertEqual(store.transcript.map(\.text), ["before", "Deploy: Started."])
@@ -1611,6 +1671,7 @@ final class ViviBackendRuntimeTests: XCTestCase {
     let store = readyCommandStore(driver: driver)
     store.reduce(.commandCatalog(swiftCommandCatalog(generation: 2)))
     store.openCommandPalette(query: "deploy")
+    store.reduce(.commandCatalog(swiftCommandCatalog(generation: 3)))
     store.activateSelectedCommand()
     store.updateCommandArgumentDraft("now")
     store.submitCommandArgument()
@@ -1627,7 +1688,7 @@ final class ViviBackendRuntimeTests: XCTestCase {
 
     store.reduce(
       .commandCompleted(
-        key: CommandKey(generation: 2, slot: 3),
+        key: CommandKey(generation: 3, slot: 3),
         message: "Started."))
 
     XCTAssertEqual(store.lifecycle, .idle)
@@ -1639,12 +1700,14 @@ final class ViviBackendRuntimeTests: XCTestCase {
     store.reduce(.commandCatalog(swiftCommandCatalog(generation: 5)))
 
     store.openCommandPalette(query: "model")
+    store.reduce(.commandCatalog(swiftCommandCatalog(generation: 6)))
     store.activateSelectedCommand()
     XCTAssertTrue(store.isModelPickerPresented)
     XCTAssertFalse(store.isCommandPalettePresented)
 
     store.isModelPickerPresented = false
     store.openCommandPalette(query: "resume")
+    store.reduce(.commandCatalog(swiftCommandCatalog(generation: 7)))
     store.activateSelectedCommand()
     XCTAssertEqual(store.historyPresentationGeneration, 1)
     XCTAssertFalse(store.isCommandPalettePresented)
@@ -1675,6 +1738,7 @@ final class ViviBackendRuntimeTests: XCTestCase {
     store.reduce(.commandCatalog(swiftCommandCatalog(generation: 6)))
     store.draft = "keep"
     store.openCommandPalette(query: "deploy")
+    store.reduce(.commandCatalog(swiftCommandCatalog(generation: 7)))
     store.activateSelectedCommand()
     store.updateCommandArgumentDraft("target")
     store.reduce(.assistantStarted)

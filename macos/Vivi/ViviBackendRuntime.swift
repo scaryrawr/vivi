@@ -445,6 +445,7 @@ final class NativeChatStore: ObservableObject {
   private var attachmentAcquisitionTask: Task<Void, Never>?
   private var closeCompletions: [@MainActor () -> Void] = []
   private var pendingCommandCatalogFailure: String?
+  private var isCommandRefreshPending = false
 
   init(
     workspace: String,
@@ -507,8 +508,9 @@ final class NativeChatStore: ObservableObject {
     if lifecycle == .responding { return "Wait for Vivi to finish responding." }
     if lifecycle == .awaitingInput { return "Answer Vivi’s question first." }
     if lifecycle == .closing || lifecycle == .closed { return "This conversation is closing." }
-    if modelState == .switching { return "Wait for the model switch to finish." }
+    if modelState != .ready { return "Wait for model controls to finish." }
     if sessionState != .ready { return "Wait for session history to finish." }
+    if isCommandRefreshPending { return "Wait for command discovery to finish." }
     if commandExecution != nil { return "Wait for the current command to finish." }
     return nil
   }
@@ -1014,9 +1016,11 @@ final class NativeChatStore: ObservableObject {
     else { return }
     let result = driver.refreshCommands()
     if result == .accepted {
+      isCommandRefreshPending = true
       commandCatalogState = .loading
       pendingCommandCatalogFailure = nil
     } else {
+      isCommandRefreshPending = false
       commandCatalogState = .failed(
         message: message(for: result, action: "refresh commands"),
         hasFallback: commandCatalog != nil)
@@ -1070,19 +1074,22 @@ final class NativeChatStore: ObservableObject {
       $0.key == selectedCommandKey
     }?.name
     commandCatalog = catalog
+    isCommandRefreshPending = false
     if let failure = pendingCommandCatalogFailure {
       commandCatalogState = .failed(message: failure, hasFallback: true)
     } else {
       commandCatalogState = .loaded
     }
     pendingCommandCatalogFailure = nil
-    if var argument = commandArgumentSession,
-      let replacement = catalog.commands.first(where: {
+    if var argument = commandArgumentSession {
+      if let replacement = catalog.commands.first(where: {
         $0.name == argument.command.name && $0.action == argument.command.action
-      })
-    {
-      argument.command = replacement
-      commandArgumentSession = argument
+      }) {
+        argument.command = replacement
+        commandArgumentSession = argument
+      } else {
+        commandArgumentSession = nil
+      }
     }
     if let selectedCommandKey,
       catalog.commands.contains(where: { $0.key == selectedCommandKey })
@@ -1136,6 +1143,7 @@ final class NativeChatStore: ObservableObject {
     commandCatalogState = .loading
     commandCatalog = nil
     pendingCommandCatalogFailure = nil
+    isCommandRefreshPending = false
     isCommandPalettePresented = false
     commandQuery = ""
     selectedCommandKey = nil
@@ -2077,6 +2085,7 @@ enum NativeEventDecoder {
       guard event.content_kind == VIVI_BACKEND_CONTENT_TEXT,
         commands.isEmpty, models.isEmpty, semanticSpans.isEmpty,
         sessions.isEmpty, transcriptItems.isEmpty, userInputChoices.isEmpty,
+        event.default_saved == 0, event.cleanup_failed == 0,
         event.command_key.generation == 0, event.command_key.slot == 0,
         event.command_key.reserved == 0, hasNeutralConversationMetadata
       else { throw NativeEventDecodingError.malformed }
@@ -2087,6 +2096,7 @@ enum NativeEventDecoder {
       guard event.content_kind == VIVI_BACKEND_CONTENT_COMMAND_EXECUTION,
         commands.isEmpty, models.isEmpty, semanticSpans.isEmpty,
         sessions.isEmpty, transcriptItems.isEmpty, userInputChoices.isEmpty,
+        event.default_saved == 0, event.cleanup_failed == 0,
         hasNeutralConversationMetadata
       else { throw NativeEventDecodingError.malformed }
       let key = try commandKey(event.command_key)
