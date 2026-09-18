@@ -16,10 +16,9 @@ project catalog.
 - Project headers remain visible with one project, provide a comfortably sized
   native disclosure target, identify the canonical launch workspace through
   help and accessibility, show paths only for duplicate project names, and
-  contain indented title-only live conversation children with active-workspace
-  ordinals.
+  contain indented title-only conversation children without visible ordinals.
 - Cross-workspace resume preserves the existing conversation identity and launch
-  project while updating its live title, workspace, and duplicate ordinal.
+  project while updating its live title and workspace.
 
 ## How to get to it (user POV)
 

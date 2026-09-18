@@ -140,17 +140,6 @@ final class ConversationCollection: ObservableObject {
     selectedID = id
   }
 
-  func duplicatePosition(for id: ConversationID) -> (ordinal: Int, total: Int)? {
-    guard let record = records.first(where: { $0.id == id }) else { return nil }
-    let matches = records.filter {
-      $0.navigation.workspace == record.navigation.workspace
-    }
-    guard matches.count > 1,
-      let index = matches.firstIndex(where: { $0.id == id })
-    else { return nil }
-    return (index + 1, matches.count)
-  }
-
   func records(launchedFrom workspace: WorkspaceIdentity) -> [ConversationRecord] {
     records.filter { $0.launchWorkspace == workspace }
   }

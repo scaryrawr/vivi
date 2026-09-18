@@ -93,18 +93,14 @@ final class MainWindowControllerTests: XCTestCase {
     XCTAssertEqual(
       sidebarRowPresentation(
         title: second.navigation.title,
-        projectName: "vivi",
-        duplicate: conversations.duplicatePosition(for: second.id)),
+        projectName: "vivi"),
       SidebarRowPresentation(
         title: "New conversation",
-        duplicateBadge: "2",
-        accessibilityLabel: "New conversation, conversation 2 of 2"))
-    XCTAssertNil(conversations.duplicatePosition(for: other.id))
+        accessibilityLabel: "New conversation"))
     XCTAssertEqual(
       sidebarRowPresentation(
         title: "resumed",
-        projectName: "resumed",
-        duplicate: nil
+        projectName: "resumed"
       ).title,
       "New conversation")
   }
@@ -176,6 +172,83 @@ final class MainWindowControllerTests: XCTestCase {
       ProjectDisclosurePresentation(
         systemImage: "chevron.down",
         accessibilityValue: "Expanded"))
+  }
+
+  func testProjectSidebarProjectionKeepsLiveSelectionOrderAndSwapsResumeSlots() {
+    let live = (0..<4).map { _ in ConversationID(rawValue: UUID()) }
+    let workspace = "/work/current"
+    let initialCatalog = SessionCatalog(
+      sessions: [
+        historySummary(slot: 1, workspace: workspace, title: "New conversation", isCurrent: true),
+        historySummary(slot: 2, workspace: workspace, title: "Earlier"),
+        historySummary(slot: 3, workspace: workspace, title: "hey hi hello"),
+      ])
+    let initialRows = projectSidebarRows(
+      liveConversationIDs: live,
+      catalogOwnerID: live[0],
+      catalog: initialCatalog,
+      projectWorkspace: workspace,
+      catalogAnchorSlot: 1,
+      pendingResumeKey: nil)
+
+    XCTAssertEqual(
+      initialRows.map(\.id),
+      [
+        .live(live[0]),
+        .live(live[1]),
+        .live(live[2]),
+        .live(live[3]),
+        .saved(ResumeKey(generation: 42, slot: 2)),
+        .saved(ResumeKey(generation: 42, slot: 3)),
+      ])
+    for _ in [live[3], live[1], live[0]] {
+      XCTAssertEqual(
+        projectSidebarRows(
+          liveConversationIDs: live,
+          catalogOwnerID: live[0],
+          catalog: initialCatalog,
+          projectWorkspace: workspace,
+          catalogAnchorSlot: 1,
+          pendingResumeKey: nil
+        ).map(\.id),
+        initialRows.map(\.id))
+    }
+
+    let resumedKey = ResumeKey(generation: 42, slot: 3)
+    let rowsDuringResume = projectSidebarRows(
+      liveConversationIDs: live,
+      catalogOwnerID: live[0],
+      catalog: initialCatalog,
+      projectWorkspace: workspace,
+      catalogAnchorSlot: 1,
+      pendingResumeKey: resumedKey)
+    XCTAssertEqual(
+      rowsDuringResume.map(\.id),
+      [
+        .saved(ResumeKey(generation: 42, slot: 1)),
+        .live(live[1]),
+        .live(live[2]),
+        .live(live[3]),
+        .saved(ResumeKey(generation: 42, slot: 2)),
+        .live(live[0]),
+      ])
+
+    let refreshedCatalog = SessionCatalog(
+      sessions: [
+        historySummary(slot: 1, workspace: workspace, title: "New conversation"),
+        historySummary(slot: 2, workspace: workspace, title: "Earlier"),
+        historySummary(slot: 3, workspace: workspace, title: "hey hi hello", isCurrent: true),
+      ])
+    XCTAssertEqual(
+      projectSidebarRows(
+        liveConversationIDs: live,
+        catalogOwnerID: live[0],
+        catalog: refreshedCatalog,
+        projectWorkspace: workspace,
+        catalogAnchorSlot: 1,
+        pendingResumeKey: nil
+      ).map(\.id),
+      rowsDuringResume.map(\.id))
   }
 
   func testProjectSessionHistoryFiltersWorkspaceAndCurrentSession() {

@@ -3,27 +3,19 @@ import SwiftUI
 
 struct SidebarRowPresentation: Equatable {
   let title: String
-  let duplicateBadge: String?
   let accessibilityLabel: String
 }
 
 func sidebarRowPresentation(
   title: String,
-  projectName: String,
-  duplicate: (ordinal: Int, total: Int)?
+  projectName: String
 ) -> SidebarRowPresentation {
   let displayedTitle =
     title.nilIfEmpty.flatMap { $0 == projectName ? nil : $0 }
     ?? "New conversation"
-  let duplicateLabel = duplicate.map {
-    "conversation \($0.ordinal) of \($0.total)"
-  }
   return SidebarRowPresentation(
     title: displayedTitle,
-    duplicateBadge: duplicate.map { String($0.ordinal) },
-    accessibilityLabel: [displayedTitle, duplicateLabel]
-      .compactMap { $0 }
-      .joined(separator: ", "))
+    accessibilityLabel: displayedTitle)
 }
 
 struct ProjectSidebarPresentation: Equatable {
@@ -111,20 +103,95 @@ struct SessionHistoryRowPresentation: Equatable, Identifiable {
   var id: ResumeKey { key }
 }
 
+enum ProjectSidebarRow: Equatable, Identifiable {
+  enum ID: Hashable {
+    case live(ConversationID)
+    case saved(ResumeKey)
+  }
+
+  case live(ConversationID)
+  case saved(SessionHistoryRowPresentation)
+
+  var id: ID {
+    switch self {
+    case .live(let id):
+      .live(id)
+    case .saved(let presentation):
+      .saved(presentation.key)
+    }
+  }
+}
+
+func projectSidebarRows(
+  liveConversationIDs: [ConversationID],
+  catalogOwnerID: ConversationID,
+  catalog: SessionCatalog?,
+  projectWorkspace: String,
+  catalogAnchorSlot: UInt32?,
+  pendingResumeKey: ResumeKey?
+) -> [ProjectSidebarRow] {
+  guard let catalog else {
+    return liveConversationIDs.map(ProjectSidebarRow.live)
+  }
+  let sessions = catalog.sessions.filter { $0.workingDirectory == projectWorkspace }
+  guard !sessions.isEmpty else {
+    return liveConversationIDs.map(ProjectSidebarRow.live)
+  }
+  let effectiveCurrentKey =
+    pendingResumeKey
+    ?? sessions.first(where: \.isCurrent)?.key
+  let anchorSlot =
+    catalogAnchorSlot
+    ?? sessions.first(where: \.isCurrent)?.key.slot
+  guard let anchorSlot,
+    sessions.contains(where: { $0.key.slot == anchorSlot })
+  else {
+    return liveConversationIDs.map(ProjectSidebarRow.live)
+      + sessions.compactMap { session in
+        session.key == effectiveCurrentKey
+          ? nil
+          : .saved(sessionHistoryRowPresentation(session))
+      }
+  }
+  let additionalLiveRows =
+    liveConversationIDs
+    .filter { $0 != catalogOwnerID }
+    .map(ProjectSidebarRow.live)
+  var rows: [ProjectSidebarRow] = []
+
+  for session in sessions {
+    if session.key == effectiveCurrentKey {
+      rows.append(.live(catalogOwnerID))
+    } else {
+      rows.append(.saved(sessionHistoryRowPresentation(session)))
+    }
+    if session.key.slot == anchorSlot {
+      rows.append(contentsOf: additionalLiveRows)
+    }
+  }
+  return rows
+}
+
 func projectSessionHistoryPresentation(
   catalog: SessionCatalog,
   projectWorkspace: String
 ) -> [SessionHistoryRowPresentation] {
   catalog.sessions.compactMap { session in
     guard !session.isCurrent, session.workingDirectory == projectWorkspace else { return nil }
-    let title =
-      session.title?.nilIfEmpty
-      ?? "Untitled session"
-    return SessionHistoryRowPresentation(
-      key: session.key,
-      title: title,
-      accessibilityLabel: "\(title), saved session")
+    return sessionHistoryRowPresentation(session)
   }
+}
+
+private func sessionHistoryRowPresentation(
+  _ session: SessionSummary
+) -> SessionHistoryRowPresentation {
+  let title =
+    session.title?.nilIfEmpty
+    ?? "Untitled session"
+  return SessionHistoryRowPresentation(
+    key: session.key,
+    title: title,
+    accessibilityLabel: "\(title), saved session")
 }
 
 struct MainWindowView: View {
@@ -248,6 +315,7 @@ private struct ProjectSidebarSection: View {
   let conversationIDs: [ConversationID]
   let isExpanded: Bool
   let toggleExpansion: () -> Void
+  @State private var catalogAnchorSlot: UInt32?
 
   init(
     conversations: ConversationCollection,
@@ -268,8 +336,21 @@ private struct ProjectSidebarSection: View {
     _catalogStore = ObservedObject(wrappedValue: catalogConversation.store)
   }
 
-  private var records: [ConversationRecord] {
-    conversationIDs.compactMap(conversations.conversation)
+  private var catalogOwnerID: ConversationID {
+    guard let id = conversationIDs.first else {
+      preconditionFailure("Project sidebar sections require a live conversation")
+    }
+    return id
+  }
+
+  private var sidebarRows: [ProjectSidebarRow] {
+    projectSidebarRows(
+      liveConversationIDs: conversationIDs,
+      catalogOwnerID: catalogOwnerID,
+      catalog: catalogStore.sessionCatalog,
+      projectWorkspace: workspace.canonicalPath,
+      catalogAnchorSlot: catalogAnchorSlot,
+      pendingResumeKey: resumingKey)
   }
 
   private var presentation: ProjectSidebarPresentation {
@@ -285,37 +366,35 @@ private struct ProjectSidebarSection: View {
   var body: some View {
     Section {
       if isExpanded {
-        ForEach(records) { conversation in
-          ConversationSidebarRow(
-            conversation: conversation,
-            duplicate: conversations.duplicatePosition(for: conversation.id)
-          )
-          .tag(conversation.id)
-          .padding(.leading, 16)
-        }
-        switch catalogStore.sessionState {
-        case .refreshing:
-          loadingState
-        case .ready, .resuming:
-          if let failure = catalogStore.sessionCatalogFailure {
-            failureRow(failure)
-          } else if let catalog = catalogStore.sessionCatalog {
-            ForEach(
-              projectSessionHistoryPresentation(
-                catalog: catalog,
-                projectWorkspace: workspace.canonicalPath)
-            ) { row in
-              SessionHistoryRow(
-                presentation: row,
-                isResuming: resumingKey == row.key
-              ) {
-                conversations.resume(row.key, launchedFrom: workspace)
-              }
-              .disabled(isOperating)
-              .padding(.leading, 16)
+        ForEach(sidebarRows) { row in
+          switch row {
+          case .live(let id):
+            if let conversation = conversations.conversation(id) {
+              ConversationSidebarRow(conversation: conversation)
+                .tag(id)
+                .padding(.leading, 16)
             }
-          } else {
+          case .saved(let presentation):
+            SessionHistoryRow(
+              presentation: presentation,
+              isResuming: resumingKey == presentation.key
+            ) {
+              conversations.resume(presentation.key, launchedFrom: workspace)
+            }
+            .disabled(isOperating)
+            .padding(.leading, 16)
+          }
+        }
+        if let failure = catalogStore.sessionCatalogFailure {
+          failureRow(failure)
+        } else if catalogStore.sessionCatalog == nil {
+          switch catalogStore.sessionState {
+          case .refreshing:
             loadingState
+          case .ready, .resuming:
+            if catalogStore.sessionState == .ready {
+              loadingState
+            }
           }
         }
       }
@@ -352,21 +431,17 @@ private struct ProjectSidebarSection: View {
     }
     .accessibilityIdentifier("session-history-\(workspace.canonicalPath)")
     .onAppear {
+      captureCatalogAnchor()
       loadIfNeeded()
+    }
+    .onChange(of: catalogStore.sessionCatalog) {
+      captureCatalogAnchor()
     }
     .onChange(of: catalogStore.lifecycle) {
       loadIfNeeded()
     }
     .onChange(of: catalogStore.modelState) {
       loadIfNeeded()
-    }
-    .onChange(of: catalogStore.sessionState) { previous, current in
-      guard case .resuming = previous, current == .ready,
-        catalogStore.sessionCatalog == nil
-      else {
-        return
-      }
-      catalogStore.refreshSessions()
     }
   }
 
@@ -389,7 +464,8 @@ private struct ProjectSidebarSection: View {
         .lineLimit(1)
       Spacer(minLength: 4)
       Button {
-        catalogStore.refreshSessions()
+        catalogStore.refreshSessions(
+          preservingCatalog: catalogStore.sessionCatalog != nil)
       } label: {
         Image(systemName: "arrow.clockwise")
       }
@@ -412,9 +488,20 @@ private struct ProjectSidebarSection: View {
     catalogStore.refreshSessions()
   }
 
+  private func captureCatalogAnchor() {
+    guard catalogAnchorSlot == nil,
+      let current = catalogStore.sessionCatalog?.sessions.first(where: {
+        $0.isCurrent && $0.workingDirectory == workspace.canonicalPath
+      })
+    else {
+      return
+    }
+    catalogAnchorSlot = current.key.slot
+  }
+
   private var isOperating: Bool {
     catalogStore.lifecycle != .idle || catalogStore.modelState != .ready
-      || catalogStore.sessionState != .ready
+      || catalogStore.sessionState != .ready || catalogStore.sessionCatalogFailure != nil
   }
 
   private var resumingKey: ResumeKey? {
@@ -451,29 +538,17 @@ private struct SessionHistoryRow: View {
 
 private struct ConversationSidebarRow: View {
   @ObservedObject var conversation: ConversationRecord
-  let duplicate: (ordinal: Int, total: Int)?
 
   private var presentation: SidebarRowPresentation {
     sidebarRowPresentation(
       title: conversation.navigation.title,
-      projectName: projectName(for: conversation.navigation.workspace),
-      duplicate: duplicate)
+      projectName: projectName(for: conversation.navigation.workspace))
   }
 
   var body: some View {
     HStack(spacing: 8) {
       Text(presentation.title)
         .lineLimit(1)
-      Spacer(minLength: 4)
-      if let badge = presentation.duplicateBadge {
-        Text(badge)
-          .font(.caption2.monospacedDigit())
-          .foregroundStyle(.secondary)
-          .padding(.horizontal, 6)
-          .padding(.vertical, 2)
-          .background(.secondary.opacity(0.12), in: Capsule())
-          .accessibilityHidden(true)
-      }
     }
 
     .accessibilityElement(children: .ignore)

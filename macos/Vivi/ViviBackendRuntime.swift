@@ -569,13 +569,15 @@ final class NativeChatStore: ObservableObject {
     }
   }
 
-  func refreshSessions() {
+  func refreshSessions(preservingCatalog: Bool = false) {
     guard !isAcquiringAttachments, lifecycle == .idle, modelState == .ready,
       sessionState == .ready
     else { return }
     let result = driver.refreshSessions()
     if result == .accepted {
-      sessionCatalog = nil
+      if !preservingCatalog {
+        sessionCatalog = nil
+      }
       sessionCatalogFailure = nil
       sessionState = .refreshing
     } else {
@@ -713,8 +715,11 @@ final class NativeChatStore: ObservableObject {
       sessionCatalogFailure = message
       sessionState = .ready
     case .sessionResume(let result):
-      apply(result)
+      let resumed = apply(result)
       sessionState = .ready
+      if resumed {
+        refreshSessions(preservingCatalog: true)
+      }
     case .userInputRequested(let request):
       finishStreamingRows()
       ensureResponseHeader()
@@ -864,20 +869,21 @@ final class NativeChatStore: ObservableObject {
     catalog = ModelCatalog(selected: selection, models: models)
   }
 
-  private func apply(_ result: SessionResumeResult) {
+  private func apply(_ result: SessionResumeResult) -> Bool {
     guard case .resuming(let requestedKey) = sessionState else {
       transcript.append(
         .failure(id: UUID(), text: "The backend returned an unexpected session result."))
-      return
+      return false
     }
     switch result {
     case .failed(let message):
       transcript.append(.failure(id: UUID(), text: message))
+      return false
     case .resumed(let resumed):
       guard resumed.summary.key == requestedKey else {
         transcript.append(
           .failure(id: UUID(), text: "The backend resumed an unexpected session."))
-        return
+        return false
       }
       finishStreamingRows()
       responseHeaderVisible = false
@@ -898,7 +904,17 @@ final class NativeChatStore: ObservableObject {
         transcript: snapshot,
         confirmedSelection: confirmedSelection)
       sessionCatalogFailure = nil
-      sessionCatalog = nil
+      if let catalog = sessionCatalog {
+        sessionCatalog = SessionCatalog(
+          sessions: catalog.sessions.map { session in
+            SessionSummary(
+              key: session.key,
+              workingDirectory: session.workingDirectory,
+              title: session.title,
+              isCurrent: session.key == requestedKey)
+          })
+      }
+      return true
     }
   }
 

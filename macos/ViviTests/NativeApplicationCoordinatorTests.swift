@@ -336,8 +336,6 @@ final class NativeApplicationCoordinatorTests: XCTestCase {
       conversations.launchWorkspaces.map(\.canonicalPath),
       ["/tmp/one", "/tmp/two"])
     XCTAssertEqual(record.navigation.title, "Resumed conversation")
-    XCTAssertEqual(conversations.duplicatePosition(for: record.id)?.ordinal, 1)
-    XCTAssertEqual(conversations.duplicatePosition(for: conversations.records[1].id)?.ordinal, 2)
     XCTAssertEqual(
       conversations.records(launchedFrom: record.launchWorkspace).map(\.id),
       [record.id])

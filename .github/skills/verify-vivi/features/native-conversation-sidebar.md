@@ -13,8 +13,9 @@ away from each conversation store.
   lifetime. Project headers are expanded by default, use a native disclosure
   affordance, expose the canonical path to accessibility, and show it visually
   only when matching folder names need disambiguation.
-- Sidebar rows show only the live conversation title; repeated active
-  workspaces receive stable numeric disambiguation.
+- Sidebar rows show only the conversation title; repeated active workspaces
+  remain distinct through immutable internal identities without visible
+  numbering.
 - Selecting a row swaps the detail and native window title without stopping
   other conversations or changing creation order.
 - Collapsing a project hides its rows without changing canonical selection;

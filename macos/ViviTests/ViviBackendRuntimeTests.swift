@@ -1320,7 +1320,11 @@ final class ViviBackendRuntimeTests: XCTestCase {
       store.confirmedSelection,
       ModelSelection(modelID: "copilot/gpt-5", reasoning: .off))
     XCTAssertEqual(store.draft, "keep draft")
-    XCTAssertNil(store.sessionCatalog)
+    XCTAssertEqual(
+      store.sessionCatalog?.sessions.map(\.isCurrent),
+      [true])
+    XCTAssertEqual(store.sessionState, .refreshing)
+    XCTAssertEqual(driver.sessionRefreshCount, 2)
     XCTAssertEqual(
       store.transcript.map(\.text), ["", "thought", "answer", "Previous session cleanup failed."])
     guard case .user = store.transcript[0],
