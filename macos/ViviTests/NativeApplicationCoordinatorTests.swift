@@ -185,6 +185,20 @@ final class NativeApplicationCoordinatorTests: XCTestCase {
     XCTAssertEqual(harness.coordinator.presentation.workspaceChoice, .idle)
   }
 
+  func testImmediateTerminationPreventsWorkspaceChooserFromStarting() async {
+    let harness = CoordinatorHarness()
+    harness.coordinator.requestNewConversation()
+
+    let disposition = harness.coordinator.beginTermination {}
+    await Task.yield()
+
+    XCTAssertEqual(disposition, .terminateNow)
+    XCTAssertEqual(harness.choosers[0].cancelCount, 1)
+    XCTAssertEqual(harness.choosers[0].chooseCount, 0)
+    XCTAssertTrue(harness.coordinator.conversations.records.isEmpty)
+    XCTAssertEqual(harness.coordinator.presentation.workspaceChoice, .idle)
+  }
+
   func testClosingPresentationKeepsConversationsAndReopenReusesStores() {
     let harness = CoordinatorHarness()
     harness.coordinator.open([URL(string: "vivi://chat?workspace=/tmp/project")!])
@@ -361,10 +375,20 @@ private final class CoordinatorHarness {
 @MainActor
 private final class ControllableWorkspaceChooser: WorkspaceChoosing {
   private var continuation: CheckedContinuation<URL?, Never>?
+  private var hasPendingResult = false
+  private var pendingResult: URL?
   private(set) var cancelCount = 0
+  private(set) var chooseCount = 0
 
   func chooseWorkspace() async -> URL? {
-    await withCheckedContinuation { continuation in
+    chooseCount += 1
+    if hasPendingResult {
+      hasPendingResult = false
+      let result = pendingResult
+      pendingResult = nil
+      return result
+    }
+    return await withCheckedContinuation { continuation in
       self.continuation = continuation
     }
   }
@@ -375,7 +399,11 @@ private final class ControllableWorkspaceChooser: WorkspaceChoosing {
   }
 
   func finish(_ url: URL?) {
-    guard let continuation else { return }
+    guard let continuation else {
+      hasPendingResult = true
+      pendingResult = url
+      return
+    }
     self.continuation = nil
     continuation.resume(returning: url)
   }
