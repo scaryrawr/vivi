@@ -1003,6 +1003,8 @@ enum NativeEventDecoder {
         guard
           scalarValue > 0x1f,
           scalarValue < 0x7f || scalarValue > 0x9f,
+          scalarValue != 0x061c,
+          scalarValue < 0x200e || scalarValue > 0x200f,
           scalarValue < 0x202a || scalarValue > 0x202e,
           scalarValue < 0x2066 || scalarValue > 0x2069
         else {

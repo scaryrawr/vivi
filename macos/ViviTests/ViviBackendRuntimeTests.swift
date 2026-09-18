@@ -569,6 +569,9 @@ final class ViviBackendRuntimeTests: XCTestCase {
     for title in [
       "First\nSecond",
       "First\u{007f}Second",
+      "First\u{061c}Second",
+      "First\u{200e}Second",
+      "First\u{200f}Second",
       "First\u{202e}Second",
       "First\u{2066}Second\u{2069}",
     ] {
