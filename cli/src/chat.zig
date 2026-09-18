@@ -9,6 +9,8 @@ const vaxis = @import("vaxis");
 
 const TextInput = vaxis.widgets.TextInput;
 
+const terminal_title_prefix = "vivi — ";
+
 const accent = vaxis.Color{ .rgb = .{ 110, 231, 183 } };
 const user_color = vaxis.Color{ .rgb = .{ 125, 211, 252 } };
 const assistant_color = vaxis.Color{ .rgb = .{ 196, 181, 253 } };
@@ -4920,6 +4922,44 @@ const ConversationDrain = struct {
     continue_drain: bool,
 };
 
+const TerminalTitle = struct {
+    allocator: std.mem.Allocator,
+    current: ?[]u8 = null,
+
+    fn init(allocator: std.mem.Allocator) TerminalTitle {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *TerminalTitle) void {
+        if (self.current) |value| self.allocator.free(value);
+        self.* = undefined;
+    }
+
+    fn update(
+        self: *TerminalTitle,
+        writer: *std.Io.Writer,
+        title: []const u8,
+    ) !bool {
+        if (!backend.isCanonicalSessionTitle(title))
+            return error.InvalidSessionTitle;
+        if (self.current) |current| {
+            if (std.mem.eql(u8, current, title)) return false;
+        }
+
+        const replacement = try self.allocator.dupe(u8, title);
+        errdefer self.allocator.free(replacement);
+        try writer.print("\x1b]2;{s}{s}\x1b\\", .{
+            terminal_title_prefix,
+            title,
+        });
+        try writer.flush();
+
+        if (self.current) |current| self.allocator.free(current);
+        self.current = replacement;
+        return true;
+    }
+};
+
 const App = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -4932,6 +4972,7 @@ const App = struct {
     file_picker: backend.FilePicker,
     ui: ChatUi,
     render_memory: RenderMemory,
+    terminal_title: TerminalTitle,
     stream_updates_since_render: usize = 0,
     closed: bool = false,
 
@@ -4960,6 +5001,8 @@ const App = struct {
 
         self.render_memory = .init(init_args.gpa);
         errdefer self.render_memory.deinit(self.vx.window());
+        self.terminal_title = .init(init_args.gpa);
+        errdefer self.terminal_title.deinit();
 
         self.loop = .init(init_args.io, &self.tty, &self.vx);
         self.ui = try ChatUi.init(
@@ -5015,6 +5058,7 @@ const App = struct {
         self.releaseImages();
         self.render_memory.deinit(self.vx.window());
         self.ui.deinit();
+        self.terminal_title.deinit();
         self.loop.stop();
         self.vx.deinit(self.allocator, self.tty.writer());
         self.tty.deinit();
@@ -5178,6 +5222,12 @@ const App = struct {
                 self.closed = true;
                 return .{ .redraw = redraw, .continue_drain = false };
             }
+            if (event == .session_title) {
+                _ = try self.terminal_title.update(
+                    self.tty.writer(),
+                    event.session_title.bytes,
+                );
+            }
             if (stream_update and
                 self.ui.rows_from_tail == 0 and
                 self.ui.last_total_rows > self.ui.last_viewport_rows)
@@ -5263,6 +5313,52 @@ const App = struct {
         }
     }
 };
+
+test "terminal title emits exact OSC bytes only for canonical changes" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var title = TerminalTitle.init(std.testing.allocator);
+    defer title.deinit();
+
+    try std.testing.expect(try title.update(
+        &output.writer,
+        "What were the last 10 commits for?",
+    ));
+    try std.testing.expectEqualStrings(
+        "\x1b]2;vivi — What were the last 10 commits for?\x1b\\",
+        output.written(),
+    );
+
+    try std.testing.expect(!try title.update(
+        &output.writer,
+        "What were the last 10 commits for?",
+    ));
+    try std.testing.expectEqualStrings(
+        "\x1b]2;vivi — What were the last 10 commits for?\x1b\\",
+        output.written(),
+    );
+
+    try std.testing.expect(try title.update(&output.writer, "A new title"));
+    try std.testing.expectEqualStrings(
+        "\x1b]2;vivi — What were the last 10 commits for?\x1b\\" ++
+            "\x1b]2;vivi — A new title\x1b\\",
+        output.written(),
+    );
+}
+
+test "terminal title rejects unsafe or absent updates without output" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var title = TerminalTitle.init(std.testing.allocator);
+    defer title.deinit();
+
+    try std.testing.expectEqualStrings("", output.written());
+    try std.testing.expectError(
+        error.InvalidSessionTitle,
+        title.update(&output.writer, "unsafe\x1b]2;injection"),
+    );
+    try std.testing.expectEqualStrings("", output.written());
+}
 
 pub fn run(
     init: std.process.Init,

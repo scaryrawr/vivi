@@ -327,11 +327,36 @@ chat_streaming() {
         "$run_dir/chat-streaming.terminal.log" |
         tr -d '\r\b' >"$run_dir/chat-streaming.normalized.txt"
 
+    session_title=$(
+        perl -0ne \
+            'if (/\e\]2;vivi — ([^\e\a]*)\e\\/) { print $1; exit }' \
+            "$run_dir/chat-streaming.terminal.log"
+    )
+    expected_title_osc=$(printf '\033]2;vivi — %s\033\\' "$session_title")
+
     {
         printf 'exit=%s\n' "$status"
         printf 'expected_response=VIVI_STREAM_OK\n'
         printf 'response_seen='
         if grep -q 'VIVI_STREAM_OK' "$run_dir/chat-streaming.normalized.txt"; then
+            printf 'yes\n'
+        else
+            printf 'no\n'
+        fi
+        printf 'session_title_seen='
+        if test -n "$session_title" &&
+            grep -F -q "Session title: $session_title" \
+                "$run_dir/chat-streaming.normalized.txt"
+        then
+            printf 'yes\n'
+        else
+            printf 'no\n'
+        fi
+        printf 'terminal_title_osc_seen='
+        if test -n "$session_title" &&
+            grep -a -F -q "$expected_title_osc" \
+                "$run_dir/chat-streaming.terminal.log"
+        then
             printf 'yes\n'
         else
             printf 'no\n'
@@ -358,6 +383,11 @@ chat_streaming() {
 
     test "$status" -eq 0
     grep -q 'VIVI_STREAM_OK' "$run_dir/chat-streaming.normalized.txt"
+    test -n "$session_title"
+    grep -F -q "Session title: $session_title" \
+        "$run_dir/chat-streaming.normalized.txt"
+    grep -a -F -q "$expected_title_osc" \
+        "$run_dir/chat-streaming.terminal.log"
     test -s "$run_dir/chat-streaming.frames.txt"
     test -s "$run_dir/chat-streaming.contact-sheet.png"
 }
