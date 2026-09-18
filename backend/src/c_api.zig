@@ -20,11 +20,18 @@ comptime {
     if (c.VIVI_BACKEND_ABI_VERSION != backend.abi_version) {
         @compileError("C header and Zig backend ABI versions differ");
     }
+    if (c.VIVI_BACKEND_MAX_COMMAND_ARGUMENT_BYTES !=
+        backend.max_command_argument_bytes)
+    {
+        @compileError("C header and Zig command argument bounds differ");
+    }
 }
 
 const Handle = struct {
     const ControlOperation = enum {
         none,
+        refresh_commands,
+        execute_command,
         refresh_models,
         switch_model,
         refresh_sessions,
@@ -78,6 +85,14 @@ fn result(error_value: anyerror) c.vivi_backend_result_t {
         error.EmptyModel,
         error.InvalidReasoningEffort,
         error.InvalidSessionKey,
+        error.InvalidCommandKey,
+        error.CommandArgumentsTooLong,
+        error.InvalidCommandArgumentsUtf8,
+        error.CommandCatalogUnavailable,
+        error.StaleCommandKey,
+        error.CommandIsNotExecutable,
+        error.CommandTakesNoArguments,
+        error.CommandRequiresArguments,
         error.EmptyAnswer,
         error.EmptyUserInputRequestId,
         error.InvalidUserInputUtf8,
@@ -293,6 +308,68 @@ export fn vivi_backend_submit(
         if (err != error.Stopping and err != error.Closed) {
             self.accepting_prompt.store(true, .release);
         }
+        return result(err);
+    };
+    return c.VIVI_BACKEND_OK;
+}
+
+export fn vivi_backend_refresh_commands(
+    conversation: ?*c.vivi_backend_conversation_t,
+) callconv(.c) c.vivi_backend_result_t {
+    const self = handle(conversation) orelse return c.VIVI_BACKEND_INVALID_ARGUMENT;
+    if (self.control_operation != .none) return c.VIVI_BACKEND_BUSY;
+    self.control_operation = .refresh_commands;
+    self.conversation.refreshCommands() catch |err| {
+        self.control_operation = .none;
+        return result(err);
+    };
+    return c.VIVI_BACKEND_OK;
+}
+
+const CommandExecution = struct {
+    key: backend.CommandKey,
+    arguments: []const u8,
+};
+
+fn commandExecution(
+    execution: ?*const c.vivi_backend_command_execution_t,
+) ?CommandExecution {
+    const input = execution orelse return null;
+    if (input.struct_size != @sizeOf(c.vivi_backend_command_execution_t) or
+        input.reserved != 0 or
+        input.reserved2 != 0 or
+        input.key.reserved != 0 or
+        input.key.generation == 0 or
+        input.key.slot == 0 or
+        input.argument_length > backend.max_command_argument_bytes)
+    {
+        return null;
+    }
+    const arguments = if (input.argument_length == 0)
+        ""
+    else
+        requiredBytes(input.arguments, input.argument_length) orelse return null;
+    if (!std.unicode.utf8ValidateSlice(arguments)) return null;
+    return .{
+        .key = .{
+            .generation = input.key.generation,
+            .slot = input.key.slot,
+        },
+        .arguments = arguments,
+    };
+}
+
+export fn vivi_backend_execute_command(
+    conversation: ?*c.vivi_backend_conversation_t,
+    execution: ?*const c.vivi_backend_command_execution_t,
+) callconv(.c) c.vivi_backend_result_t {
+    const self = handle(conversation) orelse return c.VIVI_BACKEND_INVALID_ARGUMENT;
+    const parsed = commandExecution(execution) orelse
+        return c.VIVI_BACKEND_INVALID_ARGUMENT;
+    if (self.control_operation != .none) return c.VIVI_BACKEND_BUSY;
+    self.control_operation = .execute_command;
+    self.conversation.executeCommand(parsed.key, parsed.arguments) catch |err| {
+        self.control_operation = .none;
         return result(err);
     };
     return c.VIVI_BACKEND_OK;
@@ -662,6 +739,8 @@ const Projected = struct {
     user_input_question: []const u8 = "",
     user_input_choices: []const []u8 = &.{},
     allow_freeform: bool = false,
+    commands: []const backend.CommandInfo = &.{},
+    command_key: backend.CommandKey = .{ .generation = 0, .slot = 0 },
 };
 
 const ToolDisplay = struct {
@@ -855,9 +934,32 @@ fn project(event: *const backend.ConversationEvent) ?Projected {
             .user_input_choices = request.choices,
             .allow_freeform = request.allow_freeform,
         },
-        .command_catalog,
-        .command_completed,
-        => null,
+        .command_catalog => |*catalog_event| switch (catalog_event.*) {
+            .replaced => |*catalog| .{
+                .kind = c.VIVI_BACKEND_EVENT_COMMAND_CATALOG,
+                .content_kind = c.VIVI_BACKEND_CONTENT_COMMAND_CATALOG,
+                .commands = catalog.commands,
+            },
+            .failed => |message| .{
+                .kind = c.VIVI_BACKEND_EVENT_COMMAND_CATALOG_FAILURE,
+                .content_kind = c.VIVI_BACKEND_CONTENT_TEXT,
+                .text = message.bytes,
+            },
+        },
+        .command_completed => |*execution| switch (execution.*) {
+            .completed => |completed| .{
+                .kind = c.VIVI_BACKEND_EVENT_COMMAND_COMPLETED,
+                .content_kind = c.VIVI_BACKEND_CONTENT_COMMAND_EXECUTION,
+                .text = completed.message.bytes,
+                .command_key = completed.key,
+            },
+            .failed => |failed| .{
+                .kind = c.VIVI_BACKEND_EVENT_COMMAND_FAILED,
+                .content_kind = c.VIVI_BACKEND_CONTENT_COMMAND_EXECUTION,
+                .text = failed.message.bytes,
+                .command_key = failed.key,
+            },
+        },
     };
 }
 
@@ -923,6 +1025,18 @@ fn byteCount(projected: Projected) !u32 {
         total = std.math.add(u64, total, choice.len) catch
             return error.EventTooLarge;
     }
+    for (projected.commands) |command| {
+        total = std.math.add(u64, total, command.name.len) catch
+            return error.EventTooLarge;
+        total = std.math.add(u64, total, command.display_name.len) catch
+            return error.EventTooLarge;
+        total = std.math.add(u64, total, command.description.len) catch
+            return error.EventTooLarge;
+        if (command.hint) |hint| {
+            total = std.math.add(u64, total, hint.len) catch
+                return error.EventTooLarge;
+        }
+    }
     if (total > std.math.maxInt(u32)) return error.EventTooLarge;
     return @intCast(total);
 }
@@ -963,6 +1077,11 @@ fn transcriptItemCount(projected: Projected) !u32 {
 
 fn userInputChoiceCount(projected: Projected) !u32 {
     return std.math.cast(u32, projected.user_input_choices.len) orelse
+        error.EventTooLarge;
+}
+
+fn commandCount(projected: Projected) !u32 {
+    return std.math.cast(u32, projected.commands.len) orelse
         error.EventTooLarge;
 }
 
@@ -1091,6 +1210,62 @@ fn writeUserInputChoice(
     };
 }
 
+fn cCommandSource(
+    source: backend.CommandSource,
+) c.vivi_backend_command_source_t {
+    return switch (source) {
+        .vivi => c.VIVI_BACKEND_COMMAND_SOURCE_VIVI,
+        .sdk_builtin => c.VIVI_BACKEND_COMMAND_SOURCE_SDK_BUILTIN,
+        .extension => c.VIVI_BACKEND_COMMAND_SOURCE_EXTENSION,
+    };
+}
+
+fn cCommandAction(
+    action: backend.CommandAction,
+) c.vivi_backend_command_action_t {
+    return switch (action) {
+        .execute => c.VIVI_BACKEND_COMMAND_ACTION_EXECUTE,
+        .open_model_selection => c.VIVI_BACKEND_COMMAND_ACTION_OPEN_MODEL_SELECTION,
+        .open_session_history => c.VIVI_BACKEND_COMMAND_ACTION_OPEN_SESSION_HISTORY,
+    };
+}
+
+fn cCommandArgumentPolicy(
+    policy: backend.CommandArgumentPolicy,
+) c.vivi_backend_command_argument_policy_t {
+    return switch (policy) {
+        .none => c.VIVI_BACKEND_COMMAND_ARGUMENT_NONE,
+        .optional => c.VIVI_BACKEND_COMMAND_ARGUMENT_OPTIONAL,
+        .required => c.VIVI_BACKEND_COMMAND_ARGUMENT_REQUIRED,
+    };
+}
+
+fn writeCommand(
+    destination: []u8,
+    offset: *u32,
+    command: *const backend.CommandInfo,
+) c.vivi_backend_command_t {
+    return .{
+        .struct_size = @sizeOf(c.vivi_backend_command_t),
+        .key = .{
+            .generation = command.key.generation,
+            .slot = command.key.slot,
+            .reserved = 0,
+        },
+        .name = appendBytes(destination, offset, command.name),
+        .display_name = appendBytes(destination, offset, command.display_name),
+        .description = appendBytes(destination, offset, command.description),
+        .hint = if (command.hint) |hint|
+            appendBytes(destination, offset, hint)
+        else
+            .{ .offset = 0, .length = 0 },
+        .source = cCommandSource(command.source),
+        .action = cCommandAction(command.action),
+        .argument_policy = cCommandArgumentPolicy(command.argument_policy),
+        .reserved = 0,
+    };
+}
+
 fn copyProjected(
     projected: Projected,
     output: *c.vivi_backend_event_t,
@@ -1136,6 +1311,36 @@ fn copyProjectedWithSpans(
         0,
         null,
         0,
+        null,
+        0,
+    );
+}
+
+fn copyProjectedCommands(
+    projected: Projected,
+    output: *c.vivi_backend_event_t,
+    bytes: ?[*]u8,
+    byte_capacity: u32,
+    commands: ?[*]c.vivi_backend_command_t,
+    command_capacity: u32,
+) c.vivi_backend_result_t {
+    return copyProjectedFull(
+        projected,
+        output,
+        bytes,
+        byte_capacity,
+        null,
+        0,
+        null,
+        0,
+        null,
+        0,
+        null,
+        0,
+        null,
+        0,
+        commands,
+        command_capacity,
     );
 }
 
@@ -1154,6 +1359,8 @@ fn copyProjectedFull(
     transcript_item_capacity: u32,
     user_input_choices: ?[*]c.vivi_backend_user_input_choice_t,
     user_input_choice_capacity: u32,
+    commands: ?[*]c.vivi_backend_command_t,
+    command_capacity: u32,
 ) c.vivi_backend_result_t {
     const required_bytes = byteCount(projected) catch return c.VIVI_BACKEND_FAILED;
     const required_models = modelCount(projected) catch return c.VIVI_BACKEND_FAILED;
@@ -1165,6 +1372,8 @@ fn copyProjectedFull(
         return c.VIVI_BACKEND_FAILED;
     const required_user_input_choices = userInputChoiceCount(projected) catch
         return c.VIVI_BACKEND_FAILED;
+    const required_commands = commandCount(projected) catch
+        return c.VIVI_BACKEND_FAILED;
     output.* = .{
         .kind = projected.kind,
         .content_kind = projected.content_kind,
@@ -1174,6 +1383,7 @@ fn copyProjectedFull(
         .session_count = required_sessions,
         .transcript_item_count = required_transcript_items,
         .user_input_choice_count = required_user_input_choices,
+        .command_count = required_commands,
         .content = .{ .offset = 0, .length = @intCast(projected.text.len) },
         .selected_model_id = if (projected.selected_model_id.len == 0)
             .{ .offset = 0, .length = 0 }
@@ -1188,6 +1398,11 @@ fn copyProjectedFull(
         .tool_input = .{ .offset = 0, .length = 0 },
         .user_input_request_id = .{ .offset = 0, .length = 0 },
         .user_input_question = .{ .offset = 0, .length = 0 },
+        .command_key = .{
+            .generation = projected.command_key.generation,
+            .slot = projected.command_key.slot,
+            .reserved = 0,
+        },
         .tool_input_presentation = emptyPresentation(),
         .tool_output_presentation = emptyPresentation(),
         .tool_result = projected.tool_result,
@@ -1205,7 +1420,8 @@ fn copyProjectedFull(
         semantic_span_capacity < required_semantic_spans or
         session_capacity < required_sessions or
         transcript_item_capacity < required_transcript_items or
-        user_input_choice_capacity < required_user_input_choices)
+        user_input_choice_capacity < required_user_input_choices or
+        command_capacity < required_commands)
     {
         return c.VIVI_BACKEND_BUFFER_TOO_SMALL;
     }
@@ -1215,6 +1431,7 @@ fn copyProjectedFull(
     var empty_sessions: [0]c.vivi_backend_session_summary_t = .{};
     var empty_transcript_items: [0]c.vivi_backend_transcript_item_t = .{};
     var empty_user_input_choices: [0]c.vivi_backend_user_input_choice_t = .{};
+    var empty_commands: [0]c.vivi_backend_command_t = .{};
     const byte_destination: []u8 = if (required_bytes > 0)
         (bytes orelse return c.VIVI_BACKEND_INVALID_ARGUMENT)[0..required_bytes]
     else
@@ -1244,6 +1461,12 @@ fn copyProjectedFull(
                 return c.VIVI_BACKEND_INVALID_ARGUMENT)[0..required_user_input_choices]
         else
             &empty_user_input_choices;
+    const command_destination: []c.vivi_backend_command_t =
+        if (required_commands > 0)
+            (commands orelse
+                return c.VIVI_BACKEND_INVALID_ARGUMENT)[0..required_commands]
+        else
+            &empty_commands;
     var offset: u32 = 0;
     output.content = appendBytes(byte_destination, &offset, projected.text);
     output.selected_model_id = appendOptionalBytes(
@@ -1350,6 +1573,13 @@ fn copyProjectedFull(
             choice,
         );
     }
+    for (projected.commands, 0..) |*command, index| {
+        command_destination[index] = writeCommand(
+            byte_destination,
+            &offset,
+            command,
+        );
+    }
     return c.VIVI_BACKEND_OK;
 }
 
@@ -1368,6 +1598,8 @@ export fn vivi_backend_next_event(
     transcript_item_capacity: u32,
     user_input_choices: ?[*]c.vivi_backend_user_input_choice_t,
     user_input_choice_capacity: u32,
+    commands: ?[*]c.vivi_backend_command_t,
+    command_capacity: u32,
 ) callconv(.c) c.vivi_backend_result_t {
     const self = handle(conversation) orelse return c.VIVI_BACKEND_INVALID_ARGUMENT;
     const output = out_event orelse return c.VIVI_BACKEND_INVALID_ARGUMENT;
@@ -1382,6 +1614,7 @@ export fn vivi_backend_next_event(
             .session_count = 0,
             .transcript_item_count = 0,
             .user_input_choice_count = 0,
+            .command_count = 0,
             .content = .{ .offset = 0, .length = 0 },
             .selected_model_id = .{ .offset = 0, .length = 0 },
             .tool_call_id = .{ .offset = 0, .length = 0 },
@@ -1390,6 +1623,7 @@ export fn vivi_backend_next_event(
             .tool_input = .{ .offset = 0, .length = 0 },
             .user_input_request_id = .{ .offset = 0, .length = 0 },
             .user_input_question = .{ .offset = 0, .length = 0 },
+            .command_key = .{ .generation = 0, .slot = 0, .reserved = 0 },
             .tool_input_presentation = emptyPresentation(),
             .tool_output_presentation = emptyPresentation(),
             .tool_result = c.VIVI_BACKEND_TOOL_RESULT_NONE,
@@ -1429,6 +1663,8 @@ export fn vivi_backend_next_event(
         transcript_item_capacity,
         user_input_choices,
         user_input_choice_capacity,
+        commands,
+        command_capacity,
     );
     if (copied != c.VIVI_BACKEND_OK) return copied;
     if (projected.kind == c.VIVI_BACKEND_EVENT_FAILURE) {
@@ -1460,6 +1696,15 @@ export fn vivi_backend_next_event(
         self.control_operation == .resume_session)
     {
         self.control_operation = .none;
+    } else if (projected.kind == c.VIVI_BACKEND_EVENT_COMMAND_CATALOG and
+        self.control_operation == .refresh_commands)
+    {
+        self.control_operation = .none;
+    } else if ((projected.kind == c.VIVI_BACKEND_EVENT_COMMAND_COMPLETED or
+        projected.kind == c.VIVI_BACKEND_EVENT_COMMAND_FAILED) and
+        self.control_operation == .execute_command)
+    {
+        self.control_operation = .none;
     }
     self.pending.?.deinit();
     self.pending = null;
@@ -1485,6 +1730,287 @@ export fn vivi_backend_destroy(
 test "C launch policy rejects unknown values" {
     const invalid: c.vivi_backend_copilot_cli_launch_t = 99;
     try std.testing.expect(copilotCliLaunch(invalid) == null);
+}
+
+test "C command execution validates exact typed boundary" {
+    var raw = std.mem.zeroInit(c.vivi_backend_command_execution_t, .{
+        .struct_size = @sizeOf(c.vivi_backend_command_execution_t),
+        .key = std.mem.zeroInit(c.vivi_backend_command_key_t, .{
+            .generation = 7,
+            .slot = 3,
+        }),
+        .arguments = "value",
+        .argument_length = 5,
+    });
+    const parsed = commandExecution(&raw).?;
+    try std.testing.expectEqual(@as(u64, 7), parsed.key.generation);
+    try std.testing.expectEqual(@as(u32, 3), parsed.key.slot);
+    try std.testing.expectEqualStrings("value", parsed.arguments);
+
+    raw.struct_size -= 1;
+    try std.testing.expect(commandExecution(&raw) == null);
+    raw.struct_size = @sizeOf(c.vivi_backend_command_execution_t);
+    raw.struct_size += 1;
+    try std.testing.expect(commandExecution(&raw) == null);
+    raw.struct_size = @sizeOf(c.vivi_backend_command_execution_t);
+    raw.reserved = 1;
+    try std.testing.expect(commandExecution(&raw) == null);
+    raw.reserved = 0;
+    raw.reserved2 = 1;
+    try std.testing.expect(commandExecution(&raw) == null);
+    raw.reserved2 = 0;
+    raw.key.reserved = 1;
+    try std.testing.expect(commandExecution(&raw) == null);
+    raw.key.reserved = 0;
+    raw.key.generation = 0;
+    try std.testing.expect(commandExecution(&raw) == null);
+    raw.key.generation = 7;
+    raw.key.slot = 0;
+    try std.testing.expect(commandExecution(&raw) == null);
+    raw.key.slot = 3;
+    raw.argument_length = backend.max_command_argument_bytes + 1;
+    try std.testing.expect(commandExecution(&raw) == null);
+    raw.argument_length = 1;
+    raw.arguments = null;
+    try std.testing.expect(commandExecution(&raw) == null);
+    const invalid_utf8 = [_]u8{0xff};
+    raw.arguments = &invalid_utf8;
+    try std.testing.expect(commandExecution(&raw) == null);
+    raw.arguments = null;
+    raw.argument_length = 0;
+    try std.testing.expectEqualStrings("", commandExecution(&raw).?.arguments);
+}
+
+test "C command catalog copy is atomic with caller-owned descriptors and spans" {
+    const allocator = std.testing.allocator;
+    const records = try allocator.alloc(backend.CommandInfo, 1);
+    records[0] = .{
+        .key = .{ .generation = 11, .slot = 4 },
+        .name = try allocator.dupe(u8, "review"),
+        .display_name = try allocator.dupe(u8, "Review"),
+        .description = try allocator.dupe(u8, "Review changes"),
+        .hint = try allocator.dupe(u8, "instructions"),
+        .source = .extension,
+        .action = .execute,
+        .argument_policy = .optional,
+    };
+    var event: backend.ConversationEvent = .{ .command_catalog = .{
+        .replaced = .{ .allocator = allocator, .commands = records },
+    } };
+    defer event.deinit();
+    const projected = project(&event).?;
+
+    var metadata = std.mem.zeroes(c.vivi_backend_event_t);
+    try std.testing.expectEqual(
+        @as(c.vivi_backend_result_t, c.VIVI_BACKEND_BUFFER_TOO_SMALL),
+        copyProjectedCommands(projected, &metadata, null, 0, null, 0),
+    );
+    try std.testing.expectEqual(@as(u32, 1), metadata.command_count);
+    try std.testing.expect(metadata.byte_count > 0);
+
+    var bytes = [_]u8{0xaa} ** 64;
+    var commands = [_]c.vivi_backend_command_t{
+        std.mem.zeroes(c.vivi_backend_command_t),
+    };
+    try std.testing.expectEqual(
+        @as(c.vivi_backend_result_t, c.VIVI_BACKEND_BUFFER_TOO_SMALL),
+        copyProjectedCommands(
+            projected,
+            &metadata,
+            &bytes,
+            bytes.len,
+            &commands,
+            0,
+        ),
+    );
+    try std.testing.expectEqual(@as(u8, 0xaa), bytes[0]);
+    try std.testing.expectEqual(@as(u32, 0), commands[0].struct_size);
+
+    @memset(std.mem.asBytes(&commands), 0xbb);
+    try std.testing.expectEqual(
+        @as(c.vivi_backend_result_t, c.VIVI_BACKEND_BUFFER_TOO_SMALL),
+        copyProjectedCommands(
+            projected,
+            &metadata,
+            &bytes,
+            metadata.byte_count - 1,
+            &commands,
+            commands.len,
+        ),
+    );
+    try std.testing.expectEqual(@as(u8, 0xaa), bytes[0]);
+    try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&commands), 0xbb));
+
+    try std.testing.expectEqual(
+        @as(c.vivi_backend_result_t, c.VIVI_BACKEND_OK),
+        copyProjectedCommands(
+            projected,
+            &metadata,
+            &bytes,
+            bytes.len,
+            &commands,
+            commands.len,
+        ),
+    );
+    const command = commands[0];
+    try std.testing.expectEqual(
+        @as(u32, @sizeOf(c.vivi_backend_command_t)),
+        command.struct_size,
+    );
+    try std.testing.expectEqual(@as(u64, 11), command.key.generation);
+    try std.testing.expectEqual(@as(u32, 4), command.key.slot);
+    try std.testing.expectEqual(@as(u32, 0), command.key.reserved);
+    try std.testing.expectEqual(@as(u32, 0), command.reserved);
+    try std.testing.expect(
+        command.source == c.VIVI_BACKEND_COMMAND_SOURCE_EXTENSION,
+    );
+    try std.testing.expect(
+        command.action == c.VIVI_BACKEND_COMMAND_ACTION_EXECUTE,
+    );
+    try std.testing.expect(
+        command.argument_policy == c.VIVI_BACKEND_COMMAND_ARGUMENT_OPTIONAL,
+    );
+    const spans = [_]c.vivi_backend_span_t{
+        command.name,
+        command.display_name,
+        command.description,
+        command.hint,
+    };
+    for (spans) |span| {
+        try std.testing.expect(span.length > 0);
+        try std.testing.expect(span.offset + span.length <= metadata.byte_count);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(
+            bytes[span.offset..][0..span.length],
+        ));
+    }
+    try std.testing.expectEqualStrings(
+        "review",
+        bytes[command.name.offset..][0..command.name.length],
+    );
+}
+
+test "C command event probe and retry does not consume or partially copy" {
+    const allocator = std.testing.allocator;
+    const records = try allocator.alloc(backend.CommandInfo, 1);
+    records[0] = .{
+        .key = .{ .generation = 5, .slot = 1 },
+        .name = try allocator.dupe(u8, "help"),
+        .display_name = try allocator.dupe(u8, "Help"),
+        .description = try allocator.dupe(u8, "Show help"),
+        .hint = null,
+        .source = .sdk_builtin,
+        .action = .execute,
+        .argument_policy = .none,
+    };
+    var value: Handle = undefined;
+    value.pending = .{ .command_catalog = .{ .replaced = .{
+        .allocator = allocator,
+        .commands = records,
+    } } };
+    defer if (value.pending) |*pending| pending.deinit();
+    value.emit_closed_after_failure = false;
+    value.control_operation = .refresh_commands;
+    value.accepting_prompt = .init(false);
+    const handle_pointer: *c.vivi_backend_conversation_t = @ptrCast(&value);
+
+    var metadata = std.mem.zeroes(c.vivi_backend_event_t);
+    try std.testing.expectEqual(
+        @as(c.vivi_backend_result_t, c.VIVI_BACKEND_BUFFER_TOO_SMALL),
+        vivi_backend_next_event(
+            handle_pointer,
+            &metadata,
+            null,
+            0,
+            null,
+            0,
+            null,
+            0,
+            null,
+            0,
+            null,
+            0,
+            null,
+            0,
+            null,
+            0,
+        ),
+    );
+    try std.testing.expect(value.pending != null);
+    try std.testing.expect(value.control_operation == .refresh_commands);
+
+    const bytes = try allocator.alloc(u8, metadata.byte_count);
+    defer allocator.free(bytes);
+    var commands = [_]c.vivi_backend_command_t{
+        std.mem.zeroes(c.vivi_backend_command_t),
+    };
+    try std.testing.expectEqual(
+        @as(c.vivi_backend_result_t, c.VIVI_BACKEND_OK),
+        vivi_backend_next_event(
+            handle_pointer,
+            &metadata,
+            bytes.ptr,
+            @intCast(bytes.len),
+            null,
+            0,
+            null,
+            0,
+            null,
+            0,
+            null,
+            0,
+            null,
+            0,
+            &commands,
+            commands.len,
+        ),
+    );
+    try std.testing.expect(value.pending == null);
+    try std.testing.expect(value.control_operation == .none);
+    try std.testing.expectEqual(@as(u64, 5), commands[0].key.generation);
+}
+
+test "C command failure and execution outcomes preserve chronology fields" {
+    const allocator = std.testing.allocator;
+    const key = backend.CommandKey{ .generation = 8, .slot = 2 };
+
+    var catalog_failure: backend.ConversationEvent = .{ .command_catalog = .{
+        .failed = try backend.OwnedText.init(allocator, "catalog failed"),
+    } };
+    defer catalog_failure.deinit();
+    const failed_catalog = project(&catalog_failure).?;
+    try std.testing.expect(
+        failed_catalog.kind == c.VIVI_BACKEND_EVENT_COMMAND_CATALOG_FAILURE,
+    );
+
+    var completed: backend.ConversationEvent = .{ .command_completed = .{
+        .completed = .{
+            .key = key,
+            .message = try backend.OwnedText.init(allocator, "done"),
+        },
+    } };
+    defer completed.deinit();
+    const completed_projection = project(&completed).?;
+    try std.testing.expect(
+        completed_projection.kind == c.VIVI_BACKEND_EVENT_COMMAND_COMPLETED,
+    );
+    try std.testing.expectEqual(key, completed_projection.command_key);
+
+    var failed: backend.ConversationEvent = .{ .command_completed = .{
+        .failed = .{
+            .key = key,
+            .message = try backend.OwnedText.init(allocator, "failed"),
+        },
+    } };
+    defer failed.deinit();
+    const failed_projection = project(&failed).?;
+    try std.testing.expect(
+        failed_projection.kind == c.VIVI_BACKEND_EVENT_COMMAND_FAILED,
+    );
+    try std.testing.expectEqual(key, failed_projection.command_key);
+    try std.testing.expectEqual(
+        @as(c.vivi_backend_result_t, c.VIVI_BACKEND_INVALID_ARGUMENT),
+        result(error.StaleCommandKey),
+    );
 }
 
 test "C wake coalesces before arming and schedules after arming" {
@@ -1891,6 +2417,8 @@ test "C user input request copy is atomic with caller-owned choice spans" {
             0,
             &choices,
             choices.len,
+            null,
+            0,
         ),
     );
     try std.testing.expect(
@@ -1919,6 +2447,8 @@ test "C user input request copy is atomic with caller-owned choice spans" {
             0,
             &choices,
             choices.len,
+            null,
+            0,
         ),
     );
     try std.testing.expect(
@@ -2029,6 +2559,8 @@ test "C session catalog copy is atomic and preserves opaque keys" {
                 0,
                 null,
                 0,
+                null,
+                0,
             ),
     );
     try std.testing.expectEqual(@as(u8, 0xaa), bytes[0]);
@@ -2048,6 +2580,8 @@ test "C session catalog copy is atomic and preserves opaque keys" {
                 0,
                 &sessions,
                 sessions.len,
+                null,
+                0,
                 null,
                 0,
                 null,
@@ -2136,6 +2670,8 @@ test "C session resume copies summary and ordered transcript atomically" {
                 2,
                 null,
                 0,
+                null,
+                0,
             ),
     );
     try std.testing.expectEqual(@as(u64, 0), sessions[0].key.generation);
@@ -2156,6 +2692,8 @@ test "C session resume copies summary and ordered transcript atomically" {
                 sessions.len,
                 &transcript,
                 transcript.len,
+                null,
+                0,
                 null,
                 0,
             ),
@@ -2207,6 +2745,8 @@ test "C failed session resume keeps optional metadata neutral" {
                 &metadata,
                 bytes.ptr,
                 @intCast(bytes.len),
+                null,
+                0,
                 null,
                 0,
                 null,

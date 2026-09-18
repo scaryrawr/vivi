@@ -195,6 +195,12 @@ private struct ProjectSidebarSection: View {
         )
         .accessibilityIdentifier("project-\(workspace.canonicalPath)")
     }
+    .onChange(of: historyConversation?.store.historyPresentationGeneration) {
+      isExpanded = true
+      if let store = historyConversation?.store, store.sessionCatalog == nil {
+        store.refreshSessions()
+      }
+    }
   }
 
   private var projectName: String {
