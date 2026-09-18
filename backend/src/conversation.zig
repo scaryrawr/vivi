@@ -1096,7 +1096,11 @@ pub const Worker = struct {
     }
 
     pub fn commandCatalog(self: *Worker, catalog: CommandCatalog) !void {
-        try self.installCommandCatalog(&catalog);
+        self.installCommandCatalog(&catalog) catch |err| {
+            var owned_catalog = catalog;
+            owned_catalog.deinit();
+            return err;
+        };
         try self.publish(.{ .command_catalog = .{ .replaced = catalog } });
     }
 
@@ -1217,7 +1221,11 @@ pub const Worker = struct {
         self: *Worker,
         catalog: CommandCatalog,
     ) !void {
-        try self.installCommandCatalog(&catalog);
+        self.installCommandCatalog(&catalog) catch |err| {
+            var owned_catalog = catalog;
+            owned_catalog.deinit();
+            return err;
+        };
         try self.completeControl(.{
             .command_catalog = .{ .replaced = catalog },
         });
@@ -1680,6 +1688,34 @@ fn testCommandCatalog(
         .argument_policy = .none,
     };
     return .{ .allocator = allocator, .commands = commands };
+}
+
+test "command catalog input is released when installation fails" {
+    const Harness = struct {
+        fn run(_: *Worker) void {}
+        fn notify(_: *anyopaque) void {}
+    };
+
+    var failing = std.testing.FailingAllocator.init(
+        std.testing.allocator,
+        .{ .fail_index = 0 },
+    );
+    var wake_context: u8 = 0;
+    var core: Core = .{
+        .allocator = failing.allocator(),
+        .io = std.testing.io,
+        .wake = .{
+            .context = &wake_context,
+            .notify = Harness.notify,
+        },
+        .runner = .{ .plain = Harness.run },
+    };
+    var worker: Worker = .{ .core = &core };
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        worker.commandCatalog(try testCommandCatalog(std.testing.allocator, 1)),
+    );
 }
 
 test "command admission rejects invalid arguments and stale keys" {

@@ -511,6 +511,9 @@ private struct CommandResultsView: View {
 
 private struct ModelPickerView: View {
   @ObservedObject var store: NativeChatStore
+  private let reasoningColumns = [
+    GridItem(.adaptive(minimum: 130), spacing: 6, alignment: .leading)
+  ]
 
   var body: some View {
     VStack(alignment: .leading, spacing: 8) {
@@ -527,7 +530,7 @@ private struct ModelPickerView: View {
                   .font(.caption)
                   .foregroundStyle(.secondary)
               }
-              HStack {
+              LazyVGrid(columns: reasoningColumns, alignment: .leading, spacing: 6) {
                 ForEach(model.reasoning) { effort in
                   Button {
                     store.select(modelID: model.id, reasoning: effort)
@@ -543,6 +546,7 @@ private struct ModelPickerView: View {
                     }
                   }
                   .buttonStyle(.bordered)
+                  .frame(maxWidth: .infinity, alignment: .leading)
                 }
               }
             }
