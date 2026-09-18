@@ -58,14 +58,13 @@ Any C ABI change must update the header, Zig adapter, smoke test, and every
 implemented native binding together.
 
 `zig build test` does not compile test blocks in every imported backend module.
-When changing `backend/src/settings.zig` or `backend/src/session_store.zig`,
-also run `zig test` directly on the changed module.
+When changing `backend/src/settings.zig`, also run `zig test` directly on the
+changed module.
 
-Version every persisted settings or session-shard schema change. Parse each
-supported older version explicitly, migrate it in memory, and test the next
-write/compaction. Do not rely on `ignore_unknown_fields` for forward
-compatibility because an older writer can discard new fields while compacting
-sibling shards.
+Version every persisted settings schema change. Parse each supported older
+version explicitly, migrate it in memory, and test the next write. Do not rely
+on `ignore_unknown_fields` for forward compatibility because an older writer
+can discard new fields.
 
 C API cross-builds do not compile the CLI. For platform-specific clipboard or
 terminal-input changes, also cross-build the executable:

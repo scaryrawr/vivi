@@ -39,6 +39,8 @@ slash menu, and the response produced by invoking it.
 - Vivi enables ambient workspace configuration discovery, including workspace
   MCP configuration and project skill directories. The built-in GitHub MCP
   server is limited to `web_search`.
+- Personal extensions and plugin state are isolated under
+  `~/.vivi/copilot/`; Vivi does not inherit them from `~/.copilot/`.
 - Copilot SDK empty sessions require `enableSkills = true`; ambient discovery
   supplies the workspace skill directories.
 - The recipe needs authenticated Copilot access because its assertions cross

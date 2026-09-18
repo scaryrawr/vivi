@@ -58,6 +58,11 @@ choice text, and free-form input when allowed remain supported.
 Synchronous tool output is returned whole; Copilot owns any large-result
 handling.
 
+Vivi keeps personal Copilot customization separate from Copilot CLI by using
+`~/.vivi/copilot/` as its runtime configuration directory. Personal extensions
+therefore live under `~/.vivi/copilot/extensions/`, and plugin installation and
+enablement state does not inherit from `~/.copilot/`.
+
 Mouse-wheel bursts are processed in bounded batches with one redraw per batch,
 so rapid scrolling does not replay a separate frame for every queued tick.
 
@@ -130,6 +135,11 @@ The most recently selected model and reasoning pair is stored in
 `--reasoning` values override that default for one launch without changing the
 stored preference.
 
+Vivi launches Copilot CLI with a private home at `~/.vivi/copilot/`. This keeps
+Copilot sessions, installed extensions, plugin state, and related runtime
+configuration separate from the user's normal `~/.copilot/` installation while
+still allowing ambient configuration from the active workspace.
+
 During an active chat, type `/` to open Vivi's slash-command menu. The menu
 refreshes the Copilot SDK command catalog each time it opens so commands from
 late-registering extensions can appear without restarting Vivi. Select
@@ -138,15 +148,13 @@ Copilot default, authenticated Copilot models, and discovered OMLX models.
 Selecting the active pair is a no-op. A successful switch keeps the visible
 Vivi transcript but starts a fresh server-side session, so prior turns are not
 part of the replacement model's context. Vivi currently executes
-`/model` with Vivi's model picker. Vivi records sessions it creates under
-`~/.vivi/sessions/`; select `/resume` to filter those private Vivi records by
-workspace and continue one later. Use `/resume all` (or `/resume --all`) to
-search Copilot sessions whose recorded working directory matches the active
-workspace; those broader results are not written to Vivi's index merely by
-listing them. A successful resume first replaces the terminal transcript with
-the persisted Copilot message history, then reports success. Copilot CLI remains
-the authoritative history store, and a failed resume leaves the current chat
-and transcript active. Compatible SDK-contributed commands,
+`/model` with Vivi's model picker. Select `/resume` to filter sessions stored
+by Copilot CLI in Vivi's private home and continue one from any workspace.
+Resume rows show the saved title and working directory without exposing
+Copilot's session IDs. A successful resume uses the currently selected model
+and reasoning effort, replaces the terminal transcript with the persisted
+Copilot message history, then reports success. A failed resume leaves the
+current chat and transcript active. Compatible SDK-contributed commands,
 including session-mode commands such as `/autopilot`, execute through
 Copilot's command API.
 

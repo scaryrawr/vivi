@@ -5,13 +5,12 @@ const copilot = @import("copilot_sdk");
 const conversation = @import("conversation.zig");
 const file_picker = @import("file_picker.zig");
 const models = @import("models.zig");
-const session_store = @import("session_store.zig");
 const settings = @import("settings.zig");
 const tool_activity = @import("tool_activity.zig");
 const tools = @import("tools.zig");
 
 pub const version = build_options.version;
-pub const abi_version: u32 = 6;
+pub const abi_version: u32 = 7;
 pub const Conversation = conversation.Conversation;
 pub const ConversationEvent = conversation.Event;
 pub const ConversationWake = conversation.Wake;
@@ -35,8 +34,6 @@ pub const ReasoningEffortSet = conversation.ReasoningEffortSet;
 pub const ReasoningProfile = conversation.ReasoningProfile;
 pub const SessionCatalog = conversation.SessionCatalog;
 pub const SessionSummary = conversation.SessionSummary;
-pub const SessionCatalogRequest = conversation.SessionCatalogRequest;
-pub const SessionCatalogScope = conversation.SessionCatalogScope;
 pub const ResumeKey = conversation.ResumeKey;
 pub const TranscriptSnapshot = conversation.TranscriptSnapshot;
 pub const TranscriptItem = conversation.TranscriptItem;
@@ -75,8 +72,7 @@ pub const ConversationOptions = struct {
     working_directory: []const u8,
     model: ?[]const u8 = null,
     reasoning: ?ReasoningEffort = null,
-    settings_path: ?[]const u8 = null,
-    sessions_directory: ?[]const u8 = null,
+    settings_path: []const u8,
     copilot_cli_path: ?[]const u8 = null,
     omlx: OmlxOptions = .{},
     copilot_cli_launch: CopilotCliLaunch = .sdk_default,
@@ -86,8 +82,7 @@ const ConversationContext = struct {
     working_directory: []u8,
     model: ?[]u8,
     reasoning: ?ReasoningEffort,
-    settings_path: ?[]u8,
-    sessions_directory: ?[]u8,
+    settings_path: []u8,
     copilot_cli_path: ?[]u8,
     omlx_base_url: []u8,
     omlx_api_key: ?[]u8,
@@ -110,16 +105,8 @@ const ConversationContext = struct {
         else
             null;
         errdefer if (model) |value| allocator.free(value);
-        const settings_path = if (options.settings_path) |value|
-            try allocator.dupe(u8, value)
-        else
-            null;
-        errdefer if (settings_path) |value| allocator.free(value);
-        const sessions_directory = if (options.sessions_directory) |value|
-            try allocator.dupe(u8, value)
-        else
-            null;
-        errdefer if (sessions_directory) |value| allocator.free(value);
+        const settings_path = try allocator.dupe(u8, options.settings_path);
+        errdefer allocator.free(settings_path);
         const copilot_cli_path = if (options.copilot_cli_path) |value|
             try allocator.dupe(u8, value)
         else
@@ -131,7 +118,6 @@ const ConversationContext = struct {
             .model = model,
             .reasoning = options.reasoning,
             .settings_path = settings_path,
-            .sessions_directory = sessions_directory,
             .copilot_cli_path = copilot_cli_path,
             .omlx_base_url = undefined,
             .omlx_api_key = null,
@@ -156,8 +142,7 @@ const ConversationContext = struct {
         const self: *ConversationContext = @ptrCast(@alignCast(pointer));
         allocator.free(self.working_directory);
         if (self.model) |model| allocator.free(model);
-        if (self.settings_path) |path| allocator.free(path);
-        if (self.sessions_directory) |path| allocator.free(path);
+        allocator.free(self.settings_path);
         if (self.copilot_cli_path) |path| allocator.free(path);
         allocator.free(self.omlx_base_url);
         if (self.omlx_api_key) |api_key| {
@@ -180,8 +165,11 @@ pub fn discoverModels(
     allocator: std.mem.Allocator,
     io: std.Io,
     working_directory: []const u8,
+    settings_path: []const u8,
     options: OmlxOptions,
 ) !ModelCatalog {
+    const copilot_home = try prepareCopilotHome(allocator, io, settings_path);
+    defer allocator.free(copilot_home);
     var selected: SessionPlan = .hosted;
     var client = copilot.Client.init(
         allocator,
@@ -190,6 +178,7 @@ pub fn discoverModels(
             working_directory,
             .sdk_default,
             null,
+            copilot_home,
         ),
     ) catch {
         return buildModelCatalog(allocator, null, io, &selected, options);
@@ -220,12 +209,18 @@ test "conversation contexts retain their explicit working directories" {
     const allocator = std.testing.allocator;
     const first = try ConversationContext.init(
         allocator,
-        .{ .working_directory = "/tmp/first" },
+        .{
+            .working_directory = "/tmp/first",
+            .settings_path = "/tmp/vivi/settings.json",
+        },
     );
     defer ConversationContext.destroy(allocator, first);
     const second = try ConversationContext.init(
         allocator,
-        .{ .working_directory = "/tmp/second" },
+        .{
+            .working_directory = "/tmp/second",
+            .settings_path = "/tmp/vivi/settings.json",
+        },
     );
     defer ConversationContext.destroy(allocator, second);
     try std.testing.expectEqualStrings("/tmp/first", first.working_directory);
@@ -258,10 +253,12 @@ const MinimalCodingAgent = struct {
         working_directory: []const u8,
         launch: CopilotCliLaunch,
         copilot_cli_path: ?[]const u8,
+        copilot_home: []const u8,
     ) copilot.ClientOptions {
         const command = copilotCommand(launch, copilot_cli_path);
         var options: copilot.ClientOptions = .{
             .working_directory = working_directory,
+            .base_directory = copilot_home,
             .cli_args = command.args,
             .client_info = .{
                 .application_name = "vivi",
@@ -277,12 +274,13 @@ const MinimalCodingAgent = struct {
     }
 
     fn sessionConfig(
+        comptime Config: type,
         prompt: []const u8,
         working_directory: []const u8,
         model: ?*const models.Model,
         omlx: OmlxOptions,
-    ) copilot.SessionConfig {
-        return .{
+    ) Config {
+        return Config{
             .model_capabilities = if (model) |selected| .{
                 .supports = .{ .vision = selected.supports_vision },
             } else null,
@@ -1081,6 +1079,7 @@ fn createSdkSession(
     );
     defer directories.deinit();
     var config = sessionConfigForPlan(
+        copilot.CreateSessionConfig,
         system_prompt,
         working_directory,
         plan,
@@ -1092,7 +1091,7 @@ fn createSdkSession(
     return client.createSession(config);
 }
 
-fn joinSdkSession(
+fn resumeSdkSession(
     worker: *conversation.Worker,
     client: *copilot.Client,
     session_id: []const u8,
@@ -1107,6 +1106,7 @@ fn joinSdkSession(
     );
     defer directories.deinit();
     var config = sessionConfigForPlan(
+        copilot.ResumeSessionConfig,
         system_prompt,
         working_directory,
         plan,
@@ -1115,15 +1115,16 @@ fn joinSdkSession(
     directories.apply(&config);
     config.on_user_input_request = handleSdkUserInput;
     config.user_input_context = worker;
-    return client.joinSession(session_id, config);
+    return client.resumeSession(session_id, config);
 }
 
 fn sessionConfigForPlan(
+    comptime Config: type,
     system_prompt: []const u8,
     working_directory: []const u8,
     plan: *const SessionPlan,
     api_key: ?[]const u8,
-) copilot.SessionConfig {
+) Config {
     const selected: ?models.Model = switch (plan.*) {
         .hosted, .copilot => null,
         .omlx => |value| .{
@@ -1136,6 +1137,7 @@ fn sessionConfigForPlan(
         },
     };
     var config = MinimalCodingAgent.sessionConfig(
+        Config,
         system_prompt,
         working_directory,
         if (selected) |*model| model else null,
@@ -1153,6 +1155,26 @@ fn sessionConfigForPlan(
     }
     config.reasoning_effort = sdkReasoningEffort(plan.selection().reasoning);
     return config;
+}
+
+fn copilotHome(
+    allocator: std.mem.Allocator,
+    settings_path: []const u8,
+) ![]u8 {
+    const parent = std.fs.path.dirname(settings_path) orelse
+        return error.InvalidSettingsPath;
+    return try std.fs.path.join(allocator, &.{ parent, "copilot" });
+}
+
+fn prepareCopilotHome(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    settings_path: []const u8,
+) ![]u8 {
+    const path = try copilotHome(allocator, settings_path);
+    errdefer allocator.free(path);
+    try std.Io.Dir.cwd().createDirPath(io, path);
+    return path;
 }
 
 fn buildModelCatalog(
@@ -1372,120 +1394,74 @@ fn initCommandInfo(
     };
 }
 
-fn buildSessionCatalog(
-    allocator: std.mem.Allocator,
-    index: *const session_store.Index,
-    active_session_id: []const u8,
-    generation: u64,
-) !conversation.SessionCatalog {
-    const sessions = try allocator.alloc(
-        conversation.SessionSummary,
-        index.records.len,
-    );
-    errdefer allocator.free(sessions);
-    var initialized: usize = 0;
-    errdefer for (sessions[0..initialized]) |*session| session.deinit();
-    for (index.records, 0..) |record, record_index| {
-        sessions[record_index] = try sessionSummaryFromRecord(
-            allocator,
-            .{
-                .generation = generation,
-                .slot = @intCast(record_index),
-                .scope = .local,
-            },
-            &record,
-            std.mem.eql(u8, active_session_id, record.id),
-        );
-        initialized += 1;
-    }
-    return .{
-        .allocator = allocator,
-        .scope = .local,
-        .label = try allocator.dupe(
-            u8,
-            conversation.SessionCatalogScope.local.label(),
-        ),
-        .sessions = sessions,
-        .skipped_invalid_shards = index.skipped_invalid_shards,
-    };
-}
-
-const RemoteResumeTarget = struct {
+const ResumeTarget = struct {
     id: []u8,
     working_directory: []u8,
     title: ?[]u8,
-    modified_time: []u8,
 
-    fn deinit(self: *RemoteResumeTarget, allocator: std.mem.Allocator) void {
+    fn deinit(self: *ResumeTarget, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
         allocator.free(self.working_directory);
         if (self.title) |value| allocator.free(value);
-        allocator.free(self.modified_time);
         self.* = undefined;
     }
 };
 
 fn resumableSessionTitle(summary: ?[]const u8) ?[]const u8 {
     const title = summary orelse return null;
-    return if (session_store.validTitle(title)) title else null;
+    if (title.len == 0 or title.len > 512 or
+        !std.unicode.utf8ValidateSlice(title) or
+        std.mem.trim(u8, title, " \t\r\n").len != title.len)
+    {
+        return null;
+    }
+    for (title) |byte| {
+        if (byte < 0x20 or byte == 0x7f) return null;
+    }
+    return title;
 }
 
-const ResumeTargets = union(enum) {
-    local: session_store.Index,
-    broader: []RemoteResumeTarget,
+const ResumeTargets = struct {
+    generation: u64,
+    targets: []ResumeTarget,
 
     fn deinit(self: *ResumeTargets, allocator: std.mem.Allocator) void {
-        switch (self.*) {
-            .local => |*index| index.deinit(),
-            .broader => |targets| {
-                for (targets) |*target| target.deinit(allocator);
-                allocator.free(targets);
-            },
-        }
+        for (self.targets) |*target| target.deinit(allocator);
+        allocator.free(self.targets);
         self.* = undefined;
     }
 };
 
-fn buildBroaderSessionCatalog(
+fn buildSessionCatalog(
     allocator: std.mem.Allocator,
     client: *copilot.Client,
-    active_working_directory: []const u8,
     active_session_id: []const u8,
-    active_model_id: []const u8,
-    active_reasoning: ReasoningEffort,
     generation: u64,
 ) !struct {
     catalog: conversation.SessionCatalog,
     targets: ResumeTargets,
 } {
-    var listed = try client.listSessions(.{
-        .cwd = active_working_directory,
-    });
+    var listed = try client.listSessions(null);
     defer listed.deinit();
 
-    var remote = std.ArrayList(RemoteResumeTarget).empty;
+    var resume_targets = std.ArrayList(ResumeTarget).empty;
     errdefer {
-        for (remote.items) |*target| target.deinit(allocator);
-        remote.deinit(allocator);
+        for (resume_targets.items) |*target| target.deinit(allocator);
+        resume_targets.deinit(allocator);
     }
     for (listed.sessions) |metadata| {
+        if (metadata.is_remote) continue;
         const context = metadata.context orelse continue;
-        if (!std.mem.eql(u8, context.cwd, active_working_directory)) continue;
+        if (!std.fs.path.isAbsolute(context.cwd)) continue;
         var target = blk: {
             const id = try allocator.dupe(u8, metadata.session_id);
             errdefer allocator.free(id);
             const working_directory = try allocator.dupe(u8, context.cwd);
             errdefer allocator.free(working_directory);
-            const modified_time = try allocator.dupe(
-                u8,
-                metadata.modified_time,
-            );
-            errdefer allocator.free(modified_time);
-            var value = RemoteResumeTarget{
+            var value = ResumeTarget{
                 .id = id,
                 .working_directory = working_directory,
                 .title = null,
-                .modified_time = modified_time,
             };
             errdefer value.deinit(allocator);
             if (resumableSessionTitle(metadata.summary)) |title| {
@@ -1494,10 +1470,10 @@ fn buildBroaderSessionCatalog(
             break :blk value;
         };
         errdefer target.deinit(allocator);
-        try remote.append(allocator, target);
+        try resume_targets.append(allocator, target);
     }
 
-    const targets = try remote.toOwnedSlice(allocator);
+    const targets = try resume_targets.toOwnedSlice(allocator);
     errdefer {
         for (targets) |*target| target.deinit(allocator);
         allocator.free(targets);
@@ -1513,32 +1489,20 @@ fn buildBroaderSessionCatalog(
                 target.working_directory,
             );
             errdefer allocator.free(working_directory);
-            const model_id = try allocator.dupe(u8, active_model_id);
-            errdefer allocator.free(model_id);
             var value = conversation.SessionSummary{
                 .allocator = allocator,
                 .key = .{
                     .generation = generation,
                     .slot = @intCast(index),
-                    .scope = .broader,
                 },
                 .working_directory = working_directory,
-                .model_id = model_id,
-                .reasoning = active_reasoning,
                 .title = null,
-                .summary = null,
-                .last_used_unix_ms = unixMilliseconds(client.io),
                 .current = std.mem.eql(u8, target.id, active_session_id),
             };
             errdefer value.deinit();
             if (target.title) |title| {
                 value.title = try allocator.dupe(u8, title);
             }
-            value.summary = try std.fmt.allocPrint(
-                allocator,
-                "Updated {s}",
-                .{target.modified_time},
-            );
             break :blk value;
         };
         errdefer summary.deinit();
@@ -1548,15 +1512,12 @@ fn buildBroaderSessionCatalog(
     return .{
         .catalog = .{
             .allocator = allocator,
-            .scope = .broader,
-            .label = try allocator.dupe(
-                u8,
-                conversation.SessionCatalogScope.broader.label(),
-            ),
             .sessions = sessions,
-            .skipped_invalid_shards = false,
         },
-        .targets = .{ .broader = targets },
+        .targets = .{
+            .generation = generation,
+            .targets = targets,
+        },
     };
 }
 
@@ -1711,61 +1672,23 @@ test "broader resume ignores invalid SDK session titles" {
     try std.testing.expectEqual(null, resumableSessionTitle(&oversized));
 }
 
-fn sessionSummaryFromRecord(
+fn sessionSummaryFromTarget(
     allocator: std.mem.Allocator,
     key: conversation.ResumeKey,
-    record: *const session_store.Record,
+    target: *const ResumeTarget,
     current: bool,
 ) !conversation.SessionSummary {
-    const working_directory = try allocator.dupe(u8, record.working_directory);
+    const working_directory = try allocator.dupe(u8, target.working_directory);
     errdefer allocator.free(working_directory);
-    const model_id = try allocator.dupe(u8, record.model_id);
-    errdefer allocator.free(model_id);
     return .{
         .allocator = allocator,
         .key = key,
         .working_directory = working_directory,
-        .model_id = model_id,
-        .reasoning = record.reasoning,
-        .title = if (record.title) |title|
+        .title = if (target.title) |title|
             try allocator.dupe(u8, title)
         else
             null,
-        .last_used_unix_ms = record.last_used_unix_ms,
         .current = current,
-    };
-}
-
-fn unixMilliseconds(io: std.Io) i64 {
-    return std.Io.Timestamp.now(io, .real).toMilliseconds();
-}
-
-fn recordSessionRecency(
-    worker: *conversation.Worker,
-    store: ?*session_store.Store,
-    tracking_enabled: *bool,
-    session_id: []const u8,
-    working_directory: []const u8,
-    model_id: []const u8,
-    reasoning: ReasoningEffort,
-) void {
-    if (!tracking_enabled.*) return;
-    const value = store orelse return;
-    value.recordCreated(
-        session_id,
-        working_directory,
-        model_id,
-        reasoning,
-        unixMilliseconds(worker.io()),
-    ) catch |err| {
-        tracking_enabled.* = false;
-        var buffer: [256]u8 = undefined;
-        const message = std.fmt.bufPrint(
-            &buffer,
-            "Session tracking disabled: {s}",
-            .{@errorName(err)},
-        ) catch "Session tracking disabled.";
-        worker.sessionTrackingFailed(message) catch {};
     };
 }
 
@@ -1815,7 +1738,7 @@ const WorkspaceCustomizationDirectories = struct {
 
     fn apply(
         self: *const WorkspaceCustomizationDirectories,
-        config: *copilot.SessionConfig,
+        config: anytype,
     ) void {
         config.skill_directories = &self.skills;
         config.instruction_directories = &self.instructions;
@@ -1935,8 +1858,6 @@ fn streamSessionResponse(
     client: *copilot.Client,
     session: copilot.Session,
     tool_service: *tools.Service,
-    store: ?*session_store.Store,
-    session_tracking_enabled: *bool,
 ) StreamResult {
     var typed_tool_calls = std.ArrayList([]u8).empty;
     defer {
@@ -2221,30 +2142,13 @@ fn streamSessionResponse(
                 )) return .failed;
             },
             .session_title_changed => |title| {
-                if (!session_store.validTitle(title.data.title)) {
+                if (resumableSessionTitle(title.data.title) == null) {
                     if (!reportStreamStatus(
                         worker,
                         "Session title updated.",
                         "Unable to display session title.",
                     )) return .failed;
                     continue;
-                }
-                if (session_tracking_enabled.*) {
-                    if (store) |value| {
-                        value.updateTitle(
-                            session.id,
-                            title.data.title,
-                        ) catch |err| {
-                            session_tracking_enabled.* = false;
-                            var buffer: [256]u8 = undefined;
-                            const tracking_message = std.fmt.bufPrint(
-                                &buffer,
-                                "Session tracking disabled: {s}",
-                                .{@errorName(err)},
-                            ) catch "Session tracking disabled.";
-                            worker.sessionTrackingFailed(tracking_message) catch {};
-                        };
-                    }
                 }
                 worker.sessionTitle(title.data.title) catch {
                     worker.closeFailure(.stream, "Unable to display session title.");
@@ -2318,6 +2222,15 @@ fn runSdkConversation(
     const context: *ConversationContext = @ptrCast(
         @alignCast(opaque_context),
     );
+    const copilot_home = prepareCopilotHome(
+        worker.allocator(),
+        worker.io(),
+        context.settings_path,
+    ) catch |err| {
+        worker.closeFailure(.startup, @errorName(err));
+        return;
+    };
+    defer worker.allocator().free(copilot_home);
     var active_working_directory = worker.allocator().dupe(
         u8,
         context.working_directory,
@@ -2343,6 +2256,7 @@ fn runSdkConversation(
             active_working_directory,
             context.copilot_cli_launch,
             context.copilot_cli_path,
+            copilot_home,
         ),
     ) catch |err| {
         worker.closeFailure(.startup, @errorName(err));
@@ -2363,27 +2277,19 @@ fn runSdkConversation(
         .base_url = context.omlx_base_url,
         .api_key = context.omlx_api_key,
     };
-    var store = if (context.sessions_directory) |directory|
-        session_store.Store.init(
-            worker.allocator(),
-            worker.io(),
-            directory,
-        ) catch |err| {
-            worker.closeFailure(.startup, @errorName(err));
-            return;
-        }
-    else
-        null;
-    defer if (store) |*value| value.deinit();
     var resume_targets: ?ResumeTargets = null;
     defer if (resume_targets) |*targets| targets.deinit(worker.allocator());
     var resume_generation: u64 = 0;
-    var persisted_settings = if (context.settings_path) |path|
-        settings.load(worker.allocator(), worker.io(), path) catch |err| {
+    var persisted_settings =
+        settings.load(
+            worker.allocator(),
+            worker.io(),
+            context.settings_path,
+        ) catch |err| {
             const message = std.fmt.allocPrint(
                 worker.allocator(),
                 "Unable to load Vivi settings at {s}: {s}",
-                .{ path, @errorName(err) },
+                .{ context.settings_path, @errorName(err) },
             ) catch {
                 worker.closeFailure(.startup, @errorName(err));
                 return;
@@ -2391,9 +2297,7 @@ fn runSdkConversation(
             defer worker.allocator().free(message);
             worker.closeFailure(.startup, message);
             return;
-        }
-    else
-        settings.Settings{ .allocator = worker.allocator() };
+        };
     defer persisted_settings.deinit();
 
     const persisted_startup = if (persisted_settings.default_selection) |*value|
@@ -2429,22 +2333,6 @@ fn runSdkConversation(
     };
     var session_connected = true;
     defer if (session_connected) session.disconnect() catch {};
-    if (store) |*value| {
-        value.recordCreated(
-            session.id,
-            active_working_directory,
-            active_plan.id(),
-            active_plan.selection().reasoning,
-            unixMilliseconds(worker.io()),
-        ) catch |err| {
-            session.disconnect() catch {};
-            session_connected = false;
-            worker.closeFailure(.startup, @errorName(err));
-            return;
-        };
-    }
-    var session_tracking_enabled = store != null;
-
     if (!(worker.ready() catch {
         worker.closeFailure(.startup, "Unable to publish conversation readiness.");
         return;
@@ -2527,81 +2415,34 @@ fn runSdkConversation(
                     return;
                 };
             },
-            .refresh_sessions => |request| {
-                resume_generation +%= 1;
-                if (resume_generation == 0) resume_generation = 1;
-                if (request == .local) {
-                    var new_index: session_store.Index = if (store) |*value|
-                        value.list() catch |err| {
-                            worker.completeSessionRefreshFailure(
-                                @errorName(err),
-                            ) catch {
-                                worker.closeFailure(.stream, @errorName(err));
-                                return;
-                            };
-                            continue;
-                        }
-                    else
-                        .{
-                            .allocator = worker.allocator(),
-                            .records = worker.allocator().alloc(
-                                session_store.Record,
-                                0,
-                            ) catch |err| {
-                                worker.closeFailure(.stream, @errorName(err));
-                                return;
-                            },
-                        };
-                    const catalog = buildSessionCatalog(
-                        worker.allocator(),
-                        &new_index,
-                        session.id,
-                        resume_generation,
-                    ) catch |err| {
-                        new_index.deinit();
+            .refresh_sessions => {
+                var next_generation = resume_generation +% 1;
+                if (next_generation == 0) next_generation = 1;
+                var result = buildSessionCatalog(
+                    worker.allocator(),
+                    &client,
+                    session.id,
+                    next_generation,
+                ) catch |err| {
+                    worker.completeSessionRefreshFailure(
+                        @errorName(err),
+                    ) catch {
                         worker.closeFailure(.stream, @errorName(err));
                         return;
                     };
-                    worker.completeSessionRefresh(catalog) catch {
-                        new_index.deinit();
-                        worker.closeFailure(
-                            .stream,
-                            "Unable to deliver the session catalog.",
-                        );
-                        return;
-                    };
-                    if (resume_targets) |*targets| targets.deinit(worker.allocator());
-                    resume_targets = .{ .local = new_index };
-                } else {
-                    const result = buildBroaderSessionCatalog(
-                        worker.allocator(),
-                        &client,
-                        active_working_directory,
-                        session.id,
-                        active_plan.id(),
-                        active_plan.selection().reasoning,
-                        resume_generation,
-                    ) catch |err| {
-                        worker.completeSessionRefreshFailure(
-                            @errorName(err),
-                        ) catch {
-                            worker.closeFailure(.stream, @errorName(err));
-                            return;
-                        };
-                        continue;
-                    };
-                    worker.completeSessionRefresh(result.catalog) catch {
-                        var targets = result.targets;
-                        targets.deinit(worker.allocator());
-                        worker.closeFailure(
-                            .stream,
-                            "Unable to deliver the session catalog.",
-                        );
-                        return;
-                    };
-                    if (resume_targets) |*targets| targets.deinit(worker.allocator());
-                    resume_targets = result.targets;
-                }
+                    continue;
+                };
+                worker.completeSessionRefresh(result.catalog) catch {
+                    result.targets.deinit(worker.allocator());
+                    worker.closeFailure(
+                        .stream,
+                        "Unable to deliver the session catalog.",
+                    );
+                    return;
+                };
+                if (resume_targets) |*targets| targets.deinit(worker.allocator());
+                resume_targets = result.targets;
+                resume_generation = next_generation;
             },
             .resume_session => |key| {
                 const targets = if (resume_targets) |*value| value else {
@@ -2619,7 +2460,9 @@ fn runSdkConversation(
                     };
                     continue;
                 };
-                if (key.generation != resume_generation) {
+                if (key.generation != targets.generation or
+                    key.slot >= targets.targets.len)
+                {
                     worker.completeSessionResume(.{
                         .failed = conversation.OwnedText.init(
                             worker.allocator(),
@@ -2634,60 +2477,7 @@ fn runSdkConversation(
                     };
                     continue;
                 }
-                var target: session_store.Record = switch (targets.*) {
-                    .local => |index| blk: {
-                        if (key.scope != .local or key.slot >= index.records.len) {
-                            worker.completeSessionResume(.{
-                                .failed = conversation.OwnedText.init(
-                                    worker.allocator(),
-                                    "The selected session is no longer available.",
-                                ) catch {
-                                    worker.closeFailure(.stream, "Out of memory.");
-                                    return;
-                                },
-                            }) catch {
-                                worker.closeFailure(.stream, "Unable to report resume failure.");
-                                return;
-                            };
-                            continue;
-                        }
-                        break :blk index.records[key.slot].clone(worker.allocator()) catch |err| {
-                            worker.closeFailure(.stream, @errorName(err));
-                            return;
-                        };
-                    },
-                    .broader => |records| blk: {
-                        if (key.scope != .broader or key.slot >= records.len) {
-                            worker.completeSessionResume(.{
-                                .failed = conversation.OwnedText.init(
-                                    worker.allocator(),
-                                    "The selected session is no longer available.",
-                                ) catch {
-                                    worker.closeFailure(.stream, "Out of memory.");
-                                    return;
-                                },
-                            }) catch {
-                                worker.closeFailure(.stream, "Unable to report resume failure.");
-                                return;
-                            };
-                            continue;
-                        }
-                        const record = records[key.slot];
-                        break :blk session_store.Record.initWithTitle(
-                            worker.allocator(),
-                            record.id,
-                            record.working_directory,
-                            active_plan.id(),
-                            record.title,
-                            active_plan.selection().reasoning,
-                            0,
-                        ) catch |err| {
-                            worker.closeFailure(.stream, @errorName(err));
-                            return;
-                        };
-                    },
-                };
-                defer target.deinit();
+                const target = &targets.targets[key.slot];
                 if (std.mem.eql(u8, target.id, session.id)) {
                     const snapshot = hydrateTranscriptSnapshot(
                         worker.allocator(),
@@ -2708,29 +2498,10 @@ fn runSdkConversation(
                         };
                         continue;
                     };
-                    const now = unixMilliseconds(worker.io());
-                    target.last_used_unix_ms = now;
-                    if (store) |*value| value.touch(&target, now) catch |err| {
-                        var mutable = snapshot;
-                        mutable.deinit();
-                        worker.completeSessionResume(.{
-                            .failed = conversation.OwnedText.init(
-                                worker.allocator(),
-                                @errorName(err),
-                            ) catch {
-                                worker.closeFailure(.stream, @errorName(err));
-                                return;
-                            },
-                        }) catch {
-                            worker.closeFailure(.stream, @errorName(err));
-                            return;
-                        };
-                        continue;
-                    };
-                    const summary = sessionSummaryFromRecord(
+                    const summary = sessionSummaryFromTarget(
                         worker.allocator(),
                         key,
-                        &target,
+                        target,
                         true,
                     ) catch |err| {
                         var mutable = snapshot;
@@ -2749,36 +2520,11 @@ fn runSdkConversation(
                     continue;
                 }
 
-                var target_plan = resolveSessionPlan(
-                    worker.allocator(),
-                    &client,
-                    worker.io(),
-                    .{
-                        .model_id = target.model_id,
-                        .reasoning = target.reasoning,
-                    },
-                    omlx_options,
-                ) catch |err| {
-                    worker.completeSessionResume(.{
-                        .failed = conversation.OwnedText.init(
-                            worker.allocator(),
-                            @errorName(err),
-                        ) catch {
-                            worker.closeFailure(.stream, @errorName(err));
-                            return;
-                        },
-                    }) catch {
-                        worker.closeFailure(.stream, @errorName(err));
-                        return;
-                    };
-                    continue;
-                };
                 var candidate_tools = tools.Service.init(
                     worker.allocator(),
                     worker.io(),
                     target.working_directory,
                 ) catch |err| {
-                    target_plan.deinit(worker.allocator());
                     worker.completeSessionResume(.{
                         .failed = conversation.OwnedText.init(
                             worker.allocator(),
@@ -2799,22 +2545,20 @@ fn runSdkConversation(
                     .{target.working_directory},
                 ) catch |err| {
                     candidate_tools.deinit();
-                    target_plan.deinit(worker.allocator());
                     worker.closeFailure(.stream, @errorName(err));
                     return;
                 };
                 defer worker.allocator().free(candidate_prompt);
-                var candidate = joinSdkSession(
+                var candidate = resumeSdkSession(
                     worker,
                     &client,
                     target.id,
                     candidate_prompt,
                     target.working_directory,
-                    &target_plan,
+                    &active_plan,
                     context.omlx_api_key,
                 ) catch |err| {
                     candidate_tools.deinit();
-                    target_plan.deinit(worker.allocator());
                     worker.completeSessionResume(.{
                         .failed = conversation.OwnedText.init(
                             worker.allocator(),
@@ -2836,7 +2580,6 @@ fn runSdkConversation(
                 ) catch |err| {
                     candidate.disconnect() catch {};
                     candidate_tools.deinit();
-                    target_plan.deinit(worker.allocator());
                     worker.completeSessionResume(.{
                         .failed = conversation.OwnedText.init(
                             worker.allocator(),
@@ -2851,8 +2594,6 @@ fn runSdkConversation(
                     };
                     continue;
                 };
-                const now = unixMilliseconds(worker.io());
-                target.last_used_unix_ms = now;
                 const candidate_working_directory = worker.allocator().dupe(
                     u8,
                     target.working_directory,
@@ -2861,14 +2602,13 @@ fn runSdkConversation(
                     mutable.deinit();
                     candidate.disconnect() catch {};
                     candidate_tools.deinit();
-                    target_plan.deinit(worker.allocator());
                     worker.closeFailure(.stream, @errorName(err));
                     return;
                 };
-                const summary = sessionSummaryFromRecord(
+                const summary = sessionSummaryFromTarget(
                     worker.allocator(),
                     key,
-                    &target,
+                    target,
                     true,
                 ) catch |err| {
                     var mutable = snapshot;
@@ -2876,43 +2616,17 @@ fn runSdkConversation(
                     worker.allocator().free(candidate_working_directory);
                     candidate.disconnect() catch {};
                     candidate_tools.deinit();
-                    target_plan.deinit(worker.allocator());
                     worker.closeFailure(.stream, @errorName(err));
                     return;
-                };
-                if (store) |*value| value.touch(&target, now) catch |err| {
-                    var mutable_summary = summary;
-                    mutable_summary.deinit();
-                    var mutable_snapshot = snapshot;
-                    mutable_snapshot.deinit();
-                    worker.allocator().free(candidate_working_directory);
-                    candidate.disconnect() catch {};
-                    candidate_tools.deinit();
-                    target_plan.deinit(worker.allocator());
-                    worker.completeSessionResume(.{
-                        .failed = conversation.OwnedText.init(
-                            worker.allocator(),
-                            @errorName(err),
-                        ) catch {
-                            worker.closeFailure(.stream, @errorName(err));
-                            return;
-                        },
-                    }) catch {
-                        worker.closeFailure(.stream, @errorName(err));
-                        return;
-                    };
-                    continue;
                 };
 
                 const previous_session = session;
                 var previous_tools = tool_service;
                 const previous_working_directory = active_working_directory;
-                var previous_plan = active_plan;
                 session_connected = false;
                 session = candidate;
                 tool_service = candidate_tools;
                 active_working_directory = candidate_working_directory;
-                active_plan = target_plan;
                 session_connected = true;
                 const cleanup_failed = if (previous_session.disconnect())
                     false
@@ -2920,7 +2634,6 @@ fn runSdkConversation(
                     true;
                 previous_tools.deinit();
                 worker.allocator().free(previous_working_directory);
-                previous_plan.deinit(worker.allocator());
                 worker.completeSessionResume(.{ .resumed = .{
                     .session = summary,
                     .transcript = snapshot,
@@ -2991,8 +2704,6 @@ fn runSdkConversation(
                                 &client,
                                 session,
                                 &tool_service,
-                                if (store) |*value| value else null,
-                                &session_tracking_enabled,
                             )) {
                                 .idle => {},
                                 .stopped => {
@@ -3001,15 +2712,6 @@ fn runSdkConversation(
                                 },
                                 .failed => return,
                             }
-                            recordSessionRecency(
-                                worker,
-                                if (store) |*value| value else null,
-                                &session_tracking_enabled,
-                                session.id,
-                                active_working_directory,
-                                active_plan.id(),
-                                active_plan.selection().reasoning,
-                            );
                             break :command_execution;
                         },
                         .select_subcommand => |selection| {
@@ -3116,37 +2818,35 @@ fn runSdkConversation(
                     };
                     continue;
                 };
-                if (context.settings_path) |path| {
-                    const current_settings = settings.load(
-                        worker.allocator(),
-                        worker.io(),
-                        path,
-                    ) catch |err| {
-                        target_plan.deinit(worker.allocator());
-                        worker.completeModelSwitch(.{
-                            .failed = settingsFailure(
-                                worker.allocator(),
-                                path,
-                                err,
-                            ) catch {
-                                worker.closeFailure(
-                                    .stream,
-                                    "Unable to report the settings failure.",
-                                );
-                                return;
-                            },
-                        }) catch {
+                const current_settings = settings.load(
+                    worker.allocator(),
+                    worker.io(),
+                    context.settings_path,
+                ) catch |err| {
+                    target_plan.deinit(worker.allocator());
+                    worker.completeModelSwitch(.{
+                        .failed = settingsFailure(
+                            worker.allocator(),
+                            context.settings_path,
+                            err,
+                        ) catch {
                             worker.closeFailure(
                                 .stream,
                                 "Unable to report the settings failure.",
                             );
                             return;
-                        };
-                        continue;
+                        },
+                    }) catch {
+                        worker.closeFailure(
+                            .stream,
+                            "Unable to report the settings failure.",
+                        );
+                        return;
                     };
-                    persisted_settings.deinit();
-                    persisted_settings = current_settings;
-                }
+                    continue;
+                };
+                persisted_settings.deinit();
+                persisted_settings = current_settings;
                 const persisted_selection =
                     if (persisted_settings.default_selection) |*value|
                         value.view()
@@ -3156,7 +2856,7 @@ fn runSdkConversation(
                     active_plan.selection(),
                     persisted_selection,
                     target_plan.selection(),
-                    context.settings_path != null,
+                    true,
                 )) |action| {
                     const info = target_plan.info(worker.allocator()) catch |err| {
                         target_plan.deinit(worker.allocator());
@@ -3174,7 +2874,6 @@ fn runSdkConversation(
                         return;
                     };
                     if (action == .update_default) {
-                        const path = context.settings_path.?;
                         const persisted_value = selected.clone(
                             worker.allocator(),
                         ) catch |err| {
@@ -3188,7 +2887,7 @@ fn runSdkConversation(
                         settings.saveDefaultSelection(
                             worker.allocator(),
                             worker.io(),
-                            path,
+                            context.settings_path,
                             target_plan.selection(),
                         ) catch |err| {
                             var mutable_persisted = persisted_value;
@@ -3200,7 +2899,7 @@ fn runSdkConversation(
                             worker.completeModelSwitch(.{
                                 .failed = settingsFailure(
                                     worker.allocator(),
-                                    path,
+                                    context.settings_path,
                                     err,
                                 ) catch {
                                     worker.closeFailure(
@@ -3294,7 +2993,7 @@ fn runSdkConversation(
                     return;
                 };
                 var settings_update: ?settings.DefaultSelectionUpdate = null;
-                const persisted_value = if (context.settings_path) |path| blk: {
+                const persisted_value = blk: {
                     const value = selected.clone(worker.allocator()) catch |err| {
                         candidate.disconnect() catch {};
                         target_plan.deinit(worker.allocator());
@@ -3307,7 +3006,7 @@ fn runSdkConversation(
                     settings_update = settings.updateDefaultSelection(
                         worker.allocator(),
                         worker.io(),
-                        path,
+                        context.settings_path,
                         target_plan.selection(),
                     ) catch |err| {
                         var mutable_value = value;
@@ -3320,7 +3019,7 @@ fn runSdkConversation(
                         worker.completeModelSwitch(.{
                             .failed = settingsFailure(
                                 worker.allocator(),
-                                path,
+                                context.settings_path,
                                 err,
                             ) catch {
                                 worker.closeFailure(
@@ -3339,68 +3038,7 @@ fn runSdkConversation(
                         continue;
                     };
                     break :blk value;
-                } else null;
-                if (session_tracking_enabled) {
-                    if (store) |*value| {
-                        value.recordCreated(
-                            candidate.id,
-                            active_working_directory,
-                            target_plan.id(),
-                            target_plan.selection().reasoning,
-                            unixMilliseconds(worker.io()),
-                        ) catch |err| {
-                            if (settings_update) |*update| {
-                                _ = settings.rollbackDefaultSelection(
-                                    worker.allocator(),
-                                    worker.io(),
-                                    context.settings_path.?,
-                                    update,
-                                ) catch |rollback_err| {
-                                    update.deinit();
-                                    settings_update = null;
-                                    candidate.disconnect() catch {};
-                                    target_plan.deinit(worker.allocator());
-                                    var mutable = info;
-                                    mutable.deinit();
-                                    selected.deinit();
-                                    if (persisted_value) |saved| {
-                                        var mutable_value = saved;
-                                        mutable_value.deinit();
-                                    }
-                                    worker.closeFailure(
-                                        .stream,
-                                        @errorName(rollback_err),
-                                    );
-                                    return;
-                                };
-                                update.deinit();
-                                settings_update = null;
-                            }
-                            candidate.disconnect() catch {};
-                            target_plan.deinit(worker.allocator());
-                            var mutable = info;
-                            mutable.deinit();
-                            selected.deinit();
-                            if (persisted_value) |saved| {
-                                var mutable_value = saved;
-                                mutable_value.deinit();
-                            }
-                            worker.completeModelSwitch(.{
-                                .failed = conversation.OwnedText.init(
-                                    worker.allocator(),
-                                    @errorName(err),
-                                ) catch {
-                                    worker.closeFailure(.stream, @errorName(err));
-                                    return;
-                                },
-                            }) catch {
-                                worker.closeFailure(.stream, @errorName(err));
-                                return;
-                            };
-                            continue;
-                        };
-                    }
-                }
+                };
                 if (settings_update) |*update| {
                     update.deinit();
                     settings_update = null;
@@ -3412,12 +3050,10 @@ fn runSdkConversation(
                 session_connected = true;
                 active_plan.deinit(worker.allocator());
                 active_plan = target_plan;
-                if (persisted_value) |value| {
-                    if (persisted_settings.default_selection) |*current| {
-                        current.deinit();
-                    }
-                    persisted_settings.default_selection = value;
+                if (persisted_settings.default_selection) |*current| {
+                    current.deinit();
                 }
+                persisted_settings.default_selection = persisted_value;
                 const cleanup_failed = if (previous_session.disconnect())
                     false
                 else |_|
@@ -3426,7 +3062,7 @@ fn runSdkConversation(
                     .model = info,
                     .selection = selected,
                     .history = .reset_visible_transcript_preserved,
-                    .default_saved = persisted_value != null,
+                    .default_saved = true,
                     .cleanup_failed = cleanup_failed,
                 } }) catch {
                     worker.closeFailure(
@@ -3466,8 +3102,6 @@ fn runSdkConversation(
                     &client,
                     session,
                     &tool_service,
-                    if (store) |*value| value else null,
-                    &session_tracking_enabled,
                 )) {
                     .idle => {},
                     .stopped => {
@@ -3476,15 +3110,6 @@ fn runSdkConversation(
                     },
                     .failed => return,
                 }
-                recordSessionRecency(
-                    worker,
-                    if (store) |*value| value else null,
-                    &session_tracking_enabled,
-                    session.id,
-                    active_working_directory,
-                    active_plan.id(),
-                    active_plan.selection().reasoning,
-                );
             },
         }
     }
@@ -3638,6 +3263,7 @@ test "hosted model mapping preserves raw SDK identity and capabilities" {
     );
 
     const config = sessionConfigForPlan(
+        copilot.CreateSessionConfig,
         "prompt",
         "/workspace",
         &plan,
@@ -3645,7 +3271,20 @@ test "hosted model mapping preserves raw SDK identity and capabilities" {
     );
     try std.testing.expectEqualStrings("gpt-test", config.model.?);
     try std.testing.expect(config.provider == null);
+    try std.testing.expect(config.config_directory == null);
     try std.testing.expectEqual(copilot.ReasoningEffort.high, config.reasoning_effort.?);
+}
+
+test "Copilot configuration is isolated below the Vivi settings directory" {
+    const directory = try copilotHome(
+        std.testing.allocator,
+        "/home/user/.vivi/settings.json",
+    );
+    defer std.testing.allocator.free(directory);
+    try std.testing.expectEqualStrings(
+        "/home/user/.vivi/copilot",
+        directory,
+    );
 }
 
 test "local models expose the product reasoning profile" {
@@ -3748,12 +3387,17 @@ test "minimal coding agent limits hosted tools to simplified subset" {
         "/workspace",
         .sdk_default,
         null,
+        "/home/user/.vivi/copilot",
     );
     try std.testing.expectEqualStrings(
         "/workspace",
         options.working_directory.?,
     );
     try std.testing.expectEqualStrings("copilot", options.cli_path);
+    try std.testing.expectEqualStrings(
+        "/home/user/.vivi/copilot",
+        options.base_directory.?,
+    );
 
     try std.testing.expectEqualSlices(
         []const u8,
@@ -3765,6 +3409,7 @@ test "minimal coding agent limits hosted tools to simplified subset" {
             "builtin:web_fetch",
         },
         MinimalCodingAgent.sessionConfig(
+            copilot.CreateSessionConfig,
             "minimal system prompt",
             "/workspace",
             null,
@@ -3778,6 +3423,7 @@ test "native launch uses the host-resolved Copilot path" {
         "/workspace",
         .explicit_path,
         "/opt/homebrew/bin/copilot",
+        "/home/user/.vivi/copilot",
     );
     try std.testing.expectEqualStrings("/opt/homebrew/bin/copilot", options.cli_path);
     try std.testing.expectEqualSlices(
@@ -3790,6 +3436,7 @@ test "native launch uses the host-resolved Copilot path" {
 test "terminal launch preserves SDK default command" {
     const conversation_options: ConversationOptions = .{
         .working_directory = "/workspace",
+        .settings_path = "/home/user/.vivi/settings.json",
     };
     try std.testing.expectEqual(
         CopilotCliLaunch.sdk_default,
@@ -3817,6 +3464,7 @@ test "minimal coding agent limits local tools to simplified subset" {
         .supports_vision = false,
     };
     const config = MinimalCodingAgent.sessionConfig(
+        copilot.CreateSessionConfig,
         "minimal system prompt",
         "/workspace",
         &model,
@@ -3838,6 +3486,7 @@ test "minimal coding agent limits local tools to simplified subset" {
 
 test "minimal coding agent appends Vivi tools to discovered instructions" {
     const config = MinimalCodingAgent.sessionConfig(
+        copilot.CreateSessionConfig,
         "minimal system prompt",
         "/workspace",
         null,
@@ -4077,6 +3726,7 @@ test "OMLX model configuration carries detected token limits and vision capabili
         .supports_vision = false,
     };
     const config = MinimalCodingAgent.sessionConfig(
+        copilot.CreateSessionConfig,
         "prompt",
         "/workspace",
         &model,
@@ -4101,7 +3751,13 @@ test "OMLX model configuration carries detected token limits and vision capabili
     );
     try std.testing.expectEqual(false, config.model_capabilities.?.supports.?.vision.?);
     model.supports_vision = true;
-    const vision_config = MinimalCodingAgent.sessionConfig("prompt", "/workspace", &model, .{});
+    const vision_config = MinimalCodingAgent.sessionConfig(
+        copilot.CreateSessionConfig,
+        "prompt",
+        "/workspace",
+        &model,
+        .{},
+    );
     try std.testing.expectEqual(true, vision_config.model_capabilities.?.supports.?.vision.?);
     try std.testing.expectEqualStrings("Qwen3.5-9B-mxfp4", vision_config.provider.?.wire_model.?);
 }

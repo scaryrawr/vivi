@@ -104,6 +104,12 @@ Copilot's system message. Provider-specific
 session-level source-qualified allowlists admit custom and extension tools
 while limiting Copilot's built-ins to the applicable reviewed set.
 
+Each session sets Copilot's runtime configuration directory to
+`~/.vivi/copilot/`, derived from Vivi's settings path. This isolates personal
+extensions, installed plugins, enablement state, MCP configuration, and other
+Copilot customization from the user's standalone `~/.copilot/` installation.
+Workspace customization remains discoverable from the active repository.
+
 `backend/src/tools.zig` owns SDK-free tool behavior: JSON argument validation,
 workspace-relative path resolution, text/image reads, synchronous Bash
 execution, async Bash tool adaptation, exact multi-edit planning,
@@ -218,35 +224,24 @@ same model value appearing again, or mistake a legacy writer's field-dropping
 rewrite for its own write. Hosts resolve the user's home directory and pass the
 settings path into conversation options; they do not parse the document or
 coordinate model-switch persistence. Copilot CLI continues to own its session
-storage. The SDK can create or join sessions by ID, but does not expose a
-custom session-storage backend.
-
-`backend/src/session_store.zig` owns Vivi's durable index of sessions it
-created. Processes coordinate through an advisory `.lock` file under
-`~/.vivi/sessions/`. While holding that lock, each read or write merges valid
-versioned JSON shards by SDK session ID, incrementally bounds the catalog,
-atomically writes the merged catalog to the current process's shard, and
-best-effort removes sibling shards after that commit. Malformed shards are
-skipped and then removed during compaction. An unsupported document version or
-an oversized shard aborts the operation before compaction so an older Vivi
-binary cannot delete a newer catalog it cannot safely inspect. On POSIX
-systems, the directory, lock, and shards use owner-only permissions; Windows
-creation inherits the user profile's access-controlled directory permissions.
-The store records only the session ID, generated title, working directory,
-model identity, and recency, refreshing recency after each completed response;
-Copilot CLI remains the sole transcript/history store.
+storage. Every production SDK client is launched with
+`ClientOptions.base_directory` set to `~/.vivi/copilot/`, making that private
+Copilot home the single authority for sessions, extensions, plugin state, and
+administrative APIs such as session listing. Session create and resume requests
+do not set a separate `config_directory`, so they cannot diverge from the
+process-level home. Hosts create the private home before initializing the SDK.
+Existing `~/.vivi/sessions/` data from earlier versions is ignored and left
+untouched.
 
 `/resume` is a first-class broker control operation rather than an SDK slash
-command. Bare `/resume` lists only Vivi's private local index. `/resume all`
-uses the SDK's cwd-filtered session listing and discards rows without the exact
-active working-directory context; it neither merges those rows into the local
-catalog nor persists them merely for display. The terminal receives
-display-ready summaries with refresh-scoped opaque generation-and-slot keys,
-while `backend/src/root.zig` privately resolves SDK IDs and calls
-`Client.joinSession`. Joining fetches and projects the owned message history
-before durable recency update, active-session commit, and previous-session
-cleanup. Candidate tools and the system prompt are rebuilt for the recorded
-working directory; any failure before commit disconnects the candidate and
+command. It uses the SDK's process-wide `listSessions(null)` catalog, projects
+display-ready titles and working directories, and gives the terminal
+refresh-scoped opaque generation-and-slot keys. `backend/src/root.zig`
+privately resolves those keys to SDK session IDs and calls
+`Client.resumeSession`. Candidate tools and the system prompt are rebuilt for
+the recorded working directory using the currently selected model and reasoning
+effort. The candidate history is fetched and projected before the active
+session is replaced; any failure before commit disconnects the candidate and
 leaves the current session and visible transcript active. A successful resume,
 including a same-session selection, atomically replaces the terminal transcript
 from the owned snapshot before reporting success.

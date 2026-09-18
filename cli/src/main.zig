@@ -93,20 +93,14 @@ pub fn main(init: std.process.Init) !void {
             const settings_path = try defaultSettingsPath(
                 init.gpa,
                 init.environ_map,
-            );
-            defer if (settings_path) |path| init.gpa.free(path);
-            const sessions_directory = try defaultSessionsDirectory(
-                init.gpa,
-                init.environ_map,
-            );
-            defer if (sessions_directory) |path| init.gpa.free(path);
+            ) orelse return error.MissingHomeDirectory;
+            defer init.gpa.free(settings_path);
             return chat.run(
                 init,
                 options.model,
                 options.reasoning,
                 working_directory,
                 settings_path,
-                sessions_directory,
             );
         },
     }
@@ -225,21 +219,6 @@ fn percentEncode(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     return output.toOwnedSlice(allocator);
 }
 
-fn defaultSessionsDirectory(
-    allocator: std.mem.Allocator,
-    environ_map: *const std.process.Environ.Map,
-) !?[]u8 {
-    const home = usableHome(environ_map.get("HOME")) orelse
-        usableHome(environ_map.get("USERPROFILE")) orelse return null;
-    return @as(
-        ?[]u8,
-        try std.fs.path.join(
-            allocator,
-            &.{ home, ".vivi", "sessions" },
-        ),
-    );
-}
-
 fn defaultSettingsPath(
     allocator: std.mem.Allocator,
     environ_map: *const std.process.Environ.Map,
@@ -274,10 +253,16 @@ fn writeHelp(writer: *std.Io.Writer) !void {
 }
 
 fn listModels(init: std.process.Init, writer: *std.Io.Writer) !void {
+    const settings_path = try defaultSettingsPath(
+        init.gpa,
+        init.environ_map,
+    ) orelse return error.MissingHomeDirectory;
+    defer init.gpa.free(settings_path);
     var catalog = try backend.discoverModels(
         init.gpa,
         init.io,
         init.environ_map.get("PWD") orelse ".",
+        settings_path,
         .{
             .base_url = init.environ_map.get("OMLX_BASE_URL") orelse
                 backend.default_omlx_base_url,
@@ -452,21 +437,6 @@ test "settings persistence is optional without a home directory" {
     defer environment.deinit();
     try std.testing.expect(
         try defaultSettingsPath(std.testing.allocator, &environment) == null,
-    );
-}
-
-test "sessions directory uses the supplied home directory" {
-    var environment = std.process.Environ.Map.init(std.testing.allocator);
-    defer environment.deinit();
-    try environment.put("HOME", "/tmp/vivi-home");
-    const path = try defaultSessionsDirectory(
-        std.testing.allocator,
-        &environment,
-    );
-    defer std.testing.allocator.free(path.?);
-    try std.testing.expectEqualStrings(
-        "/tmp/vivi-home/.vivi/sessions",
-        path.?,
     );
 }
 

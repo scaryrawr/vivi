@@ -1053,18 +1053,6 @@ chat_session_resume() {
     mkdir -p "$vhs_home"
     rm -rf "$resume_home/.vivi"
     rm -rf "$vhs_home/.vivi"
-    if test -n "${HOME:-}" &&
-        test -d "$HOME/.copilot" &&
-        ! test -e "$resume_home/.copilot"
-    then
-        ln -s "$HOME/.copilot" "$resume_home/.copilot"
-    fi
-    if test -n "${HOME:-}" &&
-        test -d "$HOME/.copilot" &&
-        ! test -e "$vhs_home/.copilot"
-    then
-        ln -s "$HOME/.copilot" "$vhs_home/.copilot"
-    fi
 
     (
         sleep 10
@@ -1119,7 +1107,7 @@ chat_session_resume() {
         "$run_dir/chat-session-resume-second.terminal.log" |
         tr -d '\r\b' >"$run_dir/chat-session-resume-second.normalized.txt"
     perl -0ne \
-        'if (/Showing Saved Vivi sessions\.(.*?)(?:Resuming session\.\.\.)/s) { print $1 }' \
+        'if (/Showing saved Vivi sessions\.(.*?)(?:Resuming session\.\.\.)/s) { print $1 }' \
         "$run_dir/chat-session-resume-second.normalized.txt" \
         >"$run_dir/chat-session-resume-picker.normalized.txt"
 
@@ -1197,7 +1185,7 @@ chat_session_resume() {
     rm -f "$run_dir/chat-session-resume.vhs-timeout"
     printf '%s\n' "$vhs_pid" >"$run_dir/vhs.pid"
     (
-        sleep 240
+        sleep 360
         if kill -0 "$vhs_pid" 2>/dev/null; then
             : >"$run_dir/chat-session-resume.vhs-timeout"
             kill "$vhs_pid"
