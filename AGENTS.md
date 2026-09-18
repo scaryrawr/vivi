@@ -61,6 +61,10 @@ implemented native binding together.
 When changing `backend/src/settings.zig`, also run `zig test` directly on the
 changed module.
 
+With Zig 0.16 on POSIX, open a directory with `.iterate = true` before calling
+`Dir.setPermissions`; the default `openDirAbsolute` handle may be `O_PATH` on
+Linux, causing `setPermissions` to abort with `BADF`.
+
 Version every persisted settings schema change. Parse each supported older
 version explicitly, migrate it in memory, and test the next write. Do not rely
 on `ignore_unknown_fields` for forward compatibility because an older writer
