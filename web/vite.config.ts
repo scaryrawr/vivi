@@ -3,7 +3,27 @@ import { defineConfig } from "vitest/config";
 
 export default defineConfig({
   base: "./",
-  plugins: [react()],
+  plugins: [
+    react(),
+    {
+      name: "vivi-production-csp",
+      apply: "build",
+      transformIndexHtml: {
+        order: "post",
+        handler: () => [
+          {
+            tag: "meta",
+            attrs: {
+              "http-equiv": "Content-Security-Policy",
+              content:
+                "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'none'; base-uri 'none'; form-action 'none'",
+            },
+            injectTo: "head",
+          },
+        ],
+      },
+    },
+  ],
   test: {
     environment: "jsdom",
     setupFiles: "./src/test/setup.ts",

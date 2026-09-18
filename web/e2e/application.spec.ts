@@ -78,6 +78,18 @@ test("session buttons keep native interactive semantics", async ({ page }) => {
   ).toBeVisible();
 });
 
+test("session lifecycle is visible without relying on color", async ({
+  page,
+}) => {
+  await page.goto("/?scenario=streaming");
+
+  await expect(
+    page.locator(".session-row .lifecycle-status", {
+      hasText: "Responding",
+    }),
+  ).toBeVisible();
+});
+
 test("captures stable core screenshots", async ({ page }) => {
   await page.goto("/?scenario=multiple");
   await expect(page).toHaveScreenshot("multiple-projects.png");

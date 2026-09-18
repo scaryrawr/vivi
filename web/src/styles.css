@@ -36,8 +36,8 @@ button {
   --surface: #ffffff;
   --surface-raised: #fbfbfc;
   --text: #202124;
-  --secondary: #6e7075;
-  --tertiary: #6e7075;
+  --secondary: #62646a;
+  --tertiary: #686a70;
   --line: rgb(24 26 31 / 0.11);
   --line-strong: rgb(24 26 31 / 0.18);
   --selection: #0a64d8;
@@ -227,15 +227,19 @@ button {
   color: var(--secondary);
 }
 
-.lifecycle-dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: #f5a623;
+.lifecycle-status {
+  margin-left: auto;
+  color: var(--secondary);
+  font-size: 9px;
+  font-weight: 600;
 }
 
-.lifecycle-dot.responding {
-  animation: pulse 1.4s ease-in-out infinite;
+.lifecycle-status.responding {
+  color: #8a5200;
+}
+
+.lifecycle-status.failed {
+  color: var(--danger);
 }
 
 .sidebar-empty {

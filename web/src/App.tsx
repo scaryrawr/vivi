@@ -182,7 +182,7 @@ export function ViviApp({
                           <span className="session-title">
                             {displayTitle(session.title)}
                           </span>
-                          <LifecycleDot lifecycle={session.lifecycle.kind} />
+                          <LifecycleStatus lifecycle={session.lifecycle.kind} />
                         </button>
                       );
                     })}
@@ -455,11 +455,19 @@ function Disclosure({
   );
 }
 
-function LifecycleDot({ lifecycle }: { readonly lifecycle: string }) {
+function LifecycleStatus({ lifecycle }: { readonly lifecycle: string }) {
   if (lifecycle === "idle") return null;
-  return (
-    <span className={`lifecycle-dot ${lifecycle}`} aria-label={lifecycle} />
-  );
+  const label =
+    lifecycle === "responding"
+      ? "Responding"
+      : lifecycle === "starting"
+        ? "Starting"
+        : lifecycle === "closing"
+          ? "Closing"
+          : lifecycle === "closed"
+            ? "Closed"
+            : "Failed";
+  return <span className={`lifecycle-status ${lifecycle}`}>{label}</span>;
 }
 
 function LifecyclePill({ lifecycle }: { readonly lifecycle: string }) {
