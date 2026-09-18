@@ -489,6 +489,10 @@ final class NativeChatStore: ObservableObject {
     !isAcquiringAttachments && modelState == .ready && sessionState == .ready && !isBusy
   }
 
+  var canPresentCommandPalette: Bool {
+    activeUserInput == nil && lifecycle != .closing && lifecycle != .closed
+  }
+
   var filteredCommands: [CommandInfo] {
     let query = commandQuery.trimmingCharacters(in: .whitespacesAndNewlines)
       .lowercased()
@@ -696,8 +700,14 @@ final class NativeChatStore: ObservableObject {
     }
   }
 
+  func toggleModelPicker() {
+    guard canUseModelControls else { return }
+    closeCommandPalette()
+    isModelPickerPresented.toggle()
+  }
+
   func openCommandPalette(query: String = "", consumesDraft: Bool = false) {
-    guard lifecycle != .closing, lifecycle != .closed, activeUserInput == nil else { return }
+    guard canPresentCommandPalette else { return }
     isModelPickerPresented = false
     isCommandPalettePresented = true
     commandPaletteConsumesDraft = consumesDraft

@@ -126,7 +126,7 @@ struct ContentView: View {
         .help("Commands (⌘K)")
         .accessibilityLabel("Commands")
         .accessibilityIdentifier("command-palette-button")
-        .disabled(store.lifecycle == .closing || store.lifecycle == .closed)
+        .disabled(!store.canPresentCommandPalette)
 
         attachmentMenu
         modelMenu
@@ -198,9 +198,7 @@ struct ContentView: View {
   }
 
   private var modelMenu: some View {
-    Button {
-      store.isModelPickerPresented.toggle()
-    } label: {
+    Button(action: store.toggleModelPicker) {
       Text(modelLabel)
         .lineLimit(1)
         .font(.callout)

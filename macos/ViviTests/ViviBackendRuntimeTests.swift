@@ -1802,6 +1802,18 @@ final class ViviBackendRuntimeTests: XCTestCase {
     XCTAssertFalse(store.isCommandPalettePresented)
   }
 
+  func testDirectModelPickerDismissesCommandPalette() {
+    let store = readyCommandStore(driver: FakeConversationDriver())
+    store.reduce(.commandCatalog(swiftCommandCatalog(generation: 5)))
+    store.openCommandPalette()
+    store.reduce(.commandCatalog(swiftCommandCatalog(generation: 6)))
+
+    store.toggleModelPicker()
+
+    XCTAssertFalse(store.isCommandPalettePresented)
+    XCTAssertTrue(store.isModelPickerPresented)
+  }
+
   func testSlashOpenFilteringAndWrappedSelectionAreStoreOwned() {
     let store = readyCommandStore(driver: FakeConversationDriver())
     store.reduce(.commandCatalog(swiftCommandCatalog(generation: 5)))
@@ -1858,6 +1870,7 @@ final class ViviBackendRuntimeTests: XCTestCase {
           allowsFreeform: false)))
 
     XCTAssertFalse(store.isCommandPalettePresented)
+    XCTAssertFalse(store.canPresentCommandPalette)
     XCTAssertEqual(store.draft, "keep")
 
     store.close()
