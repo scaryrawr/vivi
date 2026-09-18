@@ -41,6 +41,8 @@ and asks for the transformed token.
 ## Gotchas
 
 - Copilot authentication and service availability are required.
+- The isolated verification home receives `gh auth token` through the process
+  environment; it never links to the user's normal Copilot session store.
 - The recipe deliberately creates a temporary second session before resuming;
   both remain in the isolated private Copilot home.
 - The resumed terminal transcript is hydrated from Copilot's persisted message

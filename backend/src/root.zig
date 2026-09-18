@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const presentation = @import("presentation.zig");
 const build_options = @import("build_options");
 const copilot = @import("copilot_sdk");
@@ -8,6 +9,12 @@ const models = @import("models.zig");
 const settings = @import("settings.zig");
 const tool_activity = @import("tool_activity.zig");
 const tools = @import("tools.zig");
+
+const private_directory_permissions: std.Io.Dir.Permissions =
+    if (builtin.os.tag == .windows)
+        .default_dir
+    else
+        .fromMode(0o700);
 
 pub const version = build_options.version;
 pub const abi_version: u32 = 7;
@@ -301,6 +308,7 @@ const MinimalCodingAgent = struct {
             .skip_custom_instructions = false,
             .enable_on_demand_instruction_discovery = true,
             .github_mcp_tool_config = .{
+                .enable_all_tools = false,
                 .additional_tools = &.{"web_search"},
             },
             .streaming = true,
@@ -1173,7 +1181,16 @@ fn prepareCopilotHome(
 ) ![]u8 {
     const path = try copilotHome(allocator, settings_path);
     errdefer allocator.free(path);
-    try std.Io.Dir.cwd().createDirPath(io, path);
+    _ = try std.Io.Dir.cwd().createDirPathStatus(
+        io,
+        path,
+        private_directory_permissions,
+    );
+    if (builtin.os.tag != .windows) {
+        var directory = try std.Io.Dir.openDirAbsolute(io, path, .{});
+        defer directory.close(io);
+        try directory.setPermissions(io, private_directory_permissions);
+    }
     return path;
 }
 
@@ -3287,6 +3304,60 @@ test "Copilot configuration is isolated below the Vivi settings directory" {
     );
 }
 
+test "Copilot home uses owner-only POSIX permissions" {
+    if (builtin.os.tag == .windows) return;
+
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const root = try temporary.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(root);
+    const settings_path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root, ".vivi", "settings.json" },
+    );
+    defer std.testing.allocator.free(settings_path);
+
+    const first = try prepareCopilotHome(
+        std.testing.allocator,
+        std.testing.io,
+        settings_path,
+    );
+    defer std.testing.allocator.free(first);
+    {
+        var directory = try std.Io.Dir.openDirAbsolute(
+            std.testing.io,
+            first,
+            .{},
+        );
+        defer directory.close(std.testing.io);
+        try directory.setPermissions(
+            std.testing.io,
+            .fromMode(0o755),
+        );
+    }
+
+    const second = try prepareCopilotHome(
+        std.testing.allocator,
+        std.testing.io,
+        settings_path,
+    );
+    defer std.testing.allocator.free(second);
+    var directory = try std.Io.Dir.openDirAbsolute(
+        std.testing.io,
+        second,
+        .{},
+    );
+    defer directory.close(std.testing.io);
+    try std.testing.expectEqual(
+        @as(std.posix.mode_t, 0o700),
+        (try directory.stat(std.testing.io)).permissions.toMode() & 0o777,
+    );
+}
+
 test "local models expose the product reasoning profile" {
     const profile = localReasoningProfile();
     try std.testing.expect(profile.selectable.off);
@@ -3524,6 +3595,10 @@ test "minimal coding agent appends Vivi tools to discovered instructions" {
     try std.testing.expectEqual(
         true,
         config.enable_on_demand_instruction_discovery.?,
+    );
+    try std.testing.expectEqual(
+        false,
+        config.github_mcp_tool_config.?.enable_all_tools.?,
     );
     try std.testing.expectEqual(@as(usize, 1), config.github_mcp_tool_config.?.additional_tools.?.len);
     try std.testing.expectEqualStrings(

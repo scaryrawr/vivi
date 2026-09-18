@@ -807,16 +807,12 @@ chat_model_menu() {
     settings_home="$run_dir/home"
     mkdir -p "$settings_home"
     rm -f "$settings_home/.vivi/settings.json"
-    if test -n "${HOME:-}" &&
-        test -d "$HOME/.copilot" &&
-        ! test -e "$settings_home/.copilot"
-    then
-        ln -s "$HOME/.copilot" "$settings_home/.copilot"
-    fi
+    github_token=$(gh auth token)
 
     (
         cd "$repo_root" &&
-            HOME="$settings_home" VIVI_KEEP_GIF=1 \
+            HOME="$settings_home" GH_TOKEN="$github_token" \
+                GITHUB_TOKEN="$github_token" VIVI_KEEP_GIF=1 \
                 "$vhs_command" "$run_dir/chat-model-menu.tape"
     )
     VIVI_KEEP_GIF=1 extract_frames "$1" chat-model-menu
@@ -836,7 +832,8 @@ chat_model_menu() {
         printf '\003'
         sleep 3
         printf '\003'
-    ) | HOME="$settings_home" \
+    ) | HOME="$settings_home" GH_TOKEN="$github_token" \
+        GITHUB_TOKEN="$github_token" \
         script -q "$run_dir/chat-model-menu.terminal.log" sh -c \
         "stty cols 100 rows 30; '$binary' chat" &
     pty_pid=$!
@@ -939,14 +936,10 @@ chat_customization() {
     write_customization_tape "$run_dir" "$workspace"
     mkdir -p "$customization_home"
     rm -rf "$customization_home/.vivi"
-    if test -n "${HOME:-}" &&
-        test -d "$HOME/.copilot" &&
-        ! test -e "$customization_home/.copilot"
-    then
-        ln -s "$HOME/.copilot" "$customization_home/.copilot"
-    fi
+    github_token=$(gh auth token)
 
-    HOME="$customization_home" VIVI_KEEP_GIF=1 \
+    HOME="$customization_home" GH_TOKEN="$github_token" \
+        GITHUB_TOKEN="$github_token" VIVI_KEEP_GIF=1 \
         "$vhs_command" "$run_dir/chat-customization.tape"
     VIVI_KEEP_GIF=1 extract_frames "$1" chat-customization
 
@@ -961,7 +954,8 @@ chat_customization() {
         printf '\003'
         sleep 3
         printf '\003'
-    ) | HOME="$customization_home" \
+    ) | HOME="$customization_home" GH_TOKEN="$github_token" \
+        GITHUB_TOKEN="$github_token" \
         script -q "$run_dir/chat-customization.terminal.log" sh -c \
         "cd '$workspace' && stty cols 100 rows 30; '$binary' chat --model copilot/default" &
     pty_pid=$!
@@ -1017,16 +1011,6 @@ Set TypingSpeed 20ms
 Type "./zig-out/bin/vivi chat --model copilot/default"
 Enter
 Sleep 10s
-Type "Transform vivi_resume_memory to uppercase and reply only with the transformed token."
-Enter
-Sleep 60s
-Ctrl+C
-Sleep 3s
-Ctrl+C
-Sleep 2s
-Type "./zig-out/bin/vivi chat --model copilot/default"
-Enter
-Sleep 10s
 Type "/resume"
 Sleep 10s
 Enter
@@ -1053,6 +1037,7 @@ chat_session_resume() {
     mkdir -p "$vhs_home"
     rm -rf "$resume_home/.vivi"
     rm -rf "$vhs_home/.vivi"
+    github_token=$(gh auth token)
 
     (
         sleep 10
@@ -1062,7 +1047,8 @@ chat_session_resume() {
         sleep 3
         printf '\003'
         sleep 2
-    ) | HOME="$resume_home" \
+    ) | HOME="$resume_home" GH_TOKEN="$github_token" \
+        GITHUB_TOKEN="$github_token" \
         script -q "$run_dir/chat-session-resume-first.terminal.log" sh -c \
         "stty cols 100 rows 30; '$binary' chat --model copilot/default"
 
@@ -1080,7 +1066,8 @@ chat_session_resume() {
         sleep 3
         printf '\003'
         sleep 2
-    ) | HOME="$resume_home" \
+    ) | HOME="$resume_home" GH_TOKEN="$github_token" \
+        GITHUB_TOKEN="$github_token" \
         script -q "$run_dir/chat-session-resume-second.terminal.log" sh -c \
         "stty cols 100 rows 30; '$binary' chat --model copilot/default" &
     pty_pid=$!
@@ -1177,8 +1164,22 @@ chat_session_resume() {
         "$run_dir/chat-session-resume-picker.normalized.txt"
 
     (
+        sleep 10
+        printf 'Transform vivi_resume_memory to uppercase and reply only with the transformed token.\r'
+        sleep 60
+        printf '\003'
+        sleep 3
+        printf '\003'
+        sleep 2
+    ) | HOME="$vhs_home" GH_TOKEN="$github_token" \
+        GITHUB_TOKEN="$github_token" \
+        script -q "$run_dir/chat-session-resume-vhs-seed.terminal.log" sh -c \
+        "stty cols 100 rows 30; '$binary' chat --model copilot/default"
+
+    (
         cd "$repo_root" &&
-            HOME="$vhs_home" VIVI_KEEP_GIF=1 \
+            HOME="$vhs_home" GH_TOKEN="$github_token" \
+                GITHUB_TOKEN="$github_token" VIVI_KEEP_GIF=1 \
                 "$vhs_command" "$run_dir/chat-session-resume.tape"
     ) &
     vhs_pid=$!

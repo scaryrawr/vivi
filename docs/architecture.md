@@ -230,6 +230,8 @@ Copilot home the single authority for sessions, extensions, plugin state, and
 administrative APIs such as session listing. Session create and resume requests
 do not set a separate `config_directory`, so they cannot diverge from the
 process-level home. Hosts create the private home before initializing the SDK.
+On POSIX systems Vivi creates and tightens that directory to owner-only
+permissions; Windows creation inherits the user profile's access controls.
 Existing `~/.vivi/sessions/` data from earlier versions is ignored and left
 untouched.
 

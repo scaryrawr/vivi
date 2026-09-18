@@ -41,6 +41,8 @@ slash menu, and the response produced by invoking it.
   server is limited to `web_search`.
 - Personal extensions and plugin state are isolated under
   `~/.vivi/copilot/`; Vivi does not inherit them from `~/.copilot/`.
+- The isolated verification home receives `gh auth token` through the process
+  environment instead of linking the user's Copilot home.
 - Copilot SDK empty sessions require `enableSkills = true`; ambient discovery
   supplies the workspace skill directories.
 - The recipe needs authenticated Copilot access because its assertions cross
