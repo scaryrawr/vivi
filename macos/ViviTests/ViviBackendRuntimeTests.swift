@@ -1838,6 +1838,26 @@ final class ViviBackendRuntimeTests: XCTestCase {
     XCTAssertEqual(store.selectedCommandKey, first)
   }
 
+  func testLeavingSlashDraftClosesOnlySlashOriginatedPalette() {
+    let store = readyCommandStore(driver: FakeConversationDriver())
+    store.reduce(.commandCatalog(swiftCommandCatalog(generation: 5)))
+    store.draft = "/dep"
+    store.composerDraftChanged()
+
+    store.draft = "ordinary"
+    store.composerDraftChanged()
+
+    XCTAssertFalse(store.isCommandPalettePresented)
+    XCTAssertEqual(store.draft, "ordinary")
+
+    store.openCommandPalette()
+    store.draft = "edited"
+    store.composerDraftChanged()
+
+    XCTAssertTrue(store.isCommandPalettePresented)
+    XCTAssertEqual(store.draft, "edited")
+  }
+
   func testCommandExecutionIsGatedWithoutMutatingPrompt() {
     let driver = FakeConversationDriver()
     let store = readyCommandStore(driver: driver)

@@ -682,7 +682,13 @@ final class NativeChatStore: ObservableObject {
   }
 
   func composerDraftChanged() {
-    guard activeUserInput == nil, draft.hasPrefix("/") else { return }
+    guard activeUserInput == nil else { return }
+    guard draft.hasPrefix("/") else {
+      if commandPaletteConsumesDraft {
+        closeCommandPalette()
+      }
+      return
+    }
     if !isCommandPalettePresented {
       openCommandPalette(query: String(draft.dropFirst()), consumesDraft: true)
     } else if commandArgumentSession == nil {
