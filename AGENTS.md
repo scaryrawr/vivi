@@ -18,6 +18,12 @@ Native hosts share domain semantics through the C ABI, not widgets or view
 models. Do not add speculative sessions, generic JSON bridges, daemons, shared
 UI abstractions, or empty executable targets.
 
+Treat ambient MCP server and tool names as repository-controlled input. A
+workspace can shadow names used by built-in servers, so permission decisions
+must not trust a server/tool-name pair as proof of built-in provenance. Keep
+ambient MCP permissions fail-closed until an explicit user approval boundary
+exists.
+
 ## Build, Test, and Development Commands
 
 Use Zig 0.16.x and Xcode 26.6.
