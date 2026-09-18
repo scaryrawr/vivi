@@ -343,7 +343,6 @@ typedef struct vivi_backend_event {
     uint32_t session_count;
     uint32_t transcript_item_count;
     uint32_t user_input_choice_count;
-    uint32_t command_count;
     vivi_backend_span_t content;
     vivi_backend_span_t selected_model_id;
     vivi_backend_span_t tool_call_id;
@@ -352,7 +351,6 @@ typedef struct vivi_backend_event {
     vivi_backend_span_t tool_input;
     vivi_backend_span_t user_input_request_id;
     vivi_backend_span_t user_input_question;
-    vivi_backend_command_key_t command_key;
     vivi_backend_presentation_t tool_input_presentation;
     vivi_backend_presentation_t tool_output_presentation;
     vivi_backend_tool_result_t tool_result;
@@ -365,6 +363,8 @@ typedef struct vivi_backend_event {
     uint8_t allow_freeform;
     uint8_t event_reserved;
     uint16_t reserved;
+    uint32_t command_count;
+    vivi_backend_command_key_t command_key;
 } vivi_backend_event_t;
 
 /* Open and submit copy their input bytes before returning. */

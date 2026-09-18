@@ -1,6 +1,7 @@
 #include "vivi_backend.h"
 
 #include <assert.h>
+#include <stddef.h>
 
 int main(void) {
     vivi_backend_conversation_t *conversation = 0;
@@ -62,6 +63,16 @@ int main(void) {
     assert(VIVI_BACKEND_COMMAND_ARGUMENT_NONE == 1);
     assert(VIVI_BACKEND_COMMAND_ARGUMENT_OPTIONAL == 2);
     assert(VIVI_BACKEND_COMMAND_ARGUMENT_REQUIRED == 3);
+    assert(offsetof(vivi_backend_event_t, content)
+        == offsetof(vivi_backend_event_t, user_input_choice_count)
+            + sizeof(((vivi_backend_event_t *)0)->user_input_choice_count));
+    assert(offsetof(vivi_backend_event_t, tool_input_presentation)
+        == offsetof(vivi_backend_event_t, user_input_question)
+            + sizeof(((vivi_backend_event_t *)0)->user_input_question));
+    assert(offsetof(vivi_backend_event_t, command_count)
+        > offsetof(vivi_backend_event_t, reserved));
+    assert(offsetof(vivi_backend_event_t, command_key)
+        > offsetof(vivi_backend_event_t, command_count));
     assert(VIVI_BACKEND_USER_INPUT_ANSWER_CHOICE == 1);
     assert(VIVI_BACKEND_USER_INPUT_ANSWER_FREEFORM == 2);
     assert(VIVI_BACKEND_TOOL_RESULT_IMAGE == 4);
