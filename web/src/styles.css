@@ -258,6 +258,7 @@ button {
 }
 
 .toolbar {
+  grid-row: 1;
   display: flex;
   min-height: 62px;
   align-items: center;
@@ -307,6 +308,7 @@ button {
 }
 
 .application-error,
+.connection-error,
 .composer-error,
 .transcript-error {
   display: flex;
@@ -315,12 +317,22 @@ button {
   background: var(--danger-soft);
 }
 
+.status-region {
+  grid-row: 2;
+}
+
 .application-error {
   padding: 8px 20px;
   border-bottom: 1px solid color-mix(in srgb, var(--danger) 22%, transparent);
 }
 
+.connection-error {
+  padding: 8px 20px;
+  border-bottom: 1px solid color-mix(in srgb, var(--danger) 22%, transparent);
+}
+
 .transcript {
+  grid-row: 3;
   width: 100%;
   max-width: 820px;
   margin: 0 auto;
@@ -514,7 +526,12 @@ button {
   box-shadow: 0 4px 14px rgb(0 0 0 / 0.07);
 }
 
+.no-selection {
+  grid-row: 3;
+}
+
 .composer-zone {
+  grid-row: 4;
   padding: 0 clamp(24px, 6vw, 68px) 22px;
 }
 

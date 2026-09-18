@@ -37,6 +37,10 @@ jobs:
       - name: Install pnpm
         run: npm install --global pnpm@12.4.2
 
+      - name: Install web dependencies
+        working-directory: web
+        run: pnpm install --frozen-lockfile
+
       - name: Install Chromium
         working-directory: web
         run: pnpm exec playwright install --with-deps chromium

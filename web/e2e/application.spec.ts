@@ -71,6 +71,13 @@ test("composer accepts multiline text and sends with command enter", async ({
   await expect(composer).toHaveValue("");
 });
 
+test("session buttons keep native interactive semantics", async ({ page }) => {
+  await page.goto("/?scenario=multiple");
+  await expect(
+    page.getByRole("button", { name: "Stabilize native session ordering" }),
+  ).toBeVisible();
+});
+
 test("captures stable core screenshots", async ({ page }) => {
   await page.goto("/?scenario=multiple");
   await expect(page).toHaveScreenshot("multiple-projects.png");

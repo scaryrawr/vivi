@@ -23,10 +23,17 @@ export class MockViviHost implements ViviHostPort, ConnectedViviHost {
   private connectionState: ConnectionState = { kind: "connected" };
   private listeners = new Set<() => void>();
   private acceptedSubmissions = new Set<ClientSubmissionId>();
+  private sessions = new Map<SessionId, SessionSnapshot>();
   private nextId = 100;
 
   constructor(snapshot: HostSnapshot) {
     this.snapshot = structuredClone(snapshot);
+    if (this.snapshot.selectedSession) {
+      this.sessions.set(
+        this.snapshot.selectedSession.id,
+        this.snapshot.selectedSession,
+      );
+    }
   }
 
   async connect(): Promise<ConnectedViviHost> {
@@ -52,22 +59,21 @@ export class MockViviHost implements ViviHostPort, ConnectedViviHost {
       .find((session) => session.id === id);
     if (!summary)
       return rejected("invalid", "That conversation is no longer available.");
-    const existing =
-      this.snapshot.selectedSession?.id === id
-        ? this.snapshot.selectedSession
-        : null;
+    const existing = this.sessions.get(id);
+    const selected =
+      existing ??
+      ({
+        ...summary,
+        activeWorkspace: summary.projectPath,
+        transcript: [],
+        error: null,
+      } satisfies SessionSnapshot);
+    this.sessions.set(id, selected);
     this.publish({
       ...this.snapshot,
       revision: this.snapshot.revision + 1,
       selectedSessionId: id,
-      selectedSession:
-        existing ??
-        ({
-          ...summary,
-          activeWorkspace: summary.projectPath,
-          transcript: [],
-          error: null,
-        } satisfies SessionSnapshot),
+      selectedSession: selected,
     });
     return { kind: "accepted" };
   }
@@ -90,6 +96,7 @@ export class MockViviHost implements ViviHostPort, ConnectedViviHost {
       transcript: [],
       error: null,
     };
+    this.sessions.set(id, created);
     const projects = this.snapshot.projects.map((project, index) =>
       index === projectIndex
         ? { ...project, sessions: [...project.sessions, created] }
@@ -133,10 +140,12 @@ export class MockViviHost implements ViviHostPort, ConnectedViviHost {
         streaming: false,
       },
     ];
+    const updated = { ...selected, transcript };
+    this.sessions.set(selected.id, updated);
     this.publish({
       ...this.snapshot,
       revision: this.snapshot.revision + 1,
-      selectedSession: { ...selected, transcript },
+      selectedSession: updated,
     });
     return { kind: "accepted" };
   }
@@ -160,7 +169,6 @@ function rejected(
   return { kind: "rejected", reason, message };
 }
 
-let submissionSequence = 1;
 export function nextSubmissionId() {
-  return clientSubmissionId(`submission-${submissionSequence++}`);
+  return clientSubmissionId(crypto.randomUUID());
 }

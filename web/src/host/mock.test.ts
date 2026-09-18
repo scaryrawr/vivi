@@ -40,4 +40,25 @@ describe("MockViviHost", () => {
 
     expect(listener).toHaveBeenCalledTimes(1);
   });
+
+  it("preserves a session transcript across selection changes", async () => {
+    const host = new MockViviHost(fixtures.multiple);
+    const originalId = fixtures.multiple.selectedSessionId!;
+    const otherId = fixtures.multiple.projects[1]!.sessions[0]!.id;
+    await host.sendMessage({
+      sessionId: originalId,
+      submissionId: clientSubmissionId("preserve-transcript"),
+      text: "Keep this message",
+    });
+
+    await host.selectSession(otherId);
+    await host.selectSession(originalId);
+
+    expect(host.getSnapshot().selectedSession?.transcript.at(-2)).toMatchObject(
+      {
+        kind: "user",
+        text: "Keep this message",
+      },
+    );
+  });
 });

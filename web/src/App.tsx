@@ -42,18 +42,25 @@ export function ViviApp({
     host.getSnapshot.bind(host),
     host.getSnapshot.bind(host),
   );
+  const connectionState = useSyncExternalStore(
+    host.subscribe.bind(host),
+    host.getConnectionState.bind(host),
+    host.getConnectionState.bind(host),
+  );
   const [ui, dispatch] = useReducer(reduceUi, {
     ...initialUiState,
     collapsedProjects: new Set(initiallyCollapsed),
   });
   const [commandError, setCommandError] = useState<string | null>(null);
+  const [sendPending, setSendPending] = useState(false);
+  const sendPendingRef = useRef(false);
   const sessionIds = useMemo(
     () => selectOrderedSessionIds(snapshot),
     [snapshot],
   );
   const selected = snapshot.selectedSession;
   const draft = selected ? selectDraft(ui, selected.id) : null;
-  const canSend = selectCanSend(snapshot, ui);
+  const canSend = selectCanSend(snapshot, ui) && !sendPending;
   const sidebarRef = useRef<HTMLElement>(null);
 
   const handleResult = (result: HostCommandResult) => {
@@ -73,17 +80,24 @@ export function ViviApp({
   };
 
   const send = async () => {
-    if (!selected || !draft || !canSend) return;
+    if (!selected || !draft || !canSend || sendPendingRef.current) return;
+    sendPendingRef.current = true;
+    setSendPending(true);
     const submittedRevision = draft.revision;
-    const result = handleResult(
-      await host.sendMessage({
-        sessionId: selected.id,
-        submissionId: nextSubmissionId(),
-        text: draft.text.trim(),
-      }),
-    );
-    if (result.kind === "accepted") {
-      dispatch({ type: "draftAccepted", id: selected.id, submittedRevision });
+    try {
+      const result = handleResult(
+        await host.sendMessage({
+          sessionId: selected.id,
+          submissionId: nextSubmissionId(),
+          text: draft.text.trim(),
+        }),
+      );
+      if (result.kind === "accepted") {
+        dispatch({ type: "draftAccepted", id: selected.id, submittedRevision });
+      }
+    } finally {
+      sendPendingRef.current = false;
+      setSendPending(false);
     }
   };
 
@@ -151,7 +165,6 @@ export function ViviApp({
                 {!collapsed && (
                   <div
                     className="session-list"
-                    role="list"
                     aria-label={`${project.displayName} conversations`}
                   >
                     {project.sessions.map((session) => {
@@ -160,7 +173,6 @@ export function ViviApp({
                       return (
                         <button
                           type="button"
-                          role="listitem"
                           data-session-row
                           className="session-row"
                           aria-current={isSelected ? "page" : undefined}
@@ -211,10 +223,27 @@ export function ViviApp({
           {selected && <LifecyclePill lifecycle={selected.lifecycle.kind} />}
         </header>
 
-        {snapshot.applicationError && (
-          <div className="application-error" role="alert">
-            <strong>Host connection issue</strong>
-            <span>{snapshot.applicationError.message}</span>
+        {(snapshot.applicationError ||
+          connectionState.kind !== "connected") && (
+          <div className="status-region">
+            {snapshot.applicationError && (
+              <div className="application-error" role="alert">
+                <strong>Host connection issue</strong>
+                <span>{snapshot.applicationError.message}</span>
+              </div>
+            )}
+            {connectionState.kind !== "connected" && (
+              <div className="connection-error" role="alert">
+                <strong>
+                  {connectionState.kind === "failed"
+                    ? "Host bridge failed"
+                    : "Host bridge disconnected"}
+                </strong>
+                {connectionState.kind === "failed" && (
+                  <span>{connectionState.message}</span>
+                )}
+              </div>
+            )}
           </div>
         )}
 
@@ -268,7 +297,7 @@ export function ViviApp({
                   aria-label="Message"
                   placeholder="Ask Vivi about this project…"
                   value={draft?.text ?? ""}
-                  disabled={selected.lifecycle.kind !== "idle"}
+                  disabled={selected.lifecycle.kind !== "idle" || sendPending}
                   rows={3}
                   onChange={(event) =>
                     dispatch({
@@ -294,7 +323,7 @@ export function ViviApp({
                     disabled={!canSend}
                     aria-label="Send message"
                   >
-                    <span aria-hidden="true">↑</span>
+                    <span aria-hidden="true">{sendPending ? "…" : "↑"}</span>
                   </button>
                 </div>
               </form>
