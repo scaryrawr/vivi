@@ -28,6 +28,26 @@ const syntax_inserted = vaxis.Color{ .rgb = .{ 134, 239, 172 } };
 const syntax_deleted = vaxis.Color{ .rgb = .{ 251, 113, 133 } };
 const syntax_meta = vaxis.Color{ .rgb = .{ 125, 211, 252 } };
 
+fn promptSubmissionFailureReason(err: anyerror) ?[]const u8 {
+    return switch (err) {
+        error.TooManyAttachments => std.fmt.comptimePrint(
+            "a message can include at most {d} images",
+            .{backend.max_attachment_count},
+        ),
+        error.AttachmentsTooLarge => std.fmt.comptimePrint(
+            "attachments for one message cannot exceed {d} MiB total",
+            .{backend.max_attachment_bytes / (1024 * 1024)},
+        ),
+        error.AttachmentTooLarge, error.ImageTooLarge => std.fmt.comptimePrint(
+            "each image must be {d} MiB or smaller",
+            .{backend.max_attachment_bytes / (1024 * 1024)},
+        ),
+        error.UnsupportedImageFormat, error.AttachmentMediaMismatch => "only PNG, JPEG, GIF, and WebP images are supported",
+        error.FileNotFound, error.AccessDenied, error.IsDir, error.InputOutput => "a selected image could not be read",
+        else => null,
+    };
+}
+
 const AppEvent = union(enum) {
     key_press: vaxis.Key,
     mouse: vaxis.Mouse,
@@ -2803,24 +2823,39 @@ const ChatUi = struct {
     fn submitPrompt(self: *ChatUi, conversation: *backend.Conversation, delivery: backend.PromptDelivery) !void {
         const text = try self.input.toOwnedContents(self.allocator);
         defer self.allocator.free(text);
-        const paths = if (self.pasted_images) |*store|
-            try store.selectedPaths(text)
+        var selected: images.Store.Selection = (if (self.pasted_images) |*store|
+            store.selectedAttachments(text)
         else
-            try self.allocator.alloc([]const u8, 0);
-        defer self.allocator.free(paths);
-        conversation.submit(.{ .text = text, .image_paths = paths }, delivery) catch |err| switch (err) {
+            images.Store.Selection.empty(self.allocator)) catch |err| {
+            try self.reportPromptSubmissionFailure(err);
+            return;
+        };
+        defer selected.deinit();
+        conversation.submit(.{
+            .text = text,
+            .attachments = selected.inputs,
+        }, delivery) catch |err| switch (err) {
             error.EmptyPrompt, error.Busy => return,
             else => {
-                const message = try std.fmt.allocPrint(self.allocator, "Message not sent: {s}. Your draft is unchanged.", .{@errorName(err)});
-                defer self.allocator.free(message);
-                try self.transcript.append(self.allocator, .status, message);
-                self.followTail();
+                try self.reportPromptSubmissionFailure(err);
                 return;
             },
         };
         try self.transcript.append(self.allocator, if (delivery == .enqueue) .queued else .user, text);
         self.input.clearRetainingCapacity();
         self.phase = .responding;
+        self.followTail();
+    }
+
+    fn reportPromptSubmissionFailure(self: *ChatUi, err: anyerror) !void {
+        const reason = promptSubmissionFailureReason(err);
+        const message = try std.fmt.allocPrint(
+            self.allocator,
+            "Message not sent: {s}. Your draft is unchanged.",
+            .{reason orelse @errorName(err)},
+        );
+        defer self.allocator.free(message);
+        try self.transcript.append(self.allocator, .status, message);
         self.followTail();
     }
 
@@ -7997,13 +8032,13 @@ test "image pasted paths survive ask-user drafts and deletion removes attachment
     const restored = try ui.input.toOwnedContents(std.testing.allocator);
     defer std.testing.allocator.free(restored);
     try std.testing.expectEqualStrings(before, restored);
-    const selected = try ui.pasted_images.?.selectedPaths(restored);
-    defer std.testing.allocator.free(selected);
-    try std.testing.expectEqual(@as(usize, 1), selected.len);
+    var selected = try ui.pasted_images.?.selectedAttachments(restored);
+    defer selected.deinit();
+    try std.testing.expectEqual(@as(usize, 1), selected.inputs.len);
     ui.input.clearRetainingCapacity();
-    const deleted = try ui.pasted_images.?.selectedPaths("");
-    defer std.testing.allocator.free(deleted);
-    try std.testing.expectEqual(@as(usize, 0), deleted.len);
+    var deleted = try ui.pasted_images.?.selectedAttachments("");
+    defer deleted.deinit();
+    try std.testing.expectEqual(@as(usize, 0), deleted.inputs.len);
 }
 
 test "image bracketed text paste never submits or executes shortcuts" {
@@ -8748,5 +8783,20 @@ test "session finder distinguishes empty catalog from empty filter" {
     try std.testing.expectEqualStrings(
         "No matching sessions.",
         ChatUi.sessionMenuEmptyMessage(true),
+    );
+}
+
+test "attachment submission failures explain user-facing limits" {
+    try std.testing.expectEqualStrings(
+        "a message can include at most 32 images",
+        promptSubmissionFailureReason(error.TooManyAttachments).?,
+    );
+    try std.testing.expectEqualStrings(
+        "attachments for one message cannot exceed 20 MiB total",
+        promptSubmissionFailureReason(error.AttachmentsTooLarge).?,
+    );
+    try std.testing.expectEqualStrings(
+        "only PNG, JPEG, GIF, and WebP images are supported",
+        promptSubmissionFailureReason(error.UnsupportedImageFormat).?,
     );
 }

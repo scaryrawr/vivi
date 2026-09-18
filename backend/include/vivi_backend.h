@@ -7,8 +7,12 @@
 extern "C" {
 #endif
 
-#define VIVI_BACKEND_ABI_VERSION 9
+#define VIVI_BACKEND_ABI_VERSION 10
 #define VIVI_BACKEND_SESSION_TITLE_MAX_CHARACTERS 80
+#define VIVI_BACKEND_ATTACHMENT_MAX_COUNT 32
+#define VIVI_BACKEND_ATTACHMENT_MAX_BYTES 20971520
+#define VIVI_BACKEND_ATTACHMENT_IDENTITY_MAX_BYTES 256
+#define VIVI_BACKEND_ATTACHMENT_DISPLAY_NAME_MAX_BYTES 1024
 
 typedef enum vivi_backend_result {
     VIVI_BACKEND_OK = 0,
@@ -22,6 +26,44 @@ typedef enum vivi_backend_result {
 } vivi_backend_result_t;
 
 typedef struct vivi_backend_conversation vivi_backend_conversation_t;
+
+typedef enum vivi_backend_attachment_media_type {
+    VIVI_BACKEND_ATTACHMENT_PNG = 1,
+    VIVI_BACKEND_ATTACHMENT_JPEG = 2,
+    VIVI_BACKEND_ATTACHMENT_GIF = 3,
+    VIVI_BACKEND_ATTACHMENT_WEBP = 4,
+} vivi_backend_attachment_media_type_t;
+
+/*
+ * Fixed-size ABI v10 array element. struct_size must equal sizeof this record
+ * because attachment arrays use the C element stride. identity and display_name
+ * must be non-empty, valid UTF-8 without NUL bytes, and no longer than their
+ * published limits. Identities must be unique within one submission. bytes must
+ * be non-empty, no longer than VIVI_BACKEND_ATTACHMENT_MAX_BYTES, and match
+ * media_type by content. The attachment array and total bytes are bounded by
+ * VIVI_BACKEND_ATTACHMENT_MAX_COUNT and VIVI_BACKEND_ATTACHMENT_MAX_BYTES.
+ * All pointers are borrowed only for the duration of vivi_backend_submit.
+ */
+typedef struct vivi_backend_submission_attachment {
+    uint32_t struct_size;
+    vivi_backend_attachment_media_type_t media_type;
+    const uint8_t *identity;
+    uint32_t identity_length;
+    const uint8_t *display_name;
+    uint32_t display_name_length;
+    const uint8_t *bytes;
+    uint32_t byte_length;
+    uint32_t reserved;
+} vivi_backend_submission_attachment_t;
+
+typedef struct vivi_backend_submission {
+    uint32_t struct_size;
+    uint32_t reserved;
+    const uint8_t *prompt;
+    uint32_t prompt_length;
+    const vivi_backend_submission_attachment_t *attachments;
+    uint32_t attachment_count;
+} vivi_backend_submission_t;
 
 /* The callback may run on a backend thread. It must only schedule a drain. */
 typedef void (*vivi_backend_wake_fn)(void *context);
@@ -277,8 +319,7 @@ vivi_backend_result_t vivi_backend_open(
     vivi_backend_conversation_t **out_conversation);
 vivi_backend_result_t vivi_backend_submit(
     vivi_backend_conversation_t *conversation,
-    const uint8_t *prompt,
-    uint32_t prompt_length);
+    const vivi_backend_submission_t *submission);
 vivi_backend_result_t vivi_backend_refresh_models(
     vivi_backend_conversation_t *conversation);
 vivi_backend_result_t vivi_backend_switch_model(

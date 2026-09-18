@@ -62,6 +62,285 @@ final class ViviBackendRuntimeTests: XCTestCase {
       [.status(id: store.transcript[0].id, text: "Chat is busy.")])
   }
 
+  func testAttachmentOnlySubmitClearsSelectionAfterAcceptance() async {
+    let driver = FakeConversationDriver()
+    let attachment = testAttachment(name: "diagram.png")
+    let acquirer = FakeAttachmentAcquirer(pasted: attachment)
+    let store = NativeChatStore(
+      workspace: "/tmp/work",
+      driver: driver,
+      attachmentAcquirer: acquirer)
+
+    store.reduce(.ready)
+    store.reduce(.modelCatalog(testCatalog()))
+    store.pasteAttachment()
+    await store.waitForAttachmentAcquisition()
+    XCTAssertTrue(store.canSubmit)
+
+    store.submit()
+
+    XCTAssertEqual(driver.submittedPrompts, [""])
+    XCTAssertEqual(driver.submittedAttachments, [[attachment]])
+    XCTAssertTrue(store.attachments.isEmpty)
+    XCTAssertEqual(store.lifecycle, .responding)
+    XCTAssertEqual(store.transcript.first?.text, "Attached diagram.png")
+  }
+
+  func testRejectedAttachmentSubmitPreservesDraftAndSelection() async {
+    let driver = FakeConversationDriver()
+    driver.submitResult = .rejected
+    let attachment = testAttachment(name: "reference.png")
+    let store = NativeChatStore(
+      workspace: "/tmp/work",
+      driver: driver,
+      attachmentAcquirer: FakeAttachmentAcquirer(pasted: attachment))
+
+    store.reduce(.ready)
+    store.reduce(.modelCatalog(testCatalog()))
+    store.draft = "Keep this"
+    store.pasteAttachment()
+    await store.waitForAttachmentAcquisition()
+    store.submit()
+
+    XCTAssertEqual(store.draft, "Keep this")
+    XCTAssertEqual(store.attachments, [attachment])
+    XCTAssertEqual(driver.submittedAttachments, [[attachment]])
+    XCTAssertEqual(store.transcript.first?.text, "That response was not accepted. Try again.")
+  }
+
+  func testAttachmentAcquisitionFailurePreservesExistingSelection() async {
+    let first = testAttachment(name: "first.png")
+    let acquirer = FakeAttachmentAcquirer(pasted: first)
+    let store = NativeChatStore(
+      workspace: "/tmp/work",
+      driver: FakeConversationDriver(),
+      attachmentAcquirer: acquirer)
+
+    store.reduce(.ready)
+    store.reduce(.modelCatalog(testCatalog()))
+    store.pasteAttachment()
+    await store.waitForAttachmentAcquisition()
+    acquirer.pasteError = ComposerAttachmentAcquisitionError.unsupported("notes.txt")
+    store.pasteAttachment()
+    await store.waitForAttachmentAcquisition()
+
+    XCTAssertEqual(store.attachments, [first])
+    XCTAssertEqual(
+      store.attachmentError,
+      "“notes.txt” is not a supported PNG, JPEG, GIF, or WebP image.")
+  }
+
+  func testAttachmentsRemainSelectedWhileAskUserBlocksSubmissionAndClearOnClose() async {
+    let attachment = testAttachment(name: "context.png")
+    let acquirer = FakeAttachmentAcquirer(pasted: attachment)
+    let store = NativeChatStore(
+      workspace: "/tmp/work",
+      driver: FakeConversationDriver(),
+      attachmentAcquirer: acquirer)
+
+    store.reduce(.ready)
+    store.reduce(.modelCatalog(testCatalog()))
+    store.pasteAttachment()
+    await store.waitForAttachmentAcquisition()
+    store.reduce(
+      .userInputRequested(
+        UserInputRequest(
+          id: "ask-attachment",
+          question: "Continue?",
+          choices: ["Yes"],
+          allowsFreeform: false)))
+
+    XCTAssertFalse(store.canSubmit)
+    XCTAssertEqual(store.attachments, [attachment])
+
+    store.close()
+
+    XCTAssertTrue(store.attachments.isEmpty)
+    XCTAssertEqual(acquirer.cancelCount, 1)
+  }
+
+  func testAttachmentAcquisitionBlocksSubmissionAndCannotAppendAfterLifecycleChanges() async {
+    let acquirer = FakeAttachmentAcquirer(chosen: [testAttachment(name: "late.png")])
+    acquirer.suspendChoose = true
+    let driver = FakeConversationDriver()
+    let store = NativeChatStore(
+      workspace: "/tmp/work",
+      driver: driver,
+      attachmentAcquirer: acquirer)
+
+    store.reduce(.ready)
+    store.reduce(.modelCatalog(testCatalog()))
+    store.draft = "Send without the pending image"
+    store.chooseAttachments()
+
+    XCTAssertTrue(store.isAcquiringAttachments)
+    XCTAssertFalse(store.canSubmit)
+    store.submit()
+    store.refreshSessions()
+    store.selectModel("copilot/gpt-5")
+    XCTAssertTrue(driver.submittedPrompts.isEmpty)
+    XCTAssertEqual(driver.sessionRefreshCount, 0)
+    XCTAssertTrue(driver.selections.isEmpty)
+
+    store.close()
+    await store.waitForAttachmentAcquisition()
+    XCTAssertTrue(store.attachments.isEmpty)
+    XCTAssertFalse(store.isAcquiringAttachments)
+  }
+
+  func testAppKitAttachmentAcquirerCancelsRetainedBackgroundWork() async {
+    let probe = AttachmentCancellationProbe()
+    let acquirer = AppKitComposerAttachmentAcquirer { _ in
+      probe.markStarted()
+      while !Task.isCancelled {
+        Thread.sleep(forTimeInterval: 0.001)
+      }
+      probe.markCancelled()
+      throw CancellationError()
+    }
+    let task = Task {
+      try await acquirer.snapshotFiles([URL(fileURLWithPath: "/unused.png")])
+    }
+    while !probe.started {
+      await Task.yield()
+    }
+
+    acquirer.cancel()
+    do {
+      _ = try await task.value
+      XCTFail("Expected cancelled background acquisition")
+    } catch is CancellationError {
+    } catch {
+      XCTFail("Unexpected cancellation error: \(error)")
+    }
+    XCTAssertTrue(probe.cancelled)
+  }
+
+  func testAppKitAttachmentSnapshotReadsOnceAndValidatesContent() throws {
+    let directory = FileManager.default.temporaryDirectory
+      .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let url = directory.appendingPathComponent("photo.bin")
+    try testPNGData().write(to: url)
+
+    let attachment = try AppKitComposerAttachmentAcquirer.snapshot(url)
+    try Data("changed".utf8).write(to: url)
+
+    XCTAssertEqual(attachment.displayName, "photo.bin")
+    XCTAssertEqual(attachment.media, .png)
+    XCTAssertEqual(attachment.data, testPNGData())
+    XCTAssertThrowsError(
+      try AppKitComposerAttachmentAcquirer.snapshot(
+        data: Data("not an image".utf8),
+        displayName: "bad.png"))
+  }
+
+  func testAppKitAttachmentBoundedReadContinuesAfterShortChunks() async throws {
+    let pipe = Pipe()
+    let expected = testPNGData() + Data("remaining bytes".utf8)
+    let writer = Task.detached {
+      try pipe.fileHandleForWriting.write(contentsOf: expected.prefix(4))
+      try await Task.sleep(for: .milliseconds(10))
+      try pipe.fileHandleForWriting.write(contentsOf: expected.dropFirst(4))
+      try pipe.fileHandleForWriting.close()
+    }
+
+    let actual = try AppKitComposerAttachmentAcquirer.readBounded(pipe.fileHandleForReading)
+    try await writer.value
+
+    XCTAssertEqual(actual, expected)
+  }
+
+  func testAppKitAttachmentRejectsExcessiveDecodedDimensions() throws {
+    XCTAssertNoThrow(
+      try AppKitComposerAttachmentAcquirer.validateDecodedDimensions(
+        width: 4_096,
+        height: 4_096))
+    XCTAssertThrowsError(
+      try AppKitComposerAttachmentAcquirer.validateDecodedDimensions(
+        width: 4_097,
+        height: 4_096)
+    ) { error in
+      XCTAssertEqual(
+        error as? ComposerAttachmentAcquisitionError,
+        .dimensionsTooLarge)
+    }
+  }
+
+  func testSubmissionAttachmentBridgeKeepsMultipleDescriptorBuffersAlive() {
+    let first = testAttachment(name: "first.png")
+    let second = ComposerAttachment(
+      id: UUID(uuidString: "00000000-0000-0000-0000-000000000002")!,
+      displayName: "second.jpg",
+      media: .jpeg,
+      data: Data([0xFF, 0xD8, 0xFF, 0x00]))
+    let attachments = [first, second]
+    var descriptors: [vivi_backend_submission_attachment_t] = []
+
+    let visited = ViviConversationDriver.withSubmissionAttachments(
+      attachments[...],
+      descriptors: &descriptors
+    ) { buffer in
+      XCTAssertEqual(buffer.count, 2)
+      for (index, descriptor) in buffer.enumerated() {
+        XCTAssertEqual(
+          descriptor.struct_size,
+          UInt32(MemoryLayout<vivi_backend_submission_attachment_t>.size))
+        XCTAssertEqual(descriptor.media_type.rawValue, attachments[index].media.rawValue)
+        XCTAssertEqual(
+          String(
+            decoding: UnsafeBufferPointer(
+              start: descriptor.identity,
+              count: Int(descriptor.identity_length)),
+            as: UTF8.self),
+          attachments[index].id.uuidString)
+        XCTAssertEqual(
+          String(
+            decoding: UnsafeBufferPointer(
+              start: descriptor.display_name,
+              count: Int(descriptor.display_name_length)),
+            as: UTF8.self),
+          attachments[index].displayName)
+        XCTAssertEqual(
+          Data(bytes: descriptor.bytes!, count: Int(descriptor.byte_length)),
+          attachments[index].data)
+      }
+      return true
+    }
+
+    XCTAssertTrue(visited)
+    XCTAssertTrue(descriptors.isEmpty)
+  }
+
+  func testAppKitAttachmentSelectionEnforcesCountBeforeReadsAndAggregateWhileReading() throws {
+    let missing = URL(fileURLWithPath: "/missing/image.png")
+    XCTAssertThrowsError(
+      try AppKitComposerAttachmentAcquirer.snapshots(
+        Array(repeating: missing, count: composerAttachmentCountLimit + 1))
+    ) { error in
+      XCTAssertEqual(error as? ComposerAttachmentAcquisitionError, .tooMany)
+    }
+
+    let directory = FileManager.default.temporaryDirectory
+      .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    var oversizedAggregate = testPNGData()
+    oversizedAggregate.append(
+      Data(repeating: 0, count: composerAttachmentByteLimit / 2))
+    let first = directory.appendingPathComponent("first.png")
+    let second = directory.appendingPathComponent("second.png")
+    try oversizedAggregate.write(to: first)
+    try oversizedAggregate.write(to: second)
+
+    XCTAssertThrowsError(
+      try AppKitComposerAttachmentAcquirer.snapshots([first, second])
+    ) { error in
+      XCTAssertEqual(error as? ComposerAttachmentAcquisitionError, .totalTooLarge)
+    }
+  }
+
   func testUserInputChoicePreservesToolChronologyAndBackendIdentity() {
     let driver = FakeConversationDriver()
     let store = NativeChatStore(workspace: "/tmp/work", driver: driver)
@@ -1176,6 +1455,7 @@ private final class FakeConversationDriver: ViviConversationDriving {
   var sessionRefreshCount = 0
   var resumeKeys: [ResumeKey] = []
   var submittedPrompts: [String] = []
+  var submittedAttachments: [[ComposerAttachment]] = []
   var userInputResponses: [(String, UserInputAnswer)] = []
   private var receive: (@MainActor (ChatEvent) -> Void)?
 
@@ -1186,8 +1466,12 @@ private final class FakeConversationDriver: ViviConversationDriving {
     return .accepted
   }
 
-  func submit(_ prompt: String) -> ConversationOperationResult {
+  func submit(
+    _ prompt: String,
+    attachments: [ComposerAttachment]
+  ) -> ConversationOperationResult {
     submittedPrompts.append(prompt)
+    submittedAttachments.append(attachments)
     return submitResult
   }
 
@@ -1221,6 +1505,80 @@ private final class FakeConversationDriver: ViviConversationDriving {
   func close(completion: @escaping @MainActor () -> Void) {
     Task { @MainActor in completion() }
   }
+}
+
+@MainActor
+private final class FakeAttachmentAcquirer: ComposerAttachmentAcquiring {
+  var chosen: [ComposerAttachment]
+  var pasted: ComposerAttachment
+  var chooseError: Error?
+  var pasteError: Error?
+  var suspendChoose = false
+  private var chooseContinuation: CheckedContinuation<[ComposerAttachment], Error>?
+  private(set) var cancelCount = 0
+
+  init(
+    chosen: [ComposerAttachment] = [],
+    pasted: ComposerAttachment = testAttachment()
+  ) {
+    self.chosen = chosen
+    self.pasted = pasted
+  }
+
+  func chooseImages() async throws -> [ComposerAttachment] {
+    if let chooseError { throw chooseError }
+    if suspendChoose {
+      return try await withCheckedThrowingContinuation { continuation in
+        chooseContinuation = continuation
+      }
+    }
+    return chosen
+  }
+
+  func pasteImage() async throws -> ComposerAttachment {
+    if let pasteError { throw pasteError }
+    return pasted
+  }
+
+  func cancel() {
+    cancelCount += 1
+    chooseContinuation?.resume(throwing: CancellationError())
+    chooseContinuation = nil
+  }
+}
+
+private final class AttachmentCancellationProbe: @unchecked Sendable {
+  private let lock = NSLock()
+  private var didStart = false
+  private var didCancel = false
+
+  var started: Bool {
+    lock.withLock { didStart }
+  }
+
+  var cancelled: Bool {
+    lock.withLock { didCancel }
+  }
+
+  func markStarted() {
+    lock.withLock { didStart = true }
+  }
+
+  func markCancelled() {
+    lock.withLock { didCancel = true }
+  }
+}
+
+private func testPNGData() -> Data {
+  Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00])
+}
+
+private func testAttachment(name: String = "image.png") -> ComposerAttachment {
+  ComposerAttachment(
+    id: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!,
+    displayName: name,
+    media: .png,
+    data: testPNGData())
 }
 
 private func testCatalog() -> ModelCatalog {

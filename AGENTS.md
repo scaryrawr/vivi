@@ -64,8 +64,8 @@ Any C ABI change must update the header, Zig adapter, smoke test, and every
 implemented native binding together.
 
 `zig build test` does not compile test blocks in every imported backend module.
-When changing `backend/src/settings.zig`, also run `zig test` directly on the
-changed module.
+When changing `backend/src/attachment.zig` or `backend/src/settings.zig`, also
+run `zig test` directly on the changed module.
 
 With Zig 0.16 on POSIX, open a directory with `.iterate = true` before calling
 `Dir.setPermissions`; the default `openDirAbsolute` handle may be `O_PATH` on

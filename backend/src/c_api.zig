@@ -5,6 +5,18 @@ const c = @cImport({
 });
 
 comptime {
+    if (c.VIVI_BACKEND_ATTACHMENT_MAX_COUNT != backend.max_attachment_count or
+        c.VIVI_BACKEND_ATTACHMENT_MAX_BYTES != backend.max_attachment_bytes or
+        c.VIVI_BACKEND_ATTACHMENT_IDENTITY_MAX_BYTES !=
+            backend.max_attachment_identity_bytes or
+        c.VIVI_BACKEND_ATTACHMENT_DISPLAY_NAME_MAX_BYTES !=
+            backend.max_attachment_display_name_bytes)
+    {
+        @compileError("C attachment limits must match the backend domain");
+    }
+}
+
+comptime {
     if (c.VIVI_BACKEND_ABI_VERSION != backend.abi_version) {
         @compileError("C header and Zig backend ABI versions differ");
     }
@@ -55,6 +67,14 @@ fn result(error_value: anyerror) c.vivi_backend_result_t {
         error.Stopping => c.VIVI_BACKEND_STOPPING,
         error.Closed => c.VIVI_BACKEND_CLOSED,
         error.EmptyPrompt,
+        error.TooManyAttachments,
+        error.AttachmentsTooLarge,
+        error.DuplicateAttachmentIdentity,
+        error.InvalidAttachmentIdentity,
+        error.InvalidAttachmentDisplayName,
+        error.EmptyAttachment,
+        error.AttachmentTooLarge,
+        error.AttachmentMediaMismatch,
         error.EmptyModel,
         error.InvalidReasoningEffort,
         error.InvalidSessionKey,
@@ -168,20 +188,106 @@ export fn vivi_backend_open(
     return c.VIVI_BACKEND_OK;
 }
 
+const Submission = struct {
+    prompt: []const u8,
+    attachments: []backend.AttachmentInput,
+
+    fn deinit(self: Submission) void {
+        std.heap.c_allocator.free(self.attachments);
+    }
+};
+
+fn attachmentMediaType(
+    raw: c.vivi_backend_attachment_media_type_t,
+) ?backend.ImageFormat {
+    return switch (raw) {
+        c.VIVI_BACKEND_ATTACHMENT_PNG => .png,
+        c.VIVI_BACKEND_ATTACHMENT_JPEG => .jpeg,
+        c.VIVI_BACKEND_ATTACHMENT_GIF => .gif,
+        c.VIVI_BACKEND_ATTACHMENT_WEBP => .webp,
+        else => null,
+    };
+}
+
+fn requiredBytes(pointer: ?[*]const u8, length: u32) ?[]const u8 {
+    if (length == 0) return null;
+    return (pointer orelse return null)[0..length];
+}
+
+const SubmissionParseError = error{
+    InvalidSubmission,
+    OutOfMemory,
+};
+
+fn parseSubmission(
+    input: ?*const c.vivi_backend_submission_t,
+) SubmissionParseError!Submission {
+    const submission = input orelse return error.InvalidSubmission;
+    if (submission.struct_size < @sizeOf(c.vivi_backend_submission_t) or
+        submission.reserved != 0 or
+        submission.attachment_count > backend.max_attachment_count)
+    {
+        return error.InvalidSubmission;
+    }
+    const prompt = if (submission.prompt_length == 0)
+        ""
+    else
+        requiredBytes(submission.prompt, submission.prompt_length) orelse
+            return error.InvalidSubmission;
+    if (!std.unicode.utf8ValidateSlice(prompt)) return error.InvalidSubmission;
+    const descriptors = if (submission.attachment_count == 0)
+        &[_]c.vivi_backend_submission_attachment_t{}
+    else blk: {
+        if (submission.attachments == null) return error.InvalidSubmission;
+        const pointer: [*]const c.vivi_backend_submission_attachment_t =
+            @ptrCast(submission.attachments);
+        break :blk pointer[0..submission.attachment_count];
+    };
+    const attachments = try std.heap.c_allocator.alloc(
+        backend.AttachmentInput,
+        descriptors.len,
+    );
+    errdefer std.heap.c_allocator.free(attachments);
+    for (descriptors, attachments) |descriptor, *attachment| {
+        if (descriptor.struct_size != @sizeOf(c.vivi_backend_submission_attachment_t) or
+            descriptor.reserved != 0)
+        {
+            return error.InvalidSubmission;
+        }
+        attachment.* = .{
+            .identity = requiredBytes(
+                descriptor.identity,
+                descriptor.identity_length,
+            ) orelse return error.InvalidSubmission,
+            .display_name = requiredBytes(
+                descriptor.display_name,
+                descriptor.display_name_length,
+            ) orelse return error.InvalidSubmission,
+            .media_type = attachmentMediaType(descriptor.media_type) orelse
+                return error.InvalidSubmission,
+            .bytes = requiredBytes(descriptor.bytes, descriptor.byte_length) orelse
+                return error.InvalidSubmission,
+        };
+    }
+    return .{ .prompt = prompt, .attachments = attachments };
+}
+
 export fn vivi_backend_submit(
     conversation: ?*c.vivi_backend_conversation_t,
-    prompt: ?[*]const u8,
-    prompt_length: u32,
+    submission: ?*const c.vivi_backend_submission_t,
 ) callconv(.c) c.vivi_backend_result_t {
     const self = handle(conversation) orelse return c.VIVI_BACKEND_INVALID_ARGUMENT;
-    const bytes = prompt orelse return c.VIVI_BACKEND_INVALID_ARGUMENT;
-    if (prompt_length == 0) return c.VIVI_BACKEND_INVALID_ARGUMENT;
+    const parsed = parseSubmission(submission) catch |err| return switch (err) {
+        error.InvalidSubmission => c.VIVI_BACKEND_INVALID_ARGUMENT,
+        error.OutOfMemory => c.VIVI_BACKEND_FAILED,
+    };
+    defer parsed.deinit();
     if (self.control_operation != .none) return c.VIVI_BACKEND_BUSY;
     if (!self.accepting_prompt.swap(false, .acq_rel)) {
         return c.VIVI_BACKEND_BUSY;
     }
     self.conversation.submit(
-        .{ .text = bytes[0..prompt_length] },
+        .{ .text = parsed.prompt, .attachments = parsed.attachments },
         .enqueue,
     ) catch |err| {
         if (err != error.Stopping and err != error.Closed) {
@@ -190,6 +296,38 @@ export fn vivi_backend_submit(
         return result(err);
     };
     return c.VIVI_BACKEND_OK;
+}
+
+test "submission descriptors decode typed caller-owned attachments" {
+    const bytes = "\x89PNG\r\n\x1a\n";
+    var attachment = std.mem.zeroInit(c.vivi_backend_submission_attachment_t, .{
+        .struct_size = @sizeOf(c.vivi_backend_submission_attachment_t),
+        .media_type = c.VIVI_BACKEND_ATTACHMENT_PNG,
+        .identity = "image-1",
+        .identity_length = 7,
+        .display_name = "image.png",
+        .display_name_length = 9,
+        .bytes = bytes,
+        .byte_length = bytes.len,
+    });
+    var submission = std.mem.zeroInit(c.vivi_backend_submission_t, .{
+        .struct_size = @sizeOf(c.vivi_backend_submission_t),
+        .prompt = "describe",
+        .prompt_length = 8,
+        .attachments = &attachment,
+        .attachment_count = 1,
+    });
+    const parsed = try parseSubmission(&submission);
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("describe", parsed.prompt);
+    try std.testing.expectEqualStrings("image-1", parsed.attachments[0].identity);
+    try std.testing.expectEqual(backend.ImageFormat.png, parsed.attachments[0].media_type);
+
+    attachment.reserved = 1;
+    try std.testing.expectError(error.InvalidSubmission, parseSubmission(&submission));
+    attachment.reserved = 0;
+    attachment.struct_size += 8;
+    try std.testing.expectError(error.InvalidSubmission, parseSubmission(&submission));
 }
 
 fn reasoning(raw: c.vivi_backend_reasoning_effort_t) ?backend.ReasoningEffort {

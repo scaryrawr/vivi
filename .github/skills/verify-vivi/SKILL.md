@@ -61,6 +61,7 @@ Use the executable helper:
 .github/skills/verify-vivi/bin/verify-vivi cli-discovery <run-id>
 .github/skills/verify-vivi/bin/verify-vivi chat-streaming <run-id>
 .github/skills/verify-vivi/bin/verify-vivi chat-streaming-input <run-id>
+.github/skills/verify-vivi/bin/verify-vivi chat-attachments <run-id>
 .github/skills/verify-vivi/bin/verify-vivi chat-async-bash <run-id>
 .github/skills/verify-vivi/bin/verify-vivi chat-markdown <run-id>
 .github/skills/verify-vivi/bin/verify-vivi chat-markdown-read <run-id>
@@ -192,8 +193,8 @@ chat-model-menu <run-id>
 chat-customization <run-id>
 chat-session-resume <run-id>
 chat-shutdown <run-id>
-extract-frames <run-id> <chat-streaming|chat-streaming-input|chat-async-bash|chat-markdown|chat-markdown-read|chat-ask-user|chat-file-picker|chat-model-menu|chat-customization|chat-session-resume|chat-shutdown>
-frame-check <run-id> <chat-streaming|chat-streaming-input|chat-async-bash|chat-markdown|chat-markdown-read|chat-ask-user|chat-file-picker|chat-model-menu|chat-customization|chat-session-resume|chat-shutdown>
+extract-frames <run-id> <chat-streaming|chat-streaming-input|chat-attachments|chat-async-bash|chat-markdown|chat-markdown-read|chat-ask-user|chat-file-picker|chat-model-menu|chat-customization|chat-session-resume|chat-shutdown>
+frame-check <run-id> <chat-streaming|chat-streaming-input|chat-attachments|chat-async-bash|chat-markdown|chat-markdown-read|chat-ask-user|chat-file-picker|chat-model-menu|chat-customization|chat-session-resume|chat-shutdown>
 cleanup <run-id>
 ```
 

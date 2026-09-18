@@ -13,6 +13,7 @@ Usage:
   verify-vivi cli-discovery <run-id>
   verify-vivi chat-streaming <run-id>
   verify-vivi chat-streaming-input <run-id>
+  verify-vivi chat-attachments <run-id>
   verify-vivi chat-async-bash <run-id>
   verify-vivi chat-markdown <run-id>
   verify-vivi chat-markdown-read <run-id>
@@ -22,8 +23,8 @@ Usage:
   verify-vivi chat-customization <run-id>
   verify-vivi chat-session-resume <run-id>
   verify-vivi chat-shutdown <run-id>
-  verify-vivi extract-frames <run-id> <chat-streaming|chat-streaming-input|chat-async-bash|chat-markdown|chat-markdown-read|chat-ask-user|chat-file-picker|chat-model-menu|chat-customization|chat-session-resume|chat-shutdown>
-  verify-vivi frame-check <run-id> <chat-streaming|chat-streaming-input|chat-async-bash|chat-markdown|chat-markdown-read|chat-ask-user|chat-file-picker|chat-model-menu|chat-customization|chat-session-resume|chat-shutdown>
+  verify-vivi extract-frames <run-id> <chat-streaming|chat-streaming-input|chat-attachments|chat-async-bash|chat-markdown|chat-markdown-read|chat-ask-user|chat-file-picker|chat-model-menu|chat-customization|chat-session-resume|chat-shutdown>
+  verify-vivi frame-check <run-id> <chat-streaming|chat-streaming-input|chat-attachments|chat-async-bash|chat-markdown|chat-markdown-read|chat-ask-user|chat-file-picker|chat-model-menu|chat-customization|chat-session-resume|chat-shutdown>
   verify-vivi cleanup <run-id>
 EOF
 }
@@ -167,9 +168,9 @@ cli_discovery() {
 
 validate_capture_name() {
     case "$1" in
-        chat-streaming|chat-streaming-input|chat-async-bash|chat-markdown|chat-markdown-read|chat-ask-user|chat-file-picker|chat-model-menu|chat-customization|chat-session-resume|chat-shutdown) ;;
+        chat-streaming|chat-streaming-input|chat-attachments|chat-async-bash|chat-markdown|chat-markdown-read|chat-ask-user|chat-file-picker|chat-model-menu|chat-customization|chat-session-resume|chat-shutdown) ;;
         *)
-            printf 'capture must be chat-streaming, chat-streaming-input, chat-async-bash, chat-markdown, chat-markdown-read, chat-ask-user, chat-file-picker, chat-model-menu, chat-customization, chat-session-resume, or chat-shutdown\n' >&2
+            printf 'capture must be chat-streaming, chat-streaming-input, chat-attachments, chat-async-bash, chat-markdown, chat-markdown-read, chat-ask-user, chat-file-picker, chat-model-menu, chat-customization, chat-session-resume, or chat-shutdown\n' >&2
             exit 1
             ;;
     esac
@@ -359,6 +360,164 @@ chat_streaming() {
     grep -q 'VIVI_STREAM_OK' "$run_dir/chat-streaming.normalized.txt"
     test -s "$run_dir/chat-streaming.frames.txt"
     test -s "$run_dir/chat-streaming.contact-sheet.png"
+}
+
+prepare_attachment_clipboard() {
+    run_dir=$1
+    test "$(uname -s)" = Darwin || {
+        printf 'chat-attachments currently requires the macOS AppKit clipboard\n' >&2
+        exit 1
+    }
+    require_command swift
+    cat >"$run_dir/prepare-attachment.swift" <<'EOF'
+import AppKit
+
+let image = NSImage(size: NSSize(width: 64, height: 64))
+image.lockFocus()
+NSColor.systemBlue.setFill()
+NSBezierPath(rect: NSRect(x: 0, y: 0, width: 64, height: 64)).fill()
+image.unlockFocus()
+
+guard
+  let tiff = image.tiffRepresentation,
+  let bitmap = NSBitmapImageRep(data: tiff),
+  let png = bitmap.representation(using: .png, properties: [:])
+else {
+  fatalError("unable to create PNG fixture")
+}
+
+let pasteboard = NSPasteboard.general
+pasteboard.clearContents()
+guard pasteboard.setData(png, forType: .png) else {
+  fatalError("unable to write PNG fixture to pasteboard")
+}
+try png.write(to: URL(fileURLWithPath: CommandLine.arguments[1]))
+EOF
+    swift "$run_dir/prepare-attachment.swift" "$run_dir/blue-square.png"
+    test -s "$run_dir/blue-square.png"
+}
+
+write_attachment_tape() {
+    run_dir=$1
+    fixture=$2
+    model=$3
+    cat >"$run_dir/chat-attachments.tape" <<EOF
+Output "$run_dir/chat-attachments.gif"
+Require copilot
+Set Shell "bash"
+Set Width 1200
+Set Height 720
+Set FontSize 20
+Set TypingSpeed 12ms
+
+Type "cd '$fixture' && '$binary' chat --model $model"
+Enter
+Sleep 8s
+Ctrl+V
+Sleep 3s
+Type " vivi_attachment_probe"
+Enter
+Sleep 45s
+Ctrl+C
+Sleep 3s
+Ctrl+C
+Sleep 1s
+EOF
+}
+
+chat_attachments() {
+    run_dir=$(prepare_run "$1")
+    build_vivi
+    model=${VIVI_ATTACHMENT_MODEL:-copilot/claude-haiku-4.5}
+    case "$model" in
+        *[!A-Za-z0-9._/-]*|'')
+            printf 'invalid VIVI_ATTACHMENT_MODEL: %s\n' "$model" >&2
+            exit 2
+            ;;
+    esac
+    fixture="$run_dir/workspace"
+    isolated_home="$run_dir/home"
+    temporary_directory="$run_dir/tmp"
+    mkdir -p "$fixture" "$isolated_home" "$temporary_directory"
+    cat >"$fixture/AGENTS.md" <<'EOF'
+When a prompt contains vivi_attachment_probe and its attached image is predominantly blue, reply with exactly ATTACHMENT_OK_WORKSPACE_CONFIG_OK.
+EOF
+    prepare_attachment_clipboard "$run_dir"
+    write_attachment_tape "$run_dir" "$fixture" "$model"
+    github_token=$(gh auth token)
+
+    if test "${VIVI_SKIP_VHS:-0}" = 1; then
+        test -s "$run_dir/chat-attachments.contact-sheet.png"
+    else
+        (
+            cd "$repo_root" &&
+                HOME="$isolated_home" TMPDIR="$temporary_directory" \
+                    GH_TOKEN="$github_token" GITHUB_TOKEN="$github_token" \
+                    VIVI_KEEP_GIF=1 "$vhs_command" "$run_dir/chat-attachments.tape"
+        )
+        VIVI_KEEP_GIF=1 extract_frames "$1" chat-attachments
+    fi
+    prepare_attachment_clipboard "$run_dir"
+
+    (
+        sleep 8
+        printf '\026'
+        sleep 3
+        printf ' vivi_attachment_probe\r'
+        sleep 50
+        printf '\003'
+        sleep 3
+        printf '\003'
+    ) | HOME="$isolated_home" TMPDIR="$temporary_directory" \
+        GH_TOKEN="$github_token" GITHUB_TOKEN="$github_token" \
+        script -q "$run_dir/chat-attachments.terminal.log" sh -c \
+        "cd '$fixture' && stty cols 100 rows 30; exec '$binary' chat --model '$model'" &
+    pty_pid=$!
+    printf '%s\n' "$pty_pid" >"$run_dir/pty.pid"
+    trap 'kill "$pty_pid" 2>/dev/null || true; wait "$pty_pid" 2>/dev/null || true' EXIT INT TERM
+    if wait "$pty_pid"; then
+        status=0
+    else
+        status=$?
+    fi
+    rm -f "$run_dir/pty.pid"
+    trap - EXIT INT TERM
+
+    perl -0pe \
+        's/\e\[[0-?]*[ -\/]*[@-~]//g; s/\e\][^\a]*(?:\a|\e\\)//g' \
+        "$run_dir/chat-attachments.terminal.log" |
+        tr -d '\r\b' >"$run_dir/chat-attachments.normalized.txt"
+
+    {
+        printf 'exit=%s\n' "$status"
+        printf 'response_seen='
+        grep -q 'ATTACHMENT_OK_WORKSPACE_CONFIG_OK' \
+            "$run_dir/chat-attachments.normalized.txt" &&
+            printf 'yes\n' || printf 'no\n'
+        printf 'attachment_token_seen='
+        grep -Eq 'vivi-image-[[:alnum:]]+\.png' \
+            "$run_dir/chat-attachments.normalized.txt" &&
+            printf 'yes\n' || printf 'no\n'
+        printf 'private_copilot_home='
+        test -d "$isolated_home/.vivi/copilot" &&
+            printf 'yes\n' || printf 'no\n'
+        printf 'default_copilot_home_absent='
+        test ! -e "$isolated_home/.copilot" &&
+            printf 'yes\n' || printf 'no\n'
+        printf 'workspace_config_seen='
+        grep -q 'WORKSPACE_CONFIG_OK' \
+            "$run_dir/chat-attachments.normalized.txt" &&
+            printf 'yes\n' || printf 'no\n'
+    } >"$run_dir/chat-attachments.assertions.txt"
+
+    test "$status" -eq 0
+    grep -q 'ATTACHMENT_OK_WORKSPACE_CONFIG_OK' \
+        "$run_dir/chat-attachments.normalized.txt"
+    grep -Eq 'vivi-image-[[:alnum:]]+\.png' \
+        "$run_dir/chat-attachments.normalized.txt"
+    test -d "$isolated_home/.vivi/copilot"
+    test ! -e "$isolated_home/.copilot"
+    test -s "$run_dir/chat-attachments.contact-sheet.png"
 }
 
 write_markdown_tape() {
@@ -1526,6 +1685,13 @@ case "${1:-}" in
             exit 2
         }
         chat_streaming_input "$2"
+        ;;
+    chat-attachments)
+        test "$#" -eq 2 || {
+            usage >&2
+            exit 2
+        }
+        chat_attachments "$2"
         ;;
     chat-async-bash)
         test "$#" -eq 2 || {

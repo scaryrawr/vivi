@@ -73,7 +73,8 @@ inserts its quoted file path at the cursor. Enter and Ctrl-Enter submit the
 image as a Copilot attachment along with your message, including steering and
 queued follow-ups. You can paste several images, or send just an image.
 Images are snapshotted when you submit, so later file changes cannot alter a
-queued message. Each image may be up to 20 MiB.
+queued message. Each image and the combined image payload for one message may
+be up to 20 MiB, with at most 32 images in one message.
 Removing a pasted path from the composer excludes that image from the send;
 there are no hidden attachment placeholders. Use a vision-capable model.
 
@@ -86,6 +87,13 @@ Windows PowerShell's clipboard support. Clipboard errors leave the draft intact.
 Pasted files stay available for the lifetime of the chat, including queued
 messages and tool reads, and are removed on normal exit. Their temporary paths
 are not durable references for later `/resume` sessions.
+
+The macOS app exposes the same typed image submission path through the
+composer's attachment menu. **Choose Image…** accepts PNG, JPEG, GIF, and WebP
+files, while **Paste Image** snapshots compatible pasteboard content. Selected
+images appear as removable preview chips and remain selected when acquisition
+or submission fails. AppKit reads each source once; after the backend accepts a
+message, the conversation owns an immutable copy.
 
 The `read` tool also returns PNG, JPEG, GIF, and WebP files as image content
 to the model, detecting their format from the bytes rather than the extension.

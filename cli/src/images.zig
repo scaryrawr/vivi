@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const backend = @import("vivi_backend");
 
 pub const Store = struct {
     allocator: std.mem.Allocator,
@@ -10,6 +11,29 @@ pub const Store = struct {
     const File = struct {
         path: []u8,
         token: []u8,
+    };
+
+    pub const Selection = struct {
+        allocator: std.mem.Allocator,
+        snapshots: []backend.AttachmentSnapshot,
+        inputs: []backend.AttachmentInput,
+
+        pub fn empty(allocator: std.mem.Allocator) !Selection {
+            const snapshots = try allocator.alloc(backend.AttachmentSnapshot, 0);
+            errdefer allocator.free(snapshots);
+            return .{
+                .allocator = allocator,
+                .snapshots = snapshots,
+                .inputs = try allocator.alloc(backend.AttachmentInput, 0),
+            };
+        }
+
+        pub fn deinit(self: *Selection) void {
+            for (self.snapshots) |*snapshot| snapshot.deinit(self.allocator);
+            self.allocator.free(self.snapshots);
+            self.allocator.free(self.inputs);
+            self.* = undefined;
+        }
     };
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, directory: []const u8) !Store {
@@ -56,14 +80,63 @@ pub const Store = struct {
         return token;
     }
 
-    pub fn selectedPaths(self: *const Store, text: []const u8) ![]const []const u8 {
-        var paths: std.ArrayList([]const u8) = .empty;
-        errdefer paths.deinit(self.allocator);
+    pub fn selectedAttachments(
+        self: *const Store,
+        text: []const u8,
+    ) !Selection {
+        var selected_count: usize = 0;
         for (self.files.items) |file| {
-            if (std.mem.indexOf(u8, text, file.token) != null)
-                try paths.append(self.allocator, file.path);
+            if (std.mem.indexOf(u8, text, file.token) != null) {
+                selected_count += 1;
+                if (selected_count > backend.max_attachment_count) {
+                    return error.TooManyAttachments;
+                }
+            }
         }
-        return paths.toOwnedSlice(self.allocator);
+        var snapshots: std.ArrayList(backend.AttachmentSnapshot) = .empty;
+        errdefer {
+            for (snapshots.items) |*snapshot| snapshot.deinit(self.allocator);
+            snapshots.deinit(self.allocator);
+        }
+        var total_bytes: usize = 0;
+        for (self.files.items) |file| {
+            if (std.mem.indexOf(u8, text, file.token) != null) {
+                var snapshot = try backend.AttachmentSnapshot.fromFile(
+                    self.allocator,
+                    self.io,
+                    std.fs.path.basename(file.path),
+                    file.path,
+                );
+                total_bytes = std.math.add(
+                    usize,
+                    total_bytes,
+                    snapshot.bytes.len,
+                ) catch {
+                    snapshot.deinit(self.allocator);
+                    return error.AttachmentsTooLarge;
+                };
+                if (total_bytes > backend.max_attachment_bytes) {
+                    snapshot.deinit(self.allocator);
+                    return error.AttachmentsTooLarge;
+                }
+                snapshots.append(self.allocator, snapshot) catch |err| {
+                    snapshot.deinit(self.allocator);
+                    return err;
+                };
+            }
+        }
+        const owned = try snapshots.toOwnedSlice(self.allocator);
+        errdefer {
+            for (owned) |*snapshot| snapshot.deinit(self.allocator);
+            self.allocator.free(owned);
+        }
+        const inputs = try self.allocator.alloc(backend.AttachmentInput, owned.len);
+        for (owned, inputs) |snapshot, *input| input.* = snapshot.borrow();
+        return .{
+            .allocator = self.allocator,
+            .snapshots = owned,
+            .inputs = inputs,
+        };
     }
 
     fn remove(self: *Store, path: []const u8) void {
@@ -81,28 +154,34 @@ test "image paste stores private unique files and selects only visible paths" {
     const len = try temporary.dir.realPath(std.testing.io, &path_buffer);
     var store = try Store.init(std.testing.allocator, std.testing.io, path_buffer[0..len]);
     defer store.deinit();
-    const first = try store.save("first");
-    const second = try store.save("second");
+    const first = try store.save("\x89PNG\r\n\x1a\nfirst");
+    const second = try store.save("\x89PNG\r\n\x1a\nsecond");
     try std.testing.expect(!std.mem.eql(u8, first, second));
     const text = try std.fmt.allocPrint(std.testing.allocator, "Describe {s} and {s}. Again: {s}", .{ first, second, first });
     defer std.testing.allocator.free(text);
-    const selected = try store.selectedPaths(text);
-    defer std.testing.allocator.free(selected);
-    try std.testing.expectEqual(@as(usize, 2), selected.len);
-    const contents = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, selected[0], std.testing.allocator, .unlimited);
+    var selected = try store.selectedAttachments(text);
+    defer selected.deinit();
+    try std.testing.expectEqual(@as(usize, 2), selected.inputs.len);
+    try std.testing.expectEqualStrings("\x89PNG\r\n\x1a\nfirst", selected.inputs[0].bytes);
+    const contents = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        store.files.items[0].path,
+        std.testing.allocator,
+        .unlimited,
+    );
     defer std.testing.allocator.free(contents);
-    try std.testing.expectEqualStrings("first", contents);
+    try std.testing.expectEqualStrings("\x89PNG\r\n\x1a\nfirst", contents);
     if (builtin.os.tag != .windows) {
-        const file = try std.Io.Dir.cwd().openFile(std.testing.io, selected[0], .{});
+        const file = try std.Io.Dir.cwd().openFile(std.testing.io, store.files.items[0].path, .{});
         defer file.close(std.testing.io);
         try std.testing.expectEqual(@as(u32, 0o600), (try file.stat(std.testing.io)).permissions.toMode() & 0o777);
     }
-    const deleted = try store.selectedPaths("Never mind, no image");
-    defer std.testing.allocator.free(deleted);
-    try std.testing.expectEqual(@as(usize, 0), deleted.len);
-    const edited = try store.selectedPaths(first[1..]);
-    defer std.testing.allocator.free(edited);
-    try std.testing.expectEqual(@as(usize, 0), edited.len);
+    var deleted = try store.selectedAttachments("Never mind, no image");
+    defer deleted.deinit();
+    try std.testing.expectEqual(@as(usize, 0), deleted.inputs.len);
+    var edited = try store.selectedAttachments(first[1..]);
+    defer edited.deinit();
+    try std.testing.expectEqual(@as(usize, 0), edited.inputs.len);
 }
 
 test "image paste cleanup removes only files owned by this store" {
@@ -112,11 +191,80 @@ test "image paste cleanup removes only files owned by this store" {
     const len = try temporary.dir.realPath(std.testing.io, &path_buffer);
     try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "user.png", .data = "keep" });
     var store = try Store.init(std.testing.allocator, std.testing.io, path_buffer[0..len]);
-    _ = try store.save("paste");
+    _ = try store.save("\x89PNG\r\n\x1a\npaste");
     const path = try std.testing.allocator.dupe(u8, store.files.items[0].path);
     defer std.testing.allocator.free(path);
     store.deinit();
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openFile(std.testing.io, path, .{}));
     const file = try temporary.dir.openFile(std.testing.io, "user.png", .{});
     file.close(std.testing.io);
+}
+
+test "selected attachment snapshots current temporary file bytes" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const len = try temporary.dir.realPath(std.testing.io, &path_buffer);
+    var store = try Store.init(std.testing.allocator, std.testing.io, path_buffer[0..len]);
+    defer store.deinit();
+    const token = try store.save("\x89PNG\r\n\x1a\noriginal");
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = store.files.items[0].path,
+        .data = "\x89PNG\r\n\x1a\nchanged",
+    });
+
+    var selected = try store.selectedAttachments(token);
+    defer selected.deinit();
+    try std.Io.Dir.cwd().deleteFile(std.testing.io, store.files.items[0].path);
+
+    try std.testing.expectEqualStrings(
+        "\x89PNG\r\n\x1a\nchanged",
+        selected.inputs[0].bytes,
+    );
+}
+
+test "selected attachments enforce count before reads and aggregate while reading" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const len = try temporary.dir.realPath(std.testing.io, &path_buffer);
+    var store = try Store.init(std.testing.allocator, std.testing.io, path_buffer[0..len]);
+    defer store.deinit();
+
+    var composer: std.ArrayList(u8) = .empty;
+    defer composer.deinit(std.testing.allocator);
+    for (0..backend.max_attachment_count + 1) |_| {
+        const token = try store.save("\x89PNG\r\n\x1a\nsmall");
+        try composer.appendSlice(std.testing.allocator, token);
+    }
+    try std.testing.expectError(
+        error.TooManyAttachments,
+        store.selectedAttachments(composer.items),
+    );
+
+    var aggregate_store = try Store.init(
+        std.testing.allocator,
+        std.testing.io,
+        path_buffer[0..len],
+    );
+    defer aggregate_store.deinit();
+    const large = try std.testing.allocator.alloc(
+        u8,
+        backend.max_attachment_bytes / 2 + 1,
+    );
+    defer std.testing.allocator.free(large);
+    @memset(large, 0);
+    @memcpy(large[0..8], "\x89PNG\r\n\x1a\n");
+    const first = try aggregate_store.save(large);
+    const second = try aggregate_store.save(large);
+    const aggregate_composer = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s} {s}",
+        .{ first, second },
+    );
+    defer std.testing.allocator.free(aggregate_composer);
+    try std.testing.expectError(
+        error.AttachmentsTooLarge,
+        aggregate_store.selectedAttachments(aggregate_composer),
+    );
 }

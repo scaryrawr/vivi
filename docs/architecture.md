@@ -65,14 +65,16 @@ Zig 0.16 currently fails while cross-compiling its `libubsan` support for
 ARM64 Windows Debug from macOS. Treat that as a toolchain verification item,
 not as a reason to add target conditionals to domain code.
 
-The C ABI intentionally exposes one status function. The CLI's first product
-operation is a backend-owned conversation worker with a libvaxis terminal
-adapter. Product operations will
-be added only after a real caller defines their domain shape. Extensible
-structs must carry `abi_version` and `struct_size`; text crosses as UTF-8 bytes
-with explicit lengths; state uses opaque handles with matching destroy
-functions. Platform export/import decoration belongs to packaging adapters,
-never domain code.
+The C ABI exposes the backend-owned conversation to native hosts. Extensible
+records carry `abi_version` or `struct_size`; text and binary attachments cross
+as explicit pointer/length pairs; state uses opaque handles with matching
+destroy functions. Submission attachment descriptors are fixed-size ABI v10
+array elements because C array iteration uses their compile-time stride, so
+their `struct_size` must equal the known record size. The enclosing submission
+record remains extensible. Descriptors are caller-owned only for the duration
+of the call. The backend validates and copies the complete prompt before
+returning success. Platform export/import decoration belongs to packaging
+adapters, never domain code.
 
 The SDK's blocking work must never run on SwiftUI's main actor, GLib's main
 loop, or the WinUI dispatcher thread. Threading, callback lifetime, and
@@ -96,15 +98,22 @@ keeping terminal policy out of the backend.
 
 Image clipboard access and temporary-file ownership belong to the CLI.
 The composer inserts a literal quoted path, and only retained pasted-path
-tokens are selected as attachments at submission. `Conversation.submit`
-snapshots the selected image bytes into an owned message, so queued sends
-and steering never borrow editor memory or reread modified files. The image
-store outlives the conversation worker and removes only the temporary files it created after
-that worker stops. Saved ask-user drafts retain their visible image paths.
-Only `root.zig` maps the snapshots into typed `session.send` blob attachments
-through `MessageOptions.message_attachments`; the SDK's RPC details stay out of
-the SDK-free conversation boundary.
-No chat operation is exposed through the scaffold C ABI.
+tokens are selected as attachments at submission. The CLI reads its selected
+private files into typed attachment inputs, then `Conversation.submit`
+validates and copies the entire prompt atomically. Queued sends and steering
+therefore never borrow editor memory or reread files after acceptance. The
+image store outlives the conversation worker and removes only the temporary
+files it created after that worker stops. Saved ask-user drafts retain their
+visible image paths.
+
+The same typed attachment input crosses C ABI v10 as caller-owned identity,
+display-name, media-type, and raw-byte fields. AppKit owns file-panel and
+pasteboard acquisition, while `NativeChatStore` owns one conversation's
+immutable composer snapshots and removal state. The coordinator and session
+history do not know about attachments. Only `root.zig` maps accepted snapshots
+into typed `session.send` blob attachments through
+`MessageOptions.message_attachments`; base64 and SDK details stay out of the
+domain and C boundary.
 On Windows, Vivi drives the libvaxis terminal parser and existing event queue
 directly to preserve paste-boundary events omitted by the pinned library's
 Windows loop adapter. All other events still use libvaxis's generic forwarding;
@@ -290,11 +299,11 @@ ownership early. All native build systems call the root `install-c-api` step;
 the macOS staging script is not a template for Windows because Windows ships
 separate architecture-specific binaries rather than a fat archive.
 
-The CLI chat uses a backend conversation broker rather than a CLI-owned SDK
-worker. The broker was chosen because its small submit/take/stop/deinit
+The CLI and native app use a backend conversation broker rather than host-owned
+SDK workers. The broker was chosen because its small submit/take/stop/deinit
 surface hides SDK sequencing, single-thread ownership, event copying, and
-teardown. libvaxis remains a CLI-only dependency, and the native C ABI remains
-unchanged until a native caller defines its callback and ownership contract.
+teardown. libvaxis remains a CLI-only dependency, and AppKit remains a
+macOS-host dependency.
 
 The minimal agent configuration stays private to the SDK-owning root module
 rather than becoming caller-supplied conversation options. This keeps tool

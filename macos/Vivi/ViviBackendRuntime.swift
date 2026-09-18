@@ -309,7 +309,10 @@ enum ConversationOperationResult: Equatable {
 
 protocol ViviConversationDriving: AnyObject {
   func start(receive: @escaping @MainActor (ChatEvent) -> Void) -> ConversationOperationResult
-  func submit(_ prompt: String) -> ConversationOperationResult
+  func submit(
+    _ prompt: String,
+    attachments: [ComposerAttachment]
+  ) -> ConversationOperationResult
   func refreshModels() -> ConversationOperationResult
   func switchModel(_ selection: ModelSelection) -> ConversationOperationResult
   func refreshSessions() -> ConversationOperationResult
@@ -338,6 +341,9 @@ final class NativeChatStore: ObservableObject {
   @Published private(set) var sessionCatalogFailure: String?
   @Published private(set) var sessionState: SessionControlState = .ready
   @Published private(set) var activeUserInput: ActiveUserInput?
+  @Published private(set) var attachments: [ComposerAttachment] = []
+  @Published private(set) var attachmentError: String?
+  @Published private(set) var isAcquiringAttachments = false
   @Published var draft = ""
 
   var workspace: String { activePresentation.workspace }
@@ -354,9 +360,15 @@ final class NativeChatStore: ObservableObject {
   private var activeReasoningPrefix = ""
   private var responseHeaderVisible = false
   private let driver: ViviConversationDriving
+  private let attachmentAcquirer: ComposerAttachmentAcquiring
+  private var attachmentAcquisitionTask: Task<Void, Never>?
   private var closeCompletions: [@MainActor () -> Void] = []
 
-  init(workspace: String, driver: ViviConversationDriving) {
+  init(
+    workspace: String,
+    driver: ViviConversationDriving,
+    attachmentAcquirer: ComposerAttachmentAcquiring = AppKitComposerAttachmentAcquirer()
+  ) {
     let presentation = ActiveConversationPresentation(
       workspace: workspace,
       sessionTitle: URL(fileURLWithPath: workspace).lastPathComponent,
@@ -364,6 +376,7 @@ final class NativeChatStore: ObservableObject {
       confirmedSelection: nil)
     activePresentation = presentation
     self.driver = driver
+    self.attachmentAcquirer = attachmentAcquirer
     let started = driver.start { [weak self] event in
       self?.reduce(event)
     }
@@ -378,8 +391,15 @@ final class NativeChatStore: ObservableObject {
   }
 
   var canSubmit: Bool {
-    !isBusy && modelState == .ready && sessionState == .ready
-      && !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    !isBusy && !isAcquiringAttachments && modelState == .ready && sessionState == .ready
+      && (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        || !attachments.isEmpty)
+  }
+
+  var canAcquireAttachments: Bool {
+    lifecycle == .idle && !isAcquiringAttachments
+      && modelState == .ready && sessionState == .ready
+      && activeUserInput == nil && attachments.count < composerAttachmentCountLimit
   }
 
   var canSubmitUserInput: Bool {
@@ -422,7 +442,8 @@ final class NativeChatStore: ObservableObject {
   func submit() {
     let prompt = draft.trimmingCharacters(in: .whitespacesAndNewlines)
     guard canSubmit else { return }
-    let result = driver.submit(prompt)
+    let submittedAttachments = attachments
+    let result = driver.submit(prompt, attachments: submittedAttachments)
     guard result == .accepted else {
       finishStreamingRows()
       transcript.append(.status(id: UUID(), text: message(for: result, action: "send message")))
@@ -431,9 +452,68 @@ final class NativeChatStore: ObservableObject {
 
     finishStreamingRows()
     responseHeaderVisible = false
-    transcript.append(.user(id: UUID(), text: prompt))
+    transcript.append(
+      .user(
+        id: UUID(),
+        text: submittedMessageText(prompt: prompt, attachments: submittedAttachments)))
     draft = ""
+    attachments = []
+    attachmentError = nil
     lifecycle = .responding
+  }
+
+  func chooseAttachments() {
+    guard canAcquireAttachments, attachmentAcquisitionTask == nil else { return }
+    attachmentError = nil
+    isAcquiringAttachments = true
+    attachmentAcquisitionTask = Task { [weak self] in
+      guard let self else { return }
+      defer {
+        attachmentAcquisitionTask = nil
+        isAcquiringAttachments = false
+      }
+      guard !Task.isCancelled else { return }
+      do {
+        let selected = try await attachmentAcquirer.chooseImages()
+        guard !Task.isCancelled, canPublishAttachmentAcquisition else { return }
+        try appendAttachments(selected)
+      } catch {
+        guard !Task.isCancelled else { return }
+        attachmentError = attachmentMessage(error)
+      }
+    }
+  }
+
+  func pasteAttachment() {
+    guard canAcquireAttachments, attachmentAcquisitionTask == nil else { return }
+    attachmentError = nil
+    isAcquiringAttachments = true
+    attachmentAcquisitionTask = Task { [weak self] in
+      guard let self else { return }
+      defer {
+        attachmentAcquisitionTask = nil
+        isAcquiringAttachments = false
+      }
+      guard !Task.isCancelled else { return }
+      do {
+        let selected = try await attachmentAcquirer.pasteImage()
+        guard !Task.isCancelled, canPublishAttachmentAcquisition else { return }
+        try appendAttachments([selected])
+      } catch {
+        guard !Task.isCancelled else { return }
+        attachmentError = attachmentMessage(error)
+      }
+    }
+  }
+
+  func waitForAttachmentAcquisition() async {
+    await attachmentAcquisitionTask?.value
+  }
+
+  func removeAttachment(_ id: UUID) {
+    guard lifecycle != .closing && lifecycle != .closed else { return }
+    attachments.removeAll { $0.id == id }
+    attachmentError = nil
   }
 
   func revealFreeformInput() {
@@ -480,7 +560,7 @@ final class NativeChatStore: ObservableObject {
   }
 
   func refreshModels() {
-    guard modelState == .ready, sessionState == .ready else { return }
+    guard !isAcquiringAttachments, modelState == .ready, sessionState == .ready else { return }
     let result = driver.refreshModels()
     if result == .accepted {
       modelState = .refreshing
@@ -490,7 +570,9 @@ final class NativeChatStore: ObservableObject {
   }
 
   func refreshSessions() {
-    guard lifecycle == .idle, modelState == .ready, sessionState == .ready else { return }
+    guard !isAcquiringAttachments, lifecycle == .idle, modelState == .ready,
+      sessionState == .ready
+    else { return }
     let result = driver.refreshSessions()
     if result == .accepted {
       sessionCatalog = nil
@@ -504,7 +586,8 @@ final class NativeChatStore: ObservableObject {
   }
 
   func resumeSession(_ key: ResumeKey) {
-    guard lifecycle == .idle, modelState == .ready, sessionState == .ready,
+    guard !isAcquiringAttachments, lifecycle == .idle, modelState == .ready,
+      sessionState == .ready,
       sessionCatalog?.sessions.contains(where: { $0.key == key }) == true
     else { return }
     let result = driver.resumeSession(key)
@@ -656,6 +739,7 @@ final class NativeChatStore: ObservableObject {
       pendingReasoningCompletion = nil
       activeReasoningPrefix = ""
       activeUserInput = nil
+      clearAttachments()
       finishClose()
     }
   }
@@ -667,14 +751,44 @@ final class NativeChatStore: ObservableObject {
       return
     }
     guard lifecycle != .closing else { return }
+    clearAttachments()
     lifecycle = .closing
     driver.close { [self] in
       finishClose()
     }
   }
 
+  private func appendAttachments(_ selected: [ComposerAttachment]) throws {
+    guard !selected.isEmpty else { return }
+    guard attachments.count + selected.count <= composerAttachmentCountLimit else {
+      throw ComposerAttachmentAcquisitionError.tooMany
+    }
+
+    let total =
+      attachments.reduce(0) { $0 + $1.data.count }
+      + selected.reduce(0) { $0 + $1.data.count }
+    guard total <= composerAttachmentByteLimit else {
+      throw ComposerAttachmentAcquisitionError.totalTooLarge
+    }
+    attachments.append(contentsOf: selected)
+  }
+
+  private var canPublishAttachmentAcquisition: Bool {
+    lifecycle == .idle && modelState == .ready && sessionState == .ready
+      && activeUserInput == nil
+  }
+
+  private func clearAttachments() {
+    attachmentAcquisitionTask?.cancel()
+    attachmentAcquirer.cancel()
+    attachments = []
+    attachmentError = nil
+  }
+
   private func switchModel(_ selection: ModelSelection) {
-    guard modelState == .ready, sessionState == .ready, selection != confirmedSelection else {
+    guard !isAcquiringAttachments, modelState == .ready, sessionState == .ready,
+      selection != confirmedSelection
+    else {
       return
     }
     let result = driver.switchModel(selection)
@@ -879,6 +993,22 @@ final class NativeChatStore: ObservableObject {
     guard lifecycle == .responding, !responseHeaderVisible else { return }
     responseHeaderVisible = true
     transcript.append(.assistantHeader(id: UUID()))
+  }
+
+  private func submittedMessageText(
+    prompt: String,
+    attachments: [ComposerAttachment]
+  ) -> String {
+    guard !attachments.isEmpty else { return prompt }
+    let images = attachments.map { "Attached \($0.displayName)" }.joined(separator: "\n")
+    return prompt.isEmpty ? images : "\(prompt)\n\n\(images)"
+  }
+
+  private func attachmentMessage(_ error: Error) -> String {
+    if let error = error as? LocalizedError, let message = error.errorDescription {
+      return message
+    }
+    return "The image could not be attached."
   }
 
   private func message(for result: ConversationOperationResult, action: String) -> String {
@@ -1718,14 +1848,32 @@ final class ViviConversationDriver: ViviConversationDriving, @unchecked Sendable
     }
   }
 
-  func submit(_ prompt: String) -> ConversationOperationResult {
-    let bytes = Array(prompt.utf8)
+  func submit(
+    _ prompt: String,
+    attachments: [ComposerAttachment]
+  ) -> ConversationOperationResult {
+    let promptBytes = Array(prompt.utf8)
+    guard let promptLength = UInt32(exactly: promptBytes.count),
+      let attachmentCount = UInt32(exactly: attachments.count)
+    else { return .rejected }
     return queue.sync {
       guard let handle else { return .closed }
-      return Self.operationResult(
-        bytes.withUnsafeBufferPointer {
-          vivi_backend_submit(handle, $0.baseAddress, UInt32($0.count))
-        })
+      var descriptors: [vivi_backend_submission_attachment_t] = []
+      descriptors.reserveCapacity(attachments.count)
+      return promptBytes.withUnsafeBufferPointer { promptBuffer in
+        Self.withSubmissionAttachments(
+          attachments[...],
+          descriptors: &descriptors
+        ) { descriptorBuffer in
+          var submission = vivi_backend_submission_t()
+          submission.struct_size = UInt32(MemoryLayout<vivi_backend_submission_t>.size)
+          submission.prompt = promptBuffer.baseAddress
+          submission.prompt_length = promptLength
+          submission.attachments = descriptorBuffer.baseAddress
+          submission.attachment_count = attachmentCount
+          return Self.operationResult(vivi_backend_submit(handle, &submission))
+        }
+      }
     }
   }
 
@@ -1820,6 +1968,42 @@ final class ViviConversationDriver: ViviConversationDriving, @unchecked Sendable
     context in
     guard let context else { return }
     Unmanaged<ViviConversationDriver>.fromOpaque(context).takeUnretainedValue().drain()
+  }
+
+  static func withSubmissionAttachments<Result>(
+    _ attachments: ArraySlice<ComposerAttachment>,
+    descriptors: inout [vivi_backend_submission_attachment_t],
+    body: (UnsafeBufferPointer<vivi_backend_submission_attachment_t>) -> Result
+  ) -> Result {
+    guard let attachment = attachments.first else {
+      return descriptors.withUnsafeBufferPointer(body)
+    }
+    let identity = Array(attachment.id.uuidString.utf8)
+    let displayName = Array(attachment.displayName.utf8)
+    return identity.withUnsafeBufferPointer { identityBuffer in
+      displayName.withUnsafeBufferPointer { displayNameBuffer in
+        attachment.data.withUnsafeBytes { rawBytes in
+          let bytes = rawBytes.bindMemory(to: UInt8.self)
+          var descriptor = vivi_backend_submission_attachment_t()
+          descriptor.struct_size =
+            UInt32(MemoryLayout<vivi_backend_submission_attachment_t>.size)
+          descriptor.media_type = vivi_backend_attachment_media_type_t(
+            rawValue: attachment.media.rawValue)
+          descriptor.identity = identityBuffer.baseAddress
+          descriptor.identity_length = UInt32(identityBuffer.count)
+          descriptor.display_name = displayNameBuffer.baseAddress
+          descriptor.display_name_length = UInt32(displayNameBuffer.count)
+          descriptor.bytes = bytes.baseAddress
+          descriptor.byte_length = UInt32(bytes.count)
+          descriptors.append(descriptor)
+          defer { descriptors.removeLast() }
+          return withSubmissionAttachments(
+            attachments.dropFirst(),
+            descriptors: &descriptors,
+            body: body)
+        }
+      }
+    }
   }
 
   private func drainLocked() {
