@@ -57,6 +57,39 @@ final class MainWindowControllerTests: XCTestCase {
     XCTAssertEqual(window.title, "Vivi | First renamed")
     firstDriver.send(.sessionTitle("First final"))
     XCTAssertEqual(window.title, "Vivi | First final")
+    let resumedKey = ResumeKey(generation: 42, slot: 7)
+    let resumedSummary = SessionSummary(
+      key: resumedKey,
+      workingDirectory: "/tmp/resumed",
+      title: "resumed",
+      isCurrent: false)
+    let selectedModel = ModelSelection(modelID: "test", reasoning: .off)
+    firstDriver.send(.ready)
+    firstDriver.send(
+      .modelCatalog(
+        ModelCatalog(
+          selected: selectedModel,
+          models: [
+            ModelInfo(
+              id: selectedModel.modelID,
+              displayName: "Test",
+              maxContextWindowTokens: 0,
+              maxOutputTokens: 0,
+              supportsVision: false,
+              reasoning: [.off],
+              advertisedDefaultReasoning: .off)
+          ])))
+    first.store.refreshSessions()
+    firstDriver.send(.sessionCatalog(SessionCatalog(sessions: [resumedSummary])))
+    first.store.resumeSession(resumedKey)
+    firstDriver.send(
+      .sessionResume(
+        .resumed(
+          ResumedSession(
+            summary: resumedSummary,
+            transcript: [],
+            cleanupFailed: false))))
+    XCTAssertEqual(window.title, "Vivi | New conversation")
     _ = controller
   }
 

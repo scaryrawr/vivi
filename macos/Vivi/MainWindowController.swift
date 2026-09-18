@@ -83,11 +83,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, MainWind
     }
     window?.title = Self.windowTitle(for: conversation)
     titleObservation = conversation.$navigation
-      .map { [weak conversation] navigation in
-        guard let conversation else { return "Vivi" }
-        return Self.windowTitle(
+      .map { navigation in
+        Self.windowTitle(
           conversationTitle: navigation.title,
-          workspace: conversation.launchWorkspace)
+          workspace: navigation.workspace)
       }
       .removeDuplicates()
       .sink { [weak window] title in
@@ -120,7 +119,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, MainWind
   private static func windowTitle(for conversation: ConversationRecord) -> String {
     windowTitle(
       conversationTitle: conversation.navigation.title,
-      workspace: conversation.launchWorkspace)
+      workspace: conversation.navigation.workspace)
   }
 
   private static func windowTitle(
