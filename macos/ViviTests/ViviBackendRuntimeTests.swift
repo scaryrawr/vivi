@@ -5,7 +5,7 @@ import XCTest
 
 @MainActor
 final class ViviBackendRuntimeTests: XCTestCase {
-  func testInvalidArgumentIsRejectedOnlyForUserInputResponses() {
+  func testInvalidArgumentMappingMatchesControlRecoveryPolicy() {
     XCTAssertEqual(
       ViviConversationDriver.operationResult(VIVI_BACKEND_INVALID_ARGUMENT),
       .failed)
@@ -14,6 +14,12 @@ final class ViviBackendRuntimeTests: XCTestCase {
       .rejected)
     XCTAssertEqual(
       ViviConversationDriver.userInputOperationResult(VIVI_BACKEND_BUSY),
+      .busy)
+    XCTAssertEqual(
+      ViviConversationDriver.commandOperationResult(VIVI_BACKEND_INVALID_ARGUMENT),
+      .rejected)
+    XCTAssertEqual(
+      ViviConversationDriver.commandOperationResult(VIVI_BACKEND_BUSY),
       .busy)
   }
 
@@ -1395,6 +1401,16 @@ final class ViviBackendRuntimeTests: XCTestCase {
     XCTAssertThrowsError(
       try NativeEventDecoder.decode(
         fixture.event, bytes: fixture.bytes, models: [], commands: badSpan))
+
+    var noncanonicalEmptyHint = fixture.commands
+    noncanonicalEmptyHint[1].hint = vivi_backend_span_t(
+      offset: UInt32(fixture.bytes.count), length: 0)
+    XCTAssertThrowsError(
+      try NativeEventDecoder.decode(
+        fixture.event,
+        bytes: fixture.bytes,
+        models: [],
+        commands: noncanonicalEmptyHint))
 
     var badCount = fixture.event
     badCount.command_count += 1

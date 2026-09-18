@@ -1734,6 +1734,9 @@ enum NativeEventDecoder {
       let name = try text(raw.name)
       let displayName = try text(raw.display_name)
       let description = try text(raw.description)
+      guard raw.hint.length != 0 || canonicalEmpty(raw.hint) else {
+        throw NativeEventDecodingError.malformed
+      }
       let hint = canonicalEmpty(raw.hint) ? nil : try text(raw.hint)
       guard !name.isEmpty, !displayName.isEmpty,
         argumentPolicy == .none ? hint == nil : true
@@ -2374,7 +2377,8 @@ final class ViviConversationDriver: ViviConversationDriving, @unchecked Sendable
       execution.argument_length = UInt32(bytes.count)
       return bytes.withUnsafeBufferPointer { buffer in
         execution.arguments = buffer.baseAddress
-        return Self.operationResult(vivi_backend_execute_command(handle, &execution))
+        return Self.commandOperationResult(
+          vivi_backend_execute_command(handle, &execution))
       }
     }
   }
@@ -2644,6 +2648,15 @@ final class ViviConversationDriver: ViviConversationDriving, @unchecked Sendable
   }
 
   static func userInputOperationResult(
+    _ result: vivi_backend_result_t
+  ) -> ConversationOperationResult {
+    if result == VIVI_BACKEND_INVALID_ARGUMENT {
+      return .rejected
+    }
+    return operationResult(result)
+  }
+
+  static func commandOperationResult(
     _ result: vivi_backend_result_t
   ) -> ConversationOperationResult {
     if result == VIVI_BACKEND_INVALID_ARGUMENT {
