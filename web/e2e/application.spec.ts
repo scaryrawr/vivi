@@ -65,9 +65,11 @@ test("composer accepts multiline text and sends with command enter", async ({
 }) => {
   await page.goto("/?scenario=one");
   const composer = page.getByRole("textbox", { name: "Message" });
-  await composer.fill("First line\nSecond line");
+  await composer.fill("  First line\nSecond line  ");
   await page.keyboard.press("Meta+Enter");
-  await expect(page.getByText("First line\nSecond line")).toBeVisible();
+  const sentMessage = page.locator(".user-message").last();
+  await expect(sentMessage).toHaveText("  First line\nSecond line  ");
+  await expect(sentMessage).toHaveCSS("white-space", "pre-wrap");
   await expect(composer).toHaveValue("");
 });
 

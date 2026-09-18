@@ -92,7 +92,7 @@ export function ViviApp({
         await host.sendMessage({
           sessionId: selected.id,
           submissionId: createClientSubmissionId(),
-          text: draft.text.trim(),
+          text: draft.text,
         }),
       );
       if (result.kind === "accepted") {
