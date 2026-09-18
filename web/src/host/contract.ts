@@ -94,7 +94,6 @@ export interface SessionSnapshot extends SessionSummary {
 export interface HostError {
   readonly code: "startup" | "submission" | "stream" | "host";
   readonly message: string;
-  readonly recovery: "retry" | "newConversation" | "none";
 }
 
 export interface HostSnapshot {

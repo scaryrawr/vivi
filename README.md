@@ -260,7 +260,7 @@ Playwright evidence, and layer 2 WKWebView responsibilities.
 ./scripts/check.sh
 ```
 
-The full check composes three independently runnable CI domains:
+The full check composes four independently runnable CI domains:
 
 ```sh
 ./scripts/check-zig.sh

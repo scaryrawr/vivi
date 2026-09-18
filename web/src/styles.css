@@ -71,6 +71,7 @@ button {
   --danger: #ffb4a9;
   --danger-soft: #4a2220;
   --focus: #75b6ff;
+  --responding: #f1b85b;
 }
 
 .sidebar {
@@ -239,7 +240,7 @@ button {
 }
 
 .lifecycle-status.responding {
-  color: #8a5200;
+  color: var(--responding, #8a5200);
 }
 
 .lifecycle-status.failed {
@@ -318,6 +319,7 @@ button {
 .application-error,
 .connection-error,
 .command-error,
+.lifecycle-error,
 .composer-error,
 .transcript-error {
   display: flex;
@@ -336,7 +338,8 @@ button {
 }
 
 .connection-error,
-.command-error {
+.command-error,
+.lifecycle-error {
   padding: 8px 20px;
   border-bottom: 1px solid color-mix(in srgb, var(--danger) 22%, transparent);
 }

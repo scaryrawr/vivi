@@ -183,7 +183,6 @@ const error: HostSnapshot = {
   applicationError: {
     code: "host",
     message: "The native host stopped publishing application state.",
-    recovery: "retry",
   },
   selectedSession: {
     ...selectedSession(viviSessions[0]),
@@ -191,7 +190,6 @@ const error: HostSnapshot = {
       code: "submission",
       message:
         "The message could not be sent because the conversation is closing.",
-      recovery: "newConversation",
     },
     transcript: [
       ...baseTranscript,

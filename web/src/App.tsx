@@ -9,6 +9,7 @@ import Markdown from "react-markdown";
 import type {
   Appearance,
   ConnectedViviHost,
+  ConversationLifecycle,
   HostCommandResult,
   SessionId,
   TranscriptItem,
@@ -52,6 +53,8 @@ export function ViviApp({
     collapsedProjects: new Set(initiallyCollapsed),
   });
   const [commandError, setCommandError] = useState<string | null>(null);
+  const [createPending, setCreatePending] = useState(false);
+  const createPendingRef = useRef(false);
   const [sendPending, setSendPending] = useState(false);
   const sendPendingRef = useRef(false);
   const sessionIds = useMemo(
@@ -61,8 +64,7 @@ export function ViviApp({
   const selected = snapshot.selectedSession;
   const draft = selected ? selectDraft(ui, selected.id) : null;
   const connected = connectionState.kind === "connected";
-  const canSend =
-    connected && selectCanSend(snapshot, ui) && !sendPending;
+  const canSend = connected && selectCanSend(snapshot, ui) && !sendPending;
   const sidebarRef = useRef<HTMLElement>(null);
 
   const handleResult = (result: HostCommandResult) => {
@@ -77,8 +79,16 @@ export function ViviApp({
   };
 
   const createConversation = async (path: WorkspacePath) => {
+    if (!connected || createPendingRef.current) return;
+    createPendingRef.current = true;
+    setCreatePending(true);
     setCommandError(null);
-    handleResult(await host.createConversation(path));
+    try {
+      handleResult(await host.createConversation(path));
+    } finally {
+      createPendingRef.current = false;
+      setCreatePending(false);
+    }
   };
 
   const send = async () => {
@@ -191,7 +201,7 @@ export function ViviApp({
                     <button
                       className="new-conversation"
                       type="button"
-                      disabled={!connected}
+                      disabled={!connected || createPending}
                       onClick={() => void createConversation(project.path)}
                     >
                       <span aria-hidden="true">＋</span> New conversation
@@ -223,11 +233,12 @@ export function ViviApp({
                 "Choose a project conversation to begin."}
             </span>
           </div>
-          {selected && <LifecyclePill lifecycle={selected.lifecycle.kind} />}
+          {selected && <LifecyclePill lifecycle={selected.lifecycle} />}
         </header>
 
         {(snapshot.applicationError ||
           commandError ||
+          selected?.lifecycle.kind === "failed" ||
           connectionState.kind !== "connected") && (
           <div className="status-region">
             {snapshot.applicationError && (
@@ -252,6 +263,12 @@ export function ViviApp({
               <div className="command-error" role="alert">
                 <strong>Command not completed</strong>
                 <span>{commandError}</span>
+              </div>
+            )}
+            {selected?.lifecycle.kind === "failed" && (
+              <div className="lifecycle-error" role="alert">
+                <strong>Conversation failed</strong>
+                <span>{selected.lifecycle.message}</span>
               </div>
             )}
           </div>
@@ -473,12 +490,16 @@ function LifecycleStatus({ lifecycle }: { readonly lifecycle: string }) {
   return <span className={`lifecycle-status ${lifecycle}`}>{label}</span>;
 }
 
-function LifecyclePill({ lifecycle }: { readonly lifecycle: string }) {
+function LifecyclePill({
+  lifecycle,
+}: {
+  readonly lifecycle: ConversationLifecycle;
+}) {
   const label =
-    lifecycle === "idle"
+    lifecycle.kind === "idle"
       ? "Ready"
-      : lifecycle === "responding"
+      : lifecycle.kind === "responding"
         ? "Responding"
-        : lifecycle;
-  return <span className={`lifecycle-pill ${lifecycle}`}>{label}</span>;
+        : lifecycle.kind;
+  return <span className={`lifecycle-pill ${lifecycle.kind}`}>{label}</span>;
 }

@@ -5,7 +5,7 @@ import {
   render,
   screen,
 } from "@testing-library/react";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { ViviApp } from "./App";
 import { fixtures } from "./fixtures";
 import { MockViviHost } from "./host/mock";
@@ -39,5 +39,42 @@ describe("ViviApp", () => {
     })) {
       expect(row).toBeDisabled();
     }
+  });
+
+  it("prevents duplicate conversation creation while a request is pending", async () => {
+    const host = new MockViviHost(fixtures.one);
+    let complete: (() => void) | undefined;
+    const pending = new Promise<{
+      readonly kind: "accepted";
+    }>((resolve) => {
+      complete = () => resolve({ kind: "accepted" });
+    });
+    const create = vi
+      .spyOn(host, "createConversation")
+      .mockReturnValue(pending);
+    render(<ViviApp host={host} />);
+
+    const button = screen.getByRole("button", { name: "New conversation" });
+    fireEvent.click(button);
+    fireEvent.click(button);
+
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(button).toBeDisabled();
+    await act(async () => complete?.());
+  });
+
+  it("surfaces the failed conversation lifecycle message", () => {
+    const message = "The conversation process exited unexpectedly.";
+    const host = new MockViviHost({
+      ...fixtures.one,
+      selectedSession: {
+        ...fixtures.one.selectedSession!,
+        lifecycle: { kind: "failed", message },
+      },
+    });
+    render(<ViviApp host={host} />);
+
+    expect(screen.getByText("Conversation failed")).toBeVisible();
+    expect(screen.getByText(message)).toBeVisible();
   });
 });
