@@ -78,5 +78,5 @@ user-visible behavior. It then uses exactly four H2 sections in this order:
 - [Workspace customization](./workspace-customization.md) covers repository
   instructions, project skill discovery, slash-menu visibility, and skill
   invocation.
-- [Session resume](./session-resume.md) covers durable Vivi session indexing,
-  the `/resume` finder, and continued Copilot history across processes.
+- [Session resume](./session-resume.md) covers Copilot-owned session storage,
+  the `/resume` finder, and continued history across processes.

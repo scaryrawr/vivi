@@ -18,6 +18,12 @@ Native hosts share domain semantics through the C ABI, not widgets or view
 models. Do not add speculative sessions, generic JSON bridges, daemons, shared
 UI abstractions, or empty executable targets.
 
+Treat ambient MCP server and tool names as repository-controlled input. A
+workspace can shadow names used by built-in servers, so permission decisions
+must not trust a server/tool-name pair as proof of built-in provenance. Keep
+ambient MCP permissions fail-closed until an explicit user approval boundary
+exists.
+
 ## Build, Test, and Development Commands
 
 Use Zig 0.16.x and Xcode 26.6.
@@ -58,14 +64,17 @@ Any C ABI change must update the header, Zig adapter, smoke test, and every
 implemented native binding together.
 
 `zig build test` does not compile test blocks in every imported backend module.
-When changing `backend/src/settings.zig` or `backend/src/session_store.zig`,
-also run `zig test` directly on the changed module.
+When changing `backend/src/settings.zig`, also run `zig test` directly on the
+changed module.
 
-Version every persisted settings or session-shard schema change. Parse each
-supported older version explicitly, migrate it in memory, and test the next
-write/compaction. Do not rely on `ignore_unknown_fields` for forward
-compatibility because an older writer can discard new fields while compacting
-sibling shards.
+With Zig 0.16 on POSIX, open a directory with `.iterate = true` before calling
+`Dir.setPermissions`; the default `openDirAbsolute` handle may be `O_PATH` on
+Linux, causing `setPermissions` to abort with `BADF`.
+
+Version every persisted settings schema change. Parse each supported older
+version explicitly, migrate it in memory, and test the next write. Do not rely
+on `ignore_unknown_fields` for forward compatibility because an older writer
+can discard new fields.
 
 C API cross-builds do not compile the CLI. For platform-specific clipboard or
 terminal-input changes, also cross-build the executable:
