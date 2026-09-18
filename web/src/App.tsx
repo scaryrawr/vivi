@@ -73,7 +73,11 @@ export function ViviApp({
   const sidebarRef = useRef<HTMLElement>(null);
 
   useLayoutEffect(() => {
-    if (!selected) return;
+    if (!selected) {
+      previousSessionRef.current = null;
+      followTranscriptRef.current = true;
+      return;
+    }
     const transcript = transcriptRef.current;
     const sessionChanged = previousSessionRef.current !== selected.id;
     previousSessionRef.current = selected.id;

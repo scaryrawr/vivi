@@ -125,7 +125,15 @@ export interface SendMessageRequest {
 }
 
 export interface ConnectedViviHost {
+  /**
+   * Return the same object reference until a subscribed store change occurs.
+   * React useSyncExternalStore depends on this V1 adapter invariant.
+   */
   getSnapshot(): HostSnapshot;
+  /**
+   * Return the same object reference until a subscribed store change occurs.
+   * React useSyncExternalStore depends on this V1 adapter invariant.
+   */
   getConnectionState(): ConnectionState;
   subscribe(listener: () => void): () => void;
   selectSession(id: SessionId): Promise<HostCommandResult>;
