@@ -1480,7 +1480,10 @@ enum NativeEventDecoder {
       let choiceBytes = try userInputChoices.map { raw in
         guard raw.reserved == 0 else { throw NativeEventDecodingError.malformed }
         let value = try data(raw.text)
-        guard !value.isEmpty, String(data: value, encoding: .utf8) != nil else {
+        let isBlank = value.allSatisfy { byte in
+          byte == 0x20 || byte == 0x09 || byte == 0x0D || byte == 0x0A
+        }
+        guard !value.isEmpty, !isBlank, String(data: value, encoding: .utf8) != nil else {
           throw NativeEventDecodingError.malformed
         }
         return value

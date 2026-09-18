@@ -559,6 +559,19 @@ final class ViviBackendRuntimeTests: XCTestCase {
         bytes: bytes,
         models: [],
         userInputChoices: [choice]))
+
+    let whitespaceBytes = Array("user-input-1Question \t\r\n".utf8)
+    event.byte_count = UInt32(whitespaceBytes.count)
+    event.allow_freeform = 0
+    let whitespaceChoice = vivi_backend_user_input_choice_t(
+      text: vivi_backend_span_t(offset: 20, length: 4),
+      reserved: 0)
+    XCTAssertThrowsError(
+      try NativeEventDecoder.decode(
+        event,
+        bytes: whitespaceBytes,
+        models: [],
+        userInputChoices: [whitespaceChoice]))
   }
 
   func testDecoderPreservesCanonicallyEquivalentByteDistinctChoices() throws {

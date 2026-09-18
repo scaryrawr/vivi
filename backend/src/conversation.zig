@@ -612,6 +612,9 @@ pub const UserInputRequest = struct {
                 max_user_input_choice_bytes,
                 error.EmptyUserInputChoice,
             );
+            if (std.mem.trim(u8, choice, " \t\r\n").len == 0) {
+                return error.EmptyUserInputChoice;
+            }
             for (choices[0..index]) |previous| {
                 if (std.mem.eql(u8, choice, previous)) {
                     return error.DuplicateUserInputChoice;
@@ -1882,6 +1885,16 @@ test "user input request validates typed answer surface" {
             "request",
             "Question?",
             &.{ "yes", "yes" },
+            false,
+        ),
+    );
+    try std.testing.expectError(
+        error.EmptyUserInputChoice,
+        UserInputRequest.init(
+            std.testing.allocator,
+            "request",
+            "Question?",
+            &.{" \t\r\n"},
             false,
         ),
     );
