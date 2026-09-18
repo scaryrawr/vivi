@@ -201,9 +201,7 @@ private struct ProjectSidebarSection: View {
         Color.clear
           .onReceive(store.$historyPresentationGeneration.dropFirst()) { _ in
             isExpanded = true
-            if store.sessionCatalog == nil {
-              store.refreshSessions()
-            }
+            store.refreshSessions()
           }
       }
     }

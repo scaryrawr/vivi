@@ -212,7 +212,7 @@ struct ContentView: View {
     .buttonStyle(.plain)
     .fixedSize()
     .help(selectedModel?.detail ?? "Choose a model and reasoning level")
-    .disabled(store.modelState != .ready || store.isBusy)
+    .disabled(!store.canUseModelControls)
     .accessibilityIdentifier("model-picker-button")
     .popover(isPresented: $store.isModelPickerPresented, arrowEdge: .top) {
       ModelPickerView(store: store)
@@ -559,6 +559,7 @@ private struct ModelPickerView: View {
       Button("Refresh Models", systemImage: "arrow.clockwise", action: store.refreshModels)
     }
     .padding(14)
+    .disabled(!store.canUseModelControls)
     .accessibilityIdentifier("model-picker")
   }
 }

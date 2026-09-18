@@ -484,6 +484,10 @@ final class NativeChatStore: ObservableObject {
       && activeUserInput == nil && attachments.count < composerAttachmentCountLimit
   }
 
+  var canUseModelControls: Bool {
+    modelState == .ready && !isBusy
+  }
+
   var filteredCommands: [CommandInfo] {
     let query = commandQuery.trimmingCharacters(in: .whitespacesAndNewlines)
       .lowercased()
@@ -1084,7 +1088,7 @@ final class NativeChatStore: ObservableObject {
     if var argument = commandArgumentSession {
       if let replacement = catalog.commands.first(where: {
         $0.name == argument.command.name && $0.action == argument.command.action
-      }) {
+      }), replacement.argumentPolicy != .none {
         argument.command = replacement
         commandArgumentSession = argument
       } else {

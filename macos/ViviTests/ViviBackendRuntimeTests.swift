@@ -1681,6 +1681,28 @@ final class ViviBackendRuntimeTests: XCTestCase {
     XCTAssertNil(store.commandArgumentSession)
   }
 
+  func testCatalogReplacementClearsArgumentModeWhenPolicyBecomesNone() {
+    let store = readyCommandStore(driver: FakeConversationDriver())
+    store.reduce(.commandCatalog(swiftCommandCatalog(generation: 7)))
+    store.openCommandPalette(query: "deploy")
+    store.activateSelectedCommand()
+    store.updateCommandArgumentDraft("obsolete")
+
+    var commands = swiftCommandCatalog(generation: 8).commands
+    commands[2] = CommandInfo(
+      key: CommandKey(generation: 8, slot: 3),
+      name: "deploy",
+      displayName: "Deploy",
+      description: "Deploy the default target",
+      hint: nil,
+      source: .extensionCommand,
+      action: .execute,
+      argumentPolicy: .none)
+    store.reduce(.commandCatalog(CommandCatalog(commands: commands)))
+
+    XCTAssertNil(store.commandArgumentSession)
+  }
+
   func testRejectedCurrentCommandIsTreatedAsStaleAndRefreshes() {
     let driver = FakeConversationDriver()
     driver.executeCommandResult = .rejected
