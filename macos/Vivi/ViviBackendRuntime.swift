@@ -67,6 +67,72 @@ struct ModelCatalog: Equatable {
   let models: [ModelInfo]
 }
 
+struct CommandKey: Equatable, Hashable {
+  let generation: UInt64
+  let slot: UInt32
+}
+
+enum CommandSource: Int32, Equatable, Comparable {
+  case vivi = 1
+  case sdkBuiltin = 2
+  case extensionCommand = 3
+
+  static func < (lhs: CommandSource, rhs: CommandSource) -> Bool {
+    lhs.rawValue < rhs.rawValue
+  }
+
+  var label: String {
+    switch self {
+    case .vivi: "Vivi"
+    case .sdkBuiltin: "Copilot"
+    case .extensionCommand: "Extension"
+    }
+  }
+}
+
+enum CommandAction: Int32, Equatable {
+  case execute = 1
+  case openModelSelection = 2
+  case openSessionHistory = 3
+}
+
+enum CommandArgumentPolicy: Int32, Equatable {
+  case none = 1
+  case optional = 2
+  case required = 3
+}
+
+struct CommandInfo: Equatable, Identifiable {
+  let key: CommandKey
+  let name: String
+  let displayName: String
+  let description: String
+  let hint: String?
+  let source: CommandSource
+  let action: CommandAction
+  let argumentPolicy: CommandArgumentPolicy
+
+  var id: CommandKey { key }
+}
+
+struct CommandCatalog: Equatable {
+  let commands: [CommandInfo]
+}
+
+enum CommandCatalogState: Equatable {
+  case loading
+  case loaded
+  case failed(message: String, hasFallback: Bool)
+}
+
+struct CommandArgumentSession: Equatable {
+  var command: CommandInfo
+  var draft: String
+}
+
+struct CommandExecution: Equatable {
+  let command: CommandInfo
+}
 struct ResumeKey: Equatable, Hashable {
   let generation: UInt64
   let slot: UInt32
@@ -293,6 +359,10 @@ enum ChatEvent: Equatable {
   case sessionCatalogFailure(String)
   case sessionResume(SessionResumeResult)
   case userInputRequested(UserInputRequest)
+  case commandCatalog(CommandCatalog)
+  case commandCatalogFailure(String)
+  case commandCompleted(key: CommandKey, message: String)
+  case commandFailed(key: CommandKey, message: String)
   case idle
   case failure(String)
   case closed
@@ -313,6 +383,8 @@ protocol ViviConversationDriving: AnyObject {
     _ prompt: String,
     attachments: [ComposerAttachment]
   ) -> ConversationOperationResult
+  func refreshCommands() -> ConversationOperationResult
+  func executeCommand(_ key: CommandKey, arguments: String) -> ConversationOperationResult
   func refreshModels() -> ConversationOperationResult
   func switchModel(_ selection: ModelSelection) -> ConversationOperationResult
   func refreshSessions() -> ConversationOperationResult
@@ -344,7 +416,17 @@ final class NativeChatStore: ObservableObject {
   @Published private(set) var attachments: [ComposerAttachment] = []
   @Published private(set) var attachmentError: String?
   @Published private(set) var isAcquiringAttachments = false
+  @Published private(set) var commandCatalogState = CommandCatalogState.loading
+  @Published private(set) var commandCatalog: CommandCatalog?
+  @Published private(set) var isCommandPalettePresented = false
+  @Published var commandQuery = ""
+  @Published private(set) var selectedCommandKey: CommandKey?
+  @Published private(set) var commandArgumentSession: CommandArgumentSession?
+  @Published private(set) var commandExecution: CommandExecution?
+  @Published var isModelPickerPresented = false
+  @Published private(set) var historyPresentationGeneration: UInt64 = 0
   @Published var draft = ""
+  private var commandPaletteConsumesDraft = false
 
   var workspace: String { activePresentation.workspace }
   var sessionTitle: String { activePresentation.sessionTitle }
@@ -363,6 +445,8 @@ final class NativeChatStore: ObservableObject {
   private let attachmentAcquirer: ComposerAttachmentAcquiring
   private var attachmentAcquisitionTask: Task<Void, Never>?
   private var closeCompletions: [@MainActor () -> Void] = []
+  private var pendingCommandCatalogFailure: String?
+  private var isCommandRefreshPending = false
 
   init(
     workspace: String,
@@ -387,7 +471,7 @@ final class NativeChatStore: ObservableObject {
   }
 
   var isBusy: Bool {
-    lifecycle != .idle
+    lifecycle != .idle || isCommandRefreshPending || commandExecution != nil
   }
 
   var canSubmit: Bool {
@@ -397,9 +481,47 @@ final class NativeChatStore: ObservableObject {
   }
 
   var canAcquireAttachments: Bool {
-    lifecycle == .idle && !isAcquiringAttachments
-      && modelState == .ready && sessionState == .ready
+    !isBusy && !isAcquiringAttachments && modelState == .ready && sessionState == .ready
       && activeUserInput == nil && attachments.count < composerAttachmentCountLimit
+  }
+
+  var canUseModelControls: Bool {
+    !isAcquiringAttachments && modelState == .ready && sessionState == .ready && !isBusy
+  }
+
+  var canPresentCommandPalette: Bool {
+    activeUserInput == nil && lifecycle != .closing && lifecycle != .closed
+  }
+
+  var filteredCommands: [CommandInfo] {
+    let query = commandQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+      .lowercased()
+    return (commandCatalog?.commands ?? [])
+      .filter { command in
+        query.isEmpty
+          || command.name.lowercased().contains(query)
+          || command.displayName.lowercased().contains(query)
+          || command.description.lowercased().contains(query)
+          || command.source.label.lowercased().contains(query)
+      }
+      .sorted {
+        let names = $0.displayName.localizedCaseInsensitiveCompare($1.displayName)
+        if names != .orderedSame { return names == .orderedAscending }
+        if $0.source != $1.source { return $0.source < $1.source }
+        return $0.key.slot < $1.key.slot
+      }
+  }
+
+  var commandDisabledReason: String? {
+    if isAcquiringAttachments { return "Wait for attachment selection to finish." }
+    if lifecycle == .responding { return "Wait for Vivi to finish responding." }
+    if lifecycle == .awaitingInput { return "Answer Vivi’s question first." }
+    if lifecycle == .closing || lifecycle == .closed { return "This conversation is closing." }
+    if modelState != .ready { return "Wait for model controls to finish." }
+    if sessionState != .ready { return "Wait for session history to finish." }
+    if isCommandRefreshPending { return "Wait for command discovery to finish." }
+    if commandExecution != nil { return "Wait for the current command to finish." }
+    return nil
   }
 
   var canSubmitUserInput: Bool {
@@ -559,8 +681,110 @@ final class NativeChatStore: ObservableObject {
     submitUserInput(.freeform(answer))
   }
 
+  func composerDraftChanged() {
+    guard activeUserInput == nil else { return }
+    guard draft.hasPrefix("/") else {
+      if commandPaletteConsumesDraft {
+        closeCommandPalette()
+      }
+      return
+    }
+    if !isCommandPalettePresented {
+      openCommandPalette(query: String(draft.dropFirst()), consumesDraft: true)
+    } else if commandArgumentSession == nil {
+      commandPaletteConsumesDraft = true
+      commandQuery = String(draft.dropFirst())
+      repairCommandSelection()
+    }
+  }
+
+  func toggleCommandPalette() {
+    if isCommandPalettePresented {
+      closeCommandPalette()
+    } else {
+      openCommandPalette()
+    }
+  }
+
+  func toggleModelPicker() {
+    guard canUseModelControls else { return }
+    closeCommandPalette()
+    isModelPickerPresented.toggle()
+  }
+
+  func openCommandPalette(query: String = "", consumesDraft: Bool = false) {
+    guard canPresentCommandPalette else { return }
+    isModelPickerPresented = false
+    isCommandPalettePresented = true
+    commandPaletteConsumesDraft = consumesDraft
+    commandQuery = query
+    commandArgumentSession = nil
+    repairCommandSelection()
+    if commandCatalogState != .loading {
+      refreshCommands()
+    }
+  }
+
+  func closeCommandPalette() {
+    isCommandPalettePresented = false
+    commandPaletteConsumesDraft = false
+    commandQuery = ""
+    if commandExecution == nil {
+      commandArgumentSession = nil
+    }
+  }
+
+  func retryCommands() {
+    refreshCommands()
+  }
+
+  func moveCommandSelection(_ offset: Int) {
+    let commands = filteredCommands
+    guard !commands.isEmpty else {
+      selectedCommandKey = nil
+      return
+    }
+    let current = commands.firstIndex(where: { $0.key == selectedCommandKey }) ?? 0
+    selectedCommandKey = commands[(current + offset + commands.count) % commands.count].key
+  }
+
+  func selectCommand(_ key: CommandKey) {
+    guard filteredCommands.contains(where: { $0.key == key }) else { return }
+    selectedCommandKey = key
+  }
+
+  func activateSelectedCommand() {
+    guard
+      let key = selectedCommandKey,
+      let command = filteredCommands.first(where: { $0.key == key })
+    else { return }
+    activateCommand(command)
+  }
+
+  func updateCommandArgumentDraft(_ value: String) {
+    guard var session = commandArgumentSession,
+      value.utf8.count <= Int(VIVI_BACKEND_MAX_COMMAND_ARGUMENT_BYTES)
+    else { return }
+    session.draft = value
+    commandArgumentSession = session
+  }
+
+  func submitCommandArgument() {
+    guard let session = commandArgumentSession else { return }
+    let arguments = session.draft.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard session.command.argumentPolicy != .required || !arguments.isEmpty else { return }
+    executeCommand(session.command, arguments: arguments)
+  }
+
+  func exitCommandArgumentMode() {
+    guard commandExecution == nil else { return }
+    commandArgumentSession = nil
+  }
+
   func refreshModels() {
-    guard !isAcquiringAttachments, modelState == .ready, sessionState == .ready else { return }
+    guard !isAcquiringAttachments, modelState == .ready, sessionState == .ready,
+      !isCommandRefreshPending, commandExecution == nil
+    else { return }
     let result = driver.refreshModels()
     if result == .accepted {
       modelState = .refreshing
@@ -571,7 +795,7 @@ final class NativeChatStore: ObservableObject {
 
   func refreshSessions() {
     guard !isAcquiringAttachments, lifecycle == .idle, modelState == .ready,
-      sessionState == .ready
+      sessionState == .ready, !isCommandRefreshPending, commandExecution == nil
     else { return }
     let result = driver.refreshSessions()
     if result == .accepted {
@@ -587,7 +811,7 @@ final class NativeChatStore: ObservableObject {
 
   func resumeSession(_ key: ResumeKey) {
     guard !isAcquiringAttachments, lifecycle == .idle, modelState == .ready,
-      sessionState == .ready,
+      sessionState == .ready, !isCommandRefreshPending, commandExecution == nil,
       sessionCatalog?.sessions.contains(where: { $0.key == key }) == true
     else { return }
     let result = driver.resumeSession(key)
@@ -641,6 +865,14 @@ final class NativeChatStore: ObservableObject {
     case .sessionTitle(let title):
       activePresentation = replacingActive(sessionTitle: title)
     case .assistantStarted:
+      let commandWasExecuting = commandExecution != nil
+      if commandWasExecuting {
+        closeCommandPalette()
+      }
+      commandExecution = nil
+      if commandWasExecuting {
+        commandArgumentSession = nil
+      }
       activeAssistant = nil
       activeReasoning = nil
       pendingReasoningCompletion = nil
@@ -716,6 +948,8 @@ final class NativeChatStore: ObservableObject {
       apply(result)
       sessionState = .ready
     case .userInputRequested(let request):
+      closeCommandPalette()
+      isModelPickerPresented = false
       finishStreamingRows()
       ensureResponseHeader()
       let interaction = ActiveUserInput(
@@ -724,6 +958,26 @@ final class NativeChatStore: ObservableObject {
       activeUserInput = interaction
       transcript.append(.userInput(id: UUID(), request: request, answer: nil))
       lifecycle = .awaitingInput
+    case .commandCatalog(let catalog):
+      installCommandCatalog(catalog)
+    case .commandCatalogFailure(let message):
+      pendingCommandCatalogFailure = message
+      commandCatalogState = .failed(message: message, hasFallback: commandCatalog != nil)
+    case .commandCompleted(let key, let backendMessage):
+      finishCommand(
+        key: key,
+        backendMessage: backendMessage,
+        failed: false)
+    case .commandFailed(let key, let backendMessage):
+      let stale = backendMessage.localizedCaseInsensitiveContains("stale")
+      finishCommand(
+        key: key,
+        backendMessage: backendMessage,
+        failed: true,
+        preserveArgument: stale)
+      if stale {
+        refreshCommands()
+      }
     case .idle:
       activeAssistant = nil
       activeReasoning = nil
@@ -739,6 +993,7 @@ final class NativeChatStore: ObservableObject {
       pendingReasoningCompletion = nil
       activeReasoningPrefix = ""
       activeUserInput = nil
+      clearCommandState()
       clearAttachments()
       finishClose()
     }
@@ -751,6 +1006,7 @@ final class NativeChatStore: ObservableObject {
       return
     }
     guard lifecycle != .closing else { return }
+    clearCommandState()
     clearAttachments()
     lifecycle = .closing
     driver.close { [self] in
@@ -775,7 +1031,164 @@ final class NativeChatStore: ObservableObject {
 
   private var canPublishAttachmentAcquisition: Bool {
     lifecycle == .idle && modelState == .ready && sessionState == .ready
-      && activeUserInput == nil
+      && activeUserInput == nil && commandExecution == nil
+  }
+
+  private func refreshCommands() {
+    guard lifecycle == .idle, modelState == .ready, sessionState == .ready,
+      !isCommandRefreshPending, commandExecution == nil
+    else { return }
+    let result = driver.refreshCommands()
+    if result == .accepted {
+      isCommandRefreshPending = true
+      commandCatalogState = .loading
+      pendingCommandCatalogFailure = nil
+    } else {
+      isCommandRefreshPending = false
+      commandCatalogState = .failed(
+        message: message(for: result, action: "refresh commands"),
+        hasFallback: commandCatalog != nil)
+    }
+  }
+
+  private func activateCommand(_ command: CommandInfo) {
+    guard commandDisabledReason == nil else { return }
+    switch command.action {
+    case .openModelSelection:
+      consumeCommandDraftIfNeeded()
+      closeCommandPalette()
+      isModelPickerPresented = true
+    case .openSessionHistory:
+      consumeCommandDraftIfNeeded()
+      closeCommandPalette()
+      historyPresentationGeneration &+= 1
+    case .execute:
+      if command.argumentPolicy == .none {
+        executeCommand(command, arguments: "")
+      } else {
+        consumeCommandDraftIfNeeded()
+        commandArgumentSession = CommandArgumentSession(command: command, draft: "")
+      }
+    }
+  }
+
+  private func executeCommand(_ command: CommandInfo, arguments: String) {
+    guard commandDisabledReason == nil,
+      arguments.utf8.count <= Int(VIVI_BACKEND_MAX_COMMAND_ARGUMENT_BYTES)
+    else { return }
+    let result = driver.executeCommand(command.key, arguments: arguments)
+    guard result == .accepted else {
+      if result == .rejected {
+        transcript.append(
+          .failure(
+            id: UUID(),
+            text: "\(command.displayName): Command changed. Refreshing commands."))
+        isCommandPalettePresented = true
+        refreshCommands()
+        return
+      }
+      transcript.append(
+        .failure(
+          id: UUID(),
+          text: "\(command.displayName): \(message(for: result, action: "run command"))"))
+      return
+    }
+    consumeCommandDraftIfNeeded()
+    commandExecution = CommandExecution(command: command)
+  }
+
+  private func consumeCommandDraftIfNeeded() {
+    guard commandPaletteConsumesDraft else { return }
+    draft = ""
+    commandPaletteConsumesDraft = false
+  }
+
+  private func installCommandCatalog(_ catalog: CommandCatalog) {
+    let previousSelectedName = commandCatalog?.commands.first {
+      $0.key == selectedCommandKey
+    }?.name
+    commandCatalog = catalog
+    isCommandRefreshPending = false
+    if let failure = pendingCommandCatalogFailure {
+      commandCatalogState = .failed(message: failure, hasFallback: true)
+    } else {
+      commandCatalogState = .loaded
+    }
+    pendingCommandCatalogFailure = nil
+    if var argument = commandArgumentSession {
+      if let replacement = catalog.commands.first(where: {
+        $0.name == argument.command.name && $0.action == argument.command.action
+      }), replacement.argumentPolicy != .none {
+        argument.command = replacement
+        commandArgumentSession = argument
+      } else {
+        commandArgumentSession = nil
+      }
+    }
+    if let selectedCommandKey,
+      catalog.commands.contains(where: { $0.key == selectedCommandKey })
+    {
+      return
+    }
+    selectedCommandKey =
+      previousSelectedName.flatMap { name in
+        catalog.commands.first(where: { $0.name == name })?.key
+      }
+    repairCommandSelection()
+  }
+
+  private func repairCommandSelection() {
+    let commands = filteredCommands
+    if let selectedCommandKey,
+      commands.contains(where: { $0.key == selectedCommandKey })
+    {
+      return
+    }
+    selectedCommandKey = commands.first?.key
+  }
+
+  private func finishCommand(
+    key: CommandKey,
+    backendMessage: String,
+    failed: Bool,
+    preserveArgument: Bool = false
+  ) {
+    let command =
+      commandExecution?.command
+      ?? commandArgumentSession?.command
+      ?? commandCatalog?.commands.first(where: { $0.key == key })
+    let label = command?.displayName ?? "Command"
+    let text = backendMessage.isEmpty ? label : "\(label): \(backendMessage)"
+    transcript.append(
+      failed
+        ? .failure(id: UUID(), text: text)
+        : .status(id: UUID(), text: text))
+    commandExecution = nil
+    lifecycle = .idle
+    if !preserveArgument {
+      commandArgumentSession = nil
+      closeCommandPalette()
+    } else {
+      isCommandPalettePresented = true
+    }
+  }
+
+  private func clearCommandState() {
+    commandCatalogState = .loading
+    commandCatalog = nil
+    pendingCommandCatalogFailure = nil
+    isCommandRefreshPending = false
+    clearCommandPresentation()
+  }
+
+  private func clearCommandPresentation() {
+    isCommandPalettePresented = false
+    commandPaletteConsumesDraft = false
+    commandQuery = ""
+    selectedCommandKey = nil
+    commandArgumentSession = nil
+    commandExecution = nil
+    isModelPickerPresented = false
   }
 
   private func clearAttachments() {
@@ -787,6 +1200,7 @@ final class NativeChatStore: ObservableObject {
 
   private func switchModel(_ selection: ModelSelection) {
     guard !isAcquiringAttachments, modelState == .ready, sessionState == .ready,
+      !isCommandRefreshPending, commandExecution == nil,
       selection != confirmedSelection
     else {
       return
@@ -899,6 +1313,7 @@ final class NativeChatStore: ObservableObject {
         confirmedSelection: confirmedSelection)
       sessionCatalogFailure = nil
       sessionCatalog = nil
+      clearCommandPresentation()
     }
   }
 
@@ -1181,7 +1596,8 @@ enum NativeEventDecoder {
     semanticSpans: [vivi_backend_semantic_span_t] = [],
     sessions: [vivi_backend_session_summary_t] = [],
     transcriptItems: [vivi_backend_transcript_item_t] = [],
-    userInputChoices: [vivi_backend_user_input_choice_t] = []
+    userInputChoices: [vivi_backend_user_input_choice_t] = [],
+    commands: [vivi_backend_command_t] = []
   ) throws -> ChatEvent {
     guard event.reserved == 0, event.event_reserved == 0, event.allow_freeform <= 1,
       bytes.count == Int(event.byte_count),
@@ -1189,7 +1605,8 @@ enum NativeEventDecoder {
       semanticSpans.count == Int(event.semantic_span_count),
       sessions.count == Int(event.session_count),
       transcriptItems.count == Int(event.transcript_item_count),
-      userInputChoices.count == Int(event.user_input_choice_count)
+      userInputChoices.count == Int(event.user_input_choice_count),
+      commands.count == Int(event.command_count)
     else { throw NativeEventDecodingError.malformed }
 
     func text(_ span: vivi_backend_span_t) throws -> String {
@@ -1292,6 +1709,10 @@ enum NativeEventDecoder {
       return value
     }
 
+    func canonicalEmpty(_ span: vivi_backend_span_t) -> Bool {
+      span.offset == 0 && span.length == 0
+    }
+
     func session(_ raw: vivi_backend_session_summary_t) throws -> SessionSummary {
       let knownFlags =
         UInt32(VIVI_BACKEND_SESSION_TITLE_PRESENT.rawValue)
@@ -1327,6 +1748,51 @@ enum NativeEventDecoder {
       }
     }
 
+    func userInputChoice(_ raw: vivi_backend_user_input_choice_t) throws -> String {
+      guard raw.reserved == 0 else { throw NativeEventDecodingError.malformed }
+      let value = try text(raw.text)
+      guard !value.isEmpty else { throw NativeEventDecodingError.malformed }
+      return value
+    }
+
+    func commandKey(_ raw: vivi_backend_command_key_t) throws -> CommandKey {
+      guard raw.reserved == 0, raw.generation != 0, raw.slot != 0 else {
+        throw NativeEventDecodingError.malformed
+      }
+      return CommandKey(generation: raw.generation, slot: raw.slot)
+    }
+
+    func command(_ raw: vivi_backend_command_t) throws -> CommandInfo {
+      guard raw.struct_size == MemoryLayout<vivi_backend_command_t>.size,
+        raw.reserved == 0,
+        let sourceValue = Int32(exactly: raw.source.rawValue),
+        let source = CommandSource(rawValue: sourceValue),
+        let actionValue = Int32(exactly: raw.action.rawValue),
+        let action = CommandAction(rawValue: actionValue),
+        let argumentPolicyValue = Int32(exactly: raw.argument_policy.rawValue),
+        let argumentPolicy = CommandArgumentPolicy(
+          rawValue: argumentPolicyValue)
+      else { throw NativeEventDecodingError.malformed }
+      let name = try text(raw.name)
+      let displayName = try text(raw.display_name)
+      let description = try text(raw.description)
+      guard raw.hint.length != 0 || canonicalEmpty(raw.hint) else {
+        throw NativeEventDecodingError.malformed
+      }
+      let hint = canonicalEmpty(raw.hint) ? nil : try text(raw.hint)
+      guard !name.isEmpty, !displayName.isEmpty,
+        argumentPolicy == .none ? hint == nil : true
+      else { throw NativeEventDecodingError.malformed }
+      return CommandInfo(
+        key: try commandKey(raw.key),
+        name: name,
+        displayName: displayName,
+        description: description,
+        hint: hint,
+        source: source,
+        action: action,
+        argumentPolicy: argumentPolicy)
+    }
     func presentation(
       _ raw: vivi_backend_presentation_t,
       required: Bool
@@ -1364,13 +1830,15 @@ enum NativeEventDecoder {
         return .markdown(value)
       case VIVI_BACKEND_PRESENTATION_SOURCE:
         guard
-          let language = PresentationLanguage(rawValue: Int32(raw.language.rawValue))
+          let languageValue = Int32(exactly: raw.language.rawValue),
+          let language = PresentationLanguage(rawValue: languageValue)
         else { throw NativeEventDecodingError.malformed }
         var decoded: [SemanticSpan] = []
         var previousEnd = contentStart
         for item in semanticSpans[spanStart..<(spanStart + spanCount)] {
           guard item.reserved == 0,
-            let token = SemanticToken(rawValue: Int32(item.token.rawValue))
+            let tokenValue = Int32(exactly: item.token.rawValue),
+            let token = SemanticToken(rawValue: tokenValue)
           else { throw NativeEventDecodingError.malformed }
           let start = Int(item.bytes.offset)
           let length = Int(item.bytes.length)
@@ -1406,7 +1874,17 @@ enum NativeEventDecoder {
     let isUserInputPayload = event.kind == VIVI_BACKEND_EVENT_USER_INPUT_REQUEST
     if !isUserInputPayload {
       guard userInputChoices.isEmpty, event.allow_freeform == 0,
-        zero(event.user_input_request_id), zero(event.user_input_question)
+        canonicalEmpty(event.user_input_request_id),
+        canonicalEmpty(event.user_input_question)
+      else { throw NativeEventDecodingError.malformed }
+    }
+    let isCommandPayload =
+      event.kind == VIVI_BACKEND_EVENT_COMMAND_CATALOG
+      || event.kind == VIVI_BACKEND_EVENT_COMMAND_COMPLETED
+      || event.kind == VIVI_BACKEND_EVENT_COMMAND_FAILED
+    if !isCommandPayload {
+      guard commands.isEmpty, event.command_key.generation == 0,
+        event.command_key.slot == 0, event.command_key.reserved == 0
       else { throw NativeEventDecodingError.malformed }
     }
     func content() throws -> String {
@@ -1419,11 +1897,11 @@ enum NativeEventDecoder {
       event.tool_output_presentation,
       required: event.kind == VIVI_BACKEND_EVENT_TOOL_FINISHED)
     let hasNeutralConversationMetadata =
-      zero(event.selected_model_id)
-      && zero(event.tool_call_id)
-      && zero(event.tool_title)
-      && zero(event.tool_detail)
-      && zero(event.tool_input)
+      canonicalEmpty(event.selected_model_id)
+      && canonicalEmpty(event.tool_call_id)
+      && canonicalEmpty(event.tool_title)
+      && canonicalEmpty(event.tool_detail)
+      && canonicalEmpty(event.tool_input)
       && event.tool_result == VIVI_BACKEND_TOOL_RESULT_NONE
       && event.selected_reasoning == VIVI_BACKEND_REASONING_NONE
       && event.switch_outcome == VIVI_BACKEND_MODEL_SWITCH_NONE
@@ -1630,6 +2108,49 @@ enum NativeEventDecoder {
           question: question,
           choices: choices,
           allowsFreeform: allowsFreeform))
+    case VIVI_BACKEND_EVENT_COMMAND_CATALOG:
+      guard event.content_kind == VIVI_BACKEND_CONTENT_COMMAND_CATALOG,
+        models.isEmpty, semanticSpans.isEmpty, sessions.isEmpty,
+        transcriptItems.isEmpty, userInputChoices.isEmpty,
+        event.default_saved == 0, event.cleanup_failed == 0,
+        event.allow_freeform == 0,
+        zero(event.content), event.command_key.generation == 0,
+        event.command_key.slot == 0, event.command_key.reserved == 0,
+        hasNeutralConversationMetadata
+      else { throw NativeEventDecodingError.malformed }
+      let decoded = try commands.map(command)
+      guard Set(decoded.map(\.key)).count == decoded.count,
+        Set(decoded.map(\.name)).count == decoded.count
+      else { throw NativeEventDecodingError.malformed }
+      if let generation = decoded.first?.key.generation {
+        guard decoded.allSatisfy({ $0.key.generation == generation }) else {
+          throw NativeEventDecodingError.malformed
+        }
+      }
+      return .commandCatalog(CommandCatalog(commands: decoded))
+    case VIVI_BACKEND_EVENT_COMMAND_CATALOG_FAILURE:
+      guard event.content_kind == VIVI_BACKEND_CONTENT_TEXT,
+        commands.isEmpty, models.isEmpty, semanticSpans.isEmpty,
+        sessions.isEmpty, transcriptItems.isEmpty, userInputChoices.isEmpty,
+        event.default_saved == 0, event.cleanup_failed == 0,
+        event.command_key.generation == 0, event.command_key.slot == 0,
+        event.command_key.reserved == 0, hasNeutralConversationMetadata
+      else { throw NativeEventDecodingError.malformed }
+      let message = try content()
+      guard !message.isEmpty else { throw NativeEventDecodingError.malformed }
+      return .commandCatalogFailure(message)
+    case VIVI_BACKEND_EVENT_COMMAND_COMPLETED, VIVI_BACKEND_EVENT_COMMAND_FAILED:
+      guard event.content_kind == VIVI_BACKEND_CONTENT_COMMAND_EXECUTION,
+        commands.isEmpty, models.isEmpty, semanticSpans.isEmpty,
+        sessions.isEmpty, transcriptItems.isEmpty, userInputChoices.isEmpty,
+        event.default_saved == 0, event.cleanup_failed == 0,
+        hasNeutralConversationMetadata
+      else { throw NativeEventDecodingError.malformed }
+      let key = try commandKey(event.command_key)
+      let message = try content()
+      return event.kind == VIVI_BACKEND_EVENT_COMMAND_COMPLETED
+        ? .commandCompleted(key: key, message: message)
+        : .commandFailed(key: key, message: message)
     case VIVI_BACKEND_EVENT_IDLE: return .idle
     case VIVI_BACKEND_EVENT_FAILURE: return .failure(try content())
     case VIVI_BACKEND_EVENT_CLOSED: return .closed
@@ -1723,13 +2244,15 @@ func nativeCodePresentation(language: String, source: String) throws -> ToolPres
     return .literal(text)
   }
   guard descriptor.kind == VIVI_BACKEND_PRESENTATION_SOURCE,
-    let decodedLanguage = PresentationLanguage(rawValue: Int32(descriptor.language.rawValue))
+    let languageValue = Int32(exactly: descriptor.language.rawValue),
+    let decodedLanguage = PresentationLanguage(rawValue: languageValue)
   else { throw NativeEventDecodingError.malformed }
   var decodedSpans: [SemanticSpan] = []
   var previousEnd = 0
   for span in spans {
     guard span.reserved == 0,
-      let token = SemanticToken(rawValue: Int32(span.token.rawValue))
+      let tokenValue = Int32(exactly: span.token.rawValue),
+      let token = SemanticToken(rawValue: tokenValue)
     else { throw NativeEventDecodingError.malformed }
     let start = Int(span.bytes.offset)
     let length = Int(span.bytes.length)
@@ -1877,6 +2400,35 @@ final class ViviConversationDriver: ViviConversationDriving, @unchecked Sendable
     }
   }
 
+  func refreshCommands() -> ConversationOperationResult {
+    queue.sync {
+      guard let handle else { return .closed }
+      return Self.operationResult(vivi_backend_refresh_commands(handle))
+    }
+  }
+
+  func executeCommand(_ key: CommandKey, arguments: String) -> ConversationOperationResult {
+    let bytes = Array(arguments.utf8)
+    guard bytes.count <= Int(VIVI_BACKEND_MAX_COMMAND_ARGUMENT_BYTES) else {
+      return .rejected
+    }
+    return queue.sync {
+      guard let handle else { return .closed }
+      var execution = vivi_backend_command_execution_t()
+      execution.struct_size = UInt32(MemoryLayout<vivi_backend_command_execution_t>.size)
+      execution.key = vivi_backend_command_key_t(
+        generation: key.generation,
+        slot: key.slot,
+        reserved: 0)
+      execution.argument_length = UInt32(bytes.count)
+      return bytes.withUnsafeBufferPointer { buffer in
+        execution.arguments = buffer.baseAddress
+        return Self.commandOperationResult(
+          vivi_backend_execute_command(handle, &execution))
+      }
+    }
+  }
+
   func refreshModels() -> ConversationOperationResult {
     queue.sync {
       guard let handle else { return .closed }
@@ -2012,7 +2564,7 @@ final class ViviConversationDriver: ViviConversationDriving, @unchecked Sendable
     while true {
       var event = vivi_backend_event_t()
       let result = vivi_backend_next_event(
-        handle, &event, nil, 0, nil, 0, nil, 0, nil, 0, nil, 0, nil, 0)
+        handle, &event, nil, 0, nil, 0, nil, 0, nil, 0, nil, 0, nil, 0, nil, 0)
       if result == VIVI_BACKEND_NO_EVENT {
         deliver(events)
         return
@@ -2035,6 +2587,9 @@ final class ViviConversationDriver: ViviConversationDriving, @unchecked Sendable
       var userInputChoices = Array(
         repeating: vivi_backend_user_input_choice_t(),
         count: Int(event.user_input_choice_count))
+      var commands = Array(
+        repeating: vivi_backend_command_t(),
+        count: Int(event.command_count))
       if result == VIVI_BACKEND_BUFFER_TOO_SMALL {
         let copied = bytes.withUnsafeMutableBufferPointer { byteBuffer in
           models.withUnsafeMutableBufferPointer { modelBuffer in
@@ -2042,21 +2597,25 @@ final class ViviConversationDriver: ViviConversationDriving, @unchecked Sendable
               sessions.withUnsafeMutableBufferPointer { sessionBuffer in
                 transcriptItems.withUnsafeMutableBufferPointer { transcriptBuffer in
                   userInputChoices.withUnsafeMutableBufferPointer { choiceBuffer in
-                    vivi_backend_next_event(
-                      handle,
-                      &event,
-                      byteBuffer.baseAddress,
-                      UInt32(byteBuffer.count),
-                      modelBuffer.baseAddress,
-                      UInt32(modelBuffer.count),
-                      spanBuffer.baseAddress,
-                      UInt32(spanBuffer.count),
-                      sessionBuffer.baseAddress,
-                      UInt32(sessionBuffer.count),
-                      transcriptBuffer.baseAddress,
-                      UInt32(transcriptBuffer.count),
-                      choiceBuffer.baseAddress,
-                      UInt32(choiceBuffer.count))
+                    commands.withUnsafeMutableBufferPointer { commandBuffer in
+                      vivi_backend_next_event(
+                        handle,
+                        &event,
+                        byteBuffer.baseAddress,
+                        UInt32(byteBuffer.count),
+                        modelBuffer.baseAddress,
+                        UInt32(modelBuffer.count),
+                        spanBuffer.baseAddress,
+                        UInt32(spanBuffer.count),
+                        sessionBuffer.baseAddress,
+                        UInt32(sessionBuffer.count),
+                        transcriptBuffer.baseAddress,
+                        UInt32(transcriptBuffer.count),
+                        choiceBuffer.baseAddress,
+                        UInt32(choiceBuffer.count),
+                        commandBuffer.baseAddress,
+                        UInt32(commandBuffer.count))
+                    }
                   }
                 }
               }
@@ -2076,7 +2635,8 @@ final class ViviConversationDriver: ViviConversationDriving, @unchecked Sendable
           semanticSpans: semanticSpans,
           sessions: sessions,
           transcriptItems: transcriptItems,
-          userInputChoices: userInputChoices)
+          userInputChoices: userInputChoices,
+          commands: commands)
         events.append(decoded)
         if decoded == .closed {
           destroyLocked(handle, requestClose: false)
@@ -2134,6 +2694,15 @@ final class ViviConversationDriver: ViviConversationDriving, @unchecked Sendable
   }
 
   static func userInputOperationResult(
+    _ result: vivi_backend_result_t
+  ) -> ConversationOperationResult {
+    if result == VIVI_BACKEND_INVALID_ARGUMENT {
+      return .rejected
+    }
+    return operationResult(result)
+  }
+
+  static func commandOperationResult(
     _ result: vivi_backend_result_t
   ) -> ConversationOperationResult {
     if result == VIVI_BACKEND_INVALID_ARGUMENT {

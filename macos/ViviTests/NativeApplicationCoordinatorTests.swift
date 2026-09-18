@@ -61,15 +61,16 @@ final class NativeApplicationCoordinatorTests: XCTestCase {
 
     harness.coordinator.requestNewConversation()
     XCTAssertEqual(harness.coordinator.presentation.workspaceChoice, .choosing)
-    XCTAssertEqual(harness.choosers.count, 1)
-    await Task.yield()
-    harness.choosers[0].finish(workspace)
-    await Task.yield()
+    await waitUntil { harness.choosers.count == 1 }
+    guard let firstChooser = harness.choosers.first else { return }
+    firstChooser.finish(workspace)
+    await waitUntil { harness.coordinator.conversations.records.count == 1 }
 
     harness.coordinator.requestNewConversation()
-    await Task.yield()
-    harness.choosers[1].finish(workspace)
-    await Task.yield()
+    await waitUntil { harness.choosers.count == 2 }
+    guard let secondChooser = harness.choosers.last else { return }
+    secondChooser.finish(workspace)
+    await waitUntil { harness.coordinator.conversations.records.count == 2 }
 
     XCTAssertEqual(harness.coordinator.conversations.records.count, 2)
     XCTAssertEqual(Set(harness.coordinator.conversations.records.map(\.id)).count, 2)
@@ -92,9 +93,10 @@ final class NativeApplicationCoordinatorTests: XCTestCase {
 
     harness.coordinator.open([URL(string: "vivi://chat?workspace=/tmp/from-url")!])
     harness.coordinator.requestNewConversation()
-    await Task.yield()
-    harness.choosers[0].finish(chosenWorkspace)
-    await Task.yield()
+    await waitUntil { harness.choosers.count == 1 }
+    guard let chooser = harness.choosers.first else { return }
+    chooser.finish(chosenWorkspace)
+    await waitUntil { harness.creationRequests.count == 2 }
 
     XCTAssertEqual(
       harness.creationRequests.map(\.workspace.canonicalPath),
@@ -147,10 +149,15 @@ final class NativeApplicationCoordinatorTests: XCTestCase {
     ]
 
     for invalidChoice in invalidChoices {
+      let chooserCount = harness.choosers.count + 1
       harness.coordinator.requestNewConversation()
-      await Task.yield()
-      harness.choosers.last?.finish(invalidChoice)
-      await Task.yield()
+      await waitUntil { harness.choosers.count == chooserCount }
+      guard let chooser = harness.choosers.last else { return }
+      chooser.finish(invalidChoice)
+      await waitUntil {
+        harness.coordinator.presentation.workspaceChoice
+          == .failure("Choose an existing folder with an absolute path.")
+      }
 
       XCTAssertEqual(
         harness.coordinator.presentation.workspaceChoice,
@@ -158,6 +165,20 @@ final class NativeApplicationCoordinatorTests: XCTestCase {
       XCTAssertTrue(harness.coordinator.conversations.records.isEmpty)
       harness.coordinator.dismissWorkspaceChoiceFailure()
     }
+  }
+
+  private func waitUntil(
+    _ condition: @escaping @MainActor () -> Bool,
+    file: StaticString = #filePath,
+    line: UInt = #line
+  ) async {
+    for _ in 0..<100 {
+      if condition() {
+        return
+      }
+      await Task.yield()
+    }
+    XCTFail("Timed out waiting for coordinator state", file: file, line: line)
   }
 
   func testWorkspaceChoiceIsSingleFlight() {
@@ -456,6 +477,14 @@ final class ControllableConversationDriver: ViviConversationDriving {
     _ prompt: String,
     attachments: [ComposerAttachment]
   ) -> ConversationOperationResult {
+    .accepted
+  }
+
+  func refreshCommands() -> ConversationOperationResult {
+    .accepted
+  }
+
+  func executeCommand(_ key: CommandKey, arguments: String) -> ConversationOperationResult {
     .accepted
   }
 

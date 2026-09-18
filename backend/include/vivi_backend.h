@@ -7,12 +7,13 @@
 extern "C" {
 #endif
 
-#define VIVI_BACKEND_ABI_VERSION 10
+#define VIVI_BACKEND_ABI_VERSION 11
 #define VIVI_BACKEND_SESSION_TITLE_MAX_CHARACTERS 80
 #define VIVI_BACKEND_ATTACHMENT_MAX_COUNT 32
 #define VIVI_BACKEND_ATTACHMENT_MAX_BYTES 20971520
 #define VIVI_BACKEND_ATTACHMENT_IDENTITY_MAX_BYTES 256
 #define VIVI_BACKEND_ATTACHMENT_DISPLAY_NAME_MAX_BYTES 1024
+#define VIVI_BACKEND_MAX_COMMAND_ARGUMENT_BYTES 65536u
 
 typedef enum vivi_backend_result {
     VIVI_BACKEND_OK = 0,
@@ -108,6 +109,10 @@ typedef enum vivi_backend_event_kind {
     VIVI_BACKEND_EVENT_SESSION_CATALOG_FAILURE = 18,
     VIVI_BACKEND_EVENT_SESSION_RESUME = 19,
     VIVI_BACKEND_EVENT_USER_INPUT_REQUEST = 20,
+    VIVI_BACKEND_EVENT_COMMAND_CATALOG = 21,
+    VIVI_BACKEND_EVENT_COMMAND_CATALOG_FAILURE = 22,
+    VIVI_BACKEND_EVENT_COMMAND_COMPLETED = 23,
+    VIVI_BACKEND_EVENT_COMMAND_FAILED = 24,
 } vivi_backend_event_kind_t;
 
 typedef enum vivi_backend_content_kind {
@@ -119,6 +124,8 @@ typedef enum vivi_backend_content_kind {
     VIVI_BACKEND_CONTENT_SESSION_CATALOG = 5,
     VIVI_BACKEND_CONTENT_SESSION_RESUME = 6,
     VIVI_BACKEND_CONTENT_USER_INPUT_REQUEST = 7,
+    VIVI_BACKEND_CONTENT_COMMAND_CATALOG = 8,
+    VIVI_BACKEND_CONTENT_COMMAND_EXECUTION = 9,
 } vivi_backend_content_kind_t;
 
 typedef enum vivi_backend_tool_result {
@@ -224,6 +231,51 @@ typedef struct vivi_backend_model {
     uint8_t reserved;
 } vivi_backend_model_t;
 
+typedef struct vivi_backend_command_key {
+    uint64_t generation;
+    uint32_t slot;
+    uint32_t reserved;
+} vivi_backend_command_key_t;
+
+typedef enum vivi_backend_command_source {
+    VIVI_BACKEND_COMMAND_SOURCE_VIVI = 1,
+    VIVI_BACKEND_COMMAND_SOURCE_SDK_BUILTIN = 2,
+    VIVI_BACKEND_COMMAND_SOURCE_EXTENSION = 3,
+} vivi_backend_command_source_t;
+
+typedef enum vivi_backend_command_action {
+    VIVI_BACKEND_COMMAND_ACTION_EXECUTE = 1,
+    VIVI_BACKEND_COMMAND_ACTION_OPEN_MODEL_SELECTION = 2,
+    VIVI_BACKEND_COMMAND_ACTION_OPEN_SESSION_HISTORY = 3,
+} vivi_backend_command_action_t;
+
+typedef enum vivi_backend_command_argument_policy {
+    VIVI_BACKEND_COMMAND_ARGUMENT_NONE = 1,
+    VIVI_BACKEND_COMMAND_ARGUMENT_OPTIONAL = 2,
+    VIVI_BACKEND_COMMAND_ARGUMENT_REQUIRED = 3,
+} vivi_backend_command_argument_policy_t;
+
+typedef struct vivi_backend_command {
+    uint32_t struct_size;
+    vivi_backend_command_key_t key;
+    vivi_backend_span_t name;
+    vivi_backend_span_t display_name;
+    vivi_backend_span_t description;
+    vivi_backend_span_t hint;
+    vivi_backend_command_source_t source;
+    vivi_backend_command_action_t action;
+    vivi_backend_command_argument_policy_t argument_policy;
+    uint32_t reserved;
+} vivi_backend_command_t;
+
+typedef struct vivi_backend_command_execution {
+    uint32_t struct_size;
+    uint32_t reserved;
+    vivi_backend_command_key_t key;
+    const uint8_t *arguments;
+    uint32_t argument_length;
+    uint32_t reserved2;
+} vivi_backend_command_execution_t;
 typedef enum vivi_backend_session_resume_outcome {
     VIVI_BACKEND_SESSION_RESUME_NONE = 0,
     VIVI_BACKEND_SESSION_RESUME_RESUMED = 1,
@@ -311,15 +363,22 @@ typedef struct vivi_backend_event {
     uint8_t allow_freeform;
     uint8_t event_reserved;
     uint16_t reserved;
+    uint32_t command_count;
+    vivi_backend_command_key_t command_key;
 } vivi_backend_event_t;
 
-/* Open and submit copy their input bytes before returning. */
+/* Open, submit, and execute_command copy their input bytes before returning. */
 vivi_backend_result_t vivi_backend_open(
     const vivi_backend_conversation_options_t *options,
     vivi_backend_conversation_t **out_conversation);
 vivi_backend_result_t vivi_backend_submit(
     vivi_backend_conversation_t *conversation,
     const vivi_backend_submission_t *submission);
+vivi_backend_result_t vivi_backend_refresh_commands(
+    vivi_backend_conversation_t *conversation);
+vivi_backend_result_t vivi_backend_execute_command(
+    vivi_backend_conversation_t *conversation,
+    const vivi_backend_command_execution_t *execution);
 vivi_backend_result_t vivi_backend_refresh_models(
     vivi_backend_conversation_t *conversation);
 vivi_backend_result_t vivi_backend_switch_model(
@@ -379,7 +438,9 @@ vivi_backend_result_t vivi_backend_next_event(
     vivi_backend_transcript_item_t *transcript_items,
     uint32_t transcript_item_capacity,
     vivi_backend_user_input_choice_t *user_input_choices,
-    uint32_t user_input_choice_capacity);
+    uint32_t user_input_choice_capacity,
+    vivi_backend_command_t *commands,
+    uint32_t command_capacity);
 vivi_backend_result_t vivi_backend_close(
     vivi_backend_conversation_t *conversation);
 /*

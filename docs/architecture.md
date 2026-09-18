@@ -106,7 +106,7 @@ image store outlives the conversation worker and removes only the temporary
 files it created after that worker stops. Saved ask-user drafts retain their
 visible image paths.
 
-The same typed attachment input crosses C ABI v10 as caller-owned identity,
+The same typed attachment input crosses C ABI v11 as caller-owned identity,
 display-name, media-type, and raw-byte fields. AppKit owns file-panel and
 pasteboard acquisition, while `NativeChatStore` owns one conversation's
 immutable composer snapshots and removal state. The coordinator and session
@@ -114,6 +114,16 @@ history do not know about attachments. Only `root.zig` maps accepted snapshots
 into typed `session.send` blob attachments through
 `MessageOptions.message_attachments`; base64 and SDK details stay out of the
 domain and C boundary.
+
+Command discovery and execution use the same boundary. Zig assigns each
+catalog entry a generation-and-slot key plus typed source, action, and argument
+policy. C ABI v11 transfers catalog descriptors and strings through atomic
+caller-owned probe/retry buffers, and accepts only the issued key with bounded
+UTF-8 argument bytes for execution. `NativeChatStore` owns the selected
+conversation's catalog, palette, and execution state; Swift never reconstructs
+extension identity or dispatches from display names. Model and resume actions
+route to their existing native controls while SDK execution remains in
+`root.zig`.
 On Windows, Vivi drives the libvaxis terminal parser and existing event queue
 directly to preserve paste-boundary events omitted by the pinned library's
 Windows loop adapter. All other events still use libvaxis's generic forwarding;
@@ -214,14 +224,16 @@ Vivi also passes the detected vision capability through
 Unknown BYOK model names otherwise default to no vision in Copilot, which
 removes image content before it reaches OMLX.
 
-The SDK's generic `Client.callRpc` adapts `session.commands.list` into the
-SDK-free command catalog owned by
-`backend/src/conversation.zig`. It refreshes that catalog after session
-creation, after session replacement, when an unknown SDK event identifies
-`commands.changed`, and whenever the terminal opens `/`. The explicit open-time refresh is
-required because the single SDK-owning worker waits on Vivi's command mailbox
-while idle and cannot concurrently wait for SDK events from late-registering
-extensions.
+The existing SDK client's generic `Client.callRpc` adapts
+`session.commands.list` for the current session into the SDK-free command
+catalog owned by `backend/src/conversation.zig`. Command execution uses that
+same client and current session through `session.commands.invoke`; no
+command-specific client, home, or configuration path exists. The worker
+refreshes the catalog after session creation and replacement, model switching,
+resume, `commands.changed`, and whenever a host explicitly requests a refresh.
+The explicit refresh is required because the single SDK-owning worker waits on
+Vivi's command mailbox while idle and cannot concurrently wait for SDK events
+from late-registering extensions.
 
 `cli/src/chat.zig` owns the generic slash menu, filtering, selection,
 navigation, viewport, and responsive layout. `TextInput` remains the sole
