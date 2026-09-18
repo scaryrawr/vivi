@@ -11,3 +11,10 @@ DerivedData/
 
 *.result
 *.xcresult
+
+web/node_modules/
+web/dist/
+web/storybook-static/
+web/test-results/
+web/playwright-report/
+web/blob-report/
