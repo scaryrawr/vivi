@@ -91,14 +91,13 @@ Windows loop adapter. All other events still use libvaxis's generic forwarding;
 input failures are delivered to the app for normal terminal cleanup.
 
 The initial coding-agent policy is private to `backend/src/root.zig`. Hosted
-Copilot sessions enable the SDK's curated session-isolated built-ins for
-planning and subagent coordination. OMLX sessions omit the entire task and
-agent-orchestration built-in family because Vivi owns one local model at a
-time, retaining only `ask_user` and `skill`. Built-in MCP servers and ambient
-workspace configuration discovery remain disabled for both. Vivi explicitly
-supplies the workspace root for instructions and `.github/skills`,
-`.agents/skills`, and `.claude/skills` for skills. The SDK provides its typed `ask_user` callback; the session registers exactly
-four Vivi-owned tools: `read`, `bash`, `edit`, and `write`. The `bash` tool
+Copilot and OMLX sessions retain only the `ask_user` and `skill` built-ins
+plus `web_fetch`, alongside custom tools and tools from configured MCP servers.
+The built-in GitHub MCP server exposes only `web_search`; its other tools remain
+disabled. Ambient workspace configuration discovery admits workspace MCP
+configuration and project skill directories. The SDK provides its typed
+`ask_user` callback; the session registers exactly four Vivi-owned tools:
+`read`, `bash`, `edit`, and `write`. The `bash` tool
 dispatches synchronous `run` plus persistent PTY `start`, `list`, `read`,
 `write`, and `stop` actions. Vivi appends its concise workspace-aware prompt to
 Copilot's system message. Provider-specific
@@ -276,10 +275,10 @@ unchanged until a native caller defines its callback and ownership contract.
 The minimal agent configuration stays private to the SDK-owning root module
 rather than becoming caller-supplied conversation options. This keeps tool
 availability and prompt policy consistent across every host. The session-level
-allowlist is authoritative for model-visible capabilities, while the process
-flag prevents built-in MCP servers from starting. The SDK declarations use the
-same four descriptors that drive the SDK-free dispatcher, and permission
-requests remain fail-closed because Vivi has no approval UI yet.
+allowlist is authoritative for model-visible capabilities, and the GitHub MCP
+configuration narrows its built-in server to `web_search`. The SDK declarations
+use the same four descriptors that drive the SDK-free dispatcher, and
+permission requests remain fail-closed because Vivi has no approval UI yet.
 
 ## Tradeoffs accepted
 
@@ -298,8 +297,9 @@ requests remain fail-closed because Vivi has no approval UI yet.
   the backend worker and terminal thread.
 - We accept cooperative cancellation in exchange for never calling the
   single-threaded SDK concurrently.
-- We accept a CLI launch flag alongside SDK session configuration because
-  built-in MCP startup remains a process-level concern.
+- We accept starting the built-in GitHub MCP server in exchange for its
+  `web_search` tool, while using the SDK's explicit tool selection to exclude
+  its other tools.
 - We accept unbounded in-memory tool results in exchange for leaving
   truncation and large-result transport to Copilot.
 - We accept synchronous tool execution on the SDK worker in exchange for one

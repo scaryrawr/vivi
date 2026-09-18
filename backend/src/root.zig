@@ -233,16 +233,15 @@ test "conversation contexts retain their explicit working directories" {
 }
 
 const MinimalCodingAgent = struct {
-    const direct_cli_args = [_][]const u8{"--disable-builtin-mcps"};
-    const path_lookup_cli_args = [_][]const u8{
-        "copilot",
-        "--disable-builtin-mcps",
-    };
+    const direct_cli_args = [_][]const u8{};
+    const path_lookup_cli_args = [_][]const u8{"copilot"};
 
     const available_tools = [_][]const u8{
         "custom:*",
+        "mcp:*",
         "builtin:ask_user",
         "builtin:skill",
+        "builtin:web_fetch",
     };
 
     const system_prompt =
@@ -299,10 +298,13 @@ const MinimalCodingAgent = struct {
                 .max_output_tokens = selected.max_output_tokens,
             } else null,
             .working_directory = working_directory,
-            .enable_config_discovery = false,
+            .enable_config_discovery = true,
             .enable_skills = true,
             .skip_custom_instructions = false,
             .enable_on_demand_instruction_discovery = true,
+            .github_mcp_tool_config = .{
+                .additional_tools = &.{"web_search"},
+            },
             .streaming = true,
             .tools = &sdk_tools,
             .available_tools = &available_tools,
@@ -3738,7 +3740,7 @@ test "Copilot SDK exposes typed local provider configuration" {
 test "minimal coding agent limits hosted tools to simplified subset" {
     try std.testing.expectEqualSlices(
         []const u8,
-        &.{"--disable-builtin-mcps"},
+        &.{},
         &MinimalCodingAgent.direct_cli_args,
     );
 
@@ -3757,8 +3759,10 @@ test "minimal coding agent limits hosted tools to simplified subset" {
         []const u8,
         &.{
             "custom:*",
+            "mcp:*",
             "builtin:ask_user",
             "builtin:skill",
+            "builtin:web_fetch",
         },
         MinimalCodingAgent.sessionConfig(
             "minimal system prompt",
@@ -3778,7 +3782,7 @@ test "native launch uses the host-resolved Copilot path" {
     try std.testing.expectEqualStrings("/opt/homebrew/bin/copilot", options.cli_path);
     try std.testing.expectEqualSlices(
         []const u8,
-        &.{"--disable-builtin-mcps"},
+        &.{},
         options.cli_args,
     );
 }
@@ -3798,7 +3802,7 @@ test "terminal launch preserves SDK default command" {
     try std.testing.expectEqualStrings("copilot", command.executable);
     try std.testing.expectEqualSlices(
         []const u8,
-        &.{"--disable-builtin-mcps"},
+        &.{},
         command.args,
     );
 }
@@ -3823,8 +3827,10 @@ test "minimal coding agent limits local tools to simplified subset" {
         []const u8,
         &.{
             "custom:*",
+            "mcp:*",
             "builtin:ask_user",
             "builtin:skill",
+            "builtin:web_fetch",
         },
         config.available_tools.?,
     );
@@ -3861,7 +3867,7 @@ test "minimal coding agent appends Vivi tools to discovered instructions" {
         "/workspace",
         config.working_directory.?,
     );
-    try std.testing.expectEqual(false, config.enable_config_discovery.?);
+    try std.testing.expectEqual(true, config.enable_config_discovery.?);
     try std.testing.expectEqual(true, config.enable_skills.?);
     try std.testing.expect(config.skill_directories == null);
     try std.testing.expect(config.instruction_directories == null);
@@ -3869,6 +3875,11 @@ test "minimal coding agent appends Vivi tools to discovered instructions" {
     try std.testing.expectEqual(
         true,
         config.enable_on_demand_instruction_discovery.?,
+    );
+    try std.testing.expectEqual(@as(usize, 1), config.github_mcp_tool_config.?.additional_tools.?.len);
+    try std.testing.expectEqualStrings(
+        "web_search",
+        config.github_mcp_tool_config.?.additional_tools.?[0],
     );
     try std.testing.expectEqual(
         copilot.SystemMessageMode.append,

@@ -38,16 +38,13 @@ to `zig build` or `./scripts/check-zig.sh`; both run the same tests and checks.
 
 `vivi chat` opens a full-screen Vivi chat with a scrolling transcript,
 workspace context, and a compact bottom composer. It streams responses as they
-arrive and restores the composer after each completed turn. Hosted Copilot
-sessions enable reviewed session-isolated built-ins for planning and subagent
-coordination. OMLX sessions omit the entire task and agent-orchestration
-built-in family because Vivi runs one local model at a time; only `ask_user`
-and `skill` remain alongside custom tools. Both keep built-in MCP servers
-disabled. Vivi scopes workspace customization to instruction files and the
-supported project skill directories; it does not enable ambient workspace
-configuration discovery. Copilot loads the workspace's instruction files,
-including top-level `AGENTS.md`, and discovers project skills from
-`.github/skills/`, `.agents/skills/`, and `.claude/skills/`. Skills marked
+arrive and restores the composer after each completed turn. Hosted Copilot and
+OMLX sessions retain the `ask_user`, `skill`, and `web_fetch` built-ins
+alongside custom tools and tools from configured MCP servers. The built-in
+GitHub MCP server exposes only `web_search`; its other tools remain disabled.
+Vivi enables ambient workspace configuration discovery, including workspace
+MCP configuration and project skill directories. Copilot also loads the
+workspace's instruction files, including top-level `AGENTS.md`. Skills marked
 `user-invocable: true` appear in the `/` menu and run through Copilot's skill
 prompt when selected. The SDK supplies `ask_user`, while Vivi supplies exactly
 four custom tools: `read`, `bash`, `edit`, and `write`. Bash action `run` is the
