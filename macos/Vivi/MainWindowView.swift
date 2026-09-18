@@ -85,9 +85,9 @@ func resolvedSidebarSelection(
   savedSelection: SidebarSelection?,
   visibleSavedSessionSelections: Set<SidebarSelection>
 ) -> SidebarSelection? {
-  if case .savedSession(let conversationID, _) = savedSelection,
+  if case .savedSession(let conversationID, let key) = savedSelection,
     selectedConversationID == conversationID,
-    visibleSavedSessionSelections.contains(savedSelection)
+    visibleSavedSessionSelections.contains(.savedSession(conversationID, key))
   {
     return savedSelection
   }
