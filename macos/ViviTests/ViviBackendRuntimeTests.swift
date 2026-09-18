@@ -1331,6 +1331,49 @@ final class ViviBackendRuntimeTests: XCTestCase {
     observation.cancel()
   }
 
+  func testSuccessfulResumePreservesReasoningSegmentsAcrossPersistedToolBoundary() {
+    let driver = FakeConversationDriver()
+    let store = NativeChatStore(workspace: "/work/current", driver: driver)
+    let catalog = swiftSessionCatalog()
+    store.reduce(.ready)
+    store.reduce(.modelCatalog(testCatalog()))
+    store.refreshSessions()
+    store.reduce(.sessionCatalog(catalog))
+    let key = catalog.sessions[0].key
+
+    store.resumeSession(key)
+    store.reduce(
+      .sessionResume(
+        .resumed(
+          ResumedSession(
+            summary: SessionSummary(
+              key: key,
+              workingDirectory: "/work/resumed",
+              title: "Resumed title",
+              isCurrent: false),
+            transcript: [
+              .user("question"),
+              .reasoning("before tool"),
+              .assistant(""),
+              .reasoning("after tool"),
+              .assistant("answer"),
+            ],
+            cleanupFailed: false))))
+
+    XCTAssertEqual(
+      store.transcript.map(\.text),
+      ["question", "before tool", "", "after tool", "answer"])
+    guard case .user = store.transcript[0],
+      case .reasoning = store.transcript[1],
+      case .assistant = store.transcript[2],
+      case .reasoning = store.transcript[3],
+      case .assistant = store.transcript[4]
+    else {
+      return XCTFail(
+        "Expected persisted reasoning segments to remain distinct around the tool boundary")
+    }
+  }
+
   func testSubmitIsBlockedDuringModelOperation() {
     let driver = FakeConversationDriver()
     let store = NativeChatStore(workspace: "/tmp/work", driver: driver)
