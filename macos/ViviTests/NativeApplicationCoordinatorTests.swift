@@ -366,6 +366,14 @@ final class ControllableConversationDriver: ViviConversationDriving {
     .accepted
   }
 
+  func refreshCommands() -> ConversationOperationResult {
+    .accepted
+  }
+
+  func executeCommand(_ key: CommandKey, arguments: String) -> ConversationOperationResult {
+    .accepted
+  }
+
   func refreshModels() -> ConversationOperationResult {
     .accepted
   }

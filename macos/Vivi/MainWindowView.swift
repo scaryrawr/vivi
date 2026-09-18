@@ -275,6 +275,12 @@ private struct SessionHistorySection: View {
       guard isExpanded, shouldLoad else { return }
       store.refreshSessions(request)
     }
+    .onChange(of: store.historyPresentationGeneration) {
+      isExpanded = true
+      if shouldLoad {
+        store.refreshSessions(request)
+      }
+    }
     .onChange(of: store.sessionState) { previous, current in
       guard case .resuming = previous, current == .ready, store.sessionCatalog == nil else {
         return

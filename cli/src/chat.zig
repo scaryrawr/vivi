@@ -126,18 +126,6 @@ fn fileReferenceQuery(input: []const u8, cursor: usize) ?FileReferenceQuery {
     };
 }
 
-fn buildCommandInput(
-    allocator: std.mem.Allocator,
-    command_name: []const u8,
-    composer_input: []const u8,
-) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
-        "{s}{s}",
-        .{ command_name, commandArgumentSuffix(composer_input) },
-    );
-}
-
 fn visibleSelectionRange(
     item_count: usize,
     row_count: usize,
@@ -2514,6 +2502,20 @@ const MenuMode = enum {
     sessions,
 };
 
+const CommandActivation = enum {
+    execute,
+    models,
+    sessions,
+};
+
+fn commandActivation(action: backend.CommandAction) CommandActivation {
+    return switch (action) {
+        .execute => .execute,
+        .open_model_selection => .models,
+        .open_session_history => .sessions,
+    };
+}
+
 fn userInputAnswer(
     request: backend.UserInputRequest,
     raw_answer: []const u8,
@@ -3242,7 +3244,7 @@ const ChatUi = struct {
             entries[index] = .{
                 .identity = .{ .text = command.name },
                 .key = command.name,
-                .primary = command.name,
+                .primary = command.display_name,
                 .detail = .{ .text = command.description },
                 .source_index = index,
             };
@@ -3322,54 +3324,70 @@ const ChatUi = struct {
             .commands => {
                 const catalog = self.commands orelse return;
                 const command = catalog.commands[selected.source_index];
-                if (std.ascii.eqlIgnoreCase(command.name, "resume")) {
-                    const contents = try self.input.toOwnedContents(
-                        self.allocator,
-                    );
-                    defer self.allocator.free(contents);
-                    self.input.clearRetainingCapacity();
-                    self.menu_mode = .loading_sessions;
-                    conversation.refreshSessions(
-                        resumeCatalogRequest(contents),
-                    ) catch |err| switch (err) {
-                        error.Busy => {
-                            self.menu_mode = .closed;
-                            return;
-                        },
-                        else => return err,
-                    };
-                    self.phase = .resuming;
-                    return;
-                }
-                if (!std.ascii.eqlIgnoreCase(command.name, "model")) {
-                    const contents = try self.input.toOwnedContents(
-                        self.allocator,
-                    );
-                    defer self.allocator.free(contents);
-                    const command_input = try buildCommandInput(
-                        self.allocator,
-                        command.name,
-                        contents,
-                    );
-                    defer self.allocator.free(command_input);
-                    conversation.executeCommand(command_input) catch |err| switch (err) {
-                        error.EmptyCommand, error.Busy => return,
-                        else => return err,
-                    };
-                    self.input.clearRetainingCapacity();
-                    self.menu_mode = .closed;
-                    self.phase = .running_command;
-                    return;
-                }
-                self.input.clearRetainingCapacity();
-                self.menu_mode = .loading_models;
-                conversation.refreshModels() catch |err| switch (err) {
-                    error.Busy => {
-                        self.menu_mode = .closed;
-                        return;
+                switch (commandActivation(command.action)) {
+                    .sessions => {
+                        const contents = try self.input.toOwnedContents(
+                            self.allocator,
+                        );
+                        defer self.allocator.free(contents);
+                        self.input.clearRetainingCapacity();
+                        self.menu_mode = .loading_sessions;
+                        conversation.refreshSessions(
+                            resumeCatalogRequest(contents),
+                        ) catch |err| switch (err) {
+                            error.Busy => {
+                                self.menu_mode = .closed;
+                                return;
+                            },
+                            else => return err,
+                        };
+                        self.phase = .resuming;
                     },
-                    else => return err,
-                };
+                    .execute => {
+                        const contents = try self.input.toOwnedContents(
+                            self.allocator,
+                        );
+                        defer self.allocator.free(contents);
+                        conversation.executeCommand(
+                            command.key,
+                            commandArgumentSuffix(contents),
+                        ) catch |err| switch (err) {
+                            error.Busy => return,
+                            error.CommandTakesNoArguments,
+                            error.CommandRequiresArguments,
+                            error.CommandArgumentsTooLong,
+                            error.InvalidCommandArgumentsUtf8,
+                            error.InvalidCommandKey,
+                            error.StaleCommandKey,
+                            error.CommandCatalogUnavailable,
+                            error.CommandIsNotExecutable,
+                            => {
+                                try self.transcript.append(
+                                    self.allocator,
+                                    .status,
+                                    @errorName(err),
+                                );
+                                self.followTail();
+                                return;
+                            },
+                            else => return err,
+                        };
+                        self.input.clearRetainingCapacity();
+                        self.menu_mode = .closed;
+                        self.phase = .running_command;
+                    },
+                    .models => {
+                        self.input.clearRetainingCapacity();
+                        self.menu_mode = .loading_models;
+                        conversation.refreshModels() catch |err| switch (err) {
+                            error.Busy => {
+                                self.menu_mode = .closed;
+                                return;
+                            },
+                            else => return err,
+                        };
+                    },
+                }
             },
             .files => {
                 const contents = try self.input.toOwnedContents(self.allocator);
@@ -3436,12 +3454,21 @@ const ChatUi = struct {
     ) !ConversationOutcome {
         switch (event.*) {
             .ready => self.phase = .ready,
-            .command_catalog => |catalog| {
-                const replacement = try catalog.clone(self.allocator);
-                if (self.commands) |*current| current.deinit();
-                self.commands = replacement;
-                if (self.phase == .loading_commands) self.phase = .ready;
-                if (self.menu_mode == .commands) try self.syncComposerMenu();
+            .command_catalog => |catalog_event| switch (catalog_event) {
+                .replaced => |catalog| {
+                    const replacement = try catalog.clone(self.allocator);
+                    if (self.commands) |*current| current.deinit();
+                    self.commands = replacement;
+                    if (self.phase == .loading_commands) self.phase = .ready;
+                    if (self.menu_mode == .commands) try self.syncComposerMenu();
+                },
+                .failed => |failure| {
+                    try self.transcript.append(
+                        self.allocator,
+                        .status,
+                        failure.bytes,
+                    );
+                },
             },
             .model_catalog => |catalog| {
                 const replacement = try catalog.clone(self.allocator);
@@ -3708,13 +3735,15 @@ const ChatUi = struct {
                 self.phase = .awaiting_input;
                 self.followTail();
             },
-            .command_completed => |message| {
+            .command_completed => |result| {
                 self.phase = .ready;
-                try self.transcript.append(
-                    self.allocator,
-                    .status,
-                    message.bytes,
-                );
+                switch (result) {
+                    inline else => |outcome| try self.transcript.append(
+                        self.allocator,
+                        .status,
+                        outcome.message.bytes,
+                    ),
+                }
             },
             .idle => {
                 self.transcript.endTurn();
@@ -8050,13 +8079,6 @@ test "slash command parsing preserves argument suffixes" {
         " thorough",
         commandArgumentSuffix("/autopilot thorough"),
     );
-    const command_input = try buildCommandInput(
-        std.testing.allocator,
-        "autopilot",
-        "/auto thorough",
-    );
-    defer std.testing.allocator.free(command_input);
-    try std.testing.expectEqualStrings("autopilot thorough", command_input);
     try std.testing.expectEqualStrings("", slashCommandQuery("/").?);
     try std.testing.expect(slashCommandQuery("not-a-command") == null);
     try std.testing.expectEqual(
@@ -8086,6 +8108,21 @@ test "file reference query follows the active composer token" {
 
     try std.testing.expect(fileReferenceQuery("email@example.com", 17) == null);
     try std.testing.expect(fileReferenceQuery("check @cli/src", 5) == null);
+}
+
+test "command activation routes by typed action instead of name" {
+    try std.testing.expectEqual(
+        CommandActivation.models,
+        commandActivation(.open_model_selection),
+    );
+    try std.testing.expectEqual(
+        CommandActivation.sessions,
+        commandActivation(.open_session_history),
+    );
+    try std.testing.expectEqual(
+        CommandActivation.execute,
+        commandActivation(.execute),
+    );
 }
 
 test "responding composer keeps file completion but suppresses commands" {

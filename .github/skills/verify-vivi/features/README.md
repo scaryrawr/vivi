@@ -88,3 +88,6 @@ user-visible behavior. It then uses exactly four H2 sections in this order:
 - [Native session history](./native-session-history.md) covers selected-store
   local and broader catalogs, persisted-session resume, and cross-workspace
   navigation identity.
+- [Native command palette](./native-command-palette.md) covers shared command
+  discovery, keyboard interaction, typed arguments, lifecycle gating, and
+  model/history routing.

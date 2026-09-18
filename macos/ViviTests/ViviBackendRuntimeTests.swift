@@ -766,6 +766,10 @@ final class ViviBackendRuntimeTests: XCTestCase {
     event.model_count = 1
     event.selected_model_id = vivi_backend_span_t(offset: 0, length: 13)
     event.selected_reasoning = VIVI_BACKEND_REASONING_HIGH
+    event.user_input_request_id = vivi_backend_span_t(
+      offset: UInt32(bytes.count), length: 0)
+    event.user_input_question = vivi_backend_span_t(
+      offset: UInt32(bytes.count), length: 0)
 
     var model = vivi_backend_model_t()
     model.id = vivi_backend_span_t(offset: 0, length: 13)
@@ -1580,6 +1584,392 @@ final class ViviBackendRuntimeTests: XCTestCase {
     XCTAssertTrue(driver.submittedPrompts.isEmpty)
     XCTAssertEqual(store.draft, "hello")
   }
+
+  func testDecoderStrictlyDecodesTypedCommandCatalog() throws {
+    let fixture = commandFixture()
+
+    guard
+      case .commandCatalog(let catalog) = try NativeEventDecoder.decode(
+        fixture.event,
+        bytes: fixture.bytes,
+        models: [],
+        commands: fixture.commands)
+    else { return XCTFail("Expected command catalog") }
+
+    XCTAssertEqual(
+      catalog.commands.map(\.key),
+      [
+        CommandKey(generation: 9, slot: 1),
+        CommandKey(generation: 9, slot: 2),
+      ])
+    XCTAssertEqual(catalog.commands[0].source, .vivi)
+    XCTAssertEqual(catalog.commands[0].action, .openModelSelection)
+    XCTAssertEqual(catalog.commands[1].argumentPolicy, .required)
+    XCTAssertEqual(catalog.commands[1].hint, "topic")
+  }
+
+  func testDecoderRejectsMalformedCommandDescriptorsAndCounts() {
+    let fixture = commandFixture()
+
+    var reserved = fixture.commands
+    reserved[0].reserved = 1
+    XCTAssertThrowsError(
+      try NativeEventDecoder.decode(
+        fixture.event, bytes: fixture.bytes, models: [], commands: reserved))
+
+    var mixedGeneration = fixture.commands
+    mixedGeneration[1].key.generation += 1
+    XCTAssertThrowsError(
+      try NativeEventDecoder.decode(
+        fixture.event, bytes: fixture.bytes, models: [], commands: mixedGeneration))
+
+    var badSpan = fixture.commands
+    badSpan[0].description = vivi_backend_span_t(
+      offset: UInt32(fixture.bytes.count), length: 1)
+    XCTAssertThrowsError(
+      try NativeEventDecoder.decode(
+        fixture.event, bytes: fixture.bytes, models: [], commands: badSpan))
+
+    var badCount = fixture.event
+    badCount.command_count += 1
+    XCTAssertThrowsError(
+      try NativeEventDecoder.decode(
+        badCount, bytes: fixture.bytes, models: [], commands: fixture.commands))
+  }
+
+  func testDecoderStrictlyDecodesCommandOutcomes() throws {
+    let bytes = Array("Done".utf8)
+    var event = vivi_backend_event_t()
+    event.kind = VIVI_BACKEND_EVENT_COMMAND_COMPLETED
+    event.content_kind = VIVI_BACKEND_CONTENT_COMMAND_EXECUTION
+    event.byte_count = UInt32(bytes.count)
+    event.content = vivi_backend_span_t(offset: 0, length: UInt32(bytes.count))
+    event.command_key = vivi_backend_command_key_t(generation: 4, slot: 2, reserved: 0)
+    event.selected_reasoning = VIVI_BACKEND_REASONING_NONE
+    let trailingEmpty = vivi_backend_span_t(offset: UInt32(bytes.count), length: 0)
+    event.selected_model_id = trailingEmpty
+    event.tool_call_id = trailingEmpty
+    event.tool_title = trailingEmpty
+    event.tool_detail = trailingEmpty
+    event.tool_input = trailingEmpty
+
+    XCTAssertEqual(
+      try NativeEventDecoder.decode(event, bytes: bytes, models: []),
+      .commandCompleted(key: CommandKey(generation: 4, slot: 2), message: "Done"))
+
+    event.kind = VIVI_BACKEND_EVENT_COMMAND_FAILED
+    event.command_key.reserved = 1
+    XCTAssertThrowsError(try NativeEventDecoder.decode(event, bytes: bytes, models: []))
+  }
+
+  func testCommandFailureFallbackRetryAndGenerationReplacement() {
+    let driver = FakeConversationDriver()
+    let store = readyCommandStore(driver: driver)
+    let original = swiftCommandCatalog(generation: 3)
+    store.reduce(.commandCatalog(original))
+    store.openCommandPalette(query: "deploy")
+    let oldKey = store.selectedCommandKey
+
+    store.reduce(.commandCatalogFailure("Discovery unavailable."))
+    XCTAssertEqual(
+      store.commandCatalogState,
+      .failed(message: "Discovery unavailable.", hasFallback: true))
+    XCTAssertEqual(store.filteredCommands.map(\.name), ["deploy"])
+
+    store.retryCommands()
+    XCTAssertEqual(store.commandCatalogState, .loading)
+    store.reduce(.commandCatalog(swiftCommandCatalog(generation: 4)))
+
+    XCTAssertNotEqual(store.selectedCommandKey, oldKey)
+    XCTAssertEqual(store.selectedCommandKey?.generation, 4)
+    XCTAssertEqual(driver.commandRefreshCount, 2)
+  }
+
+  func testCommandArgumentExecutionPreservesComposerDraftAndAttachments() {
+    let driver = FakeConversationDriver()
+    let attachment = testAttachment(name: "context.png")
+    let store = NativeChatStore(
+      workspace: "/tmp/work",
+      driver: driver,
+      attachmentAcquirer: FakeAttachmentAcquirer(pasted: attachment))
+    store.reduce(.ready)
+    store.reduce(.modelCatalog(testCatalog()))
+    store.reduce(.commandCatalog(swiftCommandCatalog(generation: 7)))
+    store.draft = "ordinary prompt"
+    store.pasteAttachment()
+    store.openCommandPalette(query: "deploy")
+    store.activateSelectedCommand()
+    store.updateCommandArgumentDraft("production")
+    store.submitCommandArgument()
+
+    XCTAssertEqual(
+      driver.commandExecutions.first?.0,
+      CommandKey(generation: 7, slot: 3))
+    XCTAssertEqual(driver.commandExecutions.first?.1, "production")
+    XCTAssertEqual(store.draft, "ordinary prompt")
+    XCTAssertEqual(store.attachments, [attachment])
+    XCTAssertEqual(store.commandExecution?.command.name, "deploy")
+  }
+
+  func testCommandExecutionGatesComposerAndAgentPromptClosesPalette() {
+    let driver = FakeConversationDriver()
+    let attachment = testAttachment(name: "context.png")
+    let store = NativeChatStore(
+      workspace: "/tmp/work",
+      driver: driver,
+      attachmentAcquirer: FakeAttachmentAcquirer(pasted: attachment))
+    store.reduce(.ready)
+    store.reduce(.modelCatalog(testCatalog()))
+    store.reduce(.commandCatalog(swiftCommandCatalog(generation: 7)))
+    store.draft = "ordinary prompt"
+    store.pasteAttachment()
+    store.openCommandPalette(query: "deploy")
+    store.activateSelectedCommand()
+    store.updateCommandArgumentDraft("production")
+    store.submitCommandArgument()
+
+    XCTAssertFalse(store.canSubmit)
+    XCTAssertFalse(store.canAcquireAttachments)
+    store.submit()
+    XCTAssertTrue(driver.submittedPrompts.isEmpty)
+
+    store.reduce(.assistantStarted)
+
+    XCTAssertNil(store.commandExecution)
+    XCTAssertNil(store.commandArgumentSession)
+    XCTAssertFalse(store.isCommandPalettePresented)
+    XCTAssertEqual(store.draft, "ordinary prompt")
+    XCTAssertEqual(store.attachments, [attachment])
+  }
+
+  func testStaleCommandFailurePreservesArgumentAndRefreshes() {
+    let driver = FakeConversationDriver()
+    let store = readyCommandStore(driver: driver)
+    store.reduce(.commandCatalog(swiftCommandCatalog(generation: 7)))
+    store.openCommandPalette(query: "deploy")
+    store.activateSelectedCommand()
+    store.updateCommandArgumentDraft("keep this")
+    store.submitCommandArgument()
+
+    store.reduce(
+      .commandFailed(
+        key: CommandKey(generation: 7, slot: 3),
+        message: "Stale command key."))
+
+    XCTAssertEqual(store.commandArgumentSession?.draft, "keep this")
+    XCTAssertTrue(store.isCommandPalettePresented)
+    XCTAssertEqual(store.commandCatalogState, .loading)
+    XCTAssertEqual(driver.commandRefreshCount, 2)
+
+    store.reduce(.commandCatalog(swiftCommandCatalog(generation: 8)))
+    XCTAssertEqual(store.commandArgumentSession?.command.key.generation, 8)
+    XCTAssertEqual(store.commandArgumentSession?.draft, "keep this")
+  }
+
+  func testRejectedCurrentCommandIsTreatedAsStaleAndRefreshes() {
+    let driver = FakeConversationDriver()
+    driver.executeCommandResult = .rejected
+    let store = readyCommandStore(driver: driver)
+    store.reduce(.commandCatalog(swiftCommandCatalog(generation: 7)))
+    store.openCommandPalette(query: "deploy")
+    store.activateSelectedCommand()
+    store.updateCommandArgumentDraft("keep this")
+
+    store.submitCommandArgument()
+
+    XCTAssertEqual(store.commandArgumentSession?.draft, "keep this")
+    XCTAssertTrue(store.isCommandPalettePresented)
+    XCTAssertEqual(store.commandCatalogState, .loading)
+    XCTAssertEqual(driver.commandRefreshCount, 2)
+    XCTAssertEqual(store.transcript.last?.text, "Deploy: Command changed. Refreshing commands.")
+  }
+
+  func testCommandOutcomesAppendChronologicallyWithLabels() {
+    let driver = FakeConversationDriver()
+    let store = readyCommandStore(driver: driver)
+    store.reduce(.status("before"))
+    store.reduce(.commandCatalog(swiftCommandCatalog(generation: 2)))
+    store.openCommandPalette(query: "deploy")
+    store.activateSelectedCommand()
+    store.updateCommandArgumentDraft("now")
+    store.submitCommandArgument()
+    store.reduce(
+      .commandCompleted(
+        key: CommandKey(generation: 2, slot: 3),
+        message: "Started."))
+
+    XCTAssertEqual(store.transcript.map(\.text), ["before", "Deploy: Started."])
+    guard case .status = store.transcript.last else {
+      return XCTFail("Expected successful command status")
+    }
+  }
+
+  func testTypedCommandActionsReuseModelAndHistorySurfaces() {
+    let store = readyCommandStore(driver: FakeConversationDriver())
+    store.reduce(.commandCatalog(swiftCommandCatalog(generation: 5)))
+
+    store.openCommandPalette(query: "model")
+    store.activateSelectedCommand()
+    XCTAssertTrue(store.isModelPickerPresented)
+    XCTAssertFalse(store.isCommandPalettePresented)
+
+    store.isModelPickerPresented = false
+    store.openCommandPalette(query: "resume")
+    store.activateSelectedCommand()
+    XCTAssertEqual(store.historyPresentationGeneration, 1)
+    XCTAssertFalse(store.isCommandPalettePresented)
+  }
+
+  func testSlashOpenFilteringAndWrappedSelectionAreStoreOwned() {
+    let store = readyCommandStore(driver: FakeConversationDriver())
+    store.reduce(.commandCatalog(swiftCommandCatalog(generation: 5)))
+    store.draft = "/dep"
+    store.composerDraftChanged()
+
+    XCTAssertTrue(store.isCommandPalettePresented)
+    XCTAssertEqual(store.commandQuery, "dep")
+    XCTAssertEqual(store.filteredCommands.map(\.name), ["deploy"])
+
+    store.commandQuery = ""
+    store.moveCommandSelection(0)
+    let first = store.selectedCommandKey
+    store.moveCommandSelection(-1)
+    XCTAssertEqual(store.selectedCommandKey, store.filteredCommands.last?.key)
+    store.moveCommandSelection(1)
+    XCTAssertEqual(store.selectedCommandKey, first)
+  }
+
+  func testCommandExecutionIsGatedWithoutMutatingPrompt() {
+    let driver = FakeConversationDriver()
+    let store = readyCommandStore(driver: driver)
+    store.reduce(.commandCatalog(swiftCommandCatalog(generation: 6)))
+    store.draft = "keep"
+    store.openCommandPalette(query: "deploy")
+    store.activateSelectedCommand()
+    store.updateCommandArgumentDraft("target")
+    store.reduce(.assistantStarted)
+    store.submitCommandArgument()
+
+    XCTAssertTrue(driver.commandExecutions.isEmpty)
+    XCTAssertEqual(store.commandDisabledReason, "Wait for Vivi to finish responding.")
+    XCTAssertEqual(store.draft, "keep")
+    XCTAssertEqual(store.commandArgumentSession?.draft, "target")
+  }
+
+  func testAskUserAndCloseClearCommandPresentationWithoutPromptMutation() {
+    let store = readyCommandStore(driver: FakeConversationDriver())
+    store.reduce(.commandCatalog(swiftCommandCatalog(generation: 1)))
+    store.draft = "keep"
+    store.openCommandPalette()
+    store.reduce(
+      .userInputRequested(
+        UserInputRequest(
+          id: "ask",
+          question: "Continue?",
+          choices: ["Yes"],
+          allowsFreeform: false)))
+
+    XCTAssertFalse(store.isCommandPalettePresented)
+    XCTAssertEqual(store.draft, "keep")
+
+    store.close()
+    XCTAssertNil(store.commandCatalog)
+    XCTAssertNil(store.commandExecution)
+  }
+}
+
+@MainActor
+private func readyCommandStore(driver: FakeConversationDriver) -> NativeChatStore {
+  let store = NativeChatStore(workspace: "/tmp/work", driver: driver)
+  store.reduce(.ready)
+  store.reduce(.modelCatalog(testCatalog()))
+  return store
+}
+
+private func swiftCommandCatalog(generation: UInt64) -> CommandCatalog {
+  CommandCatalog(commands: [
+    CommandInfo(
+      key: CommandKey(generation: generation, slot: 1),
+      name: "model",
+      displayName: "model",
+      description: "Choose a model",
+      hint: nil,
+      source: .vivi,
+      action: .openModelSelection,
+      argumentPolicy: .none),
+    CommandInfo(
+      key: CommandKey(generation: generation, slot: 2),
+      name: "resume",
+      displayName: "resume",
+      description: "Resume a session",
+      hint: "all",
+      source: .vivi,
+      action: .openSessionHistory,
+      argumentPolicy: .optional),
+    CommandInfo(
+      key: CommandKey(generation: generation, slot: 3),
+      name: "deploy",
+      displayName: "Deploy",
+      description: "Deploy a target",
+      hint: "target",
+      source: .extensionCommand,
+      action: .execute,
+      argumentPolicy: .required),
+  ])
+}
+
+private func commandFixture() -> (
+  event: vivi_backend_event_t,
+  bytes: [UInt8],
+  commands: [vivi_backend_command_t]
+) {
+  let values = [
+    Array("model".utf8),
+    Array("model".utf8),
+    Array("Choose a model".utf8),
+    Array("deploy".utf8),
+    Array("Deploy".utf8),
+    Array("Deploy a target".utf8),
+    Array("topic".utf8),
+  ]
+  let bytes = values.flatMap { $0 }
+  var offset = 0
+  func take(_ value: [UInt8]) -> vivi_backend_span_t {
+    defer { offset += value.count }
+    return vivi_backend_span_t(offset: UInt32(offset), length: UInt32(value.count))
+  }
+  let spans = values.map(take)
+  let commands = [
+    vivi_backend_command_t(
+      struct_size: UInt32(MemoryLayout<vivi_backend_command_t>.size),
+      key: vivi_backend_command_key_t(generation: 9, slot: 1, reserved: 0),
+      name: spans[0],
+      display_name: spans[1],
+      description: spans[2],
+      hint: vivi_backend_span_t(),
+      source: VIVI_BACKEND_COMMAND_SOURCE_VIVI,
+      action: VIVI_BACKEND_COMMAND_ACTION_OPEN_MODEL_SELECTION,
+      argument_policy: VIVI_BACKEND_COMMAND_ARGUMENT_NONE,
+      reserved: 0),
+    vivi_backend_command_t(
+      struct_size: UInt32(MemoryLayout<vivi_backend_command_t>.size),
+      key: vivi_backend_command_key_t(generation: 9, slot: 2, reserved: 0),
+      name: spans[3],
+      display_name: spans[4],
+      description: spans[5],
+      hint: spans[6],
+      source: VIVI_BACKEND_COMMAND_SOURCE_EXTENSION,
+      action: VIVI_BACKEND_COMMAND_ACTION_EXECUTE,
+      argument_policy: VIVI_BACKEND_COMMAND_ARGUMENT_REQUIRED,
+      reserved: 0),
+  ]
+  var event = vivi_backend_event_t()
+  event.kind = VIVI_BACKEND_EVENT_COMMAND_CATALOG
+  event.content_kind = VIVI_BACKEND_CONTENT_COMMAND_CATALOG
+  event.byte_count = UInt32(bytes.count)
+  event.command_count = UInt32(commands.count)
+  event.selected_reasoning = VIVI_BACKEND_REASONING_NONE
+  return (event, bytes, commands)
 }
 
 private func sessionFixture(
@@ -1715,6 +2105,8 @@ private func swiftSessionCatalog(scope: SessionCatalogScope) -> SessionCatalog {
 
 private final class FakeConversationDriver: ViviConversationDriving {
   var submitResult = ConversationOperationResult.accepted
+  var refreshCommandsResult = ConversationOperationResult.accepted
+  var executeCommandResult = ConversationOperationResult.accepted
   var refreshResult = ConversationOperationResult.accepted
   var switchResult = ConversationOperationResult.accepted
   var refreshSessionsResult = ConversationOperationResult.accepted
@@ -1725,6 +2117,8 @@ private final class FakeConversationDriver: ViviConversationDriving {
   var resumeKeys: [ResumeKey] = []
   var submittedPrompts: [String] = []
   var submittedAttachments: [[ComposerAttachment]] = []
+  var commandRefreshCount = 0
+  var commandExecutions: [(CommandKey, String)] = []
   var userInputResponses: [(String, UserInputAnswer)] = []
   private var receive: (@MainActor (ChatEvent) -> Void)?
 
@@ -1742,6 +2136,16 @@ private final class FakeConversationDriver: ViviConversationDriving {
     submittedPrompts.append(prompt)
     submittedAttachments.append(attachments)
     return submitResult
+  }
+
+  func refreshCommands() -> ConversationOperationResult {
+    commandRefreshCount += 1
+    return refreshCommandsResult
+  }
+
+  func executeCommand(_ key: CommandKey, arguments: String) -> ConversationOperationResult {
+    commandExecutions.append((key, arguments))
+    return executeCommandResult
   }
 
   func refreshModels() -> ConversationOperationResult {

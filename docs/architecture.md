@@ -100,7 +100,7 @@ image store outlives the conversation worker and removes only the temporary
 files it created after that worker stops. Saved ask-user drafts retain their
 visible image paths.
 
-The same typed attachment input crosses C ABI v10 as caller-owned identity,
+The same typed attachment input crosses C ABI v11 as caller-owned identity,
 display-name, media-type, and raw-byte fields. AppKit owns file-panel and
 pasteboard acquisition, while `NativeChatStore` owns one conversation's
 immutable composer snapshots and removal state. The coordinator and session
@@ -108,6 +108,16 @@ history do not know about attachments. Only `root.zig` maps accepted snapshots
 into typed `session.send` blob attachments through
 `MessageOptions.message_attachments`; base64 and SDK details stay out of the
 domain and C boundary.
+
+Command discovery and execution use the same boundary. Zig assigns each
+catalog entry a generation-and-slot key plus typed source, action, and argument
+policy. C ABI v11 transfers catalog descriptors and strings through atomic
+caller-owned probe/retry buffers, and accepts only the issued key with bounded
+UTF-8 argument bytes for execution. `NativeChatStore` owns the selected
+conversation's catalog, palette, and execution state; Swift never reconstructs
+extension identity or dispatches from display names. Model and resume actions
+route to their existing native controls while SDK execution remains in
+`root.zig`.
 On Windows, Vivi drives the libvaxis terminal parser and existing event queue
 directly to preserve paste-boundary events omitted by the pinned library's
 Windows loop adapter. All other events still use libvaxis's generic forwarding;

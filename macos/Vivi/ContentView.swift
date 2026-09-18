@@ -19,8 +19,15 @@ func toolInputIsVisible(input: String) -> Bool {
   !input.isEmpty
 }
 
+private enum ChatFocusTarget: Hashable {
+  case composer
+  case commandSearch
+  case commandArgument
+}
+
 struct ContentView: View {
   @ObservedObject private var store: NativeChatStore
+  @FocusState private var focus: ChatFocusTarget?
 
   init(store: NativeChatStore) {
     self.store = store
@@ -44,6 +51,10 @@ struct ContentView: View {
           guard let last = store.transcript.last else { return }
           proxy.scrollTo(last.id, anchor: .bottom)
         }
+      }
+      if store.isCommandPalettePresented {
+        CommandPaletteView(store: store, focus: $focus)
+          .transition(.opacity)
       }
       composer
     }
@@ -74,6 +85,10 @@ struct ContentView: View {
       .textFieldStyle(.plain)
       .lineLimit(2...6)
       .onSubmit(store.submit)
+      .focused($focus, equals: .composer)
+      .onChange(of: store.draft) {
+        store.composerDraftChanged()
+      }
       .disabled(store.activeUserInput != nil)
 
       if !store.attachments.isEmpty {
@@ -100,6 +115,18 @@ struct ContentView: View {
       }
 
       HStack(spacing: 10) {
+        Button(action: store.toggleCommandPalette) {
+          Image(systemName: "command")
+            .font(.system(size: 13, weight: .semibold))
+            .frame(width: 24, height: 24)
+        }
+        .buttonStyle(.plain)
+        .keyboardShortcut("k", modifiers: .command)
+        .help("Commands (⌘K)")
+        .accessibilityLabel("Commands")
+        .accessibilityIdentifier("command-palette-button")
+        .disabled(store.lifecycle == .closing || store.lifecycle == .closed)
+
         attachmentMenu
         modelMenu
 
@@ -135,6 +162,15 @@ struct ContentView: View {
       RoundedRectangle(cornerRadius: 16)
         .stroke(.secondary.opacity(0.45), lineWidth: 1)
     }
+    .onChange(of: store.isCommandPalettePresented) { _, presented in
+      focus =
+        presented
+        ? (store.commandArgumentSession == nil ? .commandSearch : .commandArgument)
+        : .composer
+    }
+    .onChange(of: store.commandArgumentSession) {
+      focus = store.commandArgumentSession == nil ? .commandSearch : .commandArgument
+    }
   }
 
   private var attachmentMenu: some View {
@@ -157,30 +193,8 @@ struct ContentView: View {
   }
 
   private var modelMenu: some View {
-    Menu {
-      ForEach(store.modelChoices) { model in
-        Menu(model.displayName) {
-          if !model.detail.isEmpty {
-            Text(model.detail)
-          }
-          ForEach(model.reasoning) { effort in
-            Button {
-              store.select(modelID: model.id, reasoning: effort)
-            } label: {
-              HStack {
-                Text(
-                  effort == model.advertisedDefaultReasoning
-                    ? "\(effort.label) (default)" : effort.label)
-                if store.selectedModelID == model.id && store.selectedReasoning == effort {
-                  Image(systemName: "checkmark")
-                }
-              }
-            }
-          }
-        }
-      }
-      Divider()
-      Button("Refresh Models", systemImage: "arrow.clockwise", action: store.refreshModels)
+    Button {
+      store.isModelPickerPresented.toggle()
     } label: {
       Text(modelLabel)
         .lineLimit(1)
@@ -190,11 +204,14 @@ struct ContentView: View {
         .frame(height: 28)
         .contentShape(Rectangle())
     }
-    .menuStyle(.borderlessButton)
-    .menuIndicator(.hidden)
+    .buttonStyle(.plain)
     .fixedSize()
     .help(selectedModel?.detail ?? "Choose a model and reasoning level")
     .disabled(store.modelState != .ready || store.isBusy)
+    .accessibilityIdentifier("model-picker-button")
+    .popover(isPresented: $store.isModelPickerPresented, arrowEdge: .top) {
+      ModelPickerView(store: store)
+    }
   }
 
   private var selectedModel: ModelInfo? {
@@ -217,6 +234,289 @@ struct ContentView: View {
     case .closing: return "Closing"
     case .closed: return "Closed"
     }
+  }
+}
+
+private struct CommandPaletteView: View {
+  @ObservedObject var store: NativeChatStore
+  var focus: FocusState<ChatFocusTarget?>.Binding
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 8) {
+      if let argument = store.commandArgumentSession {
+        argumentView(argument)
+      } else {
+        searchView
+        catalogContent
+      }
+    }
+    .padding(12)
+    .background(.background, in: RoundedRectangle(cornerRadius: 12))
+    .overlay {
+      RoundedRectangle(cornerRadius: 12)
+        .stroke(.secondary.opacity(0.4), lineWidth: 1)
+    }
+    .shadow(color: .black.opacity(0.08), radius: 8, y: 3)
+    .accessibilityElement(children: .contain)
+    .accessibilityIdentifier("command-palette")
+    .onAppear {
+      focus.wrappedValue =
+        store.commandArgumentSession == nil ? .commandSearch : .commandArgument
+      announce("Command palette")
+    }
+    .onChange(of: store.commandCatalogState) { _, state in
+      switch state {
+      case .loading:
+        announce("Loading commands")
+      case .failed(let message, _):
+        announce("Command loading failed. \(message)")
+      case .loaded:
+        break
+      }
+    }
+    .onChange(of: store.commandExecution) { _, execution in
+      if let execution {
+        announce("Running \(execution.command.displayName)")
+      }
+    }
+  }
+
+  private var searchView: some View {
+    HStack(spacing: 8) {
+      Image(systemName: "magnifyingglass")
+        .foregroundStyle(.secondary)
+      TextField("Search commands", text: $store.commandQuery)
+        .textFieldStyle(.plain)
+        .focused(focus, equals: .commandSearch)
+        .onChange(of: store.commandQuery) {
+          store.moveCommandSelection(0)
+        }
+        .onSubmit(store.activateSelectedCommand)
+        .onKeyPress(.upArrow) {
+          store.moveCommandSelection(-1)
+          return .handled
+        }
+        .onKeyPress(.downArrow) {
+          store.moveCommandSelection(1)
+          return .handled
+        }
+        .onKeyPress(.escape) {
+          store.closeCommandPalette()
+          return .handled
+        }
+        .accessibilityIdentifier("command-palette-search")
+      Text("⌘K")
+        .font(.caption.monospaced())
+        .foregroundStyle(.tertiary)
+        .accessibilityHidden(true)
+    }
+  }
+
+  @ViewBuilder
+  private var catalogContent: some View {
+    switch store.commandCatalogState {
+    case .loading where store.commandCatalog == nil:
+      paletteMessage("Loading commands…", systemImage: "clock")
+        .accessibilityIdentifier("command-palette-loading")
+    case .failed(let message, let hasFallback):
+      VStack(alignment: .leading, spacing: 6) {
+        Label(message, systemImage: "exclamationmark.triangle")
+          .font(.caption)
+          .foregroundStyle(.secondary)
+        HStack {
+          if hasFallback {
+            Text("Showing available built-in commands.")
+              .font(.caption)
+              .foregroundStyle(.secondary)
+          }
+          Spacer()
+          Button("Retry", action: store.retryCommands)
+            .disabled(store.commandDisabledReason != nil)
+            .accessibilityIdentifier("command-palette-retry")
+        }
+        commandResults
+      }
+      .accessibilityIdentifier("command-palette-failure")
+    case .loaded, .loading:
+      commandResults
+    }
+  }
+
+  @ViewBuilder
+  private var commandResults: some View {
+    if store.filteredCommands.isEmpty {
+      paletteMessage("No matching commands.", systemImage: "command")
+        .accessibilityIdentifier("command-palette-empty")
+    } else {
+      ScrollView {
+        LazyVStack(spacing: 2) {
+          ForEach(store.filteredCommands) { command in
+            Button {
+              store.selectCommand(command.key)
+              store.activateSelectedCommand()
+            } label: {
+              HStack(alignment: .firstTextBaseline, spacing: 10) {
+                Text("/\(command.displayName)")
+                  .font(.body.weight(.medium))
+                Text(command.description)
+                  .font(.callout)
+                  .foregroundStyle(.secondary)
+                  .lineLimit(2)
+                Spacer(minLength: 8)
+                Text(command.source.label)
+                  .font(.caption)
+                  .foregroundStyle(.tertiary)
+              }
+              .padding(.horizontal, 8)
+              .padding(.vertical, 6)
+              .frame(maxWidth: .infinity, alignment: .leading)
+              .background(
+                store.selectedCommandKey == command.key
+                  ? Color.accentColor.opacity(0.13) : Color.clear,
+                in: RoundedRectangle(cornerRadius: 7)
+              )
+              .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(store.commandDisabledReason != nil)
+            .accessibilityLabel(
+              "\(command.displayName), \(command.source.label), \(command.description)"
+            )
+            .accessibilityAddTraits(
+              store.selectedCommandKey == command.key ? .isSelected : []
+            )
+            .accessibilityIdentifier(
+              "command-row-\(command.key.generation)-\(command.key.slot)")
+          }
+        }
+      }
+      .frame(maxHeight: 260)
+    }
+    if let execution = store.commandExecution {
+      HStack(spacing: 8) {
+        ProgressView()
+          .controlSize(.small)
+        Text("Running \(execution.command.displayName)…")
+          .font(.caption)
+          .foregroundStyle(.secondary)
+      }
+      .accessibilityElement(children: .combine)
+      .accessibilityIdentifier("command-palette-execution")
+    } else if let reason = store.commandDisabledReason {
+      Label(reason, systemImage: "lock")
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .accessibilityIdentifier("command-palette-disabled-reason")
+    }
+  }
+
+  private func argumentView(_ session: CommandArgumentSession) -> some View {
+    VStack(alignment: .leading, spacing: 8) {
+      HStack {
+        Text("/\(session.command.displayName)")
+          .font(.headline)
+        Spacer()
+        Text(session.command.source.label)
+          .font(.caption)
+          .foregroundStyle(.secondary)
+      }
+      if let hint = session.command.hint {
+        Text(hint)
+          .font(.caption)
+          .foregroundStyle(.secondary)
+      }
+      TextField(
+        session.command.argumentPolicy == .required ? "Required argument" : "Optional argument",
+        text: Binding(
+          get: { session.draft },
+          set: store.updateCommandArgumentDraft)
+      )
+      .textFieldStyle(.roundedBorder)
+      .focused(focus, equals: .commandArgument)
+      .onSubmit(store.submitCommandArgument)
+      .onKeyPress(.escape) {
+        store.exitCommandArgumentMode()
+        return .handled
+      }
+      .accessibilityIdentifier("command-palette-argument")
+      HStack {
+        Button("Cancel", action: store.exitCommandArgumentMode)
+        Spacer()
+        Button("Run", action: store.submitCommandArgument)
+          .buttonStyle(.borderedProminent)
+          .disabled(
+            store.commandDisabledReason != nil
+              || (session.command.argumentPolicy == .required
+                && session.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+          )
+          .accessibilityIdentifier("command-palette-run")
+      }
+    }
+  }
+
+  private func paletteMessage(_ text: String, systemImage: String) -> some View {
+    Label(text, systemImage: systemImage)
+      .font(.callout)
+      .foregroundStyle(.secondary)
+      .frame(maxWidth: .infinity, alignment: .leading)
+      .padding(.vertical, 8)
+  }
+
+  private func announce(_ message: String) {
+    NSAccessibility.post(
+      element: NSApp.mainWindow ?? NSApp,
+      notification: .announcementRequested,
+      userInfo: [.announcement: message, .priority: NSAccessibilityPriorityLevel.medium.rawValue])
+  }
+}
+
+private struct ModelPickerView: View {
+  @ObservedObject var store: NativeChatStore
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 8) {
+      Text("Choose Model")
+        .font(.headline)
+      ScrollView {
+        LazyVStack(alignment: .leading, spacing: 8) {
+          ForEach(store.modelChoices) { model in
+            VStack(alignment: .leading, spacing: 4) {
+              Text(model.displayName)
+                .font(.body.weight(.medium))
+              if !model.detail.isEmpty {
+                Text(model.detail)
+                  .font(.caption)
+                  .foregroundStyle(.secondary)
+              }
+              HStack {
+                ForEach(model.reasoning) { effort in
+                  Button {
+                    store.select(modelID: model.id, reasoning: effort)
+                    store.isModelPickerPresented = false
+                  } label: {
+                    HStack {
+                      Text(
+                        effort == model.advertisedDefaultReasoning
+                          ? "\(effort.label) (default)" : effort.label)
+                      if store.selectedModelID == model.id && store.selectedReasoning == effort {
+                        Image(systemName: "checkmark")
+                      }
+                    }
+                  }
+                  .buttonStyle(.bordered)
+                }
+              }
+            }
+            .padding(.vertical, 4)
+          }
+        }
+      }
+      .frame(width: 360, height: 280)
+      Divider()
+      Button("Refresh Models", systemImage: "arrow.clockwise", action: store.refreshModels)
+    }
+    .padding(14)
+    .accessibilityIdentifier("model-picker")
   }
 }
 
