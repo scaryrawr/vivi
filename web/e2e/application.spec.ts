@@ -6,12 +6,27 @@ const rows = (page: import("@playwright/test").Page) =>
 test("production page declares the strict WKWebView CSP", async ({ page }) => {
   await page.goto("/?scenario=one");
 
-  await expect(
-    page.locator('meta[http-equiv="Content-Security-Policy"]'),
-  ).toHaveAttribute(
+  const csp = page.locator('meta[http-equiv="Content-Security-Policy"]');
+  await expect(csp).toHaveAttribute(
     "content",
     "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'none'; base-uri 'none'; form-action 'none'",
   );
+  expect(
+    await page.locator("head").evaluate((head) => {
+      const children = [...head.children];
+      const cspIndex = children.findIndex(
+        (element) =>
+          element.getAttribute("http-equiv") === "Content-Security-Policy",
+      );
+      const firstResourceIndex = children.findIndex(
+        (element) =>
+          element.tagName === "SCRIPT" ||
+          (element.tagName === "LINK" &&
+            element.getAttribute("rel") === "stylesheet"),
+      );
+      return cspIndex >= 0 && cspIndex < firstResourceIndex;
+    }),
+  ).toBe(true);
 });
 
 test("selecting bottom, middle, and top sessions preserves order and one selection", async ({
