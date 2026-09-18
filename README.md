@@ -95,6 +95,14 @@ images appear as removable preview chips and remain selected when acquisition
 or submission fails. AppKit reads each source once; after the backend accepts a
 message, the conversation owns an immutable copy.
 
+The CLI and macOS app also share the backend command catalog. Type `/` in the
+composer or press **Command-K** in the native app to discover Vivi, SDK, and
+extension commands with backend-owned descriptions and argument policy. The
+native palette preserves the ordinary draft and selected attachments while it
+filters or runs a command. `/model` opens the existing native model picker and
+`/resume` expands the existing History section instead of creating duplicate
+command-only workflows.
+
 The `read` tool also returns PNG, JPEG, GIF, and WebP files as image content
 to the model, detecting their format from the bytes rather than the extension.
 Image reads show a short file/MIME summary in the transcript, never base64.

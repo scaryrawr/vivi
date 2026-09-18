@@ -130,13 +130,44 @@ pub const Failure = struct {
     }
 };
 
-pub const CommandInfo = struct {
-    name: []u8,
-    description: []u8,
+pub const CommandKey = struct {
+    generation: u64,
+    slot: u32,
+};
 
-    fn deinit(self: *CommandInfo, allocator: std.mem.Allocator) void {
+pub const CommandSource = enum {
+    vivi,
+    sdk_builtin,
+    extension,
+};
+
+pub const CommandAction = enum {
+    execute,
+    open_model_selection,
+    open_session_history,
+};
+
+pub const CommandArgumentPolicy = enum {
+    none,
+    optional,
+    required,
+};
+
+pub const CommandInfo = struct {
+    key: CommandKey,
+    name: []u8,
+    display_name: []u8,
+    description: []u8,
+    hint: ?[]u8,
+    source: CommandSource,
+    action: CommandAction,
+    argument_policy: CommandArgumentPolicy,
+
+    pub fn deinit(self: *CommandInfo, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
+        allocator.free(self.display_name);
         allocator.free(self.description);
+        if (self.hint) |hint| allocator.free(hint);
         self.* = undefined;
     }
 };
@@ -163,17 +194,77 @@ pub const CommandCatalog = struct {
         };
         for (self.commands, 0..) |command, index| {
             commands[index] = .{
+                .key = command.key,
                 .name = try allocator.dupe(u8, command.name),
+                .display_name = undefined,
                 .description = undefined,
+                .hint = null,
+                .source = command.source,
+                .action = command.action,
+                .argument_policy = command.argument_policy,
             };
             errdefer allocator.free(commands[index].name);
+            commands[index].display_name = try allocator.dupe(
+                u8,
+                command.display_name,
+            );
+            errdefer allocator.free(commands[index].display_name);
             commands[index].description = try allocator.dupe(
                 u8,
                 command.description,
             );
+            errdefer allocator.free(commands[index].description);
+            commands[index].hint = if (command.hint) |hint|
+                try allocator.dupe(u8, hint)
+            else
+                null;
             initialized += 1;
         }
         return .{ .allocator = allocator, .commands = commands };
+    }
+
+    pub fn find(self: *const CommandCatalog, key: CommandKey) ?*const CommandInfo {
+        if (key.generation == 0 or key.slot == 0) return null;
+        const index = std.math.sub(u32, key.slot, 1) catch return null;
+        if (index >= self.commands.len) return null;
+        const command = &self.commands[index];
+        if (command.key.generation != key.generation or
+            command.key.slot != key.slot)
+        {
+            return null;
+        }
+        return command;
+    }
+};
+
+pub const CommandCatalogEvent = union(enum) {
+    replaced: CommandCatalog,
+    failed: OwnedText,
+
+    pub fn deinit(self: *CommandCatalogEvent) void {
+        switch (self.*) {
+            .replaced => |*catalog| catalog.deinit(),
+            .failed => |*message| message.deinit(),
+        }
+        self.* = undefined;
+    }
+};
+
+pub const CommandExecutionEvent = union(enum) {
+    completed: struct {
+        key: CommandKey,
+        message: OwnedText,
+    },
+    failed: struct {
+        key: CommandKey,
+        message: OwnedText,
+    },
+
+    pub fn deinit(self: *CommandExecutionEvent) void {
+        switch (self.*) {
+            inline else => |*result| result.message.deinit(),
+        }
+        self.* = undefined;
     }
 };
 
@@ -542,6 +633,7 @@ pub const PromptDelivery = enum {
     enqueue,
 };
 
+pub const max_command_argument_bytes = 64 * 1024;
 pub const max_user_input_request_id_bytes = 4 * 1024;
 pub const max_user_input_question_bytes = 64 * 1024;
 pub const max_user_input_choices = 100;
@@ -733,7 +825,7 @@ pub const Closed = union(enum) {
 
 pub const Event = union(enum) {
     ready,
-    command_catalog: CommandCatalog,
+    command_catalog: CommandCatalogEvent,
     model_catalog: ModelCatalog,
     model_catalog_failed: OwnedText,
     model_switch: ModelSwitchResult,
@@ -749,7 +841,7 @@ pub const Event = union(enum) {
     assistant_complete: OwnedText,
     tool_activity: tool_activity.ToolActivityUpdate,
     user_input_requested: UserInputRequest,
-    command_completed: OwnedText,
+    command_completed: CommandExecutionEvent,
     idle,
     closed: Closed,
 
@@ -759,9 +851,9 @@ pub const Event = union(enum) {
             .reasoning_complete,
             .assistant_delta,
             .assistant_complete,
-            .command_completed,
             .session_title,
             => |*text| text.deinit(),
+            .command_completed => |*result| result.deinit(),
             .tool_activity => |*update| update.deinit(),
             .user_input_requested => |*request| request.deinit(),
             .command_catalog => |*catalog| catalog.deinit(),
@@ -779,6 +871,18 @@ pub const Event = union(enum) {
     }
 };
 
+const OwnedCommandInvocation = struct {
+    key: CommandKey,
+    name: OwnedText,
+    arguments: OwnedText,
+
+    fn deinit(self: *OwnedCommandInvocation) void {
+        self.name.deinit();
+        self.arguments.deinit();
+        self.* = undefined;
+    }
+};
+
 pub const Command = union(enum) {
     prompt: struct {
         message: OwnedPrompt,
@@ -789,7 +893,7 @@ pub const Command = union(enum) {
     refresh_sessions,
     switch_model: OwnedModelSelection,
     resume_session: ResumeKey,
-    execute_command: OwnedText,
+    execute_command: OwnedCommandInvocation,
     user_input_response: OwnedUserInputResponse,
     stop,
 
@@ -797,7 +901,7 @@ pub const Command = union(enum) {
         switch (self.*) {
             .prompt => |*prompt| prompt.message.deinit(),
             .switch_model => |*selection| selection.deinit(),
-            .execute_command => |*text| text.deinit(),
+            .execute_command => |*invocation| invocation.deinit(),
             .user_input_response => |*response| response.deinit(),
             .refresh_commands,
             .refresh_models,
@@ -847,6 +951,7 @@ const Core = struct {
     commands: std.ArrayList(Command) = .empty,
     events: std.ArrayList(Event) = .empty,
     pending_user_input: ?UserInputRequest = null,
+    command_catalog: ?CommandCatalog = null,
     next_user_input_request_id: u64 = 1,
     wake_pending: bool = false,
     stop_requested: bool = false,
@@ -978,8 +1083,27 @@ pub const Worker = struct {
         try self.publish(.assistant_started);
     }
 
+    fn installCommandCatalog(
+        self: *Worker,
+        catalog: *const CommandCatalog,
+    ) !void {
+        var replacement = try catalog.clone(self.core.allocator);
+        errdefer replacement.deinit();
+        try self.core.mutex.lock(self.core.io);
+        if (self.core.command_catalog) |*current| current.deinit();
+        self.core.command_catalog = replacement;
+        self.core.mutex.unlock(self.core.io);
+    }
+
     pub fn commandCatalog(self: *Worker, catalog: CommandCatalog) !void {
-        try self.publish(.{ .command_catalog = catalog });
+        try self.installCommandCatalog(&catalog);
+        try self.publish(.{ .command_catalog = .{ .replaced = catalog } });
+    }
+
+    pub fn commandCatalogFailed(self: *Worker, message: []const u8) !void {
+        try self.publish(.{ .command_catalog = .{
+            .failed = try OwnedText.init(self.core.allocator, message),
+        } });
     }
 
     pub fn userInputRequested(
@@ -1043,12 +1167,29 @@ pub const Worker = struct {
         };
     }
 
-    pub fn commandCompleted(self: *Worker, message: []const u8) !void {
+    pub fn commandCompleted(
+        self: *Worker,
+        key: CommandKey,
+        message: []const u8,
+    ) !void {
         try self.completeControl(.{
-            .command_completed = try OwnedText.init(
-                self.core.allocator,
-                message,
-            ),
+            .command_completed = .{ .completed = .{
+                .key = key,
+                .message = try OwnedText.init(self.core.allocator, message),
+            } },
+        });
+    }
+
+    pub fn commandFailed(
+        self: *Worker,
+        key: CommandKey,
+        message: []const u8,
+    ) !void {
+        try self.completeControl(.{
+            .command_completed = .{ .failed = .{
+                .key = key,
+                .message = try OwnedText.init(self.core.allocator, message),
+            } },
         });
     }
 
@@ -1076,7 +1217,10 @@ pub const Worker = struct {
         self: *Worker,
         catalog: CommandCatalog,
     ) !void {
-        try self.completeControl(.{ .command_catalog = catalog });
+        try self.installCommandCatalog(&catalog);
+        try self.completeControl(.{
+            .command_catalog = .{ .replaced = catalog },
+        });
     }
 
     pub fn completeModelRefreshFailure(
@@ -1279,17 +1423,61 @@ pub const Conversation = struct {
 
     pub fn executeCommand(
         self: *Conversation,
-        command: []const u8,
+        key: CommandKey,
+        arguments: []const u8,
     ) !void {
-        if (std.mem.trim(u8, command, " \t\r\n").len == 0) {
-            return error.EmptyCommand;
+        if (key.generation == 0 or key.slot == 0) return error.InvalidCommandKey;
+        if (arguments.len > max_command_argument_bytes) {
+            return error.CommandArgumentsTooLong;
         }
-        try self.enqueueControl(.{
-            .execute_command = try OwnedText.init(
-                self.core.allocator,
-                command,
-            ),
+        if (!std.unicode.utf8ValidateSlice(arguments)) {
+            return error.InvalidCommandArgumentsUtf8;
+        }
+
+        try self.core.mutex.lock(self.core.io);
+        defer self.core.mutex.unlock(self.core.io);
+
+        switch (self.core.state) {
+            .idle => {},
+            .starting,
+            .streaming,
+            .controlling,
+            .awaiting_user_input,
+            => return error.Busy,
+            .stopping => return error.Stopping,
+            .closed => return error.Closed,
+        }
+        const catalog = self.core.command_catalog orelse
+            return error.CommandCatalogUnavailable;
+        if (catalog.commands.len == 0 or
+            catalog.commands[0].key.generation != key.generation)
+        {
+            return error.StaleCommandKey;
+        }
+        const command = catalog.find(key) orelse return error.InvalidCommandKey;
+        if (command.action != .execute) return error.CommandIsNotExecutable;
+        const trimmed = std.mem.trim(u8, arguments, " \t\r\n");
+        switch (command.argument_policy) {
+            .none => if (trimmed.len != 0) return error.CommandTakesNoArguments,
+            .required => if (trimmed.len == 0) return error.CommandRequiresArguments,
+            .optional => {},
+        }
+        var name = try OwnedText.init(self.core.allocator, command.name);
+        errdefer name.deinit();
+        var owned_arguments = try OwnedText.init(
+            self.core.allocator,
+            arguments,
+        );
+        errdefer owned_arguments.deinit();
+        try self.core.commands.append(self.core.allocator, .{
+            .execute_command = .{
+                .key = key,
+                .name = name,
+                .arguments = owned_arguments,
+            },
         });
+        self.core.state = .controlling;
+        self.core.command_ready.signal(self.core.io);
     }
 
     pub fn resumeSession(self: *Conversation, key: ResumeKey) !void {
@@ -1400,6 +1588,7 @@ pub const Conversation = struct {
         for (self.core.events.items) |*event| event.deinit();
         self.core.events.deinit(self.core.allocator);
         if (self.core.pending_user_input) |*request| request.deinit();
+        if (self.core.command_catalog) |*catalog| catalog.deinit();
         const allocator = self.core.allocator;
         switch (self.core.runner) {
             .plain => {},
@@ -1461,6 +1650,162 @@ fn runWorker(core: *Core) void {
         .plain => |runner| runner(&worker),
         .context => |context| context.run(&worker, context.pointer),
     }
+}
+
+fn testCommandCatalog(
+    allocator: std.mem.Allocator,
+    generation: u64,
+) !CommandCatalog {
+    const commands = try allocator.alloc(CommandInfo, 2);
+    errdefer allocator.free(commands);
+    commands[0] = .{
+        .key = .{ .generation = generation, .slot = 1 },
+        .name = try allocator.dupe(u8, "required"),
+        .display_name = try allocator.dupe(u8, "required"),
+        .description = try allocator.dupe(u8, "Needs input"),
+        .hint = try allocator.dupe(u8, "value"),
+        .source = .sdk_builtin,
+        .action = .execute,
+        .argument_policy = .required,
+    };
+    errdefer commands[0].deinit(allocator);
+    commands[1] = .{
+        .key = .{ .generation = generation, .slot = 2 },
+        .name = try allocator.dupe(u8, "plain"),
+        .display_name = try allocator.dupe(u8, "plain"),
+        .description = try allocator.dupe(u8, "No input"),
+        .hint = null,
+        .source = .extension,
+        .action = .execute,
+        .argument_policy = .none,
+    };
+    return .{ .allocator = allocator, .commands = commands };
+}
+
+test "command admission rejects invalid arguments and stale keys" {
+    const Script = struct {
+        fn run(worker: *Worker) void {
+            if (!(worker.ready() catch return)) return;
+            worker.commandCatalog(
+                testCommandCatalog(worker.allocator(), 1) catch return,
+            ) catch return;
+            var command = worker.waitCommand();
+            defer command.deinit();
+            switch (command) {
+                .execute_command => |invocation| {
+                    if (invocation.key.generation != 1 or
+                        invocation.key.slot != 1 or
+                        !std.mem.eql(u8, invocation.name.bytes, "required") or
+                        !std.mem.eql(u8, invocation.arguments.bytes, "value"))
+                    {
+                        worker.closeFailure(.stream, "Unexpected invocation.");
+                        return;
+                    }
+                    worker.commandCompleted(
+                        invocation.key,
+                        "Command complete.",
+                    ) catch return;
+                    worker.commandCatalog(
+                        testCommandCatalog(worker.allocator(), 2) catch return,
+                    ) catch return;
+                },
+                else => {
+                    worker.closeFailure(.stream, "Unexpected command.");
+                    return;
+                },
+            }
+            var stop = worker.waitCommand();
+            stop.deinit();
+            worker.closeRequested();
+        }
+    };
+    const TestWake = struct {
+        fn notify(_: *anyopaque) void {}
+    };
+    var ignored: u8 = 0;
+    var conversation = try openWithRunner(
+        std.testing.allocator,
+        std.testing.io,
+        .{ .context = &ignored, .notify = TestWake.notify },
+        Script.run,
+    );
+    defer conversation.deinit();
+
+    var first_catalog_seen = false;
+    while (!first_catalog_seen) {
+        if (try conversation.tryTakeEvent()) |event_value| {
+            var event = event_value;
+            defer event.deinit();
+            if (event == .command_catalog) {
+                first_catalog_seen = event.command_catalog == .replaced;
+            }
+        } else {
+            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+    }
+
+    try std.testing.expectError(
+        error.CommandRequiresArguments,
+        conversation.executeCommand(.{ .generation = 1, .slot = 1 }, ""),
+    );
+    try std.testing.expectError(
+        error.CommandTakesNoArguments,
+        conversation.executeCommand(.{ .generation = 1, .slot = 2 }, "extra"),
+    );
+    try std.testing.expectError(
+        error.InvalidCommandArgumentsUtf8,
+        conversation.executeCommand(
+            .{ .generation = 1, .slot = 1 },
+            &.{0xff},
+        ),
+    );
+    try conversation.executeCommand(
+        .{ .generation = 1, .slot = 1 },
+        "value",
+    );
+
+    var second_catalog_seen = false;
+    while (!second_catalog_seen) {
+        if (try conversation.tryTakeEvent()) |event_value| {
+            var event = event_value;
+            defer event.deinit();
+            if (event == .command_catalog) {
+                second_catalog_seen = event.command_catalog == .replaced and
+                    event.command_catalog.replaced.commands[0].key.generation == 2;
+            }
+        } else {
+            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+    }
+    try std.testing.expectError(
+        error.StaleCommandKey,
+        conversation.executeCommand(.{ .generation = 1, .slot = 1 }, "value"),
+    );
+}
+
+test "command execution events preserve keys and outcomes" {
+    const key = CommandKey{ .generation = 3, .slot = 4 };
+    var completed = CommandExecutionEvent{ .completed = .{
+        .key = key,
+        .message = try OwnedText.init(std.testing.allocator, "done"),
+    } };
+    defer completed.deinit();
+    try std.testing.expectEqual(key, completed.completed.key);
+    try std.testing.expectEqualStrings(
+        "done",
+        completed.completed.message.bytes,
+    );
+
+    var failed = CommandExecutionEvent{ .failed = .{
+        .key = key,
+        .message = try OwnedText.init(std.testing.allocator, "failed"),
+    } };
+    defer failed.deinit();
+    try std.testing.expectEqual(key, failed.failed.key);
+    try std.testing.expectEqualStrings(
+        "failed",
+        failed.failed.message.bytes,
+    );
 }
 
 test "conversation transfers streamed events without SDK access" {

@@ -18,7 +18,7 @@ const private_directory_permissions: std.Io.Dir.Permissions =
         .fromMode(0o700);
 
 pub const version = build_options.version;
-pub const abi_version: u32 = 10;
+pub const abi_version: u32 = 11;
 pub const max_session_title_characters = session_title.max_characters;
 pub const Conversation = conversation.Conversation;
 pub const ConversationEvent = conversation.Event;
@@ -40,6 +40,14 @@ pub const max_attachment_identity_bytes = @import("attachment.zig").max_identity
 pub const max_attachment_display_name_bytes = @import("attachment.zig").max_display_name_bytes;
 pub const ImageFormat = @import("image.zig").Format;
 pub const CommandCatalog = conversation.CommandCatalog;
+pub const CommandInfo = conversation.CommandInfo;
+pub const CommandKey = conversation.CommandKey;
+pub const CommandSource = conversation.CommandSource;
+pub const CommandAction = conversation.CommandAction;
+pub const CommandArgumentPolicy = conversation.CommandArgumentPolicy;
+pub const CommandCatalogEvent = conversation.CommandCatalogEvent;
+pub const CommandExecutionEvent = conversation.CommandExecutionEvent;
+pub const max_command_argument_bytes = conversation.max_command_argument_bytes;
 pub const UserInputRequest = conversation.UserInputRequest;
 pub const UserInputAnswer = conversation.UserInputAnswer;
 pub const UserInputResponse = conversation.UserInputResponse;
@@ -699,20 +707,11 @@ fn executeSdkCommand(
     allocator: std.mem.Allocator,
     client: anytype,
     session: anytype,
-    input: []const u8,
+    name: []const u8,
+    arguments: []const u8,
 ) !InvokedCommand {
-    const trimmed = std.mem.trim(u8, input, " \t\r\n");
-    const command = if (trimmed.len > 0 and trimmed[0] == '/')
-        trimmed[1..]
-    else
-        trimmed;
-    const separator = std.mem.indexOfAny(u8, command, " \t\r\n");
-    const name = if (separator) |index| command[0..index] else command;
-    const args = if (separator) |index|
-        std.mem.trim(u8, command[index..], " \t\r\n")
-    else
-        "";
     if (name.len == 0) return error.EmptyCommand;
+    const args = std.mem.trim(u8, arguments, " \t\r\n");
 
     var result = try client.callRpc(
         struct {
@@ -794,11 +793,7 @@ fn selectedSubcommandInput(
 ) ![]u8 {
     for (selection.options) |option| {
         if (std.mem.eql(u8, option, answer)) {
-            return std.fmt.allocPrint(
-                allocator,
-                "{s} {s}",
-                .{ selection.command, option },
-            );
+            return allocator.dupe(u8, option);
         }
     }
     return error.InvalidSubcommandSelection;
@@ -1362,12 +1357,20 @@ fn isDuplicateHostedModel(
 
 fn buildCommandCatalog(
     allocator: std.mem.Allocator,
-    client: *copilot.Client,
-    session: copilot.Session,
+    client: anytype,
+    session: anytype,
+    generation: u64,
 ) !conversation.CommandCatalog {
+    if (generation == 0) return error.InvalidCommandGeneration;
     const RpcCommand = struct {
         name: []const u8,
+        displayName: ?[]const u8 = null,
         description: []const u8 = "",
+        kind: []const u8,
+        input: ?struct {
+            hint: []const u8 = "",
+            required: ?bool = null,
+        } = null,
     };
     var listed = try client.callRpc(
         struct { commands: []const RpcCommand },
@@ -1390,30 +1393,40 @@ fn buildCommandCatalog(
             count += 1;
         }
     }
+    if (count > std.math.maxInt(u32)) return error.TooManyCommands;
     const commands = try allocator.alloc(conversation.CommandInfo, count);
     errdefer allocator.free(commands);
     var initialized: usize = 0;
-    errdefer for (commands[0..initialized]) |*command| {
-        allocator.free(command.name);
-        allocator.free(command.description);
-    };
+    errdefer for (commands[0..initialized]) |*command| command.deinit(allocator);
 
     const sdk_model = for (sdk_commands) |command| {
         if (std.ascii.eqlIgnoreCase(command.name, "model")) break command;
     } else null;
     commands[initialized] = try initCommandInfo(
         allocator,
+        .{ .generation = generation, .slot = 1 },
         "model",
+        if (sdk_model) |command| command.displayName orelse "model" else "model",
         if (sdk_model) |command|
             command.description
         else
             "Switch the model for new turns",
+        null,
+        .vivi,
+        .open_model_selection,
+        .none,
     );
     initialized += 1;
     commands[initialized] = try initCommandInfo(
         allocator,
+        .{ .generation = generation, .slot = 2 },
+        "resume",
         "resume",
         "Resume a previous Vivi session",
+        null,
+        .vivi,
+        .open_session_history,
+        .none,
     );
     initialized += 1;
     for (sdk_commands) |command| {
@@ -1424,8 +1437,23 @@ fn buildCommandCatalog(
         }
         commands[initialized] = try initCommandInfo(
             allocator,
+            .{
+                .generation = generation,
+                .slot = @intCast(initialized + 1),
+            },
             command.name,
+            command.displayName orelse command.name,
             command.description,
+            if (command.input) |input|
+                if (input.hint.len > 0) input.hint else null
+            else
+                null,
+            try commandSource(command.kind),
+            .execute,
+            if (command.input) |input|
+                if (input.required == true) .required else .optional
+            else
+                .none,
         );
         initialized += 1;
     }
@@ -1434,39 +1462,181 @@ fn buildCommandCatalog(
 
 fn buildFallbackCommandCatalog(
     allocator: std.mem.Allocator,
+    generation: u64,
 ) !conversation.CommandCatalog {
+    if (generation == 0) return error.InvalidCommandGeneration;
     const commands = try allocator.alloc(conversation.CommandInfo, 2);
     errdefer allocator.free(commands);
     var initialized: usize = 0;
-    errdefer for (commands[0..initialized]) |*command| {
-        allocator.free(command.name);
-        allocator.free(command.description);
-    };
+    errdefer for (commands[0..initialized]) |*command| command.deinit(allocator);
     commands[initialized] = try initCommandInfo(
         allocator,
+        .{ .generation = generation, .slot = 1 },
+        "model",
         "model",
         "Switch the model for new turns",
+        null,
+        .vivi,
+        .open_model_selection,
+        .none,
     );
     initialized += 1;
     commands[initialized] = try initCommandInfo(
         allocator,
+        .{ .generation = generation, .slot = 2 },
+        "resume",
         "resume",
         "Resume a previous Vivi session",
+        null,
+        .vivi,
+        .open_session_history,
+        .none,
     );
     return .{ .allocator = allocator, .commands = commands };
 }
 
 fn initCommandInfo(
     allocator: std.mem.Allocator,
+    key: conversation.CommandKey,
     name: []const u8,
+    display_name: []const u8,
     description: []const u8,
+    hint: ?[]const u8,
+    source: conversation.CommandSource,
+    action: conversation.CommandAction,
+    argument_policy: conversation.CommandArgumentPolicy,
 ) !conversation.CommandInfo {
     const owned_name = try allocator.dupe(u8, name);
     errdefer allocator.free(owned_name);
+    const owned_display_name = try allocator.dupe(u8, display_name);
+    errdefer allocator.free(owned_display_name);
+    const owned_description = try allocator.dupe(u8, description);
+    errdefer allocator.free(owned_description);
     return .{
+        .key = key,
         .name = owned_name,
-        .description = try allocator.dupe(u8, description),
+        .display_name = owned_display_name,
+        .description = owned_description,
+        .hint = if (hint) |value| try allocator.dupe(u8, value) else null,
+        .source = source,
+        .action = action,
+        .argument_policy = argument_policy,
     };
+}
+
+fn commandSource(kind: []const u8) !conversation.CommandSource {
+    if (std.mem.eql(u8, kind, "builtin")) return .sdk_builtin;
+    if (std.mem.eql(u8, kind, "client") or std.mem.eql(u8, kind, "skill")) {
+        return .extension;
+    }
+    return error.UnsupportedCommandKind;
+}
+
+fn nextCommandGeneration(current: u64) !u64 {
+    if (current == std.math.maxInt(u64)) {
+        return error.CommandGenerationExhausted;
+    }
+    return current + 1;
+}
+
+const FakeCommandListClient = struct {
+    allocator: std.mem.Allocator,
+    response_json: []const u8,
+
+    fn callRpc(
+        self: *FakeCommandListClient,
+        comptime Result: type,
+        method: []const u8,
+        params: anytype,
+    ) !std.json.Parsed(Result) {
+        try std.testing.expectEqualStrings("session.commands.list", method);
+        try std.testing.expectEqualStrings("session-1", params.sessionId);
+        try std.testing.expect(params.includeBuiltins);
+        try std.testing.expect(params.includeSkills);
+        try std.testing.expect(params.includeClientCommands);
+        return std.json.parseFromSlice(
+            Result,
+            self.allocator,
+            self.response_json,
+            .{ .ignore_unknown_fields = true },
+        );
+    }
+};
+
+test "command catalog listing uses the caller-owned client and current session" {
+    var client = FakeCommandListClient{
+        .allocator = std.testing.allocator,
+        .response_json =
+        \\{"commands":[
+        \\{"name":"help","displayName":"help","description":"Show help","kind":"builtin"},
+        \\{"name":"model","displayName":"model","description":"Choose a model","kind":"builtin","input":{"hint":"model-id"}},
+        \\{"name":"resume","displayName":"resume","description":"Runtime resume","kind":"builtin"},
+        \\{"name":"autopilot","displayName":"autopilot","description":"Run autonomously","kind":"builtin","input":{"hint":"objective","required":true}},
+        \\{"name":"review","displayName":"review","description":"Review changes","kind":"skill","input":{"hint":"instructions"}}
+        \\]}
+        ,
+    };
+    var catalog = try buildCommandCatalog(
+        std.testing.allocator,
+        &client,
+        .{ .id = "session-1" },
+        7,
+    );
+    defer catalog.deinit();
+
+    try std.testing.expectEqual(@as(usize, 5), catalog.commands.len);
+    try std.testing.expectEqualStrings("model", catalog.commands[0].name);
+    try std.testing.expectEqualStrings("resume", catalog.commands[1].name);
+    try std.testing.expectEqualStrings("help", catalog.commands[2].name);
+    try std.testing.expectEqualStrings("autopilot", catalog.commands[3].name);
+    try std.testing.expectEqualStrings("review", catalog.commands[4].name);
+    try std.testing.expectEqual(
+        conversation.CommandKey{ .generation = 7, .slot = 4 },
+        catalog.commands[3].key,
+    );
+    try std.testing.expectEqual(
+        conversation.CommandSource.sdk_builtin,
+        catalog.commands[3].source,
+    );
+    try std.testing.expectEqual(
+        conversation.CommandSource.extension,
+        catalog.commands[4].source,
+    );
+    try std.testing.expectEqual(
+        conversation.CommandArgumentPolicy.none,
+        catalog.commands[2].argument_policy,
+    );
+    try std.testing.expectEqual(
+        conversation.CommandArgumentPolicy.required,
+        catalog.commands[3].argument_policy,
+    );
+    try std.testing.expectEqualStrings(
+        "objective",
+        catalog.commands[3].hint.?,
+    );
+}
+
+test "fallback command catalog is typed and generation advances" {
+    var catalog = try buildFallbackCommandCatalog(
+        std.testing.allocator,
+        try nextCommandGeneration(9),
+    );
+    defer catalog.deinit();
+    try std.testing.expectEqual(@as(usize, 2), catalog.commands.len);
+    try std.testing.expectEqual(@as(u64, 10), catalog.commands[0].key.generation);
+    try std.testing.expectEqual(
+        conversation.CommandAction.open_model_selection,
+        catalog.commands[0].action,
+    );
+    try std.testing.expectEqual(
+        conversation.CommandAction.open_session_history,
+        catalog.commands[1].action,
+    );
+    try std.testing.expectEqual(
+        conversation.CommandArgumentPolicy.none,
+        catalog.commands[1].argument_policy,
+    );
+    try std.testing.expect(catalog.commands[1].hint == null);
 }
 
 const ResumeTarget = struct {
@@ -1724,7 +1894,7 @@ test "raw history projection ignores malformed events" {
     try std.testing.expectEqualStrings("answer", snapshot.items[1].text);
 }
 
-test "broader resume canonicalizes SDK session titles" {
+test "SDK session catalog canonicalizes session titles" {
     const canonical = (try resumableSessionTitle(
         std.testing.allocator,
         "  Remote\n session  ",
@@ -1937,14 +2107,30 @@ fn refreshCommandCatalog(
     worker: *conversation.Worker,
     client: *copilot.Client,
     session: copilot.Session,
+    generation: *u64,
 ) void {
+    const next_generation = nextCommandGeneration(generation.*) catch |err| {
+        worker.commandCatalogFailed(@errorName(err)) catch {};
+        return;
+    };
     if (buildCommandCatalog(
         worker.allocator(),
         client,
         session,
+        next_generation,
     )) |catalog| {
+        generation.* = next_generation;
         worker.commandCatalog(catalog) catch {};
-    } else |_| {}
+    } else |err| {
+        worker.commandCatalogFailed(@errorName(err)) catch {};
+        if (buildFallbackCommandCatalog(
+            worker.allocator(),
+            next_generation,
+        )) |catalog| {
+            generation.* = next_generation;
+            worker.commandCatalog(catalog) catch {};
+        } else |_| {}
+    }
 }
 
 fn streamSessionResponse(
@@ -1952,6 +2138,7 @@ fn streamSessionResponse(
     client: *copilot.Client,
     session: copilot.Session,
     tool_service: *tools.Service,
+    command_generation: *u64,
 ) StreamResult {
     var typed_tool_calls = std.ArrayList([]u8).empty;
     defer {
@@ -2136,6 +2323,7 @@ fn streamSessionResponse(
                 worker,
                 client,
                 session,
+                command_generation,
             ),
             .tool_execution_start => |started| emitTypedToolStart(
                 worker,
@@ -2296,7 +2484,12 @@ fn streamSessionResponse(
                     unknown.event_type,
                     "commands.changed",
                 )) {
-                    refreshCommandCatalog(worker, client, session);
+                    refreshCommandCatalog(
+                        worker,
+                        client,
+                        session,
+                        command_generation,
+                    );
                 }
             },
             else => {},
@@ -2450,12 +2643,8 @@ fn runSdkConversation(
         return;
     }
 
-    const initial_commands = buildCommandCatalog(
-        worker.allocator(),
-        &client,
-        session,
-    ) catch buildFallbackCommandCatalog(worker.allocator()) catch null;
-    if (initial_commands) |catalog| worker.commandCatalog(catalog) catch {};
+    var command_generation: u64 = 0;
+    refreshCommandCatalog(worker, &client, session, &command_generation);
     if (buildModelCatalog(
         worker.allocator(),
         &client,
@@ -2482,16 +2671,28 @@ fn runSdkConversation(
                 return;
             },
             .refresh_commands => {
-                const catalog = buildCommandCatalog(
-                    worker.allocator(),
-                    &client,
-                    session,
-                ) catch buildFallbackCommandCatalog(
-                    worker.allocator(),
+                const next_generation = nextCommandGeneration(
+                    command_generation,
                 ) catch |err| {
                     worker.closeFailure(.stream, @errorName(err));
                     return;
                 };
+                const catalog = buildCommandCatalog(
+                    worker.allocator(),
+                    &client,
+                    session,
+                    next_generation,
+                ) catch |err| fallback: {
+                    worker.commandCatalogFailed(@errorName(err)) catch {};
+                    break :fallback buildFallbackCommandCatalog(
+                        worker.allocator(),
+                        next_generation,
+                    ) catch |fallback_err| {
+                        worker.closeFailure(.stream, @errorName(fallback_err));
+                        return;
+                    };
+                };
+                command_generation = next_generation;
                 worker.completeCommandRefresh(catalog) catch {
                     worker.closeFailure(
                         .stream,
@@ -2741,6 +2942,12 @@ fn runSdkConversation(
                     true;
                 previous_tools.deinit();
                 worker.allocator().free(previous_working_directory);
+                refreshCommandCatalog(
+                    worker,
+                    &client,
+                    session,
+                    &command_generation,
+                );
                 worker.completeSessionResume(.{ .resumed = .{
                     .session = summary,
                     .transcript = snapshot,
@@ -2752,31 +2959,33 @@ fn runSdkConversation(
                     );
                     return;
                 };
-                if (buildCommandCatalog(
-                    worker.allocator(),
-                    &client,
-                    session,
-                )) |catalog| {
-                    worker.commandCatalog(catalog) catch {};
-                } else |_| {}
             },
             .execute_command => |requested| {
-                var command_input = worker.allocator().dupe(
+                var command_name = worker.allocator().dupe(
                     u8,
-                    requested.bytes,
+                    requested.name.bytes,
                 ) catch |err| {
                     worker.closeFailure(.stream, @errorName(err));
                     return;
                 };
-                defer worker.allocator().free(command_input);
+                defer worker.allocator().free(command_name);
+                var command_arguments = worker.allocator().dupe(
+                    u8,
+                    requested.arguments.bytes,
+                ) catch |err| {
+                    worker.closeFailure(.stream, @errorName(err));
+                    return;
+                };
+                defer worker.allocator().free(command_arguments);
                 command_execution: while (true) {
                     var result = executeSdkCommand(
                         worker.allocator(),
                         &client,
                         session,
-                        command_input,
+                        command_name,
+                        command_arguments,
                     ) catch |err| {
-                        worker.commandCompleted(@errorName(err)) catch {
+                        worker.commandFailed(requested.key, @errorName(err)) catch {
                             worker.closeFailure(.stream, @errorName(err));
                             return;
                         };
@@ -2785,7 +2994,7 @@ fn runSdkConversation(
                     defer result.deinit(worker.allocator());
                     switch (result) {
                         .completed => |message| {
-                            worker.commandCompleted(message) catch {
+                            worker.commandCompleted(requested.key, message) catch {
                                 worker.closeFailure(
                                     .stream,
                                     "Unable to report slash command completion.",
@@ -2811,6 +3020,7 @@ fn runSdkConversation(
                                 &client,
                                 session,
                                 &tool_service,
+                                &command_generation,
                             )) {
                                 .idle => {},
                                 .stopped => {
@@ -2852,7 +3062,8 @@ fn runSdkConversation(
                                         selection,
                                         typed.answer.text(),
                                     ) catch |err| {
-                                        worker.commandCompleted(
+                                        worker.commandFailed(
+                                            requested.key,
                                             @errorName(err),
                                         ) catch {
                                             worker.closeFailure(
@@ -2863,8 +3074,21 @@ fn runSdkConversation(
                                         };
                                         break :command_execution;
                                     };
-                                    worker.allocator().free(command_input);
-                                    command_input = next_input;
+                                    const next_name = worker.allocator().dupe(
+                                        u8,
+                                        selection.command,
+                                    ) catch |err| {
+                                        worker.allocator().free(next_input);
+                                        worker.closeFailure(
+                                            .stream,
+                                            @errorName(err),
+                                        );
+                                        return;
+                                    };
+                                    worker.allocator().free(command_name);
+                                    worker.allocator().free(command_arguments);
+                                    command_name = next_name;
+                                    command_arguments = next_input;
                                     continue :command_execution;
                                 },
                                 .prompt,
@@ -3149,6 +3373,12 @@ fn runSdkConversation(
                     false
                 else |_|
                     true;
+                refreshCommandCatalog(
+                    worker,
+                    &client,
+                    session,
+                    &command_generation,
+                );
                 worker.completeModelSwitch(.{ .switched = .{
                     .model = info,
                     .selection = selected,
@@ -3162,13 +3392,6 @@ fn runSdkConversation(
                     );
                     return;
                 };
-                if (buildCommandCatalog(
-                    worker.allocator(),
-                    &client,
-                    session,
-                )) |catalog| {
-                    worker.commandCatalog(catalog) catch {};
-                } else |_| {}
             },
             .prompt => |prompt| {
                 sendPrompt(
@@ -3193,6 +3416,7 @@ fn runSdkConversation(
                     &client,
                     session,
                     &tool_service,
+                    &command_generation,
                 )) {
                     .idle => {},
                     .stopped => {
@@ -3815,7 +4039,7 @@ const FakeCommandClient = struct {
     }
 };
 
-test "slash command invocation handles all interactive result kinds" {
+test "command execution uses the caller-owned client and current session" {
     const session = .{ .id = "session-1" };
     var completed_client = FakeCommandClient{
         .allocator = std.testing.allocator,
@@ -3829,7 +4053,8 @@ test "slash command invocation handles all interactive result kinds" {
         std.testing.allocator,
         &completed_client,
         session,
-        "/autopilot thorough",
+        "autopilot",
+        "thorough",
     );
     defer completed.deinit(std.testing.allocator);
     switch (completed) {
@@ -3853,7 +4078,8 @@ test "slash command invocation handles all interactive result kinds" {
         std.testing.allocator,
         &prompt_client,
         session,
-        "/autopilot thorough",
+        "autopilot",
+        "thorough",
     );
     defer prompt.deinit(std.testing.allocator);
     switch (prompt) {
@@ -3877,7 +4103,8 @@ test "slash command invocation handles all interactive result kinds" {
         std.testing.allocator,
         &select_client,
         session,
-        "/chronicle",
+        "chronicle",
+        "",
     );
     defer selected.deinit(std.testing.allocator);
     switch (selected) {
@@ -3896,7 +4123,7 @@ test "slash command invocation handles all interactive result kinds" {
                 "show",
             );
             defer std.testing.allocator.free(next_input);
-            try std.testing.expectEqualStrings("chronicle show", next_input);
+            try std.testing.expectEqualStrings("show", next_input);
         },
     }
 }

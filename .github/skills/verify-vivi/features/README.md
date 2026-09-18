@@ -88,6 +88,8 @@ user-visible behavior. It then uses exactly four H2 sections in this order:
   Dock reopen, and joined application termination.
 - [Native project entry](./native-project-entry.md) covers directory-selected
   conversations, launch-project grouping, cancellation, validation, and Command-N.
-- [Native session history](./native-session-history.md) covers selected-store
-  per-project local catalogs, persisted-session resume, and cross-workspace
-  navigation identity.
+- [Native session history](./native-session-history.md) covers the SDK-owned
+  history catalog, persisted-session resume, and project-level navigation.
+- [Native command palette](./native-command-palette.md) covers shared command
+  discovery, keyboard interaction, typed arguments, lifecycle gating, and
+  model/history routing.
