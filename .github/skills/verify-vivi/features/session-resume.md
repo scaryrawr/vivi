@@ -1,30 +1,31 @@
 # Session resume
 
-Vivi records sessions it creates and lets the user continue their Copilot
-history later through a filterable `/resume` finder.
+Vivi lets the user continue Copilot CLI sessions from its private Copilot home
+through a filterable `/resume` finder.
 
 ## Sub-features
 
-- Successful Vivi session creation writes durable metadata under
-  `~/.vivi/sessions/`.
-- `/resume` opens a private Vivi-session finder without exposing Copilot
-  session IDs; `/resume all` searches Copilot sessions for the active workspace.
+- Successful Vivi session creation is persisted by Copilot CLI under
+  `~/.vivi/copilot/`.
+- `/resume` lists saved sessions across workspaces without exposing Copilot
+  session IDs.
 - Resume rows show the session title and working directory without model
   metadata.
 - The finder explains when no earlier session is available or a filter has no
   matches.
-- Selecting a row joins the saved Copilot session and replaces the visible Vivi
+- Selecting a row resumes the saved Copilot session and replaces the visible Vivi
   transcript with persisted Copilot history before reporting success.
 - A resumed session retains the server-side history from its earlier run.
+- The active Vivi model and reasoning selection apply to the resumed session;
+  Vivi does not maintain separate model metadata for saved sessions.
 - Isolated verification homes do not modify the user's real Vivi settings or
-  session index.
+  Copilot home.
 
 ## How to get to it (user POV)
 
 Start `vivi chat`, use it normally, and exit. Start another chat, type
 `/resume`, press Enter, select the saved workspace, and press Enter again. Use
-`/resume all` when the session was not previously recorded by Vivi but belongs
-to the current workspace.
+the finder text to narrow sessions by title or working directory.
 
 ## Driving it with verify-vivi
 
@@ -40,7 +41,9 @@ and asks for the transformed token.
 ## Gotchas
 
 - Copilot authentication and service availability are required.
+- The isolated verification home receives `gh auth token` through the process
+  environment; it never links to the user's normal Copilot session store.
 - The recipe deliberately creates a temporary second session before resuming;
-  both remain in the isolated verification index.
+  both remain in the isolated private Copilot home.
 - The resumed terminal transcript is hydrated from Copilot's persisted message
   history; a failed hydration leaves the current terminal transcript intact.

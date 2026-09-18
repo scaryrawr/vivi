@@ -66,6 +66,16 @@ final class NativeApplicationCoordinatorTests: XCTestCase {
     XCTAssertEqual(harness.coordinator.conversations.selectedID, record.id)
   }
 
+  func testUntitledLaunchPresentsMainWindow() {
+    let harness = CoordinatorHarness()
+    let delegate = ViviAppDelegate(applicationCoordinator: harness.coordinator)
+
+    XCTAssertTrue(delegate.applicationOpenUntitledFile(NSApplication.shared))
+
+    XCTAssertEqual(harness.windows.count, 1)
+    XCTAssertEqual(harness.windows[0].showCount, 1)
+  }
+
   func testTerminationWaitsForEveryUniqueConversationAndDefersReply() async {
     let harness = CoordinatorHarness()
     harness.coordinator.open([

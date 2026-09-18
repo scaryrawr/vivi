@@ -107,14 +107,11 @@ export fn vivi_backend_open(
     if (!std.fs.path.isAbsolute(working_directory)) {
         return c.VIVI_BACKEND_INVALID_ARGUMENT;
     }
-    const settings_path = optionalAbsolutePath(
+    const settings_path = (optionalAbsolutePath(
         input.settings_path,
         input.settings_path_length,
-    ) catch return c.VIVI_BACKEND_INVALID_ARGUMENT;
-    const sessions_directory = optionalAbsolutePath(
-        input.sessions_directory,
-        input.sessions_directory_length,
-    ) catch return c.VIVI_BACKEND_INVALID_ARGUMENT;
+    ) catch return c.VIVI_BACKEND_INVALID_ARGUMENT) orelse
+        return c.VIVI_BACKEND_INVALID_ARGUMENT;
     const copilot_cli_path = optionalAbsolutePath(
         input.copilot_cli_path,
         input.copilot_cli_path_length,
@@ -144,7 +141,6 @@ export fn vivi_backend_open(
         .{
             .working_directory = working_directory,
             .settings_path = settings_path,
-            .sessions_directory = sessions_directory,
             .copilot_cli_path = copilot_cli_path,
             .copilot_cli_launch = launch,
         },
@@ -587,7 +583,6 @@ fn project(event: *const backend.ConversationEvent) ?Projected {
         .command_catalog,
         .session_catalog,
         .session_catalog_failed,
-        .session_tracking_failed,
         .session_resume,
         .command_completed,
         => null,

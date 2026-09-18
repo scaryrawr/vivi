@@ -37,8 +37,6 @@ typedef struct vivi_backend_conversation_options {
     uint32_t working_directory_length;
     const uint8_t *settings_path;
     uint32_t settings_path_length;
-    const uint8_t *sessions_directory;
-    uint32_t sessions_directory_length;
     const uint8_t *copilot_cli_path;
     uint32_t copilot_cli_path_length;
     vivi_backend_copilot_cli_launch_t copilot_cli_launch;

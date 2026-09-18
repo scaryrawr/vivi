@@ -1196,15 +1196,11 @@ final class ViviConversationDriver: ViviConversationDriving, @unchecked Sendable
       let settingsPath =
         FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".vivi/settings.json").path
-      let sessionsDirectory =
-        FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent(".vivi/sessions").path
       guard let copilotPath = nativeCopilotExecutablePath() else {
         self.receive = nil
         return .failed
       }
       let settingsBytes = Array(settingsPath.utf8)
-      let sessionsBytes = Array(sessionsDirectory.utf8)
       let copilotBytes = Array(copilotPath.utf8)
       var options = vivi_backend_conversation_options_t(
         abi_version: UInt32(VIVI_BACKEND_ABI_VERSION),
@@ -1213,8 +1209,6 @@ final class ViviConversationDriver: ViviConversationDriving, @unchecked Sendable
         working_directory_length: UInt32(bytes.count),
         settings_path: nil,
         settings_path_length: UInt32(settingsBytes.count),
-        sessions_directory: nil,
-        sessions_directory_length: UInt32(sessionsBytes.count),
         copilot_cli_path: nil,
         copilot_cli_path_length: UInt32(copilotBytes.count),
         copilot_cli_launch: VIVI_BACKEND_COPILOT_CLI_EXPLICIT_PATH,
@@ -1223,14 +1217,11 @@ final class ViviConversationDriver: ViviConversationDriving, @unchecked Sendable
       )
       let result = bytes.withUnsafeBufferPointer { buffer in
         settingsBytes.withUnsafeBufferPointer { settingsBuffer in
-          sessionsBytes.withUnsafeBufferPointer { sessionsBuffer in
-            copilotBytes.withUnsafeBufferPointer { copilotBuffer in
-              options.working_directory = buffer.baseAddress
-              options.settings_path = settingsBuffer.baseAddress
-              options.sessions_directory = sessionsBuffer.baseAddress
-              options.copilot_cli_path = copilotBuffer.baseAddress
-              return vivi_backend_open(&options, &handle)
-            }
+          copilotBytes.withUnsafeBufferPointer { copilotBuffer in
+            options.working_directory = buffer.baseAddress
+            options.settings_path = settingsBuffer.baseAddress
+            options.copilot_cli_path = copilotBuffer.baseAddress
+            return vivi_backend_open(&options, &handle)
           }
         }
       }
