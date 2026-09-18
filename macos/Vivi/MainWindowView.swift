@@ -91,6 +91,7 @@ struct MainWindowView: View {
       .safeAreaInset(edge: .bottom) {
         newConversationControl
       }
+      .toolbar(removing: .sidebarToggle)
       .navigationSplitViewColumnWidth(min: 210, ideal: 250, max: 340)
       .accessibilityIdentifier("conversation-sidebar")
     } detail: {

@@ -28,7 +28,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, MainWind
     self.onClosed = onClosed
     super.init(window: window)
 
-    window.title = "Vivi"
+    Self.configureTitlebar(of: window)
     window.contentViewController = NSHostingController(
       rootView: MainWindowView(
         conversations: conversations,
@@ -81,13 +81,62 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, MainWind
       window?.title = "Vivi"
       return
     }
-    window?.title = conversation.navigation.title
+    window?.title = Self.windowTitle(for: conversation)
     titleObservation = conversation.$navigation
-      .map(\.title)
+      .map { [weak conversation] navigation in
+        guard let conversation else { return "Vivi" }
+        return Self.windowTitle(
+          conversationTitle: navigation.title,
+          workspace: conversation.launchWorkspace)
+      }
       .removeDuplicates()
       .sink { [weak window] title in
         window?.title = title
       }
+  }
+
+  private static func configureTitlebar(of window: NSWindow) {
+    let sidebarButton = SidebarToggleButton(
+      image: NSImage(
+        systemSymbolName: "sidebar.left",
+        accessibilityDescription: "Toggle Sidebar")!,
+      target: nil,
+      action: #selector(NSSplitViewController.toggleSidebar(_:)))
+    sidebarButton.bezelStyle = .toolbar
+    sidebarButton.imagePosition = .imageOnly
+    sidebarButton.toolTip = "Toggle Sidebar"
+    sidebarButton.setAccessibilityLabel("Toggle Sidebar")
+    sidebarButton.frame.size = NSSize(width: 36, height: 28)
+
+    let accessory = NSTitlebarAccessoryViewController()
+    accessory.layoutAttribute = .leading
+    accessory.view = sidebarButton
+
+    window.title = "Vivi"
+    window.titleVisibility = .visible
+    window.addTitlebarAccessoryViewController(accessory)
+  }
+
+  private static func windowTitle(for conversation: ConversationRecord) -> String {
+    windowTitle(
+      conversationTitle: conversation.navigation.title,
+      workspace: conversation.launchWorkspace)
+  }
+
+  private static func windowTitle(
+    conversationTitle: String,
+    workspace: WorkspaceIdentity
+  ) -> String {
+    let lastPathComponent =
+      URL(fileURLWithPath: workspace.canonicalPath)
+      .lastPathComponent
+    let projectName = lastPathComponent.isEmpty ? "/" : lastPathComponent
+    let displayedTitle = sidebarRowPresentation(
+      title: conversationTitle,
+      projectName: projectName,
+      duplicate: nil
+    ).title
+    return "Vivi | \(displayedTitle)"
   }
 
   private static func makeWindow() -> NSWindow {
@@ -101,5 +150,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, MainWind
     window.tabbingMode = .disallowed
     window.center()
     return window
+  }
+}
+
+@MainActor
+private final class SidebarToggleButton: NSButton {
+  override func accessibilityPerformPress() -> Bool {
+    guard let action else { return false }
+    return NSApp.sendAction(action, to: target, from: self)
   }
 }
