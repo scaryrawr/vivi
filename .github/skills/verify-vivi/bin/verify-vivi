@@ -440,7 +440,7 @@ chat_attachments() {
     temporary_directory="$run_dir/tmp"
     mkdir -p "$fixture" "$isolated_home" "$temporary_directory"
     cat >"$fixture/AGENTS.md" <<'EOF'
-When a prompt begins with vivi_attachment_probe and its attached image is predominantly blue, reply with exactly ATTACHMENT_OK_WORKSPACE_CONFIG_OK.
+When a prompt contains vivi_attachment_probe and its attached image is predominantly blue, reply with exactly ATTACHMENT_OK_WORKSPACE_CONFIG_OK.
 EOF
     prepare_attachment_clipboard "$run_dir"
     write_attachment_tape "$run_dir" "$fixture" "$model"

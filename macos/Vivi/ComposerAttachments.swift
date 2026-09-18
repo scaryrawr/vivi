@@ -95,7 +95,7 @@ final class AppKitComposerAttachmentAcquirer: ComposerAttachmentAcquiring {
   func chooseImages() async throws -> [ComposerAttachment] {
     precondition(panel == nil)
     guard let urls = await chooseURLs() else { return [] }
-    return try urls.map(Self.snapshot)
+    return try Self.snapshots(urls)
   }
 
   func pasteImage() throws -> ComposerAttachment {
@@ -148,6 +148,24 @@ final class AppKitComposerAttachmentAcquirer: ComposerAttachmentAcquiring {
       throw ComposerAttachmentAcquisitionError.unreadable(name)
     }
     return try snapshot(data: data, displayName: name)
+  }
+
+  static func snapshots(_ urls: [URL]) throws -> [ComposerAttachment] {
+    guard urls.count <= composerAttachmentCountLimit else {
+      throw ComposerAttachmentAcquisitionError.tooMany
+    }
+    var attachments: [ComposerAttachment] = []
+    attachments.reserveCapacity(urls.count)
+    var totalBytes = 0
+    for url in urls {
+      let attachment = try snapshot(url)
+      totalBytes += attachment.data.count
+      guard totalBytes <= composerAttachmentByteLimit else {
+        throw ComposerAttachmentAcquisitionError.totalTooLarge
+      }
+      attachments.append(attachment)
+    }
+    return attachments
   }
 
   static func snapshot(data: Data, displayName: String) throws -> ComposerAttachment {

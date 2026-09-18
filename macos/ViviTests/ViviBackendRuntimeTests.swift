@@ -174,6 +174,34 @@ final class ViviBackendRuntimeTests: XCTestCase {
         displayName: "bad.png"))
   }
 
+  func testAppKitAttachmentSelectionEnforcesCountBeforeReadsAndAggregateWhileReading() throws {
+    let missing = URL(fileURLWithPath: "/missing/image.png")
+    XCTAssertThrowsError(
+      try AppKitComposerAttachmentAcquirer.snapshots(
+        Array(repeating: missing, count: composerAttachmentCountLimit + 1))
+    ) { error in
+      XCTAssertEqual(error as? ComposerAttachmentAcquisitionError, .tooMany)
+    }
+
+    let directory = FileManager.default.temporaryDirectory
+      .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    var oversizedAggregate = testPNGData()
+    oversizedAggregate.append(
+      Data(repeating: 0, count: composerAttachmentByteLimit / 2))
+    let first = directory.appendingPathComponent("first.png")
+    let second = directory.appendingPathComponent("second.png")
+    try oversizedAggregate.write(to: first)
+    try oversizedAggregate.write(to: second)
+
+    XCTAssertThrowsError(
+      try AppKitComposerAttachmentAcquirer.snapshots([first, second])
+    ) { error in
+      XCTAssertEqual(error as? ComposerAttachmentAcquisitionError, .totalTooLarge)
+    }
+  }
+
   func testUserInputChoicePreservesToolChronologyAndBackendIdentity() {
     let driver = FakeConversationDriver()
     let store = NativeChatStore(workspace: "/tmp/work", driver: driver)
