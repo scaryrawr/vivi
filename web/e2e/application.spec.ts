@@ -3,6 +3,17 @@ import { expect, test } from "@playwright/test";
 const rows = (page: import("@playwright/test").Page) =>
   page.locator("[data-session-row]").allTextContents();
 
+test("production page declares the strict WKWebView CSP", async ({ page }) => {
+  await page.goto("/?scenario=one");
+
+  await expect(
+    page.locator('meta[http-equiv="Content-Security-Policy"]'),
+  ).toHaveAttribute(
+    "content",
+    "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'none'; base-uri 'none'; form-action 'none'",
+  );
+});
+
 test("selecting bottom, middle, and top sessions preserves order and one selection", async ({
   page,
 }) => {

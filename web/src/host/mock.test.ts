@@ -25,6 +25,38 @@ describe("MockViviHost", () => {
     ).toEqual(before);
   });
 
+  it("creates, appends, selects, and publishes a conversation", async () => {
+    const host = new MockViviHost(fixtures.one);
+    const listener = vi.fn();
+    host.subscribe(listener);
+    const before = host.getSnapshot();
+    const project = before.projects[0]!;
+
+    await expect(host.createConversation(project.path)).resolves.toEqual({
+      kind: "accepted",
+    });
+
+    const after = host.getSnapshot();
+    const createdSummary = after.projects[0]!.sessions.at(-1)!;
+    expect(after).not.toBe(before);
+    expect(after.revision).toBe(before.revision + 1);
+    expect(after.projects[0]!.sessions).toHaveLength(
+      project.sessions.length + 1,
+    );
+    expect(createdSummary).toMatchObject({
+      projectPath: project.path,
+      title: "",
+      lifecycle: { kind: "idle" },
+    });
+    expect(after.selectedSession).toMatchObject({
+      id: createdSummary.id,
+      activeWorkspace: project.path,
+      transcript: [],
+      error: null,
+    });
+    expect(listener).toHaveBeenCalledTimes(1);
+  });
+
   it("deduplicates accepted submission identifiers", async () => {
     const host = new MockViviHost(fixtures.one);
     const listener = vi.fn();

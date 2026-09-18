@@ -40,15 +40,17 @@ export function ViviApp({
   appearance = "light",
   initiallyCollapsed = [],
 }: ViviAppProps) {
-  const snapshot = useSyncExternalStore(
-    host.subscribe.bind(host),
-    host.getSnapshot.bind(host),
-    host.getSnapshot.bind(host),
+  const subscribe = useMemo(() => host.subscribe.bind(host), [host]);
+  const getSnapshot = useMemo(() => host.getSnapshot.bind(host), [host]);
+  const getConnectionState = useMemo(
+    () => host.getConnectionState.bind(host),
+    [host],
   );
+  const snapshot = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
   const connectionState = useSyncExternalStore(
-    host.subscribe.bind(host),
-    host.getConnectionState.bind(host),
-    host.getConnectionState.bind(host),
+    subscribe,
+    getConnectionState,
+    getConnectionState,
   );
   const [ui, dispatch] = useReducer(reduceUi, {
     ...initialUiState,
