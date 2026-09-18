@@ -9,6 +9,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, MainWind
   private let activate: @MainActor () -> Void
   private let onClosed: @MainActor (MainWindowIdentity) -> Void
   private let titlebarAccessory = MainWindowTitlebarAccessoryController()
+  private let sidebarPresentation = MainWindowSidebarPresentation()
   private var selectionObservation: AnyCancellable?
   private var titleObservation: AnyCancellable?
   private var closingForTermination = false
@@ -33,6 +34,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, MainWind
       rootView: MainWindowView(
         conversations: conversations,
         applicationPresentation: applicationCoordinator.presentation,
+        sidebarPresentation: sidebarPresentation,
         requestNewConversation: { [weak applicationCoordinator] in
           applicationCoordinator?.requestNewConversation()
         },
@@ -41,6 +43,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, MainWind
         }))
     // Realize SwiftUI's split-view chrome before replacing it with the owned accessory.
     window.contentViewController?.view.layoutSubtreeIfNeeded()
+    titlebarAccessory.sidebarButton.target = self
+    titlebarAccessory.sidebarButton.action = #selector(toggleSidebar(_:))
     installTitlebarAccessory(in: window)
     window.delegate = self
     window.setFrameAutosaveName("ViviMainWindow")
@@ -75,10 +79,23 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, MainWind
     onClosed(identity)
   }
 
+  func windowDidUpdate(_ notification: Notification) {
+    guard let window else { return }
+    installTitlebarAccessory(in: window)
+  }
+
   func closeForTermination() {
     closingForTermination = true
     window?.orderOut(nil)
     close()
+  }
+
+  @objc private func toggleSidebar(_ sender: Any?) {
+    sidebarPresentation.toggle()
+    DispatchQueue.main.async { [weak self] in
+      guard let self, let window = self.window else { return }
+      self.installTitlebarAccessory(in: window)
+    }
   }
 
   private func installTitlebarAccessory(in window: NSWindow) {
@@ -144,7 +161,7 @@ final class MainWindowTitlebarAccessoryController: NSTitlebarAccessoryViewContro
     sidebarButton = NSButton(
       image: NSImage(systemSymbolName: "sidebar.left", accessibilityDescription: nil)!,
       target: nil,
-      action: #selector(NSSplitViewController.toggleSidebar(_:)))
+      action: nil)
     sidebarButton.isBordered = false
     sidebarButton.toolTip = "Toggle Sidebar"
     sidebarButton.setAccessibilityLabel("Toggle Sidebar")

@@ -113,12 +113,13 @@ func projectSessionHistoryPresentation(
 struct MainWindowView: View {
   @ObservedObject var conversations: ConversationCollection
   @ObservedObject var applicationPresentation: NativeApplicationPresentation
+  @ObservedObject var sidebarPresentation: MainWindowSidebarPresentation
   let requestNewConversation: () -> Void
   let dismissWorkspaceChoiceFailure: () -> Void
   @State private var sidebarSelection: SidebarSelection?
 
   var body: some View {
-    NavigationSplitView {
+    NavigationSplitView(columnVisibility: $sidebarPresentation.columnVisibility) {
       List(selection: selectionBinding) {
         ForEach(conversations.launchWorkspaces, id: \.self) { workspace in
           Section {
@@ -175,6 +176,7 @@ struct MainWindowView: View {
       }
     }
     .navigationSplitViewStyle(.balanced)
+    .toolbar(removing: .sidebarToggle)
     .frame(minWidth: 760, minHeight: 500)
     .alert(
       "Can’t Start Conversation",
@@ -263,6 +265,15 @@ struct MainWindowView: View {
           projectWorkspace: workspace.canonicalPath
         ).map(\.key)
       })
+  }
+}
+
+@MainActor
+final class MainWindowSidebarPresentation: ObservableObject {
+  @Published var columnVisibility: NavigationSplitViewVisibility = .all
+
+  func toggle() {
+    columnVisibility = columnVisibility == .detailOnly ? .all : .detailOnly
   }
 }
 

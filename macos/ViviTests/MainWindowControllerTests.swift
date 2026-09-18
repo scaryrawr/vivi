@@ -65,9 +65,20 @@ final class MainWindowControllerTests: XCTestCase {
     controller.showAndActivate()
     layoutTitlebar(in: window)
 
+    guard let sidebar = navigationSidebar(in: window) else {
+      XCTFail("Missing realized navigation sidebar")
+      return
+    }
+    let sidebarWasHidden = sidebar.isHidden
     assertVisibleTitlebarGeometry(in: window)
     titlebarAccessory(in: window)?.sidebarButton.performClick(nil)
+    RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.3))
     layoutTitlebar(in: window)
+    XCTAssertNotEqual(navigationSidebar(in: window)?.isHidden, sidebarWasHidden)
+    titlebarAccessory(in: window)?.sidebarButton.performClick(nil)
+    RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.3))
+    layoutTitlebar(in: window)
+    XCTAssertEqual(navigationSidebar(in: window)?.isHidden, sidebarWasHidden)
 
     XCTAssertEqual(window.title, "Vivi")
     XCTAssertEqual(window.titleVisibility, .hidden)
@@ -96,6 +107,18 @@ final class MainWindowControllerTests: XCTestCase {
     window.titlebarAccessoryViewControllers.lazy
       .compactMap { $0 as? MainWindowTitlebarAccessoryController }
       .first
+  }
+
+  @MainActor
+  private func navigationSidebar(in window: NSWindow) -> NSView? {
+    guard
+      let splitView = descendantViews(of: NSSplitView.self, below: window.contentView).first
+    else {
+      return nil
+    }
+    return splitView.subviews
+      .filter { $0.frame.width > 44 && $0.frame.width < splitView.bounds.width / 2 }
+      .max { $0.frame.width < $1.frame.width }
   }
 
   @MainActor

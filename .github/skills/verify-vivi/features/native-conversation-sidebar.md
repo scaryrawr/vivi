@@ -10,7 +10,8 @@ away from each conversation store.
 - Every `vivi chat --native` occurrence adds and selects a fresh conversation,
   including repeated launches from the same workspace.
 - Each canonical launch workspace gets one stable project section for the app
-  lifetime, with the canonical path shown as project context.
+  lifetime. Its canonical path stays in tooltip/accessibility context unless
+  duplicate project names require a visible secondary line.
 - Sidebar rows show the conversation title without repeating the project path;
   repeated workspaces receive stable numeric disambiguation.
 - Saved sessions follow live conversations directly in backend order without a
