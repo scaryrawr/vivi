@@ -178,6 +178,18 @@ const streaming: HostSnapshot = {
   ],
 };
 
+const longTranscript: HostSnapshot = {
+  ...one,
+  selectedSession: selectedSession(
+    viviSessions[0],
+    Array.from({ length: 100 }, (_, index) => ({
+      id: transcriptItemId(`long-status-${index}`),
+      kind: "status" as const,
+      text: `Completed deterministic step ${index + 1}.`,
+    })),
+  ),
+};
+
 const error: HostSnapshot = {
   ...one,
   applicationError: {
@@ -208,6 +220,7 @@ export const fixtures = {
   one,
   multiple,
   longTitles,
+  longTranscript,
   streaming,
   error,
 };

@@ -1,4 +1,5 @@
 import {
+  useLayoutEffect,
   useMemo,
   useReducer,
   useRef,
@@ -58,6 +59,9 @@ export function ViviApp({
   const createPendingRef = useRef(false);
   const [sendPending, setSendPending] = useState(false);
   const sendPendingRef = useRef(false);
+  const transcriptRef = useRef<HTMLDivElement>(null);
+  const followTranscriptRef = useRef(true);
+  const previousSessionRef = useRef<SessionId | null>(null);
   const sessionIds = useMemo(
     () => selectOrderedSessionIds(snapshot),
     [snapshot],
@@ -67,6 +71,17 @@ export function ViviApp({
   const connected = connectionState.kind === "connected";
   const canSend = connected && selectCanSend(snapshot, ui) && !sendPending;
   const sidebarRef = useRef<HTMLElement>(null);
+
+  useLayoutEffect(() => {
+    if (!selected) return;
+    const transcript = transcriptRef.current;
+    const sessionChanged = previousSessionRef.current !== selected.id;
+    previousSessionRef.current = selected.id;
+    if (!transcript || (!sessionChanged && !followTranscriptRef.current))
+      return;
+    transcript.scrollTop = transcript.scrollHeight;
+    followTranscriptRef.current = true;
+  }, [selected]);
 
   const handleResult = (result: HostCommandResult) => {
     if (result.kind === "rejected") setCommandError(result.message);
@@ -280,8 +295,17 @@ export function ViviApp({
           <>
             <div
               className="transcript"
+              ref={transcriptRef}
               aria-live="polite"
               aria-busy={selected.lifecycle.kind === "responding"}
+              onScroll={(event) => {
+                const transcript = event.currentTarget;
+                followTranscriptRef.current =
+                  transcript.scrollHeight -
+                    transcript.scrollTop -
+                    transcript.clientHeight <=
+                  24;
+              }}
             >
               {selected.transcript.length ? (
                 selected.transcript.map((item) => (

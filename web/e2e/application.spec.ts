@@ -94,6 +94,55 @@ test("session lifecycle is visible without relying on color", async ({
   ).toBeVisible();
 });
 
+test("transcript follows new content until the user scrolls up", async ({
+  page,
+}) => {
+  await page.goto("/?scenario=longTranscript");
+  const transcript = page.locator(".transcript");
+  const composer = page.getByRole("textbox", { name: "Message" });
+
+  await expect
+    .poll(() =>
+      transcript.evaluate(
+        (element) => element.scrollHeight - element.clientHeight,
+      ),
+    )
+    .toBeGreaterThan(0);
+  await transcript.evaluate((element) => {
+    element.scrollTop = element.scrollHeight;
+  });
+  await expect
+    .poll(() =>
+      transcript.evaluate(
+        (element) =>
+          element.scrollHeight - element.scrollTop - element.clientHeight,
+      ),
+    )
+    .toBeLessThanOrEqual(24);
+  await composer.fill("Follow this response");
+  await page.keyboard.press("Meta+Enter");
+  await expect(page.getByText("Follow this response")).toBeVisible();
+  await expect
+    .poll(() =>
+      transcript.evaluate(
+        (element) =>
+          element.scrollHeight - element.scrollTop - element.clientHeight,
+      ),
+    )
+    .toBeLessThanOrEqual(24);
+
+  await transcript.evaluate((element) => {
+    element.scrollTop = 0;
+  });
+  await expect
+    .poll(() => transcript.evaluate((element) => element.scrollTop))
+    .toBeLessThanOrEqual(1);
+  await composer.fill("Do not pull me down");
+  await page.keyboard.press("Meta+Enter");
+  await expect(page.getByText("Do not pull me down")).toBeAttached();
+  expect(await transcript.evaluate((element) => element.scrollTop)).toBe(0);
+});
+
 test("captures stable core screenshots", async ({ page }) => {
   await page.goto("/?scenario=multiple");
   await expect(page).toHaveScreenshot("multiple-projects.png");
