@@ -53,6 +53,7 @@ export class MockViviHost implements ViviHostPort, ConnectedViviHost {
   }
 
   async selectSession(id: SessionId): Promise<HostCommandResult> {
+    if (this.connectionState.kind !== "connected") return disconnected();
     const summary = this.snapshot.projects
       .flatMap((project) => project.sessions)
       .find((session) => session.id === id);
@@ -79,6 +80,7 @@ export class MockViviHost implements ViviHostPort, ConnectedViviHost {
   async createConversation(
     projectPath: WorkspacePath,
   ): Promise<HostCommandResult> {
+    if (this.connectionState.kind !== "connected") return disconnected();
     const projectIndex = this.snapshot.projects.findIndex(
       (project) => project.path === projectPath,
     );
@@ -110,6 +112,7 @@ export class MockViviHost implements ViviHostPort, ConnectedViviHost {
   }
 
   async sendMessage(request: SendMessageRequest): Promise<HostCommandResult> {
+    if (this.connectionState.kind !== "connected") return disconnected();
     if (this.acceptedSubmissions.has(request.submissionId))
       return { kind: "accepted" };
     const selected = this.snapshot.selectedSession;
@@ -165,4 +168,8 @@ function rejected(
   message: string,
 ): HostCommandResult {
   return { kind: "rejected", reason, message };
+}
+
+function disconnected(): HostCommandResult {
+  return rejected("closed", "The host is disconnected.");
 }

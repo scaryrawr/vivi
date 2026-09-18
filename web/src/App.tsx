@@ -60,10 +60,9 @@ export function ViviApp({
   );
   const selected = snapshot.selectedSession;
   const draft = selected ? selectDraft(ui, selected.id) : null;
+  const connected = connectionState.kind === "connected";
   const canSend =
-    connectionState.kind === "connected" &&
-    selectCanSend(snapshot, ui) &&
-    !sendPending;
+    connected && selectCanSend(snapshot, ui) && !sendPending;
   const sidebarRef = useRef<HTMLElement>(null);
 
   const handleResult = (result: HostCommandResult) => {
@@ -179,6 +178,7 @@ export function ViviApp({
                           className="session-row"
                           aria-current={isSelected ? "page" : undefined}
                           key={session.id}
+                          disabled={!connected}
                           onClick={() => void selectSession(session.id)}
                         >
                           <span className="session-title">
@@ -191,6 +191,7 @@ export function ViviApp({
                     <button
                       className="new-conversation"
                       type="button"
+                      disabled={!connected}
                       onClick={() => void createConversation(project.path)}
                     >
                       <span aria-hidden="true">＋</span> New conversation

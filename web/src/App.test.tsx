@@ -27,4 +27,17 @@ describe("ViviApp", () => {
     expect(screen.getByRole("button", { name: "Send message" })).toBeDisabled();
     expect(screen.getByText("Host bridge disconnected")).toBeVisible();
   });
+
+  it("disables host-backed sidebar commands after disconnection", () => {
+    const host = new MockViviHost(fixtures.multiple);
+    render(<ViviApp host={host} />);
+
+    act(() => host.disconnect());
+
+    for (const row of screen.getAllByRole("button", {
+      name: /Stabilize native session ordering|New conversation|Review streaming event ownership/,
+    })) {
+      expect(row).toBeDisabled();
+    }
+  });
 });

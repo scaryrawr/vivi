@@ -71,4 +71,51 @@ describe("MockViviHost", () => {
 
     expect(states).toEqual(["disconnected"]);
   });
+
+  it("rejects every command without mutating state after disconnection", async () => {
+    const host = new MockViviHost(fixtures.multiple);
+    const before = host.getSnapshot();
+    const selectedId = before.selectedSession!.id;
+    const otherId = before.projects[1]!.sessions[0]!.id;
+    const projectPath = before.projects[0]!.path;
+
+    host.disconnect();
+
+    await expect(host.selectSession(otherId)).resolves.toMatchObject({
+      kind: "rejected",
+      reason: "closed",
+    });
+    await expect(host.createConversation(projectPath)).resolves.toMatchObject({
+      kind: "rejected",
+      reason: "closed",
+    });
+    await expect(
+      host.sendMessage({
+        sessionId: selectedId,
+        submissionId: clientSubmissionId("disconnected"),
+        text: "Do not submit",
+      }),
+    ).resolves.toMatchObject({ kind: "rejected", reason: "closed" });
+
+    expect(host.getSnapshot()).toBe(before);
+  });
+
+  it("does not accept a duplicate submission after disconnection", async () => {
+    const host = new MockViviHost(fixtures.one);
+    const request = {
+      sessionId: fixtures.one.selectedSession!.id,
+      submissionId: clientSubmissionId("accepted-then-disconnected"),
+      text: "Hello",
+    };
+
+    await host.sendMessage(request);
+    const before = host.getSnapshot();
+    host.disconnect();
+
+    await expect(host.sendMessage(request)).resolves.toMatchObject({
+      kind: "rejected",
+      reason: "closed",
+    });
+    expect(host.getSnapshot()).toBe(before);
+  });
 });
