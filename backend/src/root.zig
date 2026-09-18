@@ -18,7 +18,7 @@ const private_directory_permissions: std.Io.Dir.Permissions =
         .fromMode(0o700);
 
 pub const version = build_options.version;
-pub const abi_version: u32 = 8;
+pub const abi_version: u32 = 9;
 pub const max_session_title_characters = session_title.max_characters;
 pub const Conversation = conversation.Conversation;
 pub const ConversationEvent = conversation.Event;
@@ -34,6 +34,17 @@ pub const PromptDelivery = conversation.PromptDelivery;
 pub const Prompt = conversation.Prompt;
 pub const CommandCatalog = conversation.CommandCatalog;
 pub const UserInputRequest = conversation.UserInputRequest;
+pub const UserInputAnswer = conversation.UserInputAnswer;
+pub const UserInputResponse = conversation.UserInputResponse;
+pub const max_user_input_request_id_bytes =
+    conversation.max_user_input_request_id_bytes;
+pub const max_user_input_question_bytes =
+    conversation.max_user_input_question_bytes;
+pub const max_user_input_choices = conversation.max_user_input_choices;
+pub const max_user_input_choice_bytes =
+    conversation.max_user_input_choice_bytes;
+pub const max_user_input_answer_bytes =
+    conversation.max_user_input_answer_bytes;
 pub const ModelCatalog = conversation.ModelCatalog;
 pub const ModelInfo = conversation.ModelInfo;
 pub const ModelSelection = conversation.ModelSelection;
@@ -790,31 +801,23 @@ fn handleSdkUserInput(
     const worker: *conversation.Worker = @ptrCast(
         @alignCast(context orelse return error.MissingUserInputContext),
     );
-    try worker.userInputRequested(try conversation.UserInputRequest.init(
-        allocator,
-        request.session_id,
+    try worker.userInputRequested(
         request.question,
         request.choices orelse &.{},
         request.allow_freeform orelse true,
-    ));
+    );
 
     var command = worker.waitUserInputResponse();
     defer command.deinit();
     switch (command) {
         .user_input_response => |response| {
-            if (!std.mem.eql(
-                u8,
-                response.request_id.bytes,
-                request.session_id,
-            )) {
-                return error.UnexpectedUserInputResponse;
-            }
+            const typed = response.view();
             return .{
                 .answer = try allocator.dupe(
                     u8,
-                    response.answer.bytes,
+                    typed.answer.text(),
                 ),
-                .was_freeform = response.was_freeform,
+                .was_freeform = typed.answer == .freeform,
             };
         },
         .stop => return error.UserInputCancelled,
@@ -2808,17 +2811,11 @@ fn runSdkConversation(
                             break :command_execution;
                         },
                         .select_subcommand => |selection| {
-                            const request = conversation.UserInputRequest.init(
-                                worker.allocator(),
-                                session.id,
+                            worker.userInputRequested(
                                 selection.title,
                                 selection.options,
                                 false,
                             ) catch |err| {
-                                worker.closeFailure(.stream, @errorName(err));
-                                return;
-                            };
-                            worker.userInputRequested(request) catch |err| {
                                 worker.closeFailure(.stream, @errorName(err));
                                 return;
                             };
@@ -2838,21 +2835,11 @@ fn runSdkConversation(
                                     return;
                                 },
                                 .user_input_response => |answer| {
-                                    if (!std.mem.eql(
-                                        u8,
-                                        answer.request_id.bytes,
-                                        session.id,
-                                    )) {
-                                        worker.closeFailure(
-                                            .stream,
-                                            "Subcommand response ID mismatch.",
-                                        );
-                                        return;
-                                    }
+                                    const typed = answer.view();
                                     const next_input = selectedSubcommandInput(
                                         worker.allocator(),
                                         selection,
-                                        answer.answer.bytes,
+                                        typed.answer.text(),
                                     ) catch |err| {
                                         worker.commandCompleted(
                                             @errorName(err),

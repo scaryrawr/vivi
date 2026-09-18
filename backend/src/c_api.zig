@@ -58,6 +58,14 @@ fn result(error_value: anyerror) c.vivi_backend_result_t {
         error.EmptyModel,
         error.InvalidReasoningEffort,
         error.InvalidSessionKey,
+        error.EmptyAnswer,
+        error.EmptyUserInputRequestId,
+        error.InvalidUserInputUtf8,
+        error.UserInputTextTooLong,
+        error.StaleUserInputRequest,
+        error.InvalidUserInputChoice,
+        error.FreeformUserInputNotAllowed,
+        error.NotAwaitingInput,
         => c.VIVI_BACKEND_INVALID_ARGUMENT,
         else => c.VIVI_BACKEND_FAILED,
     };
@@ -276,6 +284,52 @@ export fn vivi_backend_resume_session(
     return c.VIVI_BACKEND_OK;
 }
 
+fn userInputResponse(
+    response: *const c.vivi_backend_user_input_response_t,
+) ?backend.UserInputResponse {
+    if (response.struct_size < @sizeOf(c.vivi_backend_user_input_response_t) or
+        response.reserved != 0 or
+        response.request_id_length == 0 or
+        response.request_id_length > backend.max_user_input_request_id_bytes or
+        response.answer_length == 0 or
+        response.answer_length > backend.max_user_input_answer_bytes)
+    {
+        return null;
+    }
+    if (response.request_id == null or response.answer == null) {
+        return null;
+    }
+    const request_id = response.request_id[0..response.request_id_length];
+    const answer = response.answer[0..response.answer_length];
+    if (!std.unicode.utf8ValidateSlice(request_id) or
+        !std.unicode.utf8ValidateSlice(answer) or
+        std.mem.trim(u8, answer, " \t\r\n").len == 0)
+    {
+        return null;
+    }
+    const typed_answer: backend.UserInputAnswer = switch (response.answer_kind) {
+        c.VIVI_BACKEND_USER_INPUT_ANSWER_CHOICE => .{ .choice = answer },
+        c.VIVI_BACKEND_USER_INPUT_ANSWER_FREEFORM => .{ .freeform = answer },
+        else => return null,
+    };
+    return .{
+        .request_id = request_id,
+        .answer = typed_answer,
+    };
+}
+
+export fn vivi_backend_respond_to_user_input(
+    conversation: ?*c.vivi_backend_conversation_t,
+    response_value: ?*const c.vivi_backend_user_input_response_t,
+) callconv(.c) c.vivi_backend_result_t {
+    const self = handle(conversation) orelse return c.VIVI_BACKEND_INVALID_ARGUMENT;
+    const raw = response_value orelse return c.VIVI_BACKEND_INVALID_ARGUMENT;
+    const response = userInputResponse(raw) orelse
+        return c.VIVI_BACKEND_INVALID_ARGUMENT;
+    self.conversation.respondToUserInput(response) catch |err| return result(err);
+    return c.VIVI_BACKEND_OK;
+}
+
 export fn vivi_backend_sanitize_tool_markdown(
     input: ?[*]const u8,
     input_length: u32,
@@ -466,6 +520,10 @@ const Projected = struct {
     sessions: []const backend.SessionSummary = &.{},
     resumed_session: ?*const backend.SessionSummary = null,
     transcript: []const backend.TranscriptItem = &.{},
+    user_input_request_id: []const u8 = "",
+    user_input_question: []const u8 = "",
+    user_input_choices: []const []u8 = &.{},
+    allow_freeform: bool = false,
 };
 
 const ToolDisplay = struct {
@@ -651,10 +709,13 @@ fn project(event: *const backend.ConversationEvent) ?Projected {
                 .text = failure.message.bytes,
             },
         },
-        .user_input_requested => .{
-            .kind = c.VIVI_BACKEND_EVENT_FAILURE,
-            .content_kind = c.VIVI_BACKEND_CONTENT_TEXT,
-            .text = "Native chat cannot answer agent questions yet.",
+        .user_input_requested => |request| .{
+            .kind = c.VIVI_BACKEND_EVENT_USER_INPUT_REQUEST,
+            .content_kind = c.VIVI_BACKEND_CONTENT_USER_INPUT_REQUEST,
+            .user_input_request_id = request.request_id,
+            .user_input_question = request.question,
+            .user_input_choices = request.choices,
+            .allow_freeform = request.allow_freeform,
         },
         .command_catalog,
         .command_completed,
@@ -683,6 +744,8 @@ fn byteCount(projected: Projected) !u32 {
         projected.tool_title,
         projected.tool_detail,
         projected.tool_input,
+        projected.user_input_request_id,
+        projected.user_input_question,
     };
     for (values) |value| {
         total = std.math.add(u64, total, value.len) catch
@@ -716,6 +779,10 @@ fn byteCount(projected: Projected) !u32 {
     }
     for (projected.transcript) |item| {
         total = std.math.add(u64, total, item.text.len) catch
+            return error.EventTooLarge;
+    }
+    for (projected.user_input_choices) |choice| {
+        total = std.math.add(u64, total, choice.len) catch
             return error.EventTooLarge;
     }
     if (total > std.math.maxInt(u32)) return error.EventTooLarge;
@@ -753,6 +820,11 @@ fn sessionCount(projected: Projected) !u32 {
 
 fn transcriptItemCount(projected: Projected) !u32 {
     return std.math.cast(u32, projected.transcript.len) orelse
+        error.EventTooLarge;
+}
+
+fn userInputChoiceCount(projected: Projected) !u32 {
+    return std.math.cast(u32, projected.user_input_choices.len) orelse
         error.EventTooLarge;
 }
 
@@ -870,6 +942,17 @@ fn writeTranscriptItem(
     };
 }
 
+fn writeUserInputChoice(
+    destination: []u8,
+    offset: *u32,
+    choice: []const u8,
+) c.vivi_backend_user_input_choice_t {
+    return .{
+        .text = appendBytes(destination, offset, choice),
+        .reserved = 0,
+    };
+}
+
 fn copyProjected(
     projected: Projected,
     output: *c.vivi_backend_event_t,
@@ -913,6 +996,8 @@ fn copyProjectedWithSpans(
         0,
         null,
         0,
+        null,
+        0,
     );
 }
 
@@ -929,6 +1014,8 @@ fn copyProjectedFull(
     session_capacity: u32,
     transcript_items: ?[*]c.vivi_backend_transcript_item_t,
     transcript_item_capacity: u32,
+    user_input_choices: ?[*]c.vivi_backend_user_input_choice_t,
+    user_input_choice_capacity: u32,
 ) c.vivi_backend_result_t {
     const required_bytes = byteCount(projected) catch return c.VIVI_BACKEND_FAILED;
     const required_models = modelCount(projected) catch return c.VIVI_BACKEND_FAILED;
@@ -938,6 +1025,8 @@ fn copyProjectedFull(
         return c.VIVI_BACKEND_FAILED;
     const required_transcript_items = transcriptItemCount(projected) catch
         return c.VIVI_BACKEND_FAILED;
+    const required_user_input_choices = userInputChoiceCount(projected) catch
+        return c.VIVI_BACKEND_FAILED;
     output.* = .{
         .kind = projected.kind,
         .content_kind = projected.content_kind,
@@ -946,6 +1035,7 @@ fn copyProjectedFull(
         .semantic_span_count = required_semantic_spans,
         .session_count = required_sessions,
         .transcript_item_count = required_transcript_items,
+        .user_input_choice_count = required_user_input_choices,
         .content = .{ .offset = 0, .length = @intCast(projected.text.len) },
         .selected_model_id = if (projected.selected_model_id.len == 0)
             .{ .offset = 0, .length = 0 }
@@ -958,6 +1048,8 @@ fn copyProjectedFull(
         .tool_title = .{ .offset = 0, .length = 0 },
         .tool_detail = .{ .offset = 0, .length = 0 },
         .tool_input = .{ .offset = 0, .length = 0 },
+        .user_input_request_id = .{ .offset = 0, .length = 0 },
+        .user_input_question = .{ .offset = 0, .length = 0 },
         .tool_input_presentation = emptyPresentation(),
         .tool_output_presentation = emptyPresentation(),
         .tool_result = projected.tool_result,
@@ -967,13 +1059,15 @@ fn copyProjectedFull(
         .session_resume_outcome = projected.session_resume_outcome,
         .default_saved = @intFromBool(projected.default_saved),
         .cleanup_failed = @intFromBool(projected.cleanup_failed),
-        .session_reserved = 0,
+        .allow_freeform = @intFromBool(projected.allow_freeform),
+        .event_reserved = 0,
         .reserved = 0,
     };
     if (byte_capacity < required_bytes or model_capacity < required_models or
         semantic_span_capacity < required_semantic_spans or
         session_capacity < required_sessions or
-        transcript_item_capacity < required_transcript_items)
+        transcript_item_capacity < required_transcript_items or
+        user_input_choice_capacity < required_user_input_choices)
     {
         return c.VIVI_BACKEND_BUFFER_TOO_SMALL;
     }
@@ -982,6 +1076,7 @@ fn copyProjectedFull(
     var empty_semantic_spans: [0]c.vivi_backend_semantic_span_t = .{};
     var empty_sessions: [0]c.vivi_backend_session_summary_t = .{};
     var empty_transcript_items: [0]c.vivi_backend_transcript_item_t = .{};
+    var empty_user_input_choices: [0]c.vivi_backend_user_input_choice_t = .{};
     const byte_destination: []u8 = if (required_bytes > 0)
         (bytes orelse return c.VIVI_BACKEND_INVALID_ARGUMENT)[0..required_bytes]
     else
@@ -1005,6 +1100,12 @@ fn copyProjectedFull(
             (transcript_items orelse return c.VIVI_BACKEND_INVALID_ARGUMENT)[0..required_transcript_items]
         else
             &empty_transcript_items;
+    const user_input_choice_destination: []c.vivi_backend_user_input_choice_t =
+        if (required_user_input_choices > 0)
+            (user_input_choices orelse
+                return c.VIVI_BACKEND_INVALID_ARGUMENT)[0..required_user_input_choices]
+        else
+            &empty_user_input_choices;
     var offset: u32 = 0;
     output.content = appendBytes(byte_destination, &offset, projected.text);
     output.selected_model_id = appendOptionalBytes(
@@ -1031,6 +1132,16 @@ fn copyProjectedFull(
         byte_destination,
         &offset,
         projected.tool_input,
+    );
+    output.user_input_request_id = appendBytes(
+        byte_destination,
+        &offset,
+        projected.user_input_request_id,
+    );
+    output.user_input_question = appendBytes(
+        byte_destination,
+        &offset,
+        projected.user_input_question,
     );
     var semantic_offset: u32 = 0;
     if (projected.input_presentation) |value| {
@@ -1094,6 +1205,13 @@ fn copyProjectedFull(
             item,
         );
     }
+    for (projected.user_input_choices, 0..) |choice, index| {
+        user_input_choice_destination[index] = writeUserInputChoice(
+            byte_destination,
+            &offset,
+            choice,
+        );
+    }
     return c.VIVI_BACKEND_OK;
 }
 
@@ -1110,6 +1228,8 @@ export fn vivi_backend_next_event(
     session_capacity: u32,
     transcript_items: ?[*]c.vivi_backend_transcript_item_t,
     transcript_item_capacity: u32,
+    user_input_choices: ?[*]c.vivi_backend_user_input_choice_t,
+    user_input_choice_capacity: u32,
 ) callconv(.c) c.vivi_backend_result_t {
     const self = handle(conversation) orelse return c.VIVI_BACKEND_INVALID_ARGUMENT;
     const output = out_event orelse return c.VIVI_BACKEND_INVALID_ARGUMENT;
@@ -1123,12 +1243,15 @@ export fn vivi_backend_next_event(
             .semantic_span_count = 0,
             .session_count = 0,
             .transcript_item_count = 0,
+            .user_input_choice_count = 0,
             .content = .{ .offset = 0, .length = 0 },
             .selected_model_id = .{ .offset = 0, .length = 0 },
             .tool_call_id = .{ .offset = 0, .length = 0 },
             .tool_title = .{ .offset = 0, .length = 0 },
             .tool_detail = .{ .offset = 0, .length = 0 },
             .tool_input = .{ .offset = 0, .length = 0 },
+            .user_input_request_id = .{ .offset = 0, .length = 0 },
+            .user_input_question = .{ .offset = 0, .length = 0 },
             .tool_input_presentation = emptyPresentation(),
             .tool_output_presentation = emptyPresentation(),
             .tool_result = c.VIVI_BACKEND_TOOL_RESULT_NONE,
@@ -1138,7 +1261,8 @@ export fn vivi_backend_next_event(
             .session_resume_outcome = c.VIVI_BACKEND_SESSION_RESUME_NONE,
             .default_saved = 0,
             .cleanup_failed = 0,
-            .session_reserved = 0,
+            .allow_freeform = 0,
+            .event_reserved = 0,
             .reserved = 0,
         };
         return c.VIVI_BACKEND_OK;
@@ -1165,6 +1289,8 @@ export fn vivi_backend_next_event(
         session_capacity,
         transcript_items,
         transcript_item_capacity,
+        user_input_choices,
+        user_input_choice_capacity,
     );
     if (copied != c.VIVI_BACKEND_OK) return copied;
     if (projected.kind == c.VIVI_BACKEND_EVENT_FAILURE) {
@@ -1584,6 +1710,133 @@ test "C session title is a distinct typed text event" {
     try std.testing.expectEqualStrings("Native title", projected.text);
 }
 
+test "C user input request copy is atomic with caller-owned choice spans" {
+    const allocator = std.testing.allocator;
+    var event: backend.ConversationEvent = .{
+        .user_input_requested = try backend.UserInputRequest.init(
+            allocator,
+            "user-input-7",
+            "Choose a deployment",
+            &.{ "Staging", "Production" },
+            true,
+        ),
+    };
+    defer event.deinit();
+    const projected = project(&event).?;
+
+    const required_bytes = try byteCount(projected);
+    var metadata = std.mem.zeroes(c.vivi_backend_event_t);
+    metadata.kind = 255;
+    const too_short = try allocator.alloc(u8, required_bytes - 1);
+    defer allocator.free(too_short);
+    @memset(too_short, 0xaa);
+    var choices: [2]c.vivi_backend_user_input_choice_t = undefined;
+    @memset(std.mem.asBytes(&choices), 0xbb);
+    try std.testing.expectEqual(
+        @as(c.vivi_backend_result_t, c.VIVI_BACKEND_BUFFER_TOO_SMALL),
+        copyProjectedFull(
+            projected,
+            &metadata,
+            too_short.ptr,
+            @intCast(too_short.len),
+            null,
+            0,
+            null,
+            0,
+            null,
+            0,
+            null,
+            0,
+            &choices,
+            choices.len,
+        ),
+    );
+    try std.testing.expect(
+        metadata.kind == c.VIVI_BACKEND_EVENT_USER_INPUT_REQUEST,
+    );
+    try std.testing.expectEqual(@as(u32, 2), metadata.user_input_choice_count);
+    try std.testing.expect(std.mem.allEqual(u8, too_short, 0xaa));
+    try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&choices), 0xbb));
+
+    const bytes = try allocator.alloc(u8, required_bytes);
+    defer allocator.free(bytes);
+    try std.testing.expectEqual(
+        @as(c.vivi_backend_result_t, c.VIVI_BACKEND_OK),
+        copyProjectedFull(
+            projected,
+            &metadata,
+            bytes.ptr,
+            @intCast(bytes.len),
+            null,
+            0,
+            null,
+            0,
+            null,
+            0,
+            null,
+            0,
+            &choices,
+            choices.len,
+        ),
+    );
+    try std.testing.expect(
+        metadata.kind == c.VIVI_BACKEND_EVENT_USER_INPUT_REQUEST,
+    );
+    try std.testing.expect(
+        metadata.content_kind == c.VIVI_BACKEND_CONTENT_USER_INPUT_REQUEST,
+    );
+    try std.testing.expectEqual(@as(u32, 2), metadata.user_input_choice_count);
+    try std.testing.expectEqual(@as(u8, 1), metadata.allow_freeform);
+    try std.testing.expectEqualStrings(
+        "user-input-7",
+        bytes[metadata.user_input_request_id.offset..][0..metadata.user_input_request_id.length],
+    );
+    try std.testing.expectEqualStrings(
+        "Choose a deployment",
+        bytes[metadata.user_input_question.offset..][0..metadata.user_input_question.length],
+    );
+    try std.testing.expectEqualStrings(
+        "Staging",
+        bytes[choices[0].text.offset..][0..choices[0].text.length],
+    );
+    try std.testing.expectEqualStrings(
+        "Production",
+        bytes[choices[1].text.offset..][0..choices[1].text.length],
+    );
+}
+
+test "C user input response parser rejects malformed typed controls" {
+    var raw = std.mem.zeroes(c.vivi_backend_user_input_response_t);
+    raw.struct_size = @sizeOf(c.vivi_backend_user_input_response_t);
+    raw.answer_kind = c.VIVI_BACKEND_USER_INPUT_ANSWER_CHOICE;
+    raw.request_id = "user-input-1";
+    raw.request_id_length = "user-input-1".len;
+    raw.answer = "Beta";
+    raw.answer_length = "Beta".len;
+
+    const parsed = userInputResponse(&raw).?;
+    try std.testing.expectEqualStrings("user-input-1", parsed.request_id);
+    try std.testing.expect(parsed.answer == .choice);
+    try std.testing.expectEqualStrings("Beta", parsed.answer.text());
+
+    raw.reserved = 1;
+    try std.testing.expect(userInputResponse(&raw) == null);
+    raw.reserved = 0;
+    raw.answer_kind = 99;
+    try std.testing.expect(userInputResponse(&raw) == null);
+    raw.answer_kind = c.VIVI_BACKEND_USER_INPUT_ANSWER_FREEFORM;
+    raw.answer = " \t";
+    raw.answer_length = 2;
+    try std.testing.expect(userInputResponse(&raw) == null);
+    raw.answer = "\xff";
+    raw.answer_length = 1;
+    try std.testing.expect(userInputResponse(&raw) == null);
+    raw.answer = "Custom";
+    raw.answer_length = "Custom".len;
+    raw.request_id = null;
+    try std.testing.expect(userInputResponse(&raw) == null);
+}
+
 test "C session title projection rejects noncanonical text" {
     const allocator = std.testing.allocator;
     var event: backend.ConversationEvent = .{
@@ -1632,6 +1885,8 @@ test "C session catalog copy is atomic and preserves opaque keys" {
                 0,
                 null,
                 0,
+                null,
+                0,
             ),
     );
     try std.testing.expectEqual(@as(u8, 0xaa), bytes[0]);
@@ -1651,6 +1906,8 @@ test "C session catalog copy is atomic and preserves opaque keys" {
                 0,
                 &sessions,
                 sessions.len,
+                null,
+                0,
                 null,
                 0,
             ),
@@ -1731,6 +1988,8 @@ test "C session resume copies summary and ordered transcript atomically" {
                 sessions.len,
                 &transcript,
                 2,
+                null,
+                0,
             ),
     );
     try std.testing.expectEqual(@as(u64, 0), sessions[0].key.generation);
@@ -1751,6 +2010,8 @@ test "C session resume copies summary and ordered transcript atomically" {
                 sessions.len,
                 &transcript,
                 transcript.len,
+                null,
+                0,
             ),
     );
     try std.testing.expect(
@@ -1796,6 +2057,8 @@ test "C failed session resume keeps optional metadata neutral" {
                 &metadata,
                 bytes.ptr,
                 @intCast(bytes.len),
+                null,
+                0,
                 null,
                 0,
                 null,

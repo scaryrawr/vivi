@@ -2523,6 +2523,27 @@ const MenuMode = enum {
     sessions,
 };
 
+fn userInputAnswer(
+    request: backend.UserInputRequest,
+    raw_answer: []const u8,
+) ?backend.UserInputAnswer {
+    const answer = std.mem.trim(u8, raw_answer, " \t\r\n");
+    if (answer.len == 0) return null;
+    for (request.choices) |choice| {
+        if (std.mem.eql(u8, answer, choice)) {
+            return .{ .choice = choice };
+        }
+    }
+    if (request.choices.len > 0) {
+        const selected = std.fmt.parseUnsigned(usize, answer, 10) catch 0;
+        if (selected > 0 and selected <= request.choices.len) {
+            return .{ .choice = request.choices[selected - 1] };
+        }
+    }
+    if (!request.allow_freeform) return null;
+    return .{ .freeform = answer };
+}
+
 const ChatUi = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -2923,39 +2944,14 @@ const ChatUi = struct {
         const request = self.pending_user_input orelse return;
         const answer = try self.input.toOwnedContents(self.allocator);
         defer self.allocator.free(answer);
-        const trimmed_answer = std.mem.trim(u8, answer, " \t\r\n");
-        if (trimmed_answer.len == 0) return;
-
-        var submitted_answer: []const u8 = trimmed_answer;
-        var was_freeform = true;
-        for (request.choices) |choice| {
-            if (std.mem.eql(u8, trimmed_answer, choice)) {
-                was_freeform = false;
-                break;
-            }
-        }
-        if (was_freeform and request.choices.len > 0) {
-            const selected = std.fmt.parseUnsigned(
-                usize,
-                trimmed_answer,
-                10,
-            ) catch 0;
-            if (selected > 0 and selected <= request.choices.len) {
-                submitted_answer = request.choices[selected - 1];
-                was_freeform = false;
-            }
-        }
-        if (was_freeform and !request.allow_freeform and
-            request.choices.len > 0)
-        {
+        const submitted_answer = userInputAnswer(request, answer) orelse {
             self.invalid_user_input = true;
             return;
-        }
+        };
         try self.completeUserInput(
             conversation,
             request,
             submitted_answer,
-            was_freeform,
         );
     }
 
@@ -2972,8 +2968,7 @@ const ChatUi = struct {
         try self.completeUserInput(
             conversation,
             request,
-            request.choices[self.selected_user_input_choice],
-            false,
+            .{ .choice = request.choices[self.selected_user_input_choice] },
         );
     }
 
@@ -2981,15 +2976,23 @@ const ChatUi = struct {
         self: *ChatUi,
         conversation: *backend.Conversation,
         request: backend.UserInputRequest,
-        answer: []const u8,
-        was_freeform: bool,
+        answer: backend.UserInputAnswer,
     ) !void {
-        conversation.respondToUserInput(
-            request.request_id,
-            answer,
-            was_freeform,
-        ) catch |err| switch (err) {
-            error.EmptyAnswer, error.NotAwaitingInput => return,
+        conversation.respondToUserInput(.{
+            .request_id = request.request_id,
+            .answer = answer,
+        }) catch |err| switch (err) {
+            error.EmptyAnswer,
+            error.NotAwaitingInput,
+            error.StaleUserInputRequest,
+            error.InvalidUserInputChoice,
+            error.FreeformUserInputNotAllowed,
+            error.UserInputTextTooLong,
+            error.InvalidUserInputUtf8,
+            => {
+                self.invalid_user_input = true;
+                return;
+            },
             else => return err,
         };
         self.transcript.endTurn();
@@ -2997,7 +3000,7 @@ const ChatUi = struct {
         try self.transcript.appendBeforeQueued(
             self.allocator,
             .user,
-            answer,
+            answer.text(),
         );
         self.restoreInputAfterUserInput();
         var completed = self.pending_user_input.?;
@@ -8320,6 +8323,45 @@ test "arrow selection replaces typed ask-user input" {
     defer std.testing.allocator.free(contents);
     try std.testing.expectEqualStrings("", contents);
     try std.testing.expectEqual(@as(usize, 1), ui.selected_user_input_choice);
+}
+
+test "ask-user answers use typed choice and freeform variants" {
+    var request = try backend.UserInputRequest.init(
+        std.testing.allocator,
+        "request-1",
+        "Pick one",
+        &.{ "Alpha", "Beta" },
+        true,
+    );
+    defer request.deinit();
+
+    const exact = userInputAnswer(request, "Beta").?;
+    try std.testing.expect(exact == .choice);
+    try std.testing.expectEqualStrings("Beta", exact.text());
+
+    const numeric = userInputAnswer(request, " 1 ").?;
+    try std.testing.expect(numeric == .choice);
+    try std.testing.expectEqualStrings("Alpha", numeric.text());
+
+    const freeform = userInputAnswer(request, "Custom").?;
+    try std.testing.expect(freeform == .freeform);
+    try std.testing.expectEqualStrings("Custom", freeform.text());
+}
+
+test "ask-user disallowed freeform remains retryable" {
+    var request = try backend.UserInputRequest.init(
+        std.testing.allocator,
+        "request-1",
+        "Pick one",
+        &.{ "Alpha", "Beta" },
+        false,
+    );
+    defer request.deinit();
+
+    try std.testing.expect(userInputAnswer(request, "Custom") == null);
+    const retry = userInputAnswer(request, "2").?;
+    try std.testing.expect(retry == .choice);
+    try std.testing.expectEqualStrings("Beta", retry.text());
 }
 
 test "ask-user panel reserves rows for wrapped questions" {

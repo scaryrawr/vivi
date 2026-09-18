@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define VIVI_BACKEND_ABI_VERSION 8
+#define VIVI_BACKEND_ABI_VERSION 9
 #define VIVI_BACKEND_SESSION_TITLE_MAX_CHARACTERS 80
 
 typedef enum vivi_backend_result {
@@ -65,6 +65,7 @@ typedef enum vivi_backend_event_kind {
     VIVI_BACKEND_EVENT_SESSION_CATALOG = 17,
     VIVI_BACKEND_EVENT_SESSION_CATALOG_FAILURE = 18,
     VIVI_BACKEND_EVENT_SESSION_RESUME = 19,
+    VIVI_BACKEND_EVENT_USER_INPUT_REQUEST = 20,
 } vivi_backend_event_kind_t;
 
 typedef enum vivi_backend_content_kind {
@@ -75,6 +76,7 @@ typedef enum vivi_backend_content_kind {
     VIVI_BACKEND_CONTENT_TOOL = 4,
     VIVI_BACKEND_CONTENT_SESSION_CATALOG = 5,
     VIVI_BACKEND_CONTENT_SESSION_RESUME = 6,
+    VIVI_BACKEND_CONTENT_USER_INPUT_REQUEST = 7,
 } vivi_backend_content_kind_t;
 
 typedef enum vivi_backend_tool_result {
@@ -217,6 +219,27 @@ typedef struct vivi_backend_transcript_item {
     uint32_t reserved;
 } vivi_backend_transcript_item_t;
 
+typedef struct vivi_backend_user_input_choice {
+    vivi_backend_span_t text;
+    uint32_t reserved;
+} vivi_backend_user_input_choice_t;
+
+typedef enum vivi_backend_user_input_answer_kind {
+    VIVI_BACKEND_USER_INPUT_ANSWER_NONE = 0,
+    VIVI_BACKEND_USER_INPUT_ANSWER_CHOICE = 1,
+    VIVI_BACKEND_USER_INPUT_ANSWER_FREEFORM = 2,
+} vivi_backend_user_input_answer_kind_t;
+
+typedef struct vivi_backend_user_input_response {
+    uint32_t struct_size;
+    vivi_backend_user_input_answer_kind_t answer_kind;
+    const uint8_t *request_id;
+    uint32_t request_id_length;
+    const uint8_t *answer;
+    uint32_t answer_length;
+    uint32_t reserved;
+} vivi_backend_user_input_response_t;
+
 typedef struct vivi_backend_event {
     vivi_backend_event_kind_t kind;
     vivi_backend_content_kind_t content_kind;
@@ -225,12 +248,15 @@ typedef struct vivi_backend_event {
     uint32_t semantic_span_count;
     uint32_t session_count;
     uint32_t transcript_item_count;
+    uint32_t user_input_choice_count;
     vivi_backend_span_t content;
     vivi_backend_span_t selected_model_id;
     vivi_backend_span_t tool_call_id;
     vivi_backend_span_t tool_title;
     vivi_backend_span_t tool_detail;
     vivi_backend_span_t tool_input;
+    vivi_backend_span_t user_input_request_id;
+    vivi_backend_span_t user_input_question;
     vivi_backend_presentation_t tool_input_presentation;
     vivi_backend_presentation_t tool_output_presentation;
     vivi_backend_tool_result_t tool_result;
@@ -240,7 +266,8 @@ typedef struct vivi_backend_event {
     vivi_backend_session_resume_outcome_t session_resume_outcome;
     uint8_t default_saved;
     uint8_t cleanup_failed;
-    uint16_t session_reserved;
+    uint8_t allow_freeform;
+    uint8_t event_reserved;
     uint16_t reserved;
 } vivi_backend_event_t;
 
@@ -264,6 +291,9 @@ vivi_backend_result_t vivi_backend_refresh_sessions(
 vivi_backend_result_t vivi_backend_resume_session(
     vivi_backend_conversation_t *conversation,
     vivi_backend_resume_key_t key);
+vivi_backend_result_t vivi_backend_respond_to_user_input(
+    vivi_backend_conversation_t *conversation,
+    const vivi_backend_user_input_response_t *response);
 /*
  * Sanitizes untrusted tool text for Markdown display. out_length always receives
  * the required byte count. A short or null output buffer does not write output.
@@ -306,7 +336,9 @@ vivi_backend_result_t vivi_backend_next_event(
     vivi_backend_session_summary_t *sessions,
     uint32_t session_capacity,
     vivi_backend_transcript_item_t *transcript_items,
-    uint32_t transcript_item_capacity);
+    uint32_t transcript_item_capacity,
+    vivi_backend_user_input_choice_t *user_input_choices,
+    uint32_t user_input_choice_capacity);
 vivi_backend_result_t vivi_backend_close(
     vivi_backend_conversation_t *conversation);
 /*

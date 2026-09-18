@@ -474,6 +474,13 @@ final class ControllableConversationDriver: ViviConversationDriving {
     return .accepted
   }
 
+  func respondToUserInput(
+    requestID: String,
+    answer: UserInputAnswer
+  ) -> ConversationOperationResult {
+    .accepted
+  }
+
   func close(completion: @escaping @MainActor () -> Void) {
     closeCount += 1
     closeCompletions.append(completion)
