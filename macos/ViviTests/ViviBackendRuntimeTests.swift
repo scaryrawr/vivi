@@ -1458,7 +1458,7 @@ final class ViviBackendRuntimeTests: XCTestCase {
 
     XCTAssertNotEqual(store.selectedCommandKey, oldKey)
     XCTAssertEqual(store.selectedCommandKey?.generation, 5)
-    XCTAssertEqual(driver.commandRefreshCount, 3)
+    XCTAssertEqual(driver.commandRefreshCount, 2)
   }
 
   func testOpeningLoadedCommandPaletteRefreshesWhileShowingFallback() {
@@ -1468,12 +1468,34 @@ final class ViviBackendRuntimeTests: XCTestCase {
 
     store.openCommandPalette(query: "deploy")
 
-    XCTAssertEqual(driver.commandRefreshCount, 2)
+    XCTAssertEqual(driver.commandRefreshCount, 1)
     XCTAssertEqual(store.commandCatalogState, .loading)
     XCTAssertEqual(store.filteredCommands.map(\.name), ["deploy"])
     XCTAssertEqual(store.commandDisabledReason, "Wait for command discovery to finish.")
     store.activateSelectedCommand()
     XCTAssertNil(store.commandArgumentSession)
+  }
+
+  func testCommandDiscoveryGatesComposerAndOtherBackendControls() {
+    let driver = FakeConversationDriver()
+    let store = readyCommandStore(driver: driver)
+    store.reduce(.commandCatalog(swiftCommandCatalog(generation: 3)))
+    store.draft = "keep"
+
+    store.openCommandPalette()
+    store.closeCommandPalette()
+    store.refreshModels()
+    store.refreshSessions()
+    store.selectReasoning(.high)
+
+    XCTAssertTrue(store.isBusy)
+    XCTAssertFalse(store.canSubmit)
+    XCTAssertFalse(store.canAcquireAttachments)
+    XCTAssertEqual(store.modelState, .ready)
+    XCTAssertEqual(store.sessionState, .ready)
+    XCTAssertEqual(driver.modelRefreshCount, 0)
+    XCTAssertEqual(driver.sessionRefreshCount, 0)
+    XCTAssertTrue(driver.selections.isEmpty)
   }
 
   func testCommandCatalogFailureKeepsCachedRowsDisabledUntilFallbackArrives() {
@@ -1586,6 +1608,23 @@ final class ViviBackendRuntimeTests: XCTestCase {
     XCTAssertEqual(store.attachments, [attachment])
   }
 
+  func testRunningArgumentCommandPreservesDraftWhenPaletteCloses() {
+    let store = readyCommandStore(driver: FakeConversationDriver())
+    store.reduce(.commandCatalog(swiftCommandCatalog(generation: 7)))
+    store.openCommandPalette(query: "deploy")
+    store.reduce(.commandCatalog(swiftCommandCatalog(generation: 8)))
+    store.activateSelectedCommand()
+    store.updateCommandArgumentDraft("keep this")
+    store.submitCommandArgument()
+
+    store.exitCommandArgumentMode()
+    store.closeCommandPalette()
+
+    XCTAssertEqual(store.commandArgumentSession?.draft, "keep this")
+    XCTAssertNotNil(store.commandExecution)
+    XCTAssertFalse(store.isCommandPalettePresented)
+  }
+
   func testStaleCommandFailurePreservesArgumentAndRefreshes() {
     let driver = FakeConversationDriver()
     let store = readyCommandStore(driver: driver)
@@ -1604,7 +1643,7 @@ final class ViviBackendRuntimeTests: XCTestCase {
     XCTAssertEqual(store.commandArgumentSession?.draft, "keep this")
     XCTAssertTrue(store.isCommandPalettePresented)
     XCTAssertEqual(store.commandCatalogState, .loading)
-    XCTAssertEqual(driver.commandRefreshCount, 3)
+    XCTAssertEqual(driver.commandRefreshCount, 2)
 
     store.reduce(.commandCatalog(swiftCommandCatalog(generation: 9)))
     XCTAssertEqual(store.commandArgumentSession?.command.key.generation, 9)
@@ -1641,7 +1680,7 @@ final class ViviBackendRuntimeTests: XCTestCase {
     XCTAssertEqual(store.commandArgumentSession?.draft, "keep this")
     XCTAssertTrue(store.isCommandPalettePresented)
     XCTAssertEqual(store.commandCatalogState, .loading)
-    XCTAssertEqual(driver.commandRefreshCount, 3)
+    XCTAssertEqual(driver.commandRefreshCount, 2)
     XCTAssertEqual(store.transcript.last?.text, "Deploy: Command changed. Refreshing commands.")
   }
 
@@ -1978,6 +2017,7 @@ private final class FakeConversationDriver: ViviConversationDriving {
   var submittedPrompts: [String] = []
   var submittedAttachments: [[ComposerAttachment]] = []
   var commandRefreshCount = 0
+  var modelRefreshCount = 0
   var commandExecutions: [(CommandKey, String)] = []
   var userInputResponses: [(String, UserInputAnswer)] = []
   private var receive: (@MainActor (ChatEvent) -> Void)?
@@ -2009,7 +2049,8 @@ private final class FakeConversationDriver: ViviConversationDriving {
   }
 
   func refreshModels() -> ConversationOperationResult {
-    refreshResult
+    modelRefreshCount += 1
+    return refreshResult
   }
 
   func switchModel(_ selection: ModelSelection) -> ConversationOperationResult {

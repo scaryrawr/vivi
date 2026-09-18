@@ -393,13 +393,26 @@ private struct CommandPaletteView: View {
       .textFieldStyle(.roundedBorder)
       .focused(focus, equals: .commandArgument)
       .onSubmit(store.submitCommandArgument)
+      .disabled(store.commandExecution != nil)
       .onKeyPress(.escape) {
         store.exitCommandArgumentMode()
         return .handled
       }
       .accessibilityIdentifier("command-palette-argument")
+      if let execution = store.commandExecution {
+        HStack(spacing: 8) {
+          ProgressView()
+            .controlSize(.small)
+          Text("Running \(execution.command.displayName)…")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("command-palette-argument-execution")
+      }
       HStack {
         Button("Cancel", action: store.exitCommandArgumentMode)
+          .disabled(store.commandExecution != nil)
         Spacer()
         Button("Run", action: store.submitCommandArgument)
           .buttonStyle(.borderedProminent)

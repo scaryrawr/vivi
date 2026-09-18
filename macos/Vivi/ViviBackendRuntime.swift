@@ -470,7 +470,7 @@ final class NativeChatStore: ObservableObject {
   }
 
   var isBusy: Bool {
-    lifecycle != .idle || commandExecution != nil
+    lifecycle != .idle || isCommandRefreshPending || commandExecution != nil
   }
 
   var canSubmit: Bool {
@@ -705,7 +705,9 @@ final class NativeChatStore: ObservableObject {
   func closeCommandPalette() {
     isCommandPalettePresented = false
     commandQuery = ""
-    commandArgumentSession = nil
+    if commandExecution == nil {
+      commandArgumentSession = nil
+    }
   }
 
   func retryCommands() {
@@ -751,12 +753,13 @@ final class NativeChatStore: ObservableObject {
   }
 
   func exitCommandArgumentMode() {
+    guard commandExecution == nil else { return }
     commandArgumentSession = nil
   }
 
   func refreshModels() {
     guard !isAcquiringAttachments, modelState == .ready, sessionState == .ready,
-      commandExecution == nil
+      !isCommandRefreshPending, commandExecution == nil
     else { return }
     let result = driver.refreshModels()
     if result == .accepted {
@@ -768,7 +771,7 @@ final class NativeChatStore: ObservableObject {
 
   func refreshSessions() {
     guard !isAcquiringAttachments, lifecycle == .idle, modelState == .ready,
-      sessionState == .ready, commandExecution == nil
+      sessionState == .ready, !isCommandRefreshPending, commandExecution == nil
     else { return }
     let result = driver.refreshSessions()
     if result == .accepted {
@@ -784,7 +787,7 @@ final class NativeChatStore: ObservableObject {
 
   func resumeSession(_ key: ResumeKey) {
     guard !isAcquiringAttachments, lifecycle == .idle, modelState == .ready,
-      sessionState == .ready, commandExecution == nil,
+      sessionState == .ready, !isCommandRefreshPending, commandExecution == nil,
       sessionCatalog?.sessions.contains(where: { $0.key == key }) == true
     else { return }
     let result = driver.resumeSession(key)
@@ -832,17 +835,20 @@ final class NativeChatStore: ObservableObject {
     switch event {
     case .ready:
       lifecycle = .idle
-      refreshCommands()
     case .status(let text):
       finishStreamingRows()
       transcript.append(.status(id: UUID(), text: text))
     case .sessionTitle(let title):
       activePresentation = replacingActive(sessionTitle: title)
     case .assistantStarted:
-      if commandExecution != nil {
+      let commandWasExecuting = commandExecution != nil
+      if commandWasExecuting {
         closeCommandPalette()
       }
       commandExecution = nil
+      if commandWasExecuting {
+        commandArgumentSession = nil
+      }
       activeAssistant = nil
       activeReasoning = nil
       pendingReasoningCompletion = nil
@@ -892,9 +898,6 @@ final class NativeChatStore: ObservableObject {
       self.catalog = catalog
       activePresentation = replacingActive(confirmedSelection: catalog.selected)
       modelState = .ready
-      if lifecycle == .idle, commandCatalog == nil {
-        refreshCommands()
-      }
     case .modelCatalogFailure(let message):
       finishStreamingRows()
       transcript.append(.failure(id: UUID(), text: message))
@@ -920,9 +923,6 @@ final class NativeChatStore: ObservableObject {
     case .sessionResume(let result):
       apply(result)
       sessionState = .ready
-      if case .resumed = result {
-        refreshCommands()
-      }
     case .userInputRequested(let request):
       closeCommandPalette()
       isModelPickerPresented = false
@@ -1012,7 +1012,7 @@ final class NativeChatStore: ObservableObject {
 
   private func refreshCommands() {
     guard lifecycle == .idle, modelState == .ready, sessionState == .ready,
-      commandExecution == nil
+      !isCommandRefreshPending, commandExecution == nil
     else { return }
     let result = driver.refreshCommands()
     if result == .accepted {
@@ -1161,7 +1161,7 @@ final class NativeChatStore: ObservableObject {
 
   private func switchModel(_ selection: ModelSelection) {
     guard !isAcquiringAttachments, modelState == .ready, sessionState == .ready,
-      commandExecution == nil,
+      !isCommandRefreshPending, commandExecution == nil,
       selection != confirmedSelection
     else {
       return
