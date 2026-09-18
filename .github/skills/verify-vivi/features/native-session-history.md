@@ -6,7 +6,8 @@ projects in the native sidebar.
 ## Sub-features
 
 - Each canonical workspace launched during the app lifetime has one stable
-  project section with its canonical path visible beneath the project name.
+  project section. Its canonical path stays in tooltip/accessibility context
+  unless duplicate project names require a visible secondary line.
 - Live conversation rows appear first in roster order, followed directly by
   resumable sessions in backend catalog order.
 - Failure with retry and per-row resuming states remain inline in the project
