@@ -18,7 +18,7 @@ const private_directory_permissions: std.Io.Dir.Permissions =
         .fromMode(0o700);
 
 pub const version = build_options.version;
-pub const abi_version: u32 = 9;
+pub const abi_version: u32 = 10;
 pub const max_session_title_characters = session_title.max_characters;
 pub const Conversation = conversation.Conversation;
 pub const ConversationEvent = conversation.Event;
@@ -32,6 +32,13 @@ pub const FilePickerWake = file_picker.Wake;
 pub const OwnedText = conversation.OwnedText;
 pub const PromptDelivery = conversation.PromptDelivery;
 pub const Prompt = conversation.Prompt;
+pub const AttachmentInput = @import("attachment.zig").Input;
+pub const AttachmentSnapshot = @import("attachment.zig").Snapshot;
+pub const max_attachment_count = @import("attachment.zig").max_count;
+pub const max_attachment_bytes = @import("attachment.zig").max_bytes;
+pub const max_attachment_identity_bytes = @import("attachment.zig").max_identity_bytes;
+pub const max_attachment_display_name_bytes = @import("attachment.zig").max_display_name_bytes;
+pub const ImageFormat = @import("image.zig").Format;
 pub const CommandCatalog = conversation.CommandCatalog;
 pub const UserInputRequest = conversation.UserInputRequest;
 pub const UserInputAnswer = conversation.UserInputAnswer;
@@ -477,7 +484,7 @@ fn sendPrompt(
     prompt: conversation.PromptContent,
     delivery: conversation.PromptDelivery,
 ) !void {
-    const attachments = try sdkImageAttachments(session.client.allocator, prompt.images);
+    const attachments = try sdkImageAttachments(session.client.allocator, prompt.attachments);
     defer freeSdkImageAttachments(session.client.allocator, attachments);
     const message_id = try session.send(.{
         .prompt = prompt.text,
@@ -492,7 +499,7 @@ fn sendPrompt(
 
 fn sdkImageAttachments(
     allocator: std.mem.Allocator,
-    values: []const Image,
+    values: []const AttachmentSnapshot,
 ) ![]copilot.MessageAttachment {
     const attachments = try allocator.alloc(copilot.MessageAttachment, values.len);
     errdefer allocator.free(attachments);
@@ -506,8 +513,8 @@ fn sdkImageAttachments(
         _ = encoder.encode(encoded, value.bytes);
         attachment.* = .{ .blob = .{
             .data = encoded,
-            .mime_type = value.format.mimeType(),
-            .display_name = value.description,
+            .mime_type = value.media_type.mimeType(),
+            .display_name = value.display_name,
         } };
         initialized += 1;
     }
@@ -526,10 +533,14 @@ fn freeSdkImageAttachments(
 }
 
 test "image attachments use the SDK blob message shape" {
-    const values = [_]Image{.{
-        .bytes = "pixels",
-        .format = .png,
-        .description = "image.png",
+    var identity = [_]u8{ 'i', 'm', 'a', 'g', 'e', '-', '1' };
+    var display_name = [_]u8{ 'i', 'm', 'a', 'g', 'e', '.', 'p', 'n', 'g' };
+    var bytes = [_]u8{ 'p', 'i', 'x', 'e', 'l', 's' };
+    const values = [_]AttachmentSnapshot{.{
+        .identity = &identity,
+        .bytes = &bytes,
+        .media_type = .png,
+        .display_name = &display_name,
     }};
     const attachments = try sdkImageAttachments(std.testing.allocator, &values);
     defer freeSdkImageAttachments(std.testing.allocator, attachments);

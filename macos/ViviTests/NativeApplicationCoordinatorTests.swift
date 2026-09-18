@@ -452,7 +452,10 @@ final class ControllableConversationDriver: ViviConversationDriving {
     return .accepted
   }
 
-  func submit(_ prompt: String) -> ConversationOperationResult {
+  func submit(
+    _ prompt: String,
+    attachments: [ComposerAttachment]
+  ) -> ConversationOperationResult {
     .accepted
   }
 

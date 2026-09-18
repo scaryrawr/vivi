@@ -28,8 +28,9 @@ int main(void) {
     options.copilot_cli_launch = (vivi_backend_copilot_cli_launch_t)99;
     assert(vivi_backend_open(&options, &conversation) == VIVI_BACKEND_INVALID_ARGUMENT);
     assert(conversation == 0);
-    assert(VIVI_BACKEND_ABI_VERSION == 9);
+    assert(VIVI_BACKEND_ABI_VERSION == 10);
     assert(VIVI_BACKEND_SESSION_TITLE_MAX_CHARACTERS == 80);
+    assert(VIVI_BACKEND_ATTACHMENT_PNG == 1);
     assert(VIVI_BACKEND_PRESENTATION_SOURCE == 3);
     assert(VIVI_BACKEND_LANGUAGE_PYTHON == 15);
     assert(VIVI_BACKEND_TOKEN_META == 11);
@@ -53,6 +54,26 @@ int main(void) {
         .answer_length = 3,
         .reserved = 0,
     };
+    const uint8_t png[] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'};
+    vivi_backend_submission_attachment_t attachment = {
+        .struct_size = sizeof(vivi_backend_submission_attachment_t),
+        .media_type = VIVI_BACKEND_ATTACHMENT_PNG,
+        .identity = (const uint8_t *)"image-1",
+        .identity_length = 7,
+        .display_name = (const uint8_t *)"image.png",
+        .display_name_length = 9,
+        .bytes = png,
+        .byte_length = sizeof(png),
+        .reserved = 0,
+    };
+    vivi_backend_submission_t submission = {
+        .struct_size = sizeof(vivi_backend_submission_t),
+        .reserved = 0,
+        .prompt = 0,
+        .prompt_length = 0,
+        .attachments = &attachment,
+        .attachment_count = 1,
+    };
     vivi_backend_resume_key_t key = {
         .generation = 1,
         .slot = 0,
@@ -72,6 +93,7 @@ int main(void) {
     assert(presentation.kind == VIVI_BACKEND_PRESENTATION_LITERAL);
     assert(presentation.content.length == 4);
     assert(vivi_backend_refresh_models(0) == VIVI_BACKEND_INVALID_ARGUMENT);
+    assert(vivi_backend_submit(0, &submission) == VIVI_BACKEND_INVALID_ARGUMENT);
     assert(vivi_backend_refresh_sessions(0) == VIVI_BACKEND_INVALID_ARGUMENT);
     assert(vivi_backend_resume_session(0, key) == VIVI_BACKEND_INVALID_ARGUMENT);
     assert(vivi_backend_respond_to_user_input(0, &response)

@@ -62,6 +62,118 @@ final class ViviBackendRuntimeTests: XCTestCase {
       [.status(id: store.transcript[0].id, text: "Chat is busy.")])
   }
 
+  func testAttachmentOnlySubmitClearsSelectionAfterAcceptance() {
+    let driver = FakeConversationDriver()
+    let attachment = testAttachment(name: "diagram.png")
+    let acquirer = FakeAttachmentAcquirer(pasted: attachment)
+    let store = NativeChatStore(
+      workspace: "/tmp/work",
+      driver: driver,
+      attachmentAcquirer: acquirer)
+
+    store.reduce(.ready)
+    store.reduce(.modelCatalog(testCatalog()))
+    store.pasteAttachment()
+    XCTAssertTrue(store.canSubmit)
+
+    store.submit()
+
+    XCTAssertEqual(driver.submittedPrompts, [""])
+    XCTAssertEqual(driver.submittedAttachments, [[attachment]])
+    XCTAssertTrue(store.attachments.isEmpty)
+    XCTAssertEqual(store.lifecycle, .responding)
+    XCTAssertEqual(store.transcript.first?.text, "Attached diagram.png")
+  }
+
+  func testRejectedAttachmentSubmitPreservesDraftAndSelection() {
+    let driver = FakeConversationDriver()
+    driver.submitResult = .rejected
+    let attachment = testAttachment(name: "reference.png")
+    let store = NativeChatStore(
+      workspace: "/tmp/work",
+      driver: driver,
+      attachmentAcquirer: FakeAttachmentAcquirer(pasted: attachment))
+
+    store.reduce(.ready)
+    store.reduce(.modelCatalog(testCatalog()))
+    store.draft = "Keep this"
+    store.pasteAttachment()
+    store.submit()
+
+    XCTAssertEqual(store.draft, "Keep this")
+    XCTAssertEqual(store.attachments, [attachment])
+    XCTAssertEqual(driver.submittedAttachments, [[attachment]])
+    XCTAssertEqual(store.transcript.first?.text, "That response was not accepted. Try again.")
+  }
+
+  func testAttachmentAcquisitionFailurePreservesExistingSelection() {
+    let first = testAttachment(name: "first.png")
+    let acquirer = FakeAttachmentAcquirer(pasted: first)
+    let store = NativeChatStore(
+      workspace: "/tmp/work",
+      driver: FakeConversationDriver(),
+      attachmentAcquirer: acquirer)
+
+    store.reduce(.ready)
+    store.reduce(.modelCatalog(testCatalog()))
+    store.pasteAttachment()
+    acquirer.pasteError = ComposerAttachmentAcquisitionError.unsupported("notes.txt")
+    store.pasteAttachment()
+
+    XCTAssertEqual(store.attachments, [first])
+    XCTAssertEqual(
+      store.attachmentError,
+      "“notes.txt” is not a supported PNG, JPEG, GIF, or WebP image.")
+  }
+
+  func testAttachmentsRemainSelectedWhileAskUserBlocksSubmissionAndClearOnClose() {
+    let attachment = testAttachment(name: "context.png")
+    let acquirer = FakeAttachmentAcquirer(pasted: attachment)
+    let store = NativeChatStore(
+      workspace: "/tmp/work",
+      driver: FakeConversationDriver(),
+      attachmentAcquirer: acquirer)
+
+    store.reduce(.ready)
+    store.reduce(.modelCatalog(testCatalog()))
+    store.pasteAttachment()
+    store.reduce(
+      .userInputRequested(
+        UserInputRequest(
+          id: "ask-attachment",
+          question: "Continue?",
+          choices: ["Yes"],
+          allowsFreeform: false)))
+
+    XCTAssertFalse(store.canSubmit)
+    XCTAssertEqual(store.attachments, [attachment])
+
+    store.close()
+
+    XCTAssertTrue(store.attachments.isEmpty)
+    XCTAssertEqual(acquirer.cancelCount, 1)
+  }
+
+  func testAppKitAttachmentSnapshotReadsOnceAndValidatesContent() throws {
+    let directory = FileManager.default.temporaryDirectory
+      .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let url = directory.appendingPathComponent("photo.bin")
+    try testPNGData().write(to: url)
+
+    let attachment = try AppKitComposerAttachmentAcquirer.snapshot(url)
+    try Data("changed".utf8).write(to: url)
+
+    XCTAssertEqual(attachment.displayName, "photo.bin")
+    XCTAssertEqual(attachment.media, .png)
+    XCTAssertEqual(attachment.data, testPNGData())
+    XCTAssertThrowsError(
+      try AppKitComposerAttachmentAcquirer.snapshot(
+        data: Data("not an image".utf8),
+        displayName: "bad.png"))
+  }
+
   func testUserInputChoicePreservesToolChronologyAndBackendIdentity() {
     let driver = FakeConversationDriver()
     let store = NativeChatStore(workspace: "/tmp/work", driver: driver)
@@ -1176,6 +1288,7 @@ private final class FakeConversationDriver: ViviConversationDriving {
   var sessionRefreshCount = 0
   var resumeKeys: [ResumeKey] = []
   var submittedPrompts: [String] = []
+  var submittedAttachments: [[ComposerAttachment]] = []
   var userInputResponses: [(String, UserInputAnswer)] = []
   private var receive: (@MainActor (ChatEvent) -> Void)?
 
@@ -1186,8 +1299,12 @@ private final class FakeConversationDriver: ViviConversationDriving {
     return .accepted
   }
 
-  func submit(_ prompt: String) -> ConversationOperationResult {
+  func submit(
+    _ prompt: String,
+    attachments: [ComposerAttachment]
+  ) -> ConversationOperationResult {
     submittedPrompts.append(prompt)
+    submittedAttachments.append(attachments)
     return submitResult
   }
 
@@ -1221,6 +1338,49 @@ private final class FakeConversationDriver: ViviConversationDriving {
   func close(completion: @escaping @MainActor () -> Void) {
     Task { @MainActor in completion() }
   }
+}
+
+@MainActor
+private final class FakeAttachmentAcquirer: ComposerAttachmentAcquiring {
+  var chosen: [ComposerAttachment]
+  var pasted: ComposerAttachment
+  var chooseError: Error?
+  var pasteError: Error?
+  private(set) var cancelCount = 0
+
+  init(
+    chosen: [ComposerAttachment] = [],
+    pasted: ComposerAttachment = testAttachment()
+  ) {
+    self.chosen = chosen
+    self.pasted = pasted
+  }
+
+  func chooseImages() async throws -> [ComposerAttachment] {
+    if let chooseError { throw chooseError }
+    return chosen
+  }
+
+  func pasteImage() throws -> ComposerAttachment {
+    if let pasteError { throw pasteError }
+    return pasted
+  }
+
+  func cancel() {
+    cancelCount += 1
+  }
+}
+
+private func testPNGData() -> Data {
+  Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00])
+}
+
+private func testAttachment(name: String = "image.png") -> ComposerAttachment {
+  ComposerAttachment(
+    id: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!,
+    displayName: name,
+    media: .png,
+    data: testPNGData())
 }
 
 private func testCatalog() -> ModelCatalog {

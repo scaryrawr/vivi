@@ -2803,24 +2803,38 @@ const ChatUi = struct {
     fn submitPrompt(self: *ChatUi, conversation: *backend.Conversation, delivery: backend.PromptDelivery) !void {
         const text = try self.input.toOwnedContents(self.allocator);
         defer self.allocator.free(text);
-        const paths = if (self.pasted_images) |*store|
-            try store.selectedPaths(text)
+        var selected: images.Store.Selection = (if (self.pasted_images) |*store|
+            store.selectedAttachments(text)
         else
-            try self.allocator.alloc([]const u8, 0);
-        defer self.allocator.free(paths);
-        conversation.submit(.{ .text = text, .image_paths = paths }, delivery) catch |err| switch (err) {
+            images.Store.Selection.empty(self.allocator)) catch |err| {
+            try self.reportPromptSubmissionFailure(err);
+            return;
+        };
+        defer selected.deinit();
+        conversation.submit(.{
+            .text = text,
+            .attachments = selected.inputs,
+        }, delivery) catch |err| switch (err) {
             error.EmptyPrompt, error.Busy => return,
             else => {
-                const message = try std.fmt.allocPrint(self.allocator, "Message not sent: {s}. Your draft is unchanged.", .{@errorName(err)});
-                defer self.allocator.free(message);
-                try self.transcript.append(self.allocator, .status, message);
-                self.followTail();
+                try self.reportPromptSubmissionFailure(err);
                 return;
             },
         };
         try self.transcript.append(self.allocator, if (delivery == .enqueue) .queued else .user, text);
         self.input.clearRetainingCapacity();
         self.phase = .responding;
+        self.followTail();
+    }
+
+    fn reportPromptSubmissionFailure(self: *ChatUi, err: anyerror) !void {
+        const message = try std.fmt.allocPrint(
+            self.allocator,
+            "Message not sent: {s}. Your draft is unchanged.",
+            .{@errorName(err)},
+        );
+        defer self.allocator.free(message);
+        try self.transcript.append(self.allocator, .status, message);
         self.followTail();
     }
 
@@ -7997,13 +8011,13 @@ test "image pasted paths survive ask-user drafts and deletion removes attachment
     const restored = try ui.input.toOwnedContents(std.testing.allocator);
     defer std.testing.allocator.free(restored);
     try std.testing.expectEqualStrings(before, restored);
-    const selected = try ui.pasted_images.?.selectedPaths(restored);
-    defer std.testing.allocator.free(selected);
-    try std.testing.expectEqual(@as(usize, 1), selected.len);
+    var selected = try ui.pasted_images.?.selectedAttachments(restored);
+    defer selected.deinit();
+    try std.testing.expectEqual(@as(usize, 1), selected.inputs.len);
     ui.input.clearRetainingCapacity();
-    const deleted = try ui.pasted_images.?.selectedPaths("");
-    defer std.testing.allocator.free(deleted);
-    try std.testing.expectEqual(@as(usize, 0), deleted.len);
+    var deleted = try ui.pasted_images.?.selectedAttachments("");
+    defer deleted.deinit();
+    try std.testing.expectEqual(@as(usize, 0), deleted.inputs.len);
 }
 
 test "image bracketed text paste never submits or executes shortcuts" {
