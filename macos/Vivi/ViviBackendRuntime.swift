@@ -475,7 +475,7 @@ final class NativeChatStore: ObservableObject {
       guard !Task.isCancelled else { return }
       do {
         let selected = try await attachmentAcquirer.chooseImages()
-        guard !Task.isCancelled, lifecycle == .idle else { return }
+        guard !Task.isCancelled, canPublishAttachmentAcquisition else { return }
         try appendAttachments(selected)
       } catch {
         guard !Task.isCancelled else { return }
@@ -497,7 +497,7 @@ final class NativeChatStore: ObservableObject {
       guard !Task.isCancelled else { return }
       do {
         let selected = try await attachmentAcquirer.pasteImage()
-        guard !Task.isCancelled, lifecycle == .idle else { return }
+        guard !Task.isCancelled, canPublishAttachmentAcquisition else { return }
         try appendAttachments([selected])
       } catch {
         guard !Task.isCancelled else { return }
@@ -560,7 +560,7 @@ final class NativeChatStore: ObservableObject {
   }
 
   func refreshModels() {
-    guard modelState == .ready, sessionState == .ready else { return }
+    guard !isAcquiringAttachments, modelState == .ready, sessionState == .ready else { return }
     let result = driver.refreshModels()
     if result == .accepted {
       modelState = .refreshing
@@ -570,7 +570,9 @@ final class NativeChatStore: ObservableObject {
   }
 
   func refreshSessions() {
-    guard lifecycle == .idle, modelState == .ready, sessionState == .ready else { return }
+    guard !isAcquiringAttachments, lifecycle == .idle, modelState == .ready,
+      sessionState == .ready
+    else { return }
     let result = driver.refreshSessions()
     if result == .accepted {
       sessionCatalog = nil
@@ -584,7 +586,8 @@ final class NativeChatStore: ObservableObject {
   }
 
   func resumeSession(_ key: ResumeKey) {
-    guard lifecycle == .idle, modelState == .ready, sessionState == .ready,
+    guard !isAcquiringAttachments, lifecycle == .idle, modelState == .ready,
+      sessionState == .ready,
       sessionCatalog?.sessions.contains(where: { $0.key == key }) == true
     else { return }
     let result = driver.resumeSession(key)
@@ -760,6 +763,7 @@ final class NativeChatStore: ObservableObject {
     guard attachments.count + selected.count <= composerAttachmentCountLimit else {
       throw ComposerAttachmentAcquisitionError.tooMany
     }
+
     let total =
       attachments.reduce(0) { $0 + $1.data.count }
       + selected.reduce(0) { $0 + $1.data.count }
@@ -767,6 +771,11 @@ final class NativeChatStore: ObservableObject {
       throw ComposerAttachmentAcquisitionError.totalTooLarge
     }
     attachments.append(contentsOf: selected)
+  }
+
+  private var canPublishAttachmentAcquisition: Bool {
+    lifecycle == .idle && modelState == .ready && sessionState == .ready
+      && activeUserInput == nil
   }
 
   private func clearAttachments() {
@@ -777,7 +786,9 @@ final class NativeChatStore: ObservableObject {
   }
 
   private func switchModel(_ selection: ModelSelection) {
-    guard modelState == .ready, sessionState == .ready, selection != confirmedSelection else {
+    guard !isAcquiringAttachments, modelState == .ready, sessionState == .ready,
+      selection != confirmedSelection
+    else {
       return
     }
     let result = driver.switchModel(selection)

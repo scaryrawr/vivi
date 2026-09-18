@@ -176,7 +176,11 @@ final class ViviBackendRuntimeTests: XCTestCase {
     XCTAssertTrue(store.isAcquiringAttachments)
     XCTAssertFalse(store.canSubmit)
     store.submit()
+    store.refreshSessions()
+    store.selectModel("copilot/gpt-5")
     XCTAssertTrue(driver.submittedPrompts.isEmpty)
+    XCTAssertEqual(driver.sessionRefreshCount, 0)
+    XCTAssertTrue(driver.selections.isEmpty)
 
     store.close()
     await store.waitForAttachmentAcquisition()
