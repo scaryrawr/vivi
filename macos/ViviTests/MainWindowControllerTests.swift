@@ -73,6 +73,11 @@ final class MainWindowControllerTests: XCTestCase {
     XCTAssertEqual(window.toolbar?.items.map(\.itemIdentifier), initialToolbarIdentifiers)
     XCTAssertEqual(realizedSidebarToggleCount(in: window.toolbar), 1)
     XCTAssertFalse(
+      realizedToolbarView(in: window.toolbar)?.appNameLabel.isAccessibilityElement() ?? true)
+    XCTAssertFalse(
+      realizedToolbarView(in: window.toolbar)?.conversationTitleLabel.isAccessibilityElement()
+        ?? true)
+    XCTAssertFalse(
       window.toolbar?.items.contains(where: {
         $0.itemIdentifier == .toggleSidebar
       }) ?? true)

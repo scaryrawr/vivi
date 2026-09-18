@@ -110,7 +110,6 @@ struct MainWindowView: View {
                 historyConversation.store.resumeSession(key)
               }
               .padding(.leading, 12)
-              .id(historyConversation.id)
             }
           } header: {
             ProjectSidebarHeader(workspace: workspace)

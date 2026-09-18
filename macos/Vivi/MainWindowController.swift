@@ -152,8 +152,8 @@ extension NSToolbarItem.Identifier {
 @MainActor
 final class MainWindowToolbarView: NSView {
   let sidebarButton: NSButton
-  private let appNameLabel = NSTextField(labelWithString: "")
-  private let conversationTitleLabel = NSTextField(labelWithString: "")
+  let appNameLabel = NSTextField(labelWithString: "")
+  let conversationTitleLabel = NSTextField(labelWithString: "")
   private let stackView: NSStackView
 
   var presentation = MainWindowTitlePresentation(conversationTitle: nil) {
@@ -174,6 +174,7 @@ final class MainWindowToolbarView: NSView {
 
     appNameLabel.font = .systemFont(ofSize: NSFont.systemFontSize, weight: .semibold)
     appNameLabel.setContentHuggingPriority(.required, for: .horizontal)
+    appNameLabel.setAccessibilityElement(false)
 
     let separator = NSBox()
     separator.boxType = .separator
@@ -187,6 +188,7 @@ final class MainWindowToolbarView: NSView {
     conversationTitleLabel.lineBreakMode = .byTruncatingTail
     conversationTitleLabel.maximumNumberOfLines = 1
     conversationTitleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+    conversationTitleLabel.setAccessibilityElement(false)
 
     stackView = NSStackView(
       views: [sidebarButton, appNameLabel, separator, conversationTitleLabel])
