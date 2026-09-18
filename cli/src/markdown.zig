@@ -1869,34 +1869,6 @@ test "cached fenced code renders sanitized presentation text" {
     }
 }
 
-test "cached fenced code includes bytes beyond parser limit in identity" {
-    var cache: HighlightCache = .{};
-    defer cache.deinit(std.testing.allocator);
-    const source_length = highlight.max_source_bytes + 1;
-    const first = try std.testing.allocator.alloc(u8, source_length);
-    defer std.testing.allocator.free(first);
-    @memset(first, 'a');
-    const second = try std.testing.allocator.dupe(u8, first);
-    defer std.testing.allocator.free(second);
-    second[source_length - 1] = 'b';
-
-    const initial = try cache.codeFor(
-        std.testing.allocator,
-        0,
-        .zig,
-        first,
-    );
-    try std.testing.expectEqual('a', initial.text[source_length - 1]);
-
-    const updated = try cache.codeFor(
-        std.testing.allocator,
-        0,
-        .zig,
-        second,
-    );
-    try std.testing.expectEqual('b', updated.text[source_length - 1]);
-}
-
 test "fenced code parses multiline syntax as one document" {
     var screen: vaxis.Screen = undefined;
     const window = testWindow(&screen, 100);
@@ -1948,6 +1920,36 @@ test "completed fenced code reuses cached syntax spans" {
         @intFromPtr(first_spans.ptr),
         @intFromPtr(cache.blocks.items[0].spans.ptr),
     );
+}
+
+test "fenced code cache hashes text beyond the parser limit" {
+    var cache: HighlightCache = .{};
+    defer cache.deinit(std.testing.allocator);
+    const first_source = try std.testing.allocator.alloc(
+        u8,
+        highlight.max_source_bytes + 1,
+    );
+    defer std.testing.allocator.free(first_source);
+    @memset(first_source, ' ');
+    first_source[first_source.len - 1] = 'a';
+    const second_source = try std.testing.allocator.dupe(u8, first_source);
+    defer std.testing.allocator.free(second_source);
+    second_source[second_source.len - 1] = 'b';
+
+    const first = try cache.codeFor(
+        std.testing.allocator,
+        0,
+        .zig,
+        first_source,
+    );
+    try std.testing.expectEqual(@as(u8, 'a'), first.text[first.text.len - 1]);
+    const second = try cache.codeFor(
+        std.testing.allocator,
+        0,
+        .zig,
+        second_source,
+    );
+    try std.testing.expectEqual(@as(u8, 'b'), second.text[second.text.len - 1]);
 }
 
 test "unsupported fences do not offset cached supported blocks" {

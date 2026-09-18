@@ -152,24 +152,9 @@ fn launchNativeChat(init: std.process.Init, workspace: []const u8) !void {
         .{escaped},
     );
     defer init.gpa.free(url);
-    switch (target) {
-        .app_path => |path| {
-            const args = nativeAppPathLaunchArgs(path, url);
-            try runNativeLauncher(init, &args);
-        },
-        .bundle_identifier => |identifier| {
-            const args = nativeBundleLaunchArgs(identifier, url);
-            try runNativeLauncher(init, &args);
-        },
-    }
-}
-
-fn runNativeLauncher(
-    init: std.process.Init,
-    args: []const []const u8,
-) !void {
+    const args = nativeChatLaunchArgs(target, url);
     var child = try std.process.spawn(init.io, .{
-        .argv = args,
+        .argv = &args,
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .inherit,
@@ -205,18 +190,14 @@ fn nativeAppPathIsUsable(init: std.process.Init, path: []const u8) bool {
     return true;
 }
 
-fn nativeAppPathLaunchArgs(
-    path: []const u8,
-    url: []const u8,
-) [5][]const u8 {
-    return .{ "open", "-n", "-a", path, url };
-}
-
-fn nativeBundleLaunchArgs(
-    identifier: []const u8,
+fn nativeChatLaunchArgs(
+    target: NativeChatTarget,
     url: []const u8,
 ) [4][]const u8 {
-    return .{ "open", "-b", identifier, url };
+    return switch (target) {
+        .app_path => |path| .{ "open", "-a", path, url },
+        .bundle_identifier => |identifier| .{ "open", "-b", identifier, url },
+    };
 }
 
 fn percentEncode(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
@@ -416,24 +397,23 @@ test "native chat target uses the development app before the installed bundle" {
 }
 
 test "native chat constructs app and bundle launch arguments" {
-    const app = nativeAppPathLaunchArgs(
-        "/repo/zig-out/xcode/Debug/Vivi.app",
+    const app = nativeChatLaunchArgs(
+        .{ .app_path = "/repo/zig-out/xcode/Debug/Vivi.app" },
         "vivi://chat?workspace=/tmp/Vivi",
     );
     try std.testing.expectEqualStrings("open", app[0]);
-    try std.testing.expectEqualStrings("-n", app[1]);
-    try std.testing.expectEqualStrings("-a", app[2]);
+    try std.testing.expectEqualStrings("-a", app[1]);
     try std.testing.expectEqualStrings(
         "/repo/zig-out/xcode/Debug/Vivi.app",
-        app[3],
+        app[2],
     );
     try std.testing.expectEqualStrings(
         "vivi://chat?workspace=/tmp/Vivi",
-        app[4],
+        app[3],
     );
 
-    const bundle = nativeBundleLaunchArgs(
-        "com.scaryrawr.vivi",
+    const bundle = nativeChatLaunchArgs(
+        .{ .bundle_identifier = "com.scaryrawr.vivi" },
         "vivi://chat?workspace=/tmp/Vivi",
     );
     try std.testing.expectEqualStrings("-b", bundle[1]);
