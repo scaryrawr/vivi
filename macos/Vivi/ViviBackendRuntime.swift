@@ -695,7 +695,7 @@ final class NativeChatStore: ObservableObject {
     commandQuery = query
     commandArgumentSession = nil
     repairCommandSelection()
-    if commandCatalog == nil, commandCatalogState != .loading {
+    if commandCatalogState != .loading {
       refreshCommands()
     }
   }
@@ -1662,9 +1662,8 @@ enum NativeEventDecoder {
       return value
     }
 
-    func empty(_ span: vivi_backend_span_t) -> Bool {
-      span.length == 0 && Int(span.offset) <= bytes.count
-        && isUTF8Boundary(bytes, at: Int(span.offset))
+    func canonicalEmpty(_ span: vivi_backend_span_t) -> Bool {
+      span.offset == 0 && span.length == 0
     }
 
     func session(_ raw: vivi_backend_session_summary_t) throws -> SessionSummary {
@@ -1727,7 +1726,7 @@ enum NativeEventDecoder {
       let name = try text(raw.name)
       let displayName = try text(raw.display_name)
       let description = try text(raw.description)
-      let hint = empty(raw.hint) ? nil : try text(raw.hint)
+      let hint = canonicalEmpty(raw.hint) ? nil : try text(raw.hint)
       guard !name.isEmpty, !displayName.isEmpty,
         argumentPolicy == .none ? hint == nil : true
       else { throw NativeEventDecodingError.malformed }
@@ -1820,7 +1819,8 @@ enum NativeEventDecoder {
     let isUserInputPayload = event.kind == VIVI_BACKEND_EVENT_USER_INPUT_REQUEST
     if !isUserInputPayload {
       guard userInputChoices.isEmpty, event.allow_freeform == 0,
-        empty(event.user_input_request_id), empty(event.user_input_question)
+        canonicalEmpty(event.user_input_request_id),
+        canonicalEmpty(event.user_input_question)
       else { throw NativeEventDecodingError.malformed }
     }
     let isCommandPayload =
@@ -1842,11 +1842,11 @@ enum NativeEventDecoder {
       event.tool_output_presentation,
       required: event.kind == VIVI_BACKEND_EVENT_TOOL_FINISHED)
     let hasNeutralConversationMetadata =
-      empty(event.selected_model_id)
-      && empty(event.tool_call_id)
-      && empty(event.tool_title)
-      && empty(event.tool_detail)
-      && empty(event.tool_input)
+      canonicalEmpty(event.selected_model_id)
+      && canonicalEmpty(event.tool_call_id)
+      && canonicalEmpty(event.tool_title)
+      && canonicalEmpty(event.tool_detail)
+      && canonicalEmpty(event.tool_input)
       && event.tool_result == VIVI_BACKEND_TOOL_RESULT_NONE
       && event.selected_reasoning == VIVI_BACKEND_REASONING_NONE
       && event.switch_outcome == VIVI_BACKEND_MODEL_SWITCH_NONE

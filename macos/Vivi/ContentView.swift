@@ -349,49 +349,7 @@ private struct CommandPaletteView: View {
       paletteMessage("No matching commands.", systemImage: "command")
         .accessibilityIdentifier("command-palette-empty")
     } else {
-      ScrollView {
-        LazyVStack(spacing: 2) {
-          ForEach(store.filteredCommands) { command in
-            Button {
-              store.selectCommand(command.key)
-              store.activateSelectedCommand()
-            } label: {
-              HStack(alignment: .firstTextBaseline, spacing: 10) {
-                Text("/\(command.displayName)")
-                  .font(.body.weight(.medium))
-                Text(command.description)
-                  .font(.callout)
-                  .foregroundStyle(.secondary)
-                  .lineLimit(2)
-                Spacer(minLength: 8)
-                Text(command.source.label)
-                  .font(.caption)
-                  .foregroundStyle(.tertiary)
-              }
-              .padding(.horizontal, 8)
-              .padding(.vertical, 6)
-              .frame(maxWidth: .infinity, alignment: .leading)
-              .background(
-                store.selectedCommandKey == command.key
-                  ? Color.accentColor.opacity(0.13) : Color.clear,
-                in: RoundedRectangle(cornerRadius: 7)
-              )
-              .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .disabled(store.commandDisabledReason != nil)
-            .accessibilityLabel(
-              "\(command.displayName), \(command.source.label), \(command.description)"
-            )
-            .accessibilityAddTraits(
-              store.selectedCommandKey == command.key ? .isSelected : []
-            )
-            .accessibilityIdentifier(
-              "command-row-\(command.key.generation)-\(command.key.slot)")
-          }
-        }
-      }
-      .frame(maxHeight: 260)
+      CommandResultsView(store: store)
     }
     if let execution = store.commandExecution {
       HStack(spacing: 8) {
@@ -468,6 +426,69 @@ private struct CommandPaletteView: View {
       element: NSApp.mainWindow ?? NSApp,
       notification: .announcementRequested,
       userInfo: [.announcement: message, .priority: NSAccessibilityPriorityLevel.medium.rawValue])
+  }
+}
+
+private struct CommandResultsView: View {
+  @ObservedObject var store: NativeChatStore
+
+  var body: some View {
+    ScrollViewReader { proxy in
+      ScrollView {
+        LazyVStack(spacing: 2) {
+          ForEach(store.filteredCommands) { command in
+            commandRow(command)
+              .id(command.key)
+          }
+        }
+      }
+      .frame(maxHeight: 260)
+      .onChange(of: store.selectedCommandKey) { _, key in
+        guard let key else { return }
+        withAnimation(.easeOut(duration: 0.12)) {
+          proxy.scrollTo(key, anchor: .center)
+        }
+      }
+    }
+  }
+
+  private func commandRow(_ command: CommandInfo) -> some View {
+    Button {
+      store.selectCommand(command.key)
+      store.activateSelectedCommand()
+    } label: {
+      HStack(alignment: .firstTextBaseline, spacing: 10) {
+        Text("/\(command.displayName)")
+          .font(.body.weight(.medium))
+        Text(command.description)
+          .font(.callout)
+          .foregroundStyle(.secondary)
+          .lineLimit(2)
+        Spacer(minLength: 8)
+        Text(command.source.label)
+          .font(.caption)
+          .foregroundStyle(.tertiary)
+      }
+      .padding(.horizontal, 8)
+      .padding(.vertical, 6)
+      .frame(maxWidth: .infinity, alignment: .leading)
+      .background(
+        store.selectedCommandKey == command.key
+          ? Color.accentColor.opacity(0.13) : Color.clear,
+        in: RoundedRectangle(cornerRadius: 7)
+      )
+      .contentShape(Rectangle())
+    }
+    .buttonStyle(.plain)
+    .disabled(store.commandDisabledReason != nil)
+    .accessibilityLabel(
+      "\(command.displayName), \(command.source.label), \(command.description)"
+    )
+    .accessibilityAddTraits(
+      store.selectedCommandKey == command.key ? .isSelected : []
+    )
+    .accessibilityIdentifier(
+      "command-row-\(command.key.generation)-\(command.key.slot)")
   }
 }
 

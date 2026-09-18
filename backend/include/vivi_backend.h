@@ -367,7 +367,7 @@ typedef struct vivi_backend_event {
     vivi_backend_command_key_t command_key;
 } vivi_backend_event_t;
 
-/* Open and submit copy their input bytes before returning. */
+/* Open, submit, and execute_command copy their input bytes before returning. */
 vivi_backend_result_t vivi_backend_open(
     const vivi_backend_conversation_options_t *options,
     vivi_backend_conversation_t **out_conversation);

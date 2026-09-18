@@ -743,10 +743,6 @@ final class ViviBackendRuntimeTests: XCTestCase {
     event.model_count = 1
     event.selected_model_id = vivi_backend_span_t(offset: 0, length: 13)
     event.selected_reasoning = VIVI_BACKEND_REASONING_HIGH
-    event.user_input_request_id = vivi_backend_span_t(
-      offset: UInt32(bytes.count), length: 0)
-    event.user_input_question = vivi_backend_span_t(
-      offset: UInt32(bytes.count), length: 0)
 
     var model = vivi_backend_model_t()
     model.id = vivi_backend_span_t(offset: 0, length: 13)
@@ -765,6 +761,11 @@ final class ViviBackendRuntimeTests: XCTestCase {
     XCTAssertEqual(catalog.models[0].displayName, "GPT-5")
     XCTAssertEqual(catalog.models[0].reasoning, [.off, .high, .max])
     XCTAssertTrue(catalog.models[0].supportsVision)
+
+    event.user_input_request_id = vivi_backend_span_t(
+      offset: UInt32(bytes.count), length: 0)
+    XCTAssertThrowsError(
+      try NativeEventDecoder.decode(event, bytes: bytes, models: [model]))
   }
 
   func testDecoderCopiesTypedUserInputRequest() throws {
@@ -1411,16 +1412,13 @@ final class ViviBackendRuntimeTests: XCTestCase {
     event.content = vivi_backend_span_t(offset: 0, length: UInt32(bytes.count))
     event.command_key = vivi_backend_command_key_t(generation: 4, slot: 2, reserved: 0)
     event.selected_reasoning = VIVI_BACKEND_REASONING_NONE
-    let trailingEmpty = vivi_backend_span_t(offset: UInt32(bytes.count), length: 0)
-    event.selected_model_id = trailingEmpty
-    event.tool_call_id = trailingEmpty
-    event.tool_title = trailingEmpty
-    event.tool_detail = trailingEmpty
-    event.tool_input = trailingEmpty
-
     XCTAssertEqual(
       try NativeEventDecoder.decode(event, bytes: bytes, models: []),
       .commandCompleted(key: CommandKey(generation: 4, slot: 2), message: "Done"))
+
+    event.tool_call_id = vivi_backend_span_t(offset: UInt32(bytes.count), length: 0)
+    XCTAssertThrowsError(try NativeEventDecoder.decode(event, bytes: bytes, models: []))
+    event.tool_call_id = vivi_backend_span_t()
 
     event.kind = VIVI_BACKEND_EVENT_COMMAND_FAILED
     event.command_key.reserved = 1
@@ -1447,7 +1445,19 @@ final class ViviBackendRuntimeTests: XCTestCase {
 
     XCTAssertNotEqual(store.selectedCommandKey, oldKey)
     XCTAssertEqual(store.selectedCommandKey?.generation, 4)
+    XCTAssertEqual(driver.commandRefreshCount, 3)
+  }
+
+  func testOpeningLoadedCommandPaletteRefreshesWhileShowingFallback() {
+    let driver = FakeConversationDriver()
+    let store = readyCommandStore(driver: driver)
+    store.reduce(.commandCatalog(swiftCommandCatalog(generation: 3)))
+
+    store.openCommandPalette(query: "deploy")
+
     XCTAssertEqual(driver.commandRefreshCount, 2)
+    XCTAssertEqual(store.commandCatalogState, .loading)
+    XCTAssertEqual(store.filteredCommands.map(\.name), ["deploy"])
   }
 
   func testCommandArgumentExecutionPreservesComposerDraftAndAttachments() async {
@@ -1551,7 +1561,7 @@ final class ViviBackendRuntimeTests: XCTestCase {
     XCTAssertEqual(store.commandArgumentSession?.draft, "keep this")
     XCTAssertTrue(store.isCommandPalettePresented)
     XCTAssertEqual(store.commandCatalogState, .loading)
-    XCTAssertEqual(driver.commandRefreshCount, 2)
+    XCTAssertEqual(driver.commandRefreshCount, 3)
 
     store.reduce(.commandCatalog(swiftCommandCatalog(generation: 8)))
     XCTAssertEqual(store.commandArgumentSession?.command.key.generation, 8)
@@ -1572,7 +1582,7 @@ final class ViviBackendRuntimeTests: XCTestCase {
     XCTAssertEqual(store.commandArgumentSession?.draft, "keep this")
     XCTAssertTrue(store.isCommandPalettePresented)
     XCTAssertEqual(store.commandCatalogState, .loading)
-    XCTAssertEqual(driver.commandRefreshCount, 2)
+    XCTAssertEqual(driver.commandRefreshCount, 3)
     XCTAssertEqual(store.transcript.last?.text, "Deploy: Command changed. Refreshing commands.")
   }
 
@@ -1725,7 +1735,7 @@ private func swiftCommandCatalog(generation: UInt64) -> CommandCatalog {
       hint: nil,
       source: .vivi,
       action: .openSessionHistory,
-      argumentPolicy: .optional),
+      argumentPolicy: .none),
     CommandInfo(
       key: CommandKey(generation: generation, slot: 3),
       name: "deploy",
