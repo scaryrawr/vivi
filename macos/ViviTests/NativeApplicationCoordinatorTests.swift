@@ -93,9 +93,10 @@ final class NativeApplicationCoordinatorTests: XCTestCase {
 
     harness.coordinator.open([URL(string: "vivi://chat?workspace=/tmp/from-url")!])
     harness.coordinator.requestNewConversation()
-    await Task.yield()
-    harness.choosers[0].finish(chosenWorkspace)
-    await Task.yield()
+    await waitUntil { harness.choosers.count == 1 }
+    guard let chooser = harness.choosers.first else { return }
+    chooser.finish(chosenWorkspace)
+    await waitUntil { harness.creationRequests.count == 2 }
 
     XCTAssertEqual(
       harness.creationRequests.map(\.workspace.canonicalPath),
