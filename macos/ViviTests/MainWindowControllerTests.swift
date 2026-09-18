@@ -62,7 +62,7 @@ final class MainWindowControllerTests: XCTestCase {
     XCTAssertEqual(driver.closeCount, 0)
   }
 
-  func testSidebarPresentationAlwaysGroupsProjectsAndDisambiguatesDuplicates() {
+  func testSidebarPresentationShowsTitlesWithoutRepeatingProjectPaths() {
     let first = ConversationRecord(
       id: ConversationID(rawValue: UUID()),
       launchWorkspace: WorkspaceIdentity(absolutePath: "/tmp/vivi")!,
@@ -93,23 +93,39 @@ final class MainWindowControllerTests: XCTestCase {
     XCTAssertEqual(
       sidebarRowPresentation(
         title: second.navigation.title,
-        workspace: second.navigation.workspace.canonicalPath,
+        projectName: "vivi",
         duplicate: conversations.duplicatePosition(for: second.id)),
       SidebarRowPresentation(
-        title: "vivi",
-        workspace: "/tmp/vivi",
+        title: "New conversation",
         duplicateBadge: "2",
-        accessibilityLabel: "vivi, /tmp/vivi, conversation 2 of 2"))
+        accessibilityLabel: "New conversation, conversation 2 of 2"))
     XCTAssertNil(conversations.duplicatePosition(for: other.id))
+    XCTAssertEqual(
+      sidebarRowPresentation(
+        title: "resumed",
+        projectName: "resumed",
+        duplicate: nil
+      ).title,
+      "New conversation")
   }
 
-  func testProjectAccessibilityLabelDisambiguatesMatchingNames() {
+  func testProjectPresentationOnlyShowsPathsForMatchingNames() {
+    let first = WorkspaceIdentity(absolutePath: "/one/app")!
+    let second = WorkspaceIdentity(absolutePath: "/two/app")!
+    let unique = WorkspaceIdentity(absolutePath: "/work/other")!
+
     XCTAssertEqual(
-      projectAccessibilityLabel(name: "app", path: "/one/app"),
-      "app, /one/app, project")
-    XCTAssertNotEqual(
-      projectAccessibilityLabel(name: "app", path: "/one/app"),
-      projectAccessibilityLabel(name: "app", path: "/two/app"))
+      projectSidebarPresentation(workspace: first, allWorkspaces: [first, second, unique]),
+      ProjectSidebarPresentation(
+        name: "app",
+        visiblePath: "/one/app",
+        accessibilityLabel: "app, /one/app, project"))
+    XCTAssertEqual(
+      projectSidebarPresentation(workspace: unique, allWorkspaces: [first, second, unique]),
+      ProjectSidebarPresentation(
+        name: "other",
+        visiblePath: nil,
+        accessibilityLabel: "other, /work/other, project"))
   }
 
   func testProjectSessionHistoryFiltersWorkspaceAndCurrentSession() {
@@ -125,10 +141,10 @@ final class MainWindowControllerTests: XCTestCase {
       catalog: catalog,
       projectWorkspace: "/work/current")
 
-    XCTAssertEqual(rows.map(\.title), ["current"])
+    XCTAssertEqual(rows.map(\.title), ["Untitled session"])
     XCTAssertEqual(
       rows[0].accessibilityLabel,
-      "current, /work/current, saved session")
+      "Untitled session, saved session")
   }
 
   func testProjectSessionHistoryPreservesBackendOrder() {

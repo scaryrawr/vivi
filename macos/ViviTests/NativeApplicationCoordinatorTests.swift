@@ -213,7 +213,7 @@ final class NativeApplicationCoordinatorTests: XCTestCase {
     XCTAssertEqual(harness.coordinator.conversations.selectedID, record.id)
   }
 
-  func testProjectHistoryUsesSelectedLaunchConversationThenLatestFallback() {
+  func testProjectCatalogOwnerAndRosterOrderStayStableAcrossSelectionAndTitles() {
     let harness = CoordinatorHarness()
     harness.coordinator.open([
       URL(string: "vivi://chat?workspace=/tmp/project")!,
@@ -225,11 +225,47 @@ final class NativeApplicationCoordinatorTests: XCTestCase {
     let projectRecords = conversations.records(launchedFrom: project)
 
     XCTAssertEqual(projectRecords.count, 2)
-    XCTAssertTrue(conversations.historyConversation(launchedFrom: project) === projectRecords[1])
+    XCTAssertTrue(conversations.catalogConversation(launchedFrom: project) === projectRecords[0])
+    let initialRecordOrder = conversations.records.map(\.id)
+    let initialWorkspaceOrder = conversations.launchWorkspaces
 
     conversations.select(projectRecords[0].id)
+    harness.drivers[0].send(.sessionTitle("Renamed first"))
+    conversations.select(projectRecords[1].id)
 
-    XCTAssertTrue(conversations.historyConversation(launchedFrom: project) === projectRecords[0])
+    XCTAssertTrue(conversations.catalogConversation(launchedFrom: project) === projectRecords[0])
+    XCTAssertEqual(conversations.records.map(\.id), initialRecordOrder)
+    XCTAssertEqual(conversations.launchWorkspaces, initialWorkspaceOrder)
+    XCTAssertEqual(conversations.selectedID, projectRecords[1].id)
+  }
+
+  func testSavedSessionResumeSelectsStableCatalogConversation() {
+    let harness = CoordinatorHarness()
+    harness.coordinator.open([
+      URL(string: "vivi://chat?workspace=/tmp/project")!,
+      URL(string: "vivi://chat?workspace=/tmp/project")!,
+    ])
+    let conversations = harness.coordinator.conversations
+    let records = conversations.records
+    let catalogRecord = conversations.catalogConversation(
+      launchedFrom: WorkspaceIdentity(absolutePath: "/tmp/project")!)!
+    let key = ResumeKey(generation: 9, slot: 2)
+    let summary = SessionSummary(
+      key: key,
+      workingDirectory: "/tmp/project",
+      title: "Saved conversation",
+      isCurrent: false)
+    harness.drivers[0].send(.ready)
+    harness.drivers[0].send(.modelCatalog(coordinatorModelCatalog()))
+    catalogRecord.store.refreshSessions()
+    harness.drivers[0].send(.sessionCatalog(SessionCatalog(sessions: [summary])))
+
+    XCTAssertEqual(conversations.selectedID, records[1].id)
+    conversations.resume(key, launchedFrom: catalogRecord.launchWorkspace)
+
+    XCTAssertEqual(conversations.selectedID, catalogRecord.id)
+    XCTAssertEqual(harness.drivers[0].resumeKeys, [key])
+    XCTAssertEqual(conversations.records.map(\.id), records.map(\.id))
   }
 
   func testCrossWorkspaceResumeKeepsConversationIdentitySelectionAndUpdatesDuplicates() {

@@ -155,14 +155,14 @@ final class ConversationCollection: ObservableObject {
     records.filter { $0.launchWorkspace == workspace }
   }
 
-  func historyConversation(launchedFrom workspace: WorkspaceIdentity) -> ConversationRecord? {
-    let matches = records(launchedFrom: workspace)
-    if let selectedID,
-      let selected = matches.first(where: { $0.id == selectedID })
-    {
-      return selected
-    }
-    return matches.last
+  func catalogConversation(launchedFrom workspace: WorkspaceIdentity) -> ConversationRecord? {
+    records.first { $0.launchWorkspace == workspace }
+  }
+
+  func resume(_ key: ResumeKey, launchedFrom workspace: WorkspaceIdentity) {
+    guard let conversation = catalogConversation(launchedFrom: workspace) else { return }
+    select(conversation.id)
+    conversation.store.resumeSession(key)
   }
 }
 
