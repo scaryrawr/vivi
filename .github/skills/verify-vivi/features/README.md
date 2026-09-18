@@ -61,6 +61,9 @@ user-visible behavior. It then uses exactly four H2 sections in this order:
 - [Streaming chat](./streaming-chat.md) covers composer input, submission,
   streamed Copilot output, steering, queued follow-ups, and return to the
   ready state.
+- [Composer image attachments](./attachments.md) covers AppKit clipboard
+  acquisition, private temporary-file tokens, hosted image submission,
+  workspace configuration, and isolated Copilot state.
 - [Async Bash](./async-bash.md) covers starting a PTY command, later input and
   output, listing, idempotent stop, and visible tool activity.
 - [Markdown rendering](./markdown-rendering.md) covers headings, inline
