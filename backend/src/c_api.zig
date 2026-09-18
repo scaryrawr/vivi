@@ -1700,7 +1700,8 @@ export fn vivi_backend_next_event(
         self.control_operation == .refresh_commands)
     {
         self.control_operation = .none;
-    } else if ((projected.kind == c.VIVI_BACKEND_EVENT_COMMAND_COMPLETED or
+    } else if ((projected.kind == c.VIVI_BACKEND_EVENT_ASSISTANT_STARTED or
+        projected.kind == c.VIVI_BACKEND_EVENT_COMMAND_COMPLETED or
         projected.kind == c.VIVI_BACKEND_EVENT_COMMAND_FAILED) and
         self.control_operation == .execute_command)
     {
@@ -1967,6 +1968,41 @@ test "C command event probe and retry does not consume or partially copy" {
     try std.testing.expect(value.pending == null);
     try std.testing.expect(value.control_operation == .none);
     try std.testing.expectEqual(@as(u64, 5), commands[0].key.generation);
+}
+
+test "C agent prompt command releases execute control on assistant start" {
+    var value: Handle = undefined;
+    value.pending = .assistant_started;
+    defer if (value.pending) |*pending| pending.deinit();
+    value.emit_closed_after_failure = false;
+    value.control_operation = .execute_command;
+    value.accepting_prompt = .init(false);
+    const handle_pointer: *c.vivi_backend_conversation_t = @ptrCast(&value);
+
+    var metadata = std.mem.zeroes(c.vivi_backend_event_t);
+    try std.testing.expectEqual(
+        @as(c.vivi_backend_result_t, c.VIVI_BACKEND_OK),
+        vivi_backend_next_event(
+            handle_pointer,
+            &metadata,
+            null,
+            0,
+            null,
+            0,
+            null,
+            0,
+            null,
+            0,
+            null,
+            0,
+            null,
+            0,
+            null,
+            0,
+        ),
+    );
+    try std.testing.expect(value.pending == null);
+    try std.testing.expect(value.control_operation == .none);
 }
 
 test "C command failure and execution outcomes preserve chronology fields" {

@@ -503,6 +503,7 @@ final class NativeChatStore: ObservableObject {
   }
 
   var commandDisabledReason: String? {
+    if isAcquiringAttachments { return "Wait for attachment selection to finish." }
     if lifecycle == .responding { return "Wait for Vivi to finish responding." }
     if lifecycle == .awaitingInput { return "Answer Vivi’s question first." }
     if lifecycle == .closing || lifecycle == .closed { return "This conversation is closing." }
@@ -1004,7 +1005,7 @@ final class NativeChatStore: ObservableObject {
 
   private var canPublishAttachmentAcquisition: Bool {
     lifecycle == .idle && modelState == .ready && sessionState == .ready
-      && activeUserInput == nil
+      && activeUserInput == nil && commandExecution == nil
   }
 
   private func refreshCommands() {
@@ -1122,6 +1123,7 @@ final class NativeChatStore: ObservableObject {
         ? .failure(id: UUID(), text: text)
         : .status(id: UUID(), text: text))
     commandExecution = nil
+    lifecycle = .idle
     if !preserveArgument {
       commandArgumentSession = nil
       closeCommandPalette()

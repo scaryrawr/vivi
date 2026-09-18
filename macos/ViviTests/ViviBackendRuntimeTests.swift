@@ -1477,6 +1477,31 @@ final class ViviBackendRuntimeTests: XCTestCase {
     XCTAssertEqual(store.commandExecution?.command.name, "deploy")
   }
 
+  func testAttachmentAcquisitionBlocksCommandExecution() async {
+    let acquirer = FakeAttachmentAcquirer(chosen: [testAttachment(name: "late.png")])
+    acquirer.suspendChoose = true
+    let driver = FakeConversationDriver()
+    let store = NativeChatStore(
+      workspace: "/tmp/work",
+      driver: driver,
+      attachmentAcquirer: acquirer)
+    store.reduce(.ready)
+    store.reduce(.modelCatalog(testCatalog()))
+    store.reduce(.commandCatalog(swiftCommandCatalog(generation: 7)))
+    store.chooseAttachments()
+    store.openCommandPalette(query: "deploy")
+    store.activateSelectedCommand()
+
+    XCTAssertEqual(
+      store.commandDisabledReason,
+      "Wait for attachment selection to finish.")
+    XCTAssertNil(store.commandArgumentSession)
+    XCTAssertTrue(driver.commandExecutions.isEmpty)
+
+    store.close()
+    await store.waitForAttachmentAcquisition()
+  }
+
   func testCommandExecutionGatesComposerAndAgentPromptClosesPalette() async {
     let driver = FakeConversationDriver()
     let attachment = testAttachment(name: "context.png")
@@ -1569,6 +1594,34 @@ final class ViviBackendRuntimeTests: XCTestCase {
     guard case .status = store.transcript.last else {
       return XCTFail("Expected successful command status")
     }
+  }
+
+  func testCompletedCommandSubcommandRestoresIdleLifecycle() {
+    let driver = FakeConversationDriver()
+    let store = readyCommandStore(driver: driver)
+    store.reduce(.commandCatalog(swiftCommandCatalog(generation: 2)))
+    store.openCommandPalette(query: "deploy")
+    store.activateSelectedCommand()
+    store.updateCommandArgumentDraft("now")
+    store.submitCommandArgument()
+    store.reduce(
+      .userInputRequested(
+        UserInputRequest(
+          id: "command-choice",
+          question: "Choose a target",
+          choices: ["Production"],
+          allowsFreeform: false)))
+    store.submitUserInputChoice("Production")
+
+    XCTAssertEqual(store.lifecycle, .responding)
+
+    store.reduce(
+      .commandCompleted(
+        key: CommandKey(generation: 2, slot: 3),
+        message: "Started."))
+
+    XCTAssertEqual(store.lifecycle, .idle)
+    XCTAssertTrue(store.canAcquireAttachments)
   }
 
   func testTypedCommandActionsReuseModelAndHistorySurfaces() {
