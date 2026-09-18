@@ -41,14 +41,34 @@ enum ComposerAttachmentMedia: UInt32, Equatable, Sendable {
   }
 }
 
-struct ComposerAttachment: Identifiable, Equatable, Sendable {
+struct ComposerAttachment: Identifiable, Equatable, @unchecked Sendable {
   let id: UUID
   let displayName: String
   let media: ComposerAttachmentMedia
   let data: Data
+  let preview: CGImage?
+
+  init(
+    id: UUID,
+    displayName: String,
+    media: ComposerAttachmentMedia,
+    data: Data,
+    preview: CGImage? = nil
+  ) {
+    self.id = id
+    self.displayName = displayName
+    self.media = media
+    self.data = data
+    self.preview = preview
+  }
 
   var sizeLabel: String {
     ByteCountFormatter.string(fromByteCount: Int64(data.count), countStyle: .file)
+  }
+
+  static func == (lhs: ComposerAttachment, rhs: ComposerAttachment) -> Bool {
+    lhs.id == rhs.id && lhs.displayName == rhs.displayName && lhs.media == rhs.media
+      && lhs.data == rhs.data
   }
 }
 
@@ -157,12 +177,28 @@ final class AppKitComposerAttachmentAcquirer: ComposerAttachmentAcquiring {
     defer { try? handle.close() }
     let data: Data
     do {
-      data = try handle.read(upToCount: composerAttachmentByteLimit + 1) ?? Data()
+      data = try readBounded(handle)
+    } catch is CancellationError {
+      throw CancellationError()
     } catch {
       throw ComposerAttachmentAcquisitionError.unreadable(name)
     }
     try Task.checkCancellation()
     return try snapshot(data: data, displayName: name)
+  }
+
+  nonisolated static func readBounded(_ handle: FileHandle) throws -> Data {
+    var data = Data()
+    while data.count <= composerAttachmentByteLimit {
+      try Task.checkCancellation()
+      let remaining = composerAttachmentByteLimit + 1 - data.count
+      guard
+        let chunk = try handle.read(upToCount: min(64 * 1024, remaining)),
+        !chunk.isEmpty
+      else { break }
+      data.append(chunk)
+    }
+    return data
   }
 
   nonisolated static func snapshots(_ urls: [URL]) throws -> [ComposerAttachment] {
@@ -201,7 +237,19 @@ final class AppKitComposerAttachmentAcquirer: ComposerAttachmentAcquiring {
       id: UUID(),
       displayName: displayName,
       media: media,
-      data: data)
+      data: data,
+      preview: preview(data))
+  }
+
+  nonisolated static func preview(_ data: Data) -> CGImage? {
+    guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+    let options: [CFString: Any] = [
+      kCGImageSourceCreateThumbnailFromImageAlways: true,
+      kCGImageSourceCreateThumbnailWithTransform: true,
+      kCGImageSourceShouldCacheImmediately: true,
+      kCGImageSourceThumbnailMaxPixelSize: 72,
+    ]
+    return CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
   }
 
   nonisolated static func snapshotTIFF(_ data: Data) throws -> ComposerAttachment {

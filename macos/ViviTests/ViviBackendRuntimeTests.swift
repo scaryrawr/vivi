@@ -236,6 +236,22 @@ final class ViviBackendRuntimeTests: XCTestCase {
         displayName: "bad.png"))
   }
 
+  func testAppKitAttachmentBoundedReadContinuesAfterShortChunks() async throws {
+    let pipe = Pipe()
+    let expected = testPNGData() + Data("remaining bytes".utf8)
+    let writer = Task.detached {
+      try pipe.fileHandleForWriting.write(contentsOf: expected.prefix(4))
+      try await Task.sleep(for: .milliseconds(10))
+      try pipe.fileHandleForWriting.write(contentsOf: expected.dropFirst(4))
+      try pipe.fileHandleForWriting.close()
+    }
+
+    let actual = try AppKitComposerAttachmentAcquirer.readBounded(pipe.fileHandleForReading)
+    try await writer.value
+
+    XCTAssertEqual(actual, expected)
+  }
+
   func testAppKitAttachmentSelectionEnforcesCountBeforeReadsAndAggregateWhileReading() throws {
     let missing = URL(fileURLWithPath: "/missing/image.png")
     XCTAssertThrowsError(

@@ -1,4 +1,3 @@
-import AppKit
 import SwiftUI
 
 enum ToolInputLayout: Equatable {
@@ -229,8 +228,8 @@ private struct ComposerAttachmentChip: View {
   var body: some View {
     HStack(spacing: 8) {
       Group {
-        if let image = NSImage(data: attachment.data) {
-          Image(nsImage: image)
+        if let preview = attachment.preview {
+          Image(decorative: preview, scale: 1)
             .resizable()
             .scaledToFill()
         } else {
