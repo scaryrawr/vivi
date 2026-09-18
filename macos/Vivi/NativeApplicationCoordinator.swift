@@ -284,6 +284,7 @@ final class NativeApplicationCoordinator {
     activeWorkspaceChooser = chooser
     presentation.workspaceChoice = .choosing
     workspaceChoiceTask = Task { [weak self] in
+      guard !Task.isCancelled else { return }
       let selectedURL = await chooser.chooseWorkspace()
       self?.workspaceChoiceDidFinish(selectedURL, chooser: chooser)
     }
