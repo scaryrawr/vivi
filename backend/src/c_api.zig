@@ -15,6 +15,8 @@ const Handle = struct {
         none,
         refresh_models,
         switch_model,
+        refresh_sessions,
+        resume_session,
     };
 
     io_threaded: std.Io.Threaded,
@@ -55,6 +57,7 @@ fn result(error_value: anyerror) c.vivi_backend_result_t {
         error.EmptyPrompt,
         error.EmptyModel,
         error.InvalidReasoningEffort,
+        error.InvalidSessionKey,
         => c.VIVI_BACKEND_INVALID_ARGUMENT,
         else => c.VIVI_BACKEND_FAILED,
     };
@@ -233,6 +236,39 @@ export fn vivi_backend_switch_model(
     self.conversation.switchModel(.{
         .model_id = bytes[0..model_id_length],
         .reasoning = selected_reasoning,
+    }) catch |err| {
+        self.control_operation = .none;
+        return result(err);
+    };
+    return c.VIVI_BACKEND_OK;
+}
+
+export fn vivi_backend_refresh_sessions(
+    conversation: ?*c.vivi_backend_conversation_t,
+) callconv(.c) c.vivi_backend_result_t {
+    const self = handle(conversation) orelse return c.VIVI_BACKEND_INVALID_ARGUMENT;
+    if (self.control_operation != .none) return c.VIVI_BACKEND_BUSY;
+    self.control_operation = .refresh_sessions;
+    self.conversation.refreshSessions() catch |err| {
+        self.control_operation = .none;
+        return result(err);
+    };
+    return c.VIVI_BACKEND_OK;
+}
+
+export fn vivi_backend_resume_session(
+    conversation: ?*c.vivi_backend_conversation_t,
+    key: c.vivi_backend_resume_key_t,
+) callconv(.c) c.vivi_backend_result_t {
+    const self = handle(conversation) orelse return c.VIVI_BACKEND_INVALID_ARGUMENT;
+    if (key.generation == 0 or key.reserved != 0) {
+        return c.VIVI_BACKEND_INVALID_ARGUMENT;
+    }
+    if (self.control_operation != .none) return c.VIVI_BACKEND_BUSY;
+    self.control_operation = .resume_session;
+    self.conversation.resumeSession(.{
+        .generation = key.generation,
+        .slot = key.slot,
     }) catch |err| {
         self.control_operation = .none;
         return result(err);
@@ -425,6 +461,11 @@ const Projected = struct {
     history_effect: c.vivi_backend_history_effect_t = c.VIVI_BACKEND_HISTORY_NONE,
     default_saved: bool = false,
     cleanup_failed: bool = false,
+    session_resume_outcome: c.vivi_backend_session_resume_outcome_t =
+        c.VIVI_BACKEND_SESSION_RESUME_NONE,
+    sessions: []const backend.SessionSummary = &.{},
+    resumed_session: ?*const backend.SessionSummary = null,
+    transcript: []const backend.TranscriptItem = &.{},
 };
 
 const ToolDisplay = struct {
@@ -566,6 +607,32 @@ fn project(event: *const backend.ConversationEvent) ?Projected {
                 .switch_outcome = c.VIVI_BACKEND_MODEL_SWITCH_FAILED,
             },
         },
+        .session_catalog => |*catalog| .{
+            .kind = c.VIVI_BACKEND_EVENT_SESSION_CATALOG,
+            .content_kind = c.VIVI_BACKEND_CONTENT_SESSION_CATALOG,
+            .sessions = catalog.sessions,
+        },
+        .session_catalog_failed => |text| .{
+            .kind = c.VIVI_BACKEND_EVENT_SESSION_CATALOG_FAILURE,
+            .content_kind = c.VIVI_BACKEND_CONTENT_TEXT,
+            .text = text.bytes,
+        },
+        .session_resume => |*resume_result| switch (resume_result.*) {
+            .resumed => |*resumed| .{
+                .kind = c.VIVI_BACKEND_EVENT_SESSION_RESUME,
+                .content_kind = c.VIVI_BACKEND_CONTENT_SESSION_RESUME,
+                .session_resume_outcome = c.VIVI_BACKEND_SESSION_RESUME_RESUMED,
+                .resumed_session = &resumed.session,
+                .transcript = resumed.transcript.items,
+                .cleanup_failed = resumed.cleanup_failed,
+            },
+            .failed => |text| .{
+                .kind = c.VIVI_BACKEND_EVENT_SESSION_RESUME,
+                .content_kind = c.VIVI_BACKEND_CONTENT_SESSION_RESUME,
+                .text = text.bytes,
+                .session_resume_outcome = c.VIVI_BACKEND_SESSION_RESUME_FAILED,
+            },
+        },
         .idle => .{ .kind = c.VIVI_BACKEND_EVENT_IDLE },
         .closed => |closed| switch (closed) {
             .requested => .{ .kind = c.VIVI_BACKEND_EVENT_CLOSED },
@@ -581,9 +648,6 @@ fn project(event: *const backend.ConversationEvent) ?Projected {
             .text = "Native chat cannot answer agent questions yet.",
         },
         .command_catalog,
-        .session_catalog,
-        .session_catalog_failed,
-        .session_resume,
         .command_completed,
         => null,
     };
@@ -623,8 +687,29 @@ fn byteCount(projected: Projected) !u32 {
         total = std.math.add(u64, total, model.display_name.len) catch
             return error.EventTooLarge;
     }
+    for (projected.sessions) |session| {
+        total = try addSessionBytes(total, &session);
+    }
+    if (projected.resumed_session) |session| {
+        total = try addSessionBytes(total, session);
+    }
+    for (projected.transcript) |item| {
+        total = std.math.add(u64, total, item.text.len) catch
+            return error.EventTooLarge;
+    }
     if (total > std.math.maxInt(u32)) return error.EventTooLarge;
     return @intCast(total);
+}
+
+fn addSessionBytes(total_value: u64, session: *const backend.SessionSummary) !u64 {
+    var total = total_value;
+    total = std.math.add(u64, total, session.working_directory.len) catch
+        return error.EventTooLarge;
+    if (session.title) |title| {
+        total = std.math.add(u64, total, title.len) catch
+            return error.EventTooLarge;
+    }
+    return total;
 }
 
 fn modelCount(projected: Projected) !u32 {
@@ -634,6 +719,20 @@ fn modelCount(projected: Projected) !u32 {
         @intFromBool(projected.model != null),
     ) catch return error.EventTooLarge;
     return std.math.cast(u32, count) orelse error.EventTooLarge;
+}
+
+fn sessionCount(projected: Projected) !u32 {
+    const count = std.math.add(
+        usize,
+        projected.sessions.len,
+        @intFromBool(projected.resumed_session != null),
+    ) catch return error.EventTooLarge;
+    return std.math.cast(u32, count) orelse error.EventTooLarge;
+}
+
+fn transcriptItemCount(projected: Projected) !u32 {
+    return std.math.cast(u32, projected.transcript.len) orelse
+        error.EventTooLarge;
 }
 
 fn semanticSpanCount(projected: Projected) !u32 {
@@ -691,6 +790,56 @@ fn writeModel(
     };
 }
 
+fn writeSessionSummary(
+    destination: []u8,
+    offset: *u32,
+    session: *const backend.SessionSummary,
+) c.vivi_backend_session_summary_t {
+    var flags: u32 = 0;
+    const title = if (session.title) |value| blk: {
+        flags |= @intCast(c.VIVI_BACKEND_SESSION_TITLE_PRESENT);
+        break :blk appendBytes(destination, offset, value);
+    } else std.mem.zeroes(c.vivi_backend_span_t);
+    if (session.current) flags |= @intCast(c.VIVI_BACKEND_SESSION_CURRENT);
+    return .{
+        .key = .{
+            .generation = session.key.generation,
+            .slot = session.key.slot,
+            .reserved = 0,
+        },
+        .working_directory = appendBytes(
+            destination,
+            offset,
+            session.working_directory,
+        ),
+        .title = title,
+        .flags = flags,
+        .reserved = 0,
+    };
+}
+
+fn cTranscriptRole(
+    role: backend.TranscriptRole,
+) c.vivi_backend_transcript_role_t {
+    return switch (role) {
+        .user => c.VIVI_BACKEND_TRANSCRIPT_USER,
+        .assistant => c.VIVI_BACKEND_TRANSCRIPT_ASSISTANT,
+        .reasoning => c.VIVI_BACKEND_TRANSCRIPT_REASONING,
+    };
+}
+
+fn writeTranscriptItem(
+    destination: []u8,
+    offset: *u32,
+    item: *const backend.TranscriptItem,
+) c.vivi_backend_transcript_item_t {
+    return .{
+        .text = appendBytes(destination, offset, item.text),
+        .role = cTranscriptRole(item.role),
+        .reserved = 0,
+    };
+}
+
 fn copyProjected(
     projected: Projected,
     output: *c.vivi_backend_event_t,
@@ -721,9 +870,43 @@ fn copyProjectedWithSpans(
     semantic_spans: ?[*]c.vivi_backend_semantic_span_t,
     semantic_span_capacity: u32,
 ) c.vivi_backend_result_t {
+    return copyProjectedFull(
+        projected,
+        output,
+        bytes,
+        byte_capacity,
+        models,
+        model_capacity,
+        semantic_spans,
+        semantic_span_capacity,
+        null,
+        0,
+        null,
+        0,
+    );
+}
+
+fn copyProjectedFull(
+    projected: Projected,
+    output: *c.vivi_backend_event_t,
+    bytes: ?[*]u8,
+    byte_capacity: u32,
+    models: ?[*]c.vivi_backend_model_t,
+    model_capacity: u32,
+    semantic_spans: ?[*]c.vivi_backend_semantic_span_t,
+    semantic_span_capacity: u32,
+    sessions: ?[*]c.vivi_backend_session_summary_t,
+    session_capacity: u32,
+    transcript_items: ?[*]c.vivi_backend_transcript_item_t,
+    transcript_item_capacity: u32,
+) c.vivi_backend_result_t {
     const required_bytes = byteCount(projected) catch return c.VIVI_BACKEND_FAILED;
     const required_models = modelCount(projected) catch return c.VIVI_BACKEND_FAILED;
     const required_semantic_spans = semanticSpanCount(projected) catch
+        return c.VIVI_BACKEND_FAILED;
+    const required_sessions = sessionCount(projected) catch
+        return c.VIVI_BACKEND_FAILED;
+    const required_transcript_items = transcriptItemCount(projected) catch
         return c.VIVI_BACKEND_FAILED;
     output.* = .{
         .kind = projected.kind,
@@ -731,6 +914,8 @@ fn copyProjectedWithSpans(
         .byte_count = required_bytes,
         .model_count = required_models,
         .semantic_span_count = required_semantic_spans,
+        .session_count = required_sessions,
+        .transcript_item_count = required_transcript_items,
         .content = .{ .offset = 0, .length = @intCast(projected.text.len) },
         .selected_model_id = .{
             .offset = @intCast(projected.text.len),
@@ -746,18 +931,24 @@ fn copyProjectedWithSpans(
         .selected_reasoning = projected.selected_reasoning,
         .switch_outcome = projected.switch_outcome,
         .history_effect = projected.history_effect,
+        .session_resume_outcome = projected.session_resume_outcome,
         .default_saved = @intFromBool(projected.default_saved),
         .cleanup_failed = @intFromBool(projected.cleanup_failed),
+        .session_reserved = 0,
         .reserved = 0,
     };
     if (byte_capacity < required_bytes or model_capacity < required_models or
-        semantic_span_capacity < required_semantic_spans)
+        semantic_span_capacity < required_semantic_spans or
+        session_capacity < required_sessions or
+        transcript_item_capacity < required_transcript_items)
     {
         return c.VIVI_BACKEND_BUFFER_TOO_SMALL;
     }
     var empty_bytes: [0]u8 = .{};
     var empty_models: [0]c.vivi_backend_model_t = .{};
     var empty_semantic_spans: [0]c.vivi_backend_semantic_span_t = .{};
+    var empty_sessions: [0]c.vivi_backend_session_summary_t = .{};
+    var empty_transcript_items: [0]c.vivi_backend_transcript_item_t = .{};
     const byte_destination: []u8 = if (required_bytes > 0)
         (bytes orelse return c.VIVI_BACKEND_INVALID_ARGUMENT)[0..required_bytes]
     else
@@ -771,6 +962,16 @@ fn copyProjectedWithSpans(
             (semantic_spans orelse return c.VIVI_BACKEND_INVALID_ARGUMENT)[0..required_semantic_spans]
         else
             &empty_semantic_spans;
+    const session_destination: []c.vivi_backend_session_summary_t =
+        if (required_sessions > 0)
+            (sessions orelse return c.VIVI_BACKEND_INVALID_ARGUMENT)[0..required_sessions]
+        else
+            &empty_sessions;
+    const transcript_destination: []c.vivi_backend_transcript_item_t =
+        if (required_transcript_items > 0)
+            (transcript_items orelse return c.VIVI_BACKEND_INVALID_ARGUMENT)[0..required_transcript_items]
+        else
+            &empty_transcript_items;
     var offset: u32 = 0;
     output.content = appendBytes(byte_destination, &offset, projected.text);
     output.selected_model_id = appendBytes(
@@ -837,6 +1038,29 @@ fn copyProjectedWithSpans(
     if (projected.model) |model| {
         model_destination[model_index] = writeModel(byte_destination, &offset, model);
     }
+    var session_index: usize = 0;
+    for (projected.sessions) |*session| {
+        session_destination[session_index] = writeSessionSummary(
+            byte_destination,
+            &offset,
+            session,
+        );
+        session_index += 1;
+    }
+    if (projected.resumed_session) |session| {
+        session_destination[session_index] = writeSessionSummary(
+            byte_destination,
+            &offset,
+            session,
+        );
+    }
+    for (projected.transcript, 0..) |*item, index| {
+        transcript_destination[index] = writeTranscriptItem(
+            byte_destination,
+            &offset,
+            item,
+        );
+    }
     return c.VIVI_BACKEND_OK;
 }
 
@@ -849,6 +1073,10 @@ export fn vivi_backend_next_event(
     model_capacity: u32,
     semantic_spans: ?[*]c.vivi_backend_semantic_span_t,
     semantic_span_capacity: u32,
+    sessions: ?[*]c.vivi_backend_session_summary_t,
+    session_capacity: u32,
+    transcript_items: ?[*]c.vivi_backend_transcript_item_t,
+    transcript_item_capacity: u32,
 ) callconv(.c) c.vivi_backend_result_t {
     const self = handle(conversation) orelse return c.VIVI_BACKEND_INVALID_ARGUMENT;
     const output = out_event orelse return c.VIVI_BACKEND_INVALID_ARGUMENT;
@@ -860,6 +1088,8 @@ export fn vivi_backend_next_event(
             .byte_count = 0,
             .model_count = 0,
             .semantic_span_count = 0,
+            .session_count = 0,
+            .transcript_item_count = 0,
             .content = .{ .offset = 0, .length = 0 },
             .selected_model_id = .{ .offset = 0, .length = 0 },
             .tool_call_id = .{ .offset = 0, .length = 0 },
@@ -872,8 +1102,10 @@ export fn vivi_backend_next_event(
             .selected_reasoning = c.VIVI_BACKEND_REASONING_NONE,
             .switch_outcome = c.VIVI_BACKEND_MODEL_SWITCH_NONE,
             .history_effect = c.VIVI_BACKEND_HISTORY_NONE,
+            .session_resume_outcome = c.VIVI_BACKEND_SESSION_RESUME_NONE,
             .default_saved = 0,
             .cleanup_failed = 0,
+            .session_reserved = 0,
             .reserved = 0,
         };
         return c.VIVI_BACKEND_OK;
@@ -887,7 +1119,7 @@ export fn vivi_backend_next_event(
         self.pending = null;
     }
     const projected = project(&self.pending.?).?;
-    const copied = copyProjectedWithSpans(
+    const copied = copyProjectedFull(
         projected,
         output,
         bytes,
@@ -896,6 +1128,10 @@ export fn vivi_backend_next_event(
         model_capacity,
         semantic_spans,
         semantic_span_capacity,
+        sessions,
+        session_capacity,
+        transcript_items,
+        transcript_item_capacity,
     );
     if (copied != c.VIVI_BACKEND_OK) return copied;
     if (projected.kind == c.VIVI_BACKEND_EVENT_FAILURE) {
@@ -916,6 +1152,15 @@ export fn vivi_backend_next_event(
         self.control_operation = .none;
     } else if (projected.kind == c.VIVI_BACKEND_EVENT_MODEL_SWITCH and
         self.control_operation == .switch_model)
+    {
+        self.control_operation = .none;
+    } else if ((projected.kind == c.VIVI_BACKEND_EVENT_SESSION_CATALOG or
+        projected.kind == c.VIVI_BACKEND_EVENT_SESSION_CATALOG_FAILURE) and
+        self.control_operation == .refresh_sessions)
+    {
+        self.control_operation = .none;
+    } else if (projected.kind == c.VIVI_BACKEND_EVENT_SESSION_RESUME and
+        self.control_operation == .resume_session)
     {
         self.control_operation = .none;
     }
@@ -1304,6 +1549,165 @@ test "C session title is a distinct typed text event" {
     const projected = project(&event).?;
     try std.testing.expect(projected.kind == c.VIVI_BACKEND_EVENT_SESSION_TITLE);
     try std.testing.expectEqualStrings("Native title", projected.text);
+}
+
+test "C session catalog copy is atomic and preserves opaque keys" {
+    const allocator = std.testing.allocator;
+    var event: backend.ConversationEvent = .{ .session_catalog = .{
+        .allocator = allocator,
+        .sessions = try allocator.alloc(backend.SessionSummary, 1),
+    } };
+    defer event.deinit();
+    event.session_catalog.sessions[0] = .{
+        .allocator = allocator,
+        .key = .{ .generation = 41, .slot = 7 },
+        .working_directory = try allocator.dupe(u8, "/tmp/other"),
+        .title = try allocator.dupe(u8, "Other session"),
+        .current = false,
+    };
+
+    const projected = project(&event).?;
+    var metadata: c.vivi_backend_event_t = undefined;
+    var bytes = [_]u8{0xaa} ** 64;
+    var sessions = [_]c.vivi_backend_session_summary_t{
+        std.mem.zeroes(c.vivi_backend_session_summary_t),
+    };
+    try std.testing.expect(
+        c.VIVI_BACKEND_BUFFER_TOO_SMALL ==
+            copyProjectedFull(
+                projected,
+                &metadata,
+                &bytes,
+                bytes.len,
+                null,
+                0,
+                null,
+                0,
+                &sessions,
+                0,
+                null,
+                0,
+            ),
+    );
+    try std.testing.expectEqual(@as(u8, 0xaa), bytes[0]);
+    try std.testing.expectEqual(@as(u64, 0), sessions[0].key.generation);
+    try std.testing.expectEqual(@as(u32, 1), metadata.session_count);
+
+    try std.testing.expect(
+        c.VIVI_BACKEND_OK ==
+            copyProjectedFull(
+                projected,
+                &metadata,
+                &bytes,
+                bytes.len,
+                null,
+                0,
+                null,
+                0,
+                &sessions,
+                sessions.len,
+                null,
+                0,
+            ),
+    );
+    try std.testing.expect(
+        metadata.kind == c.VIVI_BACKEND_EVENT_SESSION_CATALOG,
+    );
+    try std.testing.expectEqual(@as(u64, 41), sessions[0].key.generation);
+    try std.testing.expectEqual(@as(u32, 7), sessions[0].key.slot);
+    try std.testing.expect(
+        sessions[0].flags & c.VIVI_BACKEND_SESSION_TITLE_PRESENT != 0,
+    );
+    try std.testing.expectEqualStrings(
+        "/tmp/other",
+        bytes[sessions[0].working_directory.offset..][0..sessions[0].working_directory.length],
+    );
+}
+
+test "C session resume copies summary and ordered transcript atomically" {
+    const allocator = std.testing.allocator;
+    const items = try allocator.alloc(backend.TranscriptItem, 3);
+    items[0] = try backend.TranscriptItem.init(allocator, .user, "");
+    items[1] = try backend.TranscriptItem.init(allocator, .reasoning, "thinking");
+    items[2] = try backend.TranscriptItem.init(allocator, .assistant, "answer");
+    var event: backend.ConversationEvent = .{ .session_resume = .{ .resumed = .{
+        .session = .{
+            .allocator = allocator,
+            .key = .{ .generation = 9, .slot = 2 },
+            .working_directory = try allocator.dupe(u8, "/tmp/project"),
+            .title = null,
+            .current = false,
+        },
+        .transcript = .{ .allocator = allocator, .items = items },
+        .cleanup_failed = true,
+    } } };
+    defer event.deinit();
+
+    const projected = project(&event).?;
+    var metadata: c.vivi_backend_event_t = undefined;
+    const bytes = try allocator.alloc(u8, try byteCount(projected));
+    defer allocator.free(bytes);
+    var sessions = [_]c.vivi_backend_session_summary_t{
+        std.mem.zeroes(c.vivi_backend_session_summary_t),
+    };
+    var transcript = [_]c.vivi_backend_transcript_item_t{
+        std.mem.zeroes(c.vivi_backend_transcript_item_t),
+    } ** 3;
+
+    try std.testing.expect(
+        c.VIVI_BACKEND_BUFFER_TOO_SMALL ==
+            copyProjectedFull(
+                projected,
+                &metadata,
+                bytes.ptr,
+                @intCast(bytes.len),
+                null,
+                0,
+                null,
+                0,
+                &sessions,
+                sessions.len,
+                &transcript,
+                2,
+            ),
+    );
+    try std.testing.expectEqual(@as(u64, 0), sessions[0].key.generation);
+    try std.testing.expectEqual(@as(u32, 0), transcript[0].text.length);
+
+    try std.testing.expect(
+        c.VIVI_BACKEND_OK ==
+            copyProjectedFull(
+                projected,
+                &metadata,
+                bytes.ptr,
+                @intCast(bytes.len),
+                null,
+                0,
+                null,
+                0,
+                &sessions,
+                sessions.len,
+                &transcript,
+                transcript.len,
+            ),
+    );
+    try std.testing.expect(
+        metadata.session_resume_outcome ==
+            c.VIVI_BACKEND_SESSION_RESUME_RESUMED,
+    );
+    try std.testing.expectEqual(@as(u8, 1), metadata.cleanup_failed);
+    try std.testing.expectEqual(@as(u32, 3), metadata.transcript_item_count);
+    try std.testing.expect(
+        transcript[0].role == c.VIVI_BACKEND_TRANSCRIPT_USER,
+    );
+    try std.testing.expectEqual(@as(u32, 0), transcript[0].text.length);
+    try std.testing.expect(
+        transcript[1].role == c.VIVI_BACKEND_TRANSCRIPT_REASONING,
+    );
+    try std.testing.expectEqualStrings(
+        "thinking",
+        bytes[transcript[1].text.offset..][0..transcript[1].text.length],
+    );
 }
 
 test "C tool start copy-out is atomic and includes display fields" {

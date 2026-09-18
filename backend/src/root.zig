@@ -17,7 +17,7 @@ const private_directory_permissions: std.Io.Dir.Permissions =
         .fromMode(0o700);
 
 pub const version = build_options.version;
-pub const abi_version: u32 = 7;
+pub const abi_version: u32 = 8;
 pub const Conversation = conversation.Conversation;
 pub const ConversationEvent = conversation.Event;
 pub const ConversationWake = conversation.Wake;
@@ -44,6 +44,7 @@ pub const SessionSummary = conversation.SessionSummary;
 pub const ResumeKey = conversation.ResumeKey;
 pub const TranscriptSnapshot = conversation.TranscriptSnapshot;
 pub const TranscriptItem = conversation.TranscriptItem;
+pub const TranscriptRole = conversation.TranscriptRole;
 pub const ToolActivity = tool_activity.ToolActivity;
 pub const ToolActivityUpdate = tool_activity.ToolActivityUpdate;
 pub const ToolStarted = tool_activity.ToolStarted;
@@ -1820,74 +1821,52 @@ fn isViviTool(name: []const u8) bool {
     return false;
 }
 
-const ActiveToolCall = struct {
-    call_id: []u8,
-    summary: tool_activity.ToolSummary,
-
-    fn deinit(self: *ActiveToolCall, allocator: std.mem.Allocator) void {
-        allocator.free(self.call_id);
-        self.summary.deinit(allocator);
-        self.* = undefined;
-    }
-};
-
-fn containsToolCall(calls: []const ActiveToolCall, call_id: []const u8) bool {
-    for (calls) |call| {
-        if (std.mem.eql(u8, call.call_id, call_id)) return true;
+fn containsToolCall(ids: []const []const u8, call_id: []const u8) bool {
+    for (ids) |id| {
+        if (std.mem.eql(u8, id, call_id)) return true;
     }
     return false;
 }
 
 fn emitTypedToolStart(
     worker: *conversation.Worker,
-    active_calls: *std.ArrayList(ActiveToolCall),
+    active_calls: *std.ArrayList([]u8),
     call_id: []const u8,
     tool_name: []const u8,
 ) !void {
     if (isViviTool(tool_name) or containsToolCall(active_calls.items, call_id)) {
         return;
     }
-    const summary: tool_activity.ToolSummary = .{ .other = .{ .name = tool_name } };
     const started = try tool_activity.ToolStarted.init(
         worker.allocator(),
         call_id,
         "{}",
-        summary,
+        .{ .other = .{ .name = tool_name } },
     );
     try worker.toolActivity(.{ .started = started });
     const call_id_copy = try worker.allocator().dupe(u8, call_id);
     errdefer worker.allocator().free(call_id_copy);
-    const owned_summary = try summary.clone(worker.allocator());
-    errdefer {
-        var mutable = owned_summary;
-        mutable.deinit(worker.allocator());
-    }
-    try active_calls.append(worker.allocator(), .{
-        .call_id = call_id_copy,
-        .summary = owned_summary,
-    });
+    try active_calls.append(worker.allocator(), call_id_copy);
 }
 
 fn emitTypedToolComplete(
     worker: *conversation.Worker,
-    active_calls: *std.ArrayList(ActiveToolCall),
+    active_calls: *std.ArrayList([]u8),
     complete: anytype,
 ) !void {
-    const index = for (active_calls.items, 0..) |call, index| {
-        if (std.mem.eql(u8, call.call_id, complete.tool_call_id)) break index;
+    const index = for (active_calls.items, 0..) |call_id, index| {
+        if (std.mem.eql(u8, call_id, complete.tool_call_id)) break index;
     } else return;
-    var active = active_calls.orderedRemove(index);
-    defer active.deinit(worker.allocator());
+    defer worker.allocator().free(active_calls.orderedRemove(index));
     const output = if (complete.success)
         if (complete.result) |result| result.content else "Completed."
     else if (complete.error_) |failure|
         failure.message
     else
         "Failed.";
-    const finished = try tool_activity.ToolFinished.initPresented(
+    const finished = try tool_activity.ToolFinished.init(
         worker.allocator(),
         complete.tool_call_id,
-        active.summary,
         if (complete.success)
             .{ .succeeded = output }
         else
@@ -1913,16 +1892,7 @@ test "typed stream tool projection leaves Vivi tools to external events" {
     try std.testing.expect(isViviTool("bash"));
     try std.testing.expect(!isViviTool("github-mcp-server-search_code"));
     try std.testing.expect(containsToolCall(
-        &.{
-            .{
-                .call_id = @constCast("call-one"),
-                .summary = .{ .other = .{ .name = "first" } },
-            },
-            .{
-                .call_id = @constCast("call-two"),
-                .summary = .{ .other = .{ .name = "second" } },
-            },
-        },
+        &.{ "call-one", "call-two" },
         "call-two",
     ));
 }
@@ -1947,9 +1917,9 @@ fn streamSessionResponse(
     session: copilot.Session,
     tool_service: *tools.Service,
 ) StreamResult {
-    var typed_tool_calls = std.ArrayList(ActiveToolCall).empty;
+    var typed_tool_calls = std.ArrayList([]u8).empty;
     defer {
-        for (typed_tool_calls.items) |*call| call.deinit(worker.allocator());
+        for (typed_tool_calls.items) |call_id| worker.allocator().free(call_id);
         typed_tool_calls.deinit(worker.allocator());
     }
     while (true) {
@@ -2067,15 +2037,6 @@ fn streamSessionResponse(
                     worker.closeFailure(.stream, @errorName(err));
                     return .failed;
                 };
-                var presentation_summary = started.invocation.summary.clone(
-                    worker.allocator(),
-                ) catch |err| {
-                    var mutable_started = started;
-                    mutable_started.deinit();
-                    worker.closeFailure(.stream, @errorName(err));
-                    return .failed;
-                };
-                defer presentation_summary.deinit(worker.allocator());
                 worker.toolActivity(.{ .started = started }) catch |err| {
                     worker.closeFailure(.stream, @errorName(err));
                     return .failed;
@@ -2085,10 +2046,9 @@ fn streamSessionResponse(
                     return .failed;
                 };
                 defer result.deinit(worker.allocator());
-                const finished = tool_activity.ToolFinished.initPresented(
+                const finished = prepared.finished(
                     worker.allocator(),
                     request.tool_call_id,
-                    presentation_summary,
                     switch (result) {
                         .text => |text| .{ .succeeded = text },
                         .image => |value| .{ .image = value },

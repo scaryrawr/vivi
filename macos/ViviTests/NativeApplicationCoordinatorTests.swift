@@ -66,6 +66,39 @@ final class NativeApplicationCoordinatorTests: XCTestCase {
     XCTAssertEqual(harness.coordinator.conversations.selectedID, record.id)
   }
 
+  func testResumeUpdatesNavigationWithoutChangingConversationIdentity() {
+    let harness = CoordinatorHarness()
+    harness.coordinator.open([URL(string: "vivi://chat?workspace=/tmp/project")!])
+    let record = harness.coordinator.conversations.records[0]
+    let key = ResumeKey(generation: 1, slot: 0)
+    let summary = SessionSummary(
+      key: key,
+      workingDirectory: "/tmp/resumed",
+      title: "Resumed",
+      isCurrent: false)
+
+    harness.drivers[0].send(.ready)
+    harness.drivers[0].send(
+      .modelCatalog(
+        ModelCatalog(
+          selected: ModelSelection(modelID: "copilot/test", reasoning: .off),
+          models: [])))
+    record.store.refreshSessions()
+    harness.drivers[0].send(.sessionCatalog(SessionCatalog(sessions: [summary])))
+    record.store.resumeSession(key)
+    harness.drivers[0].send(
+      .sessionResume(
+        .resumed(
+          ResumedSession(
+            summary: summary,
+            transcript: [],
+            cleanupFailed: false))))
+
+    XCTAssertTrue(harness.coordinator.conversations.records[0] === record)
+    XCTAssertEqual(record.navigation.workspace.canonicalPath, "/tmp/resumed")
+    XCTAssertEqual(record.navigation.title, "Resumed")
+  }
+
   func testUntitledLaunchPresentsMainWindow() {
     let harness = CoordinatorHarness()
     let delegate = ViviAppDelegate(applicationCoordinator: harness.coordinator)
@@ -190,6 +223,14 @@ final class ControllableConversationDriver: ViviConversationDriving {
   }
 
   func switchModel(_ selection: ModelSelection) -> ConversationOperationResult {
+    .accepted
+  }
+
+  func refreshSessions() -> ConversationOperationResult {
+    .accepted
+  }
+
+  func resumeSession(_ key: ResumeKey) -> ConversationOperationResult {
     .accepted
   }
 

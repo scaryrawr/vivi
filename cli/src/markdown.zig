@@ -223,11 +223,7 @@ pub const HighlightCache = struct {
         source: []const u8,
     ) !Code {
         var digest: [digest_length]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(
-            source[0..@min(source.len, highlight.max_source_bytes)],
-            &digest,
-            .{},
-        );
+        std.crypto.hash.sha2.Sha256.hash(source, &digest, .{});
         if (index < self.blocks.items.len) {
             const block = &self.blocks.items[index];
             if (block.language == language and
@@ -1924,6 +1920,36 @@ test "completed fenced code reuses cached syntax spans" {
         @intFromPtr(first_spans.ptr),
         @intFromPtr(cache.blocks.items[0].spans.ptr),
     );
+}
+
+test "fenced code cache hashes text beyond the parser limit" {
+    var cache: HighlightCache = .{};
+    defer cache.deinit(std.testing.allocator);
+    const first_source = try std.testing.allocator.alloc(
+        u8,
+        highlight.max_source_bytes + 1,
+    );
+    defer std.testing.allocator.free(first_source);
+    @memset(first_source, ' ');
+    first_source[first_source.len - 1] = 'a';
+    const second_source = try std.testing.allocator.dupe(u8, first_source);
+    defer std.testing.allocator.free(second_source);
+    second_source[second_source.len - 1] = 'b';
+
+    const first = try cache.codeFor(
+        std.testing.allocator,
+        0,
+        .zig,
+        first_source,
+    );
+    try std.testing.expectEqual(@as(u8, 'a'), first.text[first.text.len - 1]);
+    const second = try cache.codeFor(
+        std.testing.allocator,
+        0,
+        .zig,
+        second_source,
+    );
+    try std.testing.expectEqual(@as(u8, 'b'), second.text[second.text.len - 1]);
 }
 
 test "unsupported fences do not offset cached supported blocks" {

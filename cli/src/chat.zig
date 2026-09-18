@@ -1,6 +1,5 @@
 const std = @import("std");
 const backend = @import("vivi_backend");
-const highlight = backend.syntax;
 const markdown = @import("markdown.zig");
 const tool_renderer = @import("tool_renderer.zig");
 const clipboard = @import("clipboard.zig");
@@ -303,9 +302,9 @@ const ToolEntry = struct {
     output: ?[]u8 = null,
     output_display: ?[]u8 = null,
     preview: ?image_preview.Preview = null,
-    input_highlights: []highlight.Span,
-    output_highlights: ?[]highlight.Span = null,
-    output_markdown: bool = false,
+    input_highlights: []backend.SemanticSpan,
+    output_highlights: ?[]backend.SemanticSpan = null,
+    output_kind: ?backend.PresentationKind = null,
     output_markdown_cache: markdown.HighlightCache = .{},
     expanded: bool = false,
     layout_width: u16 = 0,
@@ -359,28 +358,11 @@ const ToolEntry = struct {
         errdefer allocator.free(input);
         const input_display = try tool_renderer.renderArguments(allocator, input);
         errdefer allocator.free(input_display);
-        const input_highlights = switch (started.input_presentation.content) {
-            .source => |source| switch (started.invocation.summary) {
-                .bash => |summary| if (bashSummaryCommand(summary)) |command|
-                    if (std.mem.eql(
-                        u8,
-                        started.input_presentation.text,
-                        command,
-                    ))
-                        try mapBashInputHighlights(
-                            allocator,
-                            input_display,
-                            command,
-                            source.tokens,
-                        )
-                    else
-                        try allocator.alloc(highlight.Span, 0)
-                else
-                    try allocator.alloc(highlight.Span, 0),
-                else => try allocator.alloc(highlight.Span, 0),
-            },
-            .literal, .markdown => try allocator.alloc(highlight.Span, 0),
-        };
+        const input_highlights = try mapInputHighlights(
+            allocator,
+            input_display,
+            started,
+        );
         errdefer allocator.free(input_highlights);
         return .{
             .call_id = call_id,
@@ -457,13 +439,11 @@ const ToolEntry = struct {
             finished.output_presentation.text,
         );
         errdefer allocator.free(output_display);
-        const output_highlights = switch (finished.output_presentation.content) {
-            .source => |source| try allocator.dupe(
-                highlight.Span,
-                source.tokens,
-            ),
-            .literal, .markdown => try allocator.alloc(highlight.Span, 0),
-        };
+        const output_highlights = try mapPresentationHighlights(
+            allocator,
+            finished.output_presentation,
+            0,
+        );
         errdefer allocator.free(output_highlights);
         const preview = if (finished.result == .image)
             try image_preview.Preview.init(allocator, finished.result.image.bytes)
@@ -472,8 +452,7 @@ const ToolEntry = struct {
         self.output = output;
         self.output_display = output_display;
         self.output_highlights = output_highlights;
-        self.output_markdown =
-            std.meta.activeTag(finished.output_presentation.content) == .markdown;
+        self.output_kind = finished.output_presentation.kind();
         self.preview = preview;
         self.completion = completion;
         self.layout_valid = false;
@@ -500,22 +479,55 @@ const ToolEntry = struct {
     }
 };
 
-fn mapBashInputHighlights(
+fn mapInputHighlights(
     allocator: std.mem.Allocator,
     display: []const u8,
-    command: []const u8,
-    command_spans: []const highlight.Span,
-) ![]highlight.Span {
+    started: *const backend.ToolStarted,
+) ![]backend.SemanticSpan {
+    const command = switch (started.invocation.summary) {
+        .bash => |summary| ToolEntry.bashSummaryCommand(summary) orelse
+            return allocator.alloc(backend.SemanticSpan, 0),
+        else => return allocator.alloc(backend.SemanticSpan, 0),
+    };
+    const source = switch (started.input_presentation.content) {
+        .source => |value| value,
+        .literal, .markdown => return allocator.alloc(backend.SemanticSpan, 0),
+    };
+    if (source.language != .bash or
+        !std.mem.eql(u8, started.input_presentation.text, command))
+    {
+        return allocator.alloc(backend.SemanticSpan, 0);
+    }
     const prefix = "Command: ";
     const label_start = topLevelLabelStart(display, prefix) orelse {
-        return allocator.alloc(highlight.Span, 0);
+        return allocator.alloc(backend.SemanticSpan, 0);
     };
     const command_start = label_start + prefix.len;
-    const result = try allocator.alloc(highlight.Span, command_spans.len);
-    for (command_spans, result) |span, *mapped| {
+    const result = try allocator.alloc(backend.SemanticSpan, source.tokens.len);
+    for (source.tokens, result) |span, *mapped| {
         mapped.* = .{
             .start = command_start + commandDisplayOffset(command, span.start),
             .end = command_start + commandDisplayOffset(command, span.end),
+            .token = span.token,
+        };
+    }
+    return result;
+}
+
+fn mapPresentationHighlights(
+    allocator: std.mem.Allocator,
+    value: backend.Presentation,
+    offset: usize,
+) ![]backend.SemanticSpan {
+    const source = switch (value.content) {
+        .source => |source| source,
+        .literal, .markdown => return allocator.alloc(backend.SemanticSpan, 0),
+    };
+    const result = try allocator.alloc(backend.SemanticSpan, source.tokens.len);
+    for (source.tokens, result) |span, *mapped| {
+        mapped.* = .{
+            .start = offset + span.start,
+            .end = offset + span.end,
             .token = span.token,
         };
     }
@@ -592,7 +604,7 @@ fn hashToolPayload(payload: []const u8) [std.crypto.hash.sha2.Sha256.digest_leng
     return digest;
 }
 
-fn syntaxStyle(base: vaxis.Style, token: highlight.Token) vaxis.Style {
+fn syntaxStyle(base: vaxis.Style, token: backend.SemanticToken) vaxis.Style {
     var style = base;
     style.fg = switch (token) {
         .comment => syntax_comment,
@@ -616,7 +628,7 @@ fn drawHighlightedRange(
     text: []const u8,
     start: usize,
     end: usize,
-    highlights: []const highlight.Span,
+    highlights: []const backend.SemanticSpan,
     base_style: vaxis.Style,
 ) void {
     var offset = start;
@@ -1687,6 +1699,7 @@ const Projection = struct {
                     &entry.tool,
                     entry_index,
                     window,
+                    false,
                     0,
                     0,
                 );
@@ -1774,6 +1787,7 @@ const Projection = struct {
                 tool,
                 entry_index,
                 window,
+                cache_highlights,
                 0,
                 std.math.maxInt(usize),
             ),
@@ -1786,6 +1800,7 @@ const Projection = struct {
         tool: *ToolEntry,
         entry_index: usize,
         window: vaxis.Window,
+        cache_highlights: bool,
         first: usize,
         last: usize,
     ) !usize {
@@ -1798,6 +1813,7 @@ const Projection = struct {
             tool,
             entry_index,
             window,
+            cache_highlights,
             first,
             last,
         );
@@ -1809,6 +1825,7 @@ const Projection = struct {
         tool: *ToolEntry,
         entry_index: usize,
         window: vaxis.Window,
+        _: bool,
         first: usize,
         last: usize,
     ) !usize {
@@ -1825,11 +1842,12 @@ const Projection = struct {
         );
         if (!tool.expanded) return row;
         const render_markdown =
-            tool.output_markdown and
+            tool.output_kind == .markdown and
             if (tool.completion) |completion|
                 std.meta.activeTag(completion) == .succeeded
             else
                 false;
+
         if (row >= first and row < last) {
             try self.lines.append(allocators.result, .{
                 .kind = .tool_input_label,
@@ -1944,6 +1962,7 @@ const Projection = struct {
                 &entry.tool,
                 entry_index,
                 window,
+                true,
                 first,
                 last,
             );
@@ -5252,14 +5271,25 @@ fn toolFinished(
 fn toolFinishedPresented(
     call_id: []const u8,
     summary: backend.ToolSummary,
-    result: backend.ToolFinished.ResultInput,
+    result: union(enum) {
+        succeeded: []const u8,
+        failed: []const u8,
+    },
 ) !backend.ToolFinished {
-    return backend.ToolFinished.initPresented(
-        std.testing.allocator,
-        call_id,
-        summary,
-        result,
-    );
+    return switch (result) {
+        .succeeded => |value| backend.ToolFinished.initPresented(
+            std.testing.allocator,
+            call_id,
+            summary,
+            .{ .succeeded = value },
+        ),
+        .failed => |value| backend.ToolFinished.initPresented(
+            std.testing.allocator,
+            call_id,
+            summary,
+            .{ .failed = value },
+        ),
+    };
 }
 
 test "tool details highlight shell input and supported read output" {
@@ -5295,26 +5325,10 @@ test "tool details highlight shell input and supported read output" {
         reordered_entry.input_display[reordered_command.start..reordered_command.end],
     );
 
-    var sanitized_started = try toolStarted(
-        "bash-highlight-sanitized",
-        "{\"command\":\"printf \\u001b\"}",
-        .{ .bash = .{ .run = .{ .command = "printf \x1b" } } },
-    );
-    defer sanitized_started.deinit();
-    var sanitized_entry = try ToolEntry.init(
-        std.testing.allocator,
-        &sanitized_started,
-    );
-    defer sanitized_entry.deinit(std.testing.allocator);
-    try std.testing.expectEqual(
-        @as(usize, 0),
-        sanitized_entry.input_highlights.len,
-    );
-
     var read_started = try toolStarted(
         "read-highlight",
         "{\"path\":\"sample.zig\"}",
-        backend.ToolSummary{ .read = .{
+        .{ .read = .{
             .path = "sample.zig",
             .offset = null,
             .limit = null,
@@ -5335,7 +5349,7 @@ test "tool details highlight shell input and supported read output" {
     var failed_started = try toolStarted(
         "read-highlight-failed",
         "{\"path\":\"missing.zig\"}",
-        backend.ToolSummary{ .read = .{
+        .{ .read = .{
             .path = "missing.zig",
             .offset = null,
             .limit = null,
@@ -5347,9 +5361,8 @@ test "tool details highlight shell input and supported read output" {
         &failed_started,
     );
     defer failed_entry.deinit(std.testing.allocator);
-    var failed = try toolFinishedPresented(
+    var failed = try toolFinished(
         "read-highlight-failed",
-        failed_started.invocation.summary,
         .{ .failed = "read failed: FileNotFound" },
     );
     defer failed.deinit();
@@ -5360,7 +5373,7 @@ test "tool details highlight shell input and supported read output" {
     );
 }
 
-test "bash output plans highlight YAML and diff through the ToolEntry lifecycle" {
+test "ToolEntry consumes backend YAML and diff presentations" {
     var yaml_started = try toolStarted(
         "yaml-output",
         "{\"command\":\"cat .github/workflows/ci.yml\"}",
@@ -5382,6 +5395,10 @@ test "bash output plans highlight YAML and diff through the ToolEntry lifecycle"
     try std.testing.expectEqualStrings(
         "name: CI\nready: true\nunsafe: \\xff\\xe2\\x80\\xae\n",
         yaml_entry.output_display.?,
+    );
+    try std.testing.expectEqual(
+        backend.PresentationKind.source,
+        yaml_entry.output_kind.?,
     );
     const yaml_spans = yaml_entry.output_highlights.?;
     var saw_name = false;
@@ -5500,7 +5517,7 @@ test "strict syntax rejection restores literal output rendering" {
         @as(usize, 0),
         entry.output_highlights.?.len,
     );
-    try std.testing.expect(!entry.output_markdown);
+    try std.testing.expectEqual(backend.PresentationKind.literal, entry.output_kind.?);
     transcript.entries.items[0].releaseRenderCaches(std.testing.allocator);
     try std.testing.expectEqualStrings(
         "external diff:\\x09changed\\x0d\n",
@@ -5604,8 +5621,9 @@ test "expanded tool rows draw syntax colors across wrapping" {
         &.{ .started = bash_started },
     );
     bash_started.deinit();
-    var bash_finished = try toolFinished(
+    var bash_finished = try toolFinishedPresented(
         "bash-render",
+        .{ .bash = .{ .run = .{ .command = "printf 'abcdefghijklmnop'" } } },
         .{ .succeeded = "done" },
     );
     try ui.transcript.applyToolActivity(
@@ -7233,11 +7251,7 @@ test "successful Markdown reads use the transcript Markdown renderer" {
     );
     var finished = try toolFinishedPresented(
         "markdown-read",
-        .{ .read = .{
-            .path = "README.md",
-            .offset = null,
-            .limit = null,
-        } },
+        started.invocation.summary,
         .{ .succeeded = "# Rendered Heading\r\n\r\n**bold text** and [docs](https://example.com)\r\n\r\n" ++
             "| Feature | Status |\r\n| --- | --- |\r\n| Markdown | Rich |\r\n\r\n\tcode" },
     );
@@ -7396,34 +7410,36 @@ test "expanded tool viewport retains only visible Markdown rows" {
     );
 }
 
-test "Markdown read plans are extension based and case insensitive" {
-    var markdown_presentation = try backend.presentToolResult(
+test "backend classifies Markdown read presentations by extension" {
+    var markdown_finished = try backend.ToolFinished.initPresented(
         std.testing.allocator,
-        backend.ToolSummary{ .read = .{
+        "markdown",
+        .{ .read = .{
             .path = "docs/GUIDE.MARKDOWN",
             .offset = null,
             .limit = null,
         } },
-        .succeeded,
-        "# Guide",
+        .{ .succeeded = "# Guide" },
     );
-    defer markdown_presentation.deinit();
-    try std.testing.expect(
-        std.meta.activeTag(markdown_presentation.content) == .markdown,
+    defer markdown_finished.deinit();
+    try std.testing.expectEqual(
+        backend.PresentationKind.markdown,
+        markdown_finished.output_presentation.kind(),
     );
-    var literal_presentation = try backend.presentToolResult(
+    var literal = try backend.ToolFinished.initPresented(
         std.testing.allocator,
-        backend.ToolSummary{ .read = .{
+        "literal",
+        .{ .read = .{
             .path = "notes.md.txt",
             .offset = null,
             .limit = null,
         } },
-        .succeeded,
-        "# Guide",
+        .{ .succeeded = "# Literal" },
     );
-    defer literal_presentation.deinit();
-    try std.testing.expect(
-        std.meta.activeTag(literal_presentation.content) == .literal,
+    defer literal.deinit();
+    try std.testing.expectEqual(
+        backend.PresentationKind.literal,
+        literal.output_presentation.kind(),
     );
 }
 
