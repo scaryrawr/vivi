@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { fixtures } from "./fixtures";
-import { reduceUi, initialUiState, selectOrderedSessionIds } from "./state";
+import {
+  reduceUi,
+  initialUiState,
+  selectOrderedSessionIds,
+  selectSelectedSession,
+} from "./state";
 
 describe("UI state", () => {
   it("preserves host ordering when project disclosure changes", () => {
@@ -35,5 +40,12 @@ describe("UI state", () => {
     });
 
     expect(accepted.drafts.get(id)?.text).toBe("first plus more");
+  });
+
+  it("resolves selected presentation fields from the project summary", () => {
+    const selected = selectSelectedSession(fixtures.streaming);
+
+    expect(selected?.title).toBe("Stabilize native session ordering");
+    expect(selected?.lifecycle.kind).toBe("responding");
   });
 });

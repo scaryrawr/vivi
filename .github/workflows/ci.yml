@@ -35,7 +35,8 @@ jobs:
           node-version: 24
 
       - name: Install pnpm
-        run: npm install --global pnpm@12.4.2 --registry=https://packagefeedproxy.microsoft.io/npm/
+        # The proxy used for workspace dependencies does not publish pnpm 12.
+        run: npm install --global pnpm@12.4.2
 
       - name: Install web dependencies
         working-directory: web

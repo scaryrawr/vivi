@@ -11,6 +11,7 @@ import {
   type SendMessageRequest,
   type SessionId,
   type SessionSnapshot,
+  type SessionSummary,
   type ViviHostPort,
   type WorkspacePath,
 } from "./contract";
@@ -63,7 +64,7 @@ export class MockViviHost implements ViviHostPort, ConnectedViviHost {
     const selected =
       existing ??
       ({
-        ...summary,
+        id: summary.id,
         activeWorkspace: summary.projectPath,
         transcript: [],
         error: null,
@@ -87,19 +88,22 @@ export class MockViviHost implements ViviHostPort, ConnectedViviHost {
     if (projectIndex < 0)
       return rejected("invalid", "That project is no longer available.");
     const id = sessionId(`0c8f9cc7-4767-4cec-92a3-9d7759e8${this.nextId++}`);
-    const created: SessionSnapshot = {
+    const createdSummary = {
       id,
       projectPath,
-      activeWorkspace: projectPath,
       title: "",
       lifecycle: { kind: "idle" },
+    } satisfies SessionSummary;
+    const created: SessionSnapshot = {
+      id,
+      activeWorkspace: projectPath,
       transcript: [],
       error: null,
     };
     this.sessions.set(id, created);
     const projects = this.snapshot.projects.map((project, index) =>
       index === projectIndex
-        ? { ...project, sessions: [...project.sessions, created] }
+        ? { ...project, sessions: [...project.sessions, createdSummary] }
         : project,
     );
     this.publish({
@@ -116,9 +120,12 @@ export class MockViviHost implements ViviHostPort, ConnectedViviHost {
     if (this.acceptedSubmissions.has(request.submissionId))
       return { kind: "accepted" };
     const selected = this.snapshot.selectedSession;
-    if (!selected || selected.id !== request.sessionId)
+    const selectedSummary = this.snapshot.projects
+      .flatMap((project) => project.sessions)
+      .find((session) => session.id === selected?.id);
+    if (!selected || !selectedSummary || selected.id !== request.sessionId)
       return rejected("invalid", "Select the conversation before sending.");
-    if (selected.lifecycle.kind !== "idle")
+    if (selectedSummary.lifecycle.kind !== "idle")
       return rejected("busy", "Wait for the current response to finish.");
     if (!request.text.trim())
       return rejected("invalid", "Enter a message first.");

@@ -86,7 +86,7 @@ function selectedSession(
   transcript: readonly TranscriptItem[] = baseTranscript,
 ): SessionSnapshot {
   return {
-    ...value,
+    id: value.id,
     activeWorkspace: value.projectPath,
     transcript,
     error: null,

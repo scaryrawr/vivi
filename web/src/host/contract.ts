@@ -85,7 +85,8 @@ export interface ProjectSnapshot {
   readonly sessions: readonly SessionSummary[];
 }
 
-export interface SessionSnapshot extends SessionSummary {
+export interface SessionSnapshot {
+  readonly id: SessionId;
   readonly activeWorkspace: WorkspacePath;
   readonly transcript: readonly TranscriptItem[];
   readonly error: HostError | null;

@@ -8,6 +8,7 @@ import {
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ViviApp } from "./App";
 import { fixtures } from "./fixtures";
+import { transcriptItemId } from "./host/contract";
 import { MockViviHost } from "./host/mock";
 
 afterEach(cleanup);
@@ -35,7 +36,7 @@ describe("ViviApp", () => {
     act(() => host.disconnect());
 
     for (const row of screen.getAllByRole("button", {
-      name: /Stabilize native session ordering|New conversation|Review streaming event ownership/,
+      name: /Stabilize native session ordering|New conversation in|Review streaming event ownership/,
     })) {
       expect(row).toBeDisabled();
     }
@@ -54,7 +55,9 @@ describe("ViviApp", () => {
       .mockReturnValue(pending);
     render(<ViviApp host={host} />);
 
-    const button = screen.getByRole("button", { name: "New conversation" });
+    const button = screen.getByRole("button", {
+      name: "New conversation in vivi",
+    });
     fireEvent.click(button);
     fireEvent.click(button);
 
@@ -67,14 +70,40 @@ describe("ViviApp", () => {
     const message = "The conversation process exited unexpectedly.";
     const host = new MockViviHost({
       ...fixtures.one,
-      selectedSession: {
-        ...fixtures.one.selectedSession!,
-        lifecycle: { kind: "failed", message },
-      },
+      projects: fixtures.one.projects.map((project) => ({
+        ...project,
+        sessions: project.sessions.map((session) => ({
+          ...session,
+          lifecycle: { kind: "failed" as const, message },
+        })),
+      })),
     });
     render(<ViviApp host={host} />);
 
     expect(screen.getByText("Conversation failed")).toBeVisible();
     expect(screen.getByText(message)).toBeVisible();
+  });
+
+  it("labels user transcript messages and prevents markdown navigation", () => {
+    const host = new MockViviHost({
+      ...fixtures.one,
+      selectedSession: {
+        ...fixtures.one.selectedSession!,
+        transcript: [
+          ...fixtures.one.selectedSession!.transcript,
+          {
+            id: transcriptItemId("assistant-link-test"),
+            kind: "assistant",
+            markdown: "Read the [external guide](https://example.com).",
+            streaming: false,
+          },
+        ],
+      },
+    });
+    render(<ViviApp host={host} />);
+
+    expect(screen.getByText("You")).toHaveClass("sr-only");
+    expect(screen.getByText("external guide")).toBeVisible();
+    expect(screen.queryByRole("link")).not.toBeInTheDocument();
   });
 });

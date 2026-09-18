@@ -1,9 +1,13 @@
 import type {
   HostSnapshot,
   SessionId,
+  SessionSnapshot,
+  SessionSummary,
   TranscriptItemId,
   WorkspacePath,
 } from "./host/contract";
+
+export type ResolvedSessionSnapshot = SessionSummary & SessionSnapshot;
 
 export interface DraftState {
   readonly text: string;
@@ -83,12 +87,23 @@ export function selectOrderedSessionIds(
   );
 }
 
+export function selectSelectedSession(
+  snapshot: HostSnapshot,
+): ResolvedSessionSnapshot | null {
+  const detail = snapshot.selectedSession;
+  if (!detail) return null;
+  const summary = snapshot.projects
+    .flatMap((project) => project.sessions)
+    .find((session) => session.id === detail.id);
+  return summary ? { ...summary, ...detail } : null;
+}
+
 export function selectDraft(state: UiState, id: SessionId): DraftState {
   return state.drafts.get(id) ?? { text: "", revision: 0 };
 }
 
 export function selectCanSend(snapshot: HostSnapshot, state: UiState): boolean {
-  const selected = snapshot.selectedSession;
+  const selected = selectSelectedSession(snapshot);
   if (!selected || selected.lifecycle.kind !== "idle") return false;
   return selectDraft(state, selected.id).text.trim().length > 0;
 }

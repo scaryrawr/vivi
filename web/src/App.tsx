@@ -22,6 +22,7 @@ import {
   selectCanSend,
   selectDraft,
   selectOrderedSessionIds,
+  selectSelectedSession,
 } from "./state";
 import "./styles.css";
 
@@ -61,7 +62,7 @@ export function ViviApp({
     () => selectOrderedSessionIds(snapshot),
     [snapshot],
   );
-  const selected = snapshot.selectedSession;
+  const selected = useMemo(() => selectSelectedSession(snapshot), [snapshot]);
   const draft = selected ? selectDraft(ui, selected.id) : null;
   const connected = connectionState.kind === "connected";
   const canSend = connected && selectCanSend(snapshot, ui) && !sendPending;
@@ -201,6 +202,7 @@ export function ViviApp({
                     <button
                       className="new-conversation"
                       type="button"
+                      aria-label={`New conversation in ${project.displayName}`}
                       disabled={!connected || createPending}
                       onClick={() => void createConversation(project.path)}
                     >
@@ -382,12 +384,25 @@ function TranscriptRow({
 }) {
   switch (item.kind) {
     case "user":
-      return <div className="user-message">{item.text}</div>;
+      return (
+        <div className="user-message">
+          <span className="sr-only">You</span>
+          {item.text}
+        </div>
+      );
     case "assistant":
       return (
         <article className="assistant-message">
           <div className="speaker">Vivi</div>
-          <Markdown>{item.markdown}</Markdown>
+          <Markdown
+            components={{
+              a: ({ children }) => (
+                <span className="markdown-link">{children}</span>
+              ),
+            }}
+          >
+            {item.markdown}
+          </Markdown>
           {item.streaming && (
             <span className="streaming-caret" aria-label="Response streaming" />
           )}
