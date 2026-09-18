@@ -1,18 +1,22 @@
 const std = @import("std");
 
 pub const max_characters: usize = 80;
+pub const max_input_bytes: usize = 512;
 const suffix = "…";
 
 pub fn canonicalize(
     allocator: std.mem.Allocator,
     input: []const u8,
 ) !?[]u8 {
-    if (input.len == 0 or !std.unicode.utf8ValidateSlice(input)) {
+    if (input.len == 0 or input.len > max_input_bytes or
+        !std.unicode.utf8ValidateSlice(input))
+    {
         return null;
     }
 
-    var normalized: std.ArrayList(u8) = .empty;
-    defer normalized.deinit(allocator);
+    var normalized: [max_characters * 4]u8 = undefined;
+    var normalized_len: usize = 0;
+    var normalized_count: usize = 0;
     var pending_space = false;
     var index: usize = 0;
     while (index < input.len) {
@@ -24,26 +28,37 @@ pub fn canonicalize(
         index += length;
 
         if (isWhitespace(codepoint)) {
-            pending_space = normalized.items.len > 0;
+            pending_space = normalized_count > 0;
             continue;
         }
         if (isControl(codepoint)) continue;
         if (pending_space) {
-            try normalized.append(allocator, ' ');
+            normalized_count += 1;
+            if (normalized_count <= max_characters) {
+                normalized[normalized_len] = ' ';
+                normalized_len += 1;
+            }
             pending_space = false;
         }
-        try normalized.appendSlice(allocator, input[index - length .. index]);
+        normalized_count += 1;
+        if (normalized_count <= max_characters) {
+            @memcpy(
+                normalized[normalized_len..][0..length],
+                input[index - length .. index],
+            );
+            normalized_len += length;
+        }
     }
-    if (normalized.items.len == 0) return null;
+    if (normalized_count == 0) return null;
 
-    const count = countScalars(normalized.items);
-    if (count <= max_characters) {
-        return try normalized.toOwnedSlice(allocator);
+    const retained = normalized[0..normalized_len];
+    if (normalized_count <= max_characters) {
+        return try allocator.dupe(u8, retained);
     }
 
     const content_limit = max_characters - 1;
-    const hard_end = byteOffsetAfterScalars(normalized.items, content_limit);
-    const prefix = normalized.items[0..hard_end];
+    const hard_end = byteOffsetAfterScalars(retained, content_limit);
+    const prefix = retained[0..hard_end];
     const boundary = std.mem.lastIndexOfScalar(u8, prefix, ' ');
     const content_end = boundary orelse hard_end;
     var result = try std.ArrayList(u8).initCapacity(
@@ -51,7 +66,7 @@ pub fn canonicalize(
         content_end + suffix.len,
     );
     errdefer result.deinit(allocator);
-    try result.appendSlice(allocator, normalized.items[0..content_end]);
+    try result.appendSlice(allocator, retained[0..content_end]);
     try result.appendSlice(allocator, suffix);
     return try result.toOwnedSlice(allocator);
 }
@@ -158,6 +173,71 @@ test "canonical title hard truncation preserves multibyte scalars" {
     try std.testing.expectEqual(@as(usize, max_characters), countScalars(title));
     try std.testing.expect(std.mem.endsWith(u8, title, suffix));
     try std.testing.expect(std.unicode.utf8ValidateSlice(title));
+}
+
+test "canonical title bounds normalization and allocation at legacy input limit" {
+    const ascii = [_]u8{'a'} ** max_input_bytes;
+    var ascii_memory: [max_characters * 4]u8 = undefined;
+    var ascii_allocator = std.heap.FixedBufferAllocator.init(&ascii_memory);
+    const ascii_title = (try canonicalize(
+        ascii_allocator.allocator(),
+        &ascii,
+    )).?;
+    try std.testing.expectEqual(
+        @as(usize, max_characters),
+        countScalars(ascii_title),
+    );
+    try std.testing.expect(std.mem.endsWith(u8, ascii_title, suffix));
+
+    const multibyte = "é" ** (max_input_bytes / 2);
+    var multibyte_memory: [max_characters * 4]u8 = undefined;
+    var multibyte_allocator = std.heap.FixedBufferAllocator.init(
+        &multibyte_memory,
+    );
+    const multibyte_title = (try canonicalize(
+        multibyte_allocator.allocator(),
+        multibyte,
+    )).?;
+    try std.testing.expectEqual(
+        @as(usize, max_characters),
+        countScalars(multibyte_title),
+    );
+    try std.testing.expect(std.mem.endsWith(u8, multibyte_title, suffix));
+
+    const whitespace = ("word " ** 102) ++ "wo";
+    try std.testing.expectEqual(@as(usize, max_input_bytes), whitespace.len);
+    var whitespace_memory: [max_characters * 4]u8 = undefined;
+    var whitespace_allocator = std.heap.FixedBufferAllocator.init(
+        &whitespace_memory,
+    );
+    const whitespace_title = (try canonicalize(
+        whitespace_allocator.allocator(),
+        whitespace,
+    )).?;
+    try std.testing.expectEqualStrings(
+        ("word " ** 14) ++ "word…",
+        whitespace_title,
+    );
+}
+
+test "canonical title rejects input above legacy byte limit before allocation" {
+    const ascii = [_]u8{'a'} ** (max_input_bytes + 1);
+    try std.testing.expectEqual(
+        null,
+        try canonicalize(std.testing.failing_allocator, &ascii),
+    );
+
+    const multibyte = "é" ** ((max_input_bytes / 2) + 1);
+    try std.testing.expectEqual(
+        null,
+        try canonicalize(std.testing.failing_allocator, multibyte),
+    );
+
+    const whitespace = [_]u8{' '} ** (max_input_bytes + 1);
+    try std.testing.expectEqual(
+        null,
+        try canonicalize(std.testing.failing_allocator, &whitespace),
+    );
 }
 
 test "canonical title rejects invalid and empty results" {

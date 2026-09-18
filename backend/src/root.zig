@@ -1736,16 +1736,21 @@ test "broader resume canonicalizes SDK session titles" {
     )).?;
     defer std.testing.allocator.free(sanitized);
     try std.testing.expectEqualStrings("escape[2J", sanitized);
-    const oversized = [_]u8{'x'} ** 513;
+    const bounded = [_]u8{'x'} ** session_title.max_input_bytes;
     const truncated = (try resumableSessionTitle(
         std.testing.allocator,
-        &oversized,
+        &bounded,
     )).?;
     defer std.testing.allocator.free(truncated);
     try std.testing.expect(session_title.isCanonical(truncated));
     try std.testing.expectEqual(
         session_title.max_characters,
         std.unicode.utf8CountCodepoints(truncated) catch unreachable,
+    );
+    const oversized = [_]u8{'x'} ** (session_title.max_input_bytes + 1);
+    try std.testing.expectEqual(
+        null,
+        try resumableSessionTitle(std.testing.allocator, &oversized),
     );
 }
 
