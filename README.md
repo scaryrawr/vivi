@@ -190,6 +190,20 @@ zigdoc copilot_sdk.Client
 ## Build the macOS app
 
 ```sh
+zig build native
+zig build native-run
+```
+
+`zig build native` builds the Debug app from the current worktree at
+`zig-out/xcode/Debug/Vivi.app`. `zig build native-run` also builds the CLI and
+launches that exact bundle with the current worktree as its workspace. This
+avoids `vivi chat --native` falling back to a stale app registered with Launch
+Services when the current worktree's bundle has not been built yet. Both
+commands fail explicitly on hosts other than macOS.
+
+For troubleshooting and CI, the underlying Xcode build is:
+
+```sh
 xcodebuild \
   -project macos/Vivi.xcodeproj \
   -scheme Vivi \

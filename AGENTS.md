@@ -40,6 +40,8 @@ Future MSBuild and Meson projects should call `zig build install-c-api` rather
 than creating another Zig dependency graph.
 
 ```sh
+zig build native                  # current-worktree Debug macOS app
+zig build native-run              # build and launch that exact app bundle
 xcodebuild -project macos/Vivi.xcodeproj -scheme Vivi \
   -configuration Debug -destination 'platform=macOS' \
   CODE_SIGNING_ALLOWED=NO test
@@ -49,7 +51,8 @@ xcodebuild -project macos/Vivi.xcodeproj -scheme Vivi \
 Concurrent worktrees build macOS apps with the same bundle identifier. Before
 live Dock or URL-handler verification, confirm the running `Vivi` executable
 comes from the current worktree; otherwise macOS can route activation to
-another agent's build.
+another agent's build. Prefer `zig build native-run`, which first builds
+`zig-out/xcode/Debug/Vivi.app` and passes its exact path to the CLI.
 
 ## Coding Style & Naming Conventions
 
