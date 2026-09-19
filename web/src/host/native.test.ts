@@ -215,7 +215,7 @@ describe("NativeViviHostPort", () => {
       bridgeSessionId: connect.bridgeSessionId,
       kind: "response",
       requestId: connect.requestId,
-      result: { kind: "rejected", message: "not available" },
+      result: { kind: "rejected", reason: "closed", message: "not available" },
     });
 
     await expect(connecting).rejects.toMatchObject({
@@ -225,6 +225,21 @@ describe("NativeViviHostPort", () => {
     expect(posted.at(-1)).toMatchObject({
       bridgeSessionId: connect.bridgeSessionId,
       command: "disconnect",
+    });
+  });
+
+  it("fails closed on unknown native failure codes", async () => {
+    const { connecting, connect } = startConnection();
+    window.__viviHostV1Receive?.({
+      protocol: "vivi.host",
+      version: 1,
+      bridgeSessionId: connect.bridgeSessionId,
+      kind: "failure",
+      error: { code: "future_failure", message: "not V1" },
+    });
+
+    await expect(connecting).rejects.toMatchObject({
+      code: "invalid-message",
     });
   });
 });

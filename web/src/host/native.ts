@@ -19,6 +19,16 @@ import {
 } from "./contract";
 
 const handlerName = "viviHostV1";
+const bridgeFailureCodes = new Set([
+  "invalid_message",
+  "protocol_mismatch",
+  "stale_session",
+  "duplicate_request",
+  "handshake_required",
+  "already_connected",
+  "disconnected",
+  "capacity_exceeded",
+]);
 const maximumSafeInteger = Number.MAX_SAFE_INTEGER;
 
 type CommandName =
@@ -629,7 +639,10 @@ function parseConnectionState(input: unknown, path: string): ConnectionState {
 function parseBridgeFailure(input: unknown): string {
   const value = record(input, "message.error");
   exactKeys(value, ["code", "message"], "message.error");
-  boundedString(value.code, "message.error.code", 128, false);
+  const code = boundedString(value.code, "message.error.code", 128, false);
+  if (!bridgeFailureCodes.has(code)) {
+    invalid("message.error.code", "unknown failure code");
+  }
   return boundedString(value.message, "message.error.message", 65_536);
 }
 
