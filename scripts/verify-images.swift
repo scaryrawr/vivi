@@ -55,7 +55,8 @@ func main() throws {
   }
   let model =
     ProcessInfo.processInfo.environment["VIVI_VALIDATION_MODEL"] ?? "copilot/gpt-5.6-luna"
-  guard model.range(of: "^copilot/[A-Za-z0-9._-]+$", options: .regularExpression) != nil else {
+  guard model.range(of: "\\Acopilot/[A-Za-z0-9._-]+\\z", options: .regularExpression) != nil
+  else {
     fatalError("VIVI_VALIDATION_MODEL must be a single copilot/<model-id>")
   }
   let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
