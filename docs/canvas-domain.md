@@ -144,6 +144,11 @@ Teardown effects carry the renderer generation; adapters must ignore a
 teardown whose generation no longer matches the renderer currently bound to
 that instance key.
 
+`Domain.deinit` is a checked lifecycle boundary, not an emergency escape:
+callers must complete `shutdown` first, and destruction is rejected during a
+publisher callback. Internal tests use a private unchecked cleanup helper only
+to release intentionally partial fixtures.
+
 ## Later adapters
 
 An SDK adapter may be added only when the pinned SDK exposes the required

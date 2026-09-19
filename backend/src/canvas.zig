@@ -1211,7 +1211,13 @@ pub const Domain = struct {
         return .{ .allocator = allocator, .limits = limits };
     }
 
-    pub fn deinit(self: *Domain) void {
+    pub fn deinit(self: *Domain) !void {
+        if (self.in_operation) return error.ReentrantDomainCall;
+        if (!self.shutdown_requested) return error.ShutdownRequired;
+        self.deinitUnchecked();
+    }
+
+    fn deinitUnchecked(self: *Domain) void {
         self.registry.deinit(self.allocator);
         for (self.instances.items) |*instance| instance.deinit(self.allocator);
         self.instances.deinit(self.allocator);
@@ -2200,7 +2206,7 @@ const TestPublisher = struct {
 
 fn fixtureDomain(allocator: std.mem.Allocator) !Domain {
     var domain = Domain.init(allocator, .{});
-    errdefer domain.deinit();
+    errdefer domain.deinitUnchecked();
     try domain.setCapability(.supported);
     try domain.applyRegistry(.{
         .replacement = &.{fixture_declaration},
@@ -2290,7 +2296,7 @@ test "bounded identities and role documents validate their own shapes" {
 
 test "registry replacement and incremental update are distinct and atomic" {
     var domain = try fixtureDomain(std.testing.allocator);
-    defer domain.deinit();
+    defer domain.deinitUnchecked();
     const second: CanvasDeclarationInput = .{
         .extension_id = "fixture.extension",
         .canvas_id = "preview",
@@ -2331,7 +2337,7 @@ test "incremental registry work is bounded before cloning" {
         std.testing.allocator,
         .{ .max_registry_operations = 1 },
     );
-    defer domain.deinit();
+    defer domain.deinitUnchecked();
     try domain.applyRegistry(.{
         .replacement = &.{fixture_declaration},
     });
@@ -2366,14 +2372,14 @@ test "registry keys validate before owned allocation" {
     var no_storage: [0]u8 = .{};
     var fixed = std.heap.FixedBufferAllocator.init(&no_storage);
     var empty_domain = Domain.init(fixed.allocator(), .{});
-    defer empty_domain.deinit();
+    defer empty_domain.deinitUnchecked();
     try std.testing.expectError(
         error.IdentifierTooLong,
         empty_domain.applyRegistry(.{ .replacement = &.{invalid} }),
     );
 
     var domain = try fixtureDomain(std.testing.allocator);
-    defer domain.deinit();
+    defer domain.deinitUnchecked();
     const original_allocator = domain.allocator;
     domain.allocator = fixed.allocator();
     const result = domain.applyRegistry(.{ .incremental = .{
@@ -2389,7 +2395,7 @@ test "registry keys validate before owned allocation" {
 
 test "fixture drives open action close and stale completion semantics" {
     var domain = try fixtureDomain(std.testing.allocator);
-    defer domain.deinit();
+    defer domain.deinitUnchecked();
     var publisher: TestPublisher = .{};
     var open_input = try OpenInputDocument.init(
         std.testing.allocator,
@@ -2448,7 +2454,7 @@ test "fixture drives open action close and stale completion semantics" {
 
 test "open rejects live instances instead of discarding renderer state" {
     var domain = try fixtureDomain(std.testing.allocator);
-    defer domain.deinit();
+    defer domain.deinitUnchecked();
     var publisher: TestPublisher = .{};
     const open = try domain.open(
         .{ .key = fixture_key },
@@ -2480,7 +2486,7 @@ test "instance capacity reclaims stable unrecorded entries" {
         std.testing.allocator,
         .{ .max_instances = 1 },
     );
-    defer domain.deinit();
+    defer domain.deinitUnchecked();
     try domain.setCapability(.supported);
     try domain.applyRegistry(.{
         .replacement = &.{fixture_declaration},
@@ -2547,7 +2553,7 @@ test "instance reclamation preserves oldest-first ordering" {
         std.testing.allocator,
         .{ .max_instances = 2 },
     );
-    defer domain.deinit();
+    defer domain.deinitUnchecked();
     const first = KeyView{
         .extension_id = "fixture.extension",
         .canvas_id = "review",
@@ -2585,7 +2591,7 @@ test "instance reclamation preserves oldest-first ordering" {
 
 test "public operation keys are validated before lookup and capacity" {
     var domain = try fixtureDomain(std.testing.allocator);
-    defer domain.deinit();
+    defer domain.deinitUnchecked();
     var publisher: TestPublisher = .{};
     const invalid_key = KeyView{
         .extension_id = "fixture.extension",
@@ -2637,7 +2643,7 @@ test "public operation keys are validated before lookup and capacity" {
 
 test "operation boundaries revalidate mutable document storage" {
     var domain = try fixtureDomain(std.testing.allocator);
-    defer domain.deinit();
+    defer domain.deinitUnchecked();
     var publisher: TestPublisher = .{};
     var input = try OpenInputDocument.init(
         std.testing.allocator,
@@ -2682,7 +2688,7 @@ test "operation boundaries revalidate mutable document storage" {
 
 test "publication failure leaves opening transition unchanged" {
     var domain = try fixtureDomain(std.testing.allocator);
-    defer domain.deinit();
+    defer domain.deinitUnchecked();
     var publisher: TestPublisher = .{ .fail = true };
     try std.testing.expectError(
         error.EffectRejected,
@@ -2694,7 +2700,7 @@ test "publication failure leaves opening transition unchanged" {
 
 test "superseding open publication failure retains original live token" {
     var domain = try fixtureDomain(std.testing.allocator);
-    defer domain.deinit();
+    defer domain.deinitUnchecked();
     var publisher: TestPublisher = .{};
     const original = try domain.open(
         .{ .key = fixture_key },
@@ -2714,7 +2720,7 @@ fn supersedingOpenAllocationLifecycle(
     allocator: std.mem.Allocator,
 ) !void {
     var domain = try fixtureDomain(allocator);
-    defer domain.deinit();
+    defer domain.deinitUnchecked();
     var publisher: TestPublisher = .{};
     const original = try domain.open(
         .{ .key = fixture_key },
@@ -2744,7 +2750,7 @@ test "allocation failure cannot orphan a superseded opening token" {
 
 test "cancel failure retains pending state and successful cancel is stable" {
     var domain = try fixtureDomain(std.testing.allocator);
-    defer domain.deinit();
+    defer domain.deinitUnchecked();
     var publisher: TestPublisher = .{};
     const token = try domain.open(
         .{ .key = fixture_key },
@@ -2773,7 +2779,7 @@ test "cancel failure retains pending state and successful cancel is stable" {
 
 fn cancelAllocationLifecycle(allocator: std.mem.Allocator) !void {
     var domain = try fixtureDomain(allocator);
-    defer domain.deinit();
+    defer domain.deinitUnchecked();
     var publisher: TestPublisher = .{};
     const token = try domain.open(
         .{ .key = fixture_key },
@@ -2799,7 +2805,7 @@ test "cancel allocation failure retains the exact pending state" {
 
 test "close and action publication failures leave stable prior state" {
     var domain = try fixtureDomain(std.testing.allocator);
-    defer domain.deinit();
+    defer domain.deinitUnchecked();
     var publisher: TestPublisher = .{};
     const open = try domain.open(
         .{ .key = fixture_key },
@@ -2832,7 +2838,7 @@ test "request validation precedes operation backpressure" {
         std.testing.allocator,
         .{ .max_pending_operations = 1 },
     );
-    defer domain.deinit();
+    defer domain.deinitUnchecked();
     try domain.setCapability(.supported);
     try domain.applyRegistry(.{
         .replacement = &.{fixture_declaration},
@@ -2904,7 +2910,7 @@ test "request validation precedes operation backpressure" {
 
 test "close cancels pending actions before closing the instance" {
     var domain = try fixtureDomain(std.testing.allocator);
-    defer domain.deinit();
+    defer domain.deinitUnchecked();
     var publisher: TestPublisher = .{};
     const open = try domain.open(
         .{ .key = fixture_key },
@@ -2935,7 +2941,7 @@ test "close cancels pending actions before closing the instance" {
 
 test "close failure restores the prior opened state transactionally" {
     var domain = try fixtureDomain(std.testing.allocator);
-    defer domain.deinit();
+    defer domain.deinitUnchecked();
     var publisher: TestPublisher = .{};
     const open = try domain.open(
         .{ .key = fixture_key },
@@ -2955,7 +2961,7 @@ test "close failure restores the prior opened state transactionally" {
 
 test "unavailable publication failure retains the exact pending operation" {
     var domain = try fixtureDomain(std.testing.allocator);
-    defer domain.deinit();
+    defer domain.deinitUnchecked();
     var publisher: TestPublisher = .{};
     const token = try domain.open(
         .{ .key = fixture_key },
@@ -2976,7 +2982,7 @@ test "unavailable publication failure retains the exact pending operation" {
 
 test "unavailable transition settles renderer ownership atomically" {
     var opened_domain = try fixtureDomain(std.testing.allocator);
-    defer opened_domain.deinit();
+    defer opened_domain.deinitUnchecked();
     var publisher: TestPublisher = .{};
     const opened_token = try opened_domain.open(
         .{ .key = fixture_key },
@@ -3026,7 +3032,7 @@ test "unavailable transition settles renderer ownership atomically" {
     );
 
     var closing_domain = try fixtureDomain(std.testing.allocator);
-    defer closing_domain.deinit();
+    defer closing_domain.deinitUnchecked();
     publisher = .{};
     const closing_open_token = try closing_domain.open(
         .{ .key = fixture_key },
@@ -3085,7 +3091,7 @@ fn openCompletionAllocationLifecycle(
     allocator: std.mem.Allocator,
 ) !void {
     var domain = try fixtureDomain(allocator);
-    defer domain.deinit();
+    defer domain.deinitUnchecked();
     var publisher: TestPublisher = .{};
     const token = try domain.open(
         .{ .key = fixture_key },
@@ -3115,7 +3121,7 @@ test "open completion allocation failure retains its live token" {
 
 test "recording and resume projection exclude transient runtime metadata" {
     var domain = try fixtureDomain(std.testing.allocator);
-    defer domain.deinit();
+    defer domain.deinitUnchecked();
     var input = try OpenInputDocument.init(
         std.testing.allocator,
         "{\"selection\":\"backend/src/root.zig\"}",
@@ -3141,7 +3147,7 @@ test "recording and resume projection exclude transient runtime metadata" {
 
 fn projectionAllocationLifecycle(allocator: std.mem.Allocator) !void {
     var domain = try fixtureDomain(allocator);
-    defer domain.deinit();
+    defer domain.deinitUnchecked();
     var publisher: TestPublisher = .{};
     const token = try domain.open(
         .{ .key = fixture_key },
@@ -3176,7 +3182,7 @@ test "snapshot and resume ownership survive every allocation failure" {
 
 test "shutdown publication failure is retryable and success is idempotent" {
     var domain = try fixtureDomain(std.testing.allocator);
-    defer domain.deinit();
+    defer domain.deinitUnchecked();
     var publisher: TestPublisher = .{};
     const token = try domain.open(
         .{ .key = fixture_key },
@@ -3202,7 +3208,7 @@ test "shutdown publication failure is retryable and success is idempotent" {
 
 test "capability cannot change after shutdown" {
     var domain = try fixtureDomain(std.testing.allocator);
-    defer domain.deinit();
+    defer domain.deinitUnchecked();
     try domain.record(fixture_key, "Recorded review", null);
     var publisher: TestPublisher = .{};
     try domain.shutdown(publisher.publisher());
@@ -3218,7 +3224,7 @@ test "capability cannot change after shutdown" {
 
 test "resume projection is gated by authoritative capability state" {
     var domain = Domain.init(std.testing.allocator, .{});
-    defer domain.deinit();
+    defer domain.deinitUnchecked();
     try domain.record(fixture_key, "Recorded review", null);
 
     var unknown = try domain.resumeProjection(std.testing.allocator);
@@ -3238,7 +3244,7 @@ test "resume projection is gated by authoritative capability state" {
 
 test "shutdown publishes teardown before forgetting an opened renderer" {
     var domain = try fixtureDomain(std.testing.allocator);
-    defer domain.deinit();
+    defer domain.deinitUnchecked();
     var publisher: TestPublisher = .{};
     const token = try domain.open(
         .{ .key = fixture_key },
@@ -3261,7 +3267,7 @@ test "shutdown publishes teardown before forgetting an opened renderer" {
 
 test "shutdown cancels an in-flight close and tears down its live renderer" {
     var domain = try fixtureDomain(std.testing.allocator);
-    defer domain.deinit();
+    defer domain.deinitUnchecked();
     var publisher: TestPublisher = .{};
     const open_token = try domain.open(
         .{ .key = fixture_key },
@@ -3294,7 +3300,7 @@ test "shutdown cancels an in-flight close and tears down its live renderer" {
 
 test "shutdown publication failure preserves opened and closing renderers" {
     var opened_domain = try fixtureDomain(std.testing.allocator);
-    defer opened_domain.deinit();
+    defer opened_domain.deinitUnchecked();
     var publisher: TestPublisher = .{};
     const opened_token = try opened_domain.open(
         .{ .key = fixture_key },
@@ -3313,7 +3319,7 @@ test "shutdown publication failure preserves opened and closing renderers" {
     try std.testing.expect(!opened_domain.shutdown_requested);
 
     var closing_domain = try fixtureDomain(std.testing.allocator);
-    defer closing_domain.deinit();
+    defer closing_domain.deinitUnchecked();
     publisher = .{};
     const closing_open_token = try closing_domain.open(
         .{ .key = fixture_key },
@@ -3342,7 +3348,7 @@ test "shutdown publication failure preserves opened and closing renderers" {
 
 const ReentrantPublisher = struct {
     domain: *Domain,
-    entry_point: enum { record, apply_registry } = .record,
+    entry_point: enum { record, apply_registry, deinit } = .record,
     reentrant_error: ?anyerror = null,
 
     fn publisher(self: *ReentrantPublisher) EffectPublisher {
@@ -3363,6 +3369,7 @@ const ReentrantPublisher = struct {
             .apply_registry => self.domain.applyRegistry(.{
                 .replacement = &.{fixture_declaration},
             }),
+            .deinit => self.domain.deinit(),
         };
         result catch |err| {
             self.reentrant_error = err;
@@ -3372,7 +3379,7 @@ const ReentrantPublisher = struct {
 
 test "publication cannot reenter the domain" {
     var domain = try fixtureDomain(std.testing.allocator);
-    defer domain.deinit();
+    defer domain.deinitUnchecked();
     var reentrant: ReentrantPublisher = .{ .domain = &domain };
     const token = try domain.open(
         .{ .key = fixture_key },
@@ -3399,7 +3406,7 @@ test "publication cannot reenter the domain" {
     );
 
     var unavailable_domain = try fixtureDomain(std.testing.allocator);
-    defer unavailable_domain.deinit();
+    defer unavailable_domain.deinitUnchecked();
     var publisher: TestPublisher = .{};
     const opened_token = try unavailable_domain.open(
         .{ .key = fixture_key },
@@ -3423,6 +3430,34 @@ test "publication cannot reenter the domain" {
         RuntimeTag.unavailable,
         unavailable_domain.runtimeTag(fixture_key).?,
     );
+
+    var deinit_domain = try fixtureDomain(std.testing.allocator);
+    defer deinit_domain.deinitUnchecked();
+    var deinit_reentrant: ReentrantPublisher = .{
+        .domain = &deinit_domain,
+        .entry_point = .deinit,
+    };
+    const deinit_token = try deinit_domain.open(
+        .{ .key = fixture_key },
+        deinit_reentrant.publisher(),
+    );
+    try std.testing.expectEqual(
+        @as(anyerror, error.ReentrantDomainCall),
+        deinit_reentrant.reentrant_error.?,
+    );
+    try std.testing.expect(deinit_domain.hasPendingToken(deinit_token));
+}
+
+test "deinit requires successful shutdown" {
+    var domain = try fixtureDomain(std.testing.allocator);
+    var destroyed = false;
+    defer if (!destroyed) domain.deinitUnchecked();
+
+    try std.testing.expectError(error.ShutdownRequired, domain.deinit());
+    var publisher: TestPublisher = .{};
+    try domain.shutdown(publisher.publisher());
+    try domain.deinit();
+    destroyed = true;
 }
 
 test "registry owned bytes are bounded before cloning or allocating" {
@@ -3439,7 +3474,7 @@ test "registry owned bytes are bounded before cloning or allocating" {
         fixed.allocator(),
         .{ .max_registry_bytes = 64 },
     );
-    defer empty_domain.deinit();
+    defer empty_domain.deinitUnchecked();
     try std.testing.expectError(
         error.RegistryTooLarge,
         empty_domain.applyRegistry(.{ .replacement = &.{oversized} }),
@@ -3449,7 +3484,7 @@ test "registry owned bytes are bounded before cloning or allocating" {
         std.testing.allocator,
         .{ .max_registry_bytes = 64 },
     );
-    defer domain.deinit();
+    defer domain.deinitUnchecked();
     try domain.applyRegistry(.{ .replacement = &.{fixture_declaration} });
     const original_allocator = domain.allocator;
     domain.allocator = fixed.allocator();
@@ -3489,7 +3524,7 @@ test "registry action limits are checked before traversal or allocation" {
         fixed.allocator(),
         .{ .max_actions_per_canvas = 0 },
     );
-    defer empty_domain.deinit();
+    defer empty_domain.deinitUnchecked();
     try std.testing.expectError(
         error.TooManyActions,
         empty_domain.applyRegistry(.{ .replacement = &.{oversized} }),
@@ -3504,7 +3539,7 @@ test "registry action limits are checked before traversal or allocation" {
         std.testing.allocator,
         .{ .max_actions_per_canvas = 0 },
     );
-    defer domain.deinit();
+    defer domain.deinitUnchecked();
     try domain.applyRegistry(.{ .replacement = &.{empty} });
     const original_allocator = domain.allocator;
     domain.allocator = fixed.allocator();
@@ -3521,7 +3556,7 @@ test "registry action limits are checked before traversal or allocation" {
 
 test "open completion validates result text before cloning" {
     var domain = try fixtureDomain(std.testing.allocator);
-    defer domain.deinit();
+    defer domain.deinitUnchecked();
     var publisher: TestPublisher = .{};
     var open_input = try OpenInputDocument.init(
         std.testing.allocator,
@@ -3564,7 +3599,7 @@ test "open completion validates result text before cloning" {
 
 test "unavailable transition records the supplied reason" {
     var domain = try fixtureDomain(std.testing.allocator);
-    defer domain.deinit();
+    defer domain.deinitUnchecked();
     var publisher: TestPublisher = .{};
     const token = try domain.open(
         .{ .key = fixture_key },
