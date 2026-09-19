@@ -1335,6 +1335,11 @@ pub const Worker = struct {
             owned_closed.deinit();
             return;
         };
+        if (self.core.state == .closed) {
+            owned_closed.deinit();
+            self.core.mutex.unlock(self.core.io);
+            return;
+        }
         const should_wake = !self.core.wake_pending;
         if (self.core.command_registry.active) |key| {
             self.core.command_registry.finish(key) catch {};
@@ -1959,6 +1964,129 @@ test "allocation failures cannot prevent one terminal close and wake" {
         },
         else => return error.ExpectedClosedEvent,
     }
+    try std.testing.expect(try handle.tryTakeEvent() == null);
+}
+
+test "second close before drain preserves first reason and wake" {
+    const Harness = struct {
+        fn run(_: *Worker) void {}
+    };
+    const WakeCounter = struct {
+        count: std.atomic.Value(usize) = .init(0),
+
+        fn notify(context: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            _ = self.count.fetchAdd(1, .monotonic);
+        }
+    };
+
+    var wake_counter: WakeCounter = .{};
+    var core: Core = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .wake = .{
+            .context = &wake_counter,
+            .notify = WakeCounter.notify,
+        },
+        .runner = .{ .plain = Harness.run },
+        .state = .idle,
+        .command_registry = command_domain.Registry.init(std.testing.allocator),
+    };
+    defer {
+        for (core.commands.items) |*command| command.deinit();
+        core.commands.deinit(std.testing.allocator);
+        for (core.events.items) |*event| event.event.deinit();
+        core.events.deinit(std.testing.allocator);
+        if (core.command_terminal) |*terminal| terminal.event.deinit();
+        if (core.close_event) |*close_event| close_event.event.deinit();
+        core.command_registry.deinit();
+    }
+    var worker: Worker = .{ .core = &core };
+    var handle: Conversation = .{ .core = &core };
+
+    worker.closeFailure(.stream, "original close");
+    worker.closeFailure(.startup, "replacement close");
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        wake_counter.count.load(.monotonic),
+    );
+
+    var event = (try handle.tryTakeEvent()).?;
+    defer event.deinit();
+    switch (event) {
+        .closed => |closed| switch (closed) {
+            .requested => return error.ExpectedFailureClose,
+            .failed => |failure| {
+                try std.testing.expectEqual(FailureKind.stream, failure.kind);
+                try std.testing.expectEqualStrings(
+                    "original close",
+                    failure.messageText(),
+                );
+            },
+        },
+        else => return error.ExpectedClosedEvent,
+    }
+    try std.testing.expect(try handle.tryTakeEvent() == null);
+}
+
+test "second close after drain emits no event or wake" {
+    const Harness = struct {
+        fn run(_: *Worker) void {}
+    };
+    const WakeCounter = struct {
+        count: std.atomic.Value(usize) = .init(0),
+
+        fn notify(context: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            _ = self.count.fetchAdd(1, .monotonic);
+        }
+    };
+
+    var wake_counter: WakeCounter = .{};
+    var core: Core = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .wake = .{
+            .context = &wake_counter,
+            .notify = WakeCounter.notify,
+        },
+        .runner = .{ .plain = Harness.run },
+        .state = .idle,
+        .command_registry = command_domain.Registry.init(std.testing.allocator),
+    };
+    defer {
+        for (core.commands.items) |*command| command.deinit();
+        core.commands.deinit(std.testing.allocator);
+        for (core.events.items) |*event| event.event.deinit();
+        core.events.deinit(std.testing.allocator);
+        if (core.command_terminal) |*terminal| terminal.event.deinit();
+        if (core.close_event) |*close_event| close_event.event.deinit();
+        core.command_registry.deinit();
+    }
+    var worker: Worker = .{ .core = &core };
+    var handle: Conversation = .{ .core = &core };
+
+    worker.closeRequested();
+    var event = (try handle.tryTakeEvent()).?;
+    defer event.deinit();
+    switch (event) {
+        .closed => |closed| switch (closed) {
+            .requested => {},
+            .failed => return error.ExpectedRequestedClose,
+        },
+        else => return error.ExpectedClosedEvent,
+    }
+    try std.testing.expect(try handle.tryTakeEvent() == null);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        wake_counter.count.load(.monotonic),
+    );
+
+    worker.closeFailure(.stream, "late close");
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        wake_counter.count.load(.monotonic),
+    );
     try std.testing.expect(try handle.tryTakeEvent() == null);
 }
 
