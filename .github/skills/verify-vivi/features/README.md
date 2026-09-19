@@ -86,11 +86,3 @@ user-visible behavior. It then uses exactly four H2 sections in this order:
   invocation.
 - [Session resume](./session-resume.md) covers Copilot-owned session storage,
   the `/resume` finder, and continued history across processes.
-- [Native conversation sidebar](./native-conversation-sidebar.md) covers
-  project-grouped occurrence-based native launches, selection, window close and
-  Dock reopen, and joined application termination.
-- [Native project entry](./native-project-entry.md) covers directory-selected
-  conversations, launch-project grouping, cancellation, validation, and Command-N.
-- [Native session history](./native-session-history.md) covers selected-store
-  per-project local catalogs, persisted-session resume, and cross-workspace
-  navigation identity.

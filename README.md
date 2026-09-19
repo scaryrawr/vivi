@@ -1,279 +1,92 @@
 # Vivi
 
-Vivi is a cross-platform application with native UX on each supported
-desktop and one shared Zig core. The repository currently contains a SwiftUI
-macOS app and the cross-platform lowercase `vivi` CLI. Windows and Linux apps
-are planned but not implemented. The CLI includes the first Vivi product
-slice: an interactive streaming chat built with libvaxis and powered by
-Copilot.
+Vivi is a cross-platform command-line interface for project-aware Copilot
+conversations. Its interactive chat is built with Zig and libvaxis and runs on
+Windows, Linux, and macOS.
 
 ## Requirements
 
 - Zig 0.16.0
-- Xcode 26.6
 - `zigdoc`
-- Node.js 24 and pnpm 12 for the standalone web presentation
 - GitHub Copilot CLI in `PATH` for `vivi chat`
 
-The shared core uses
-[`scaryrawr/copilot-sdk-zig`](https://github.com/scaryrawr/copilot-sdk-zig).
-The SDK is pinned in `build.zig.zon`. A GitHub Copilot CLI installation and
-credentials are not required for builds or tests.
+Vivi uses
+[`scaryrawr/copilot-sdk-zig`](https://github.com/scaryrawr/copilot-sdk-zig),
+pinned in `build.zig.zon`. Copilot credentials are not required for builds or
+tests.
 
-## Build the CLI and backend
+## Build and test
 
 ```sh
 zig build
 zig build run -- --help
 zig build run -- models
 zig build run -- chat
-zig build run -- chat --model omlx/Qwen3.5-9B-mxfp4
 zig build test
-zig build install-c-api
+./scripts/check.sh
 ```
 
 The CLI and its tests use LLVM because Zig 0.16.0's default x86_64 backend
 crashes compiling the image decoder. Backend-only targets retain Zig's default
-selection. To compare compiler backends, pass `-Dllvm=true` or `-Dllvm=false`
-to `zig build` or `./scripts/check-zig.sh`; both run the same tests and checks.
+selection. Pass `-Dllvm=true` or `-Dllvm=false` to compare compiler backends.
 
-`vivi chat` opens a full-screen Vivi chat with a scrolling transcript,
-workspace context, and a compact bottom composer. It streams responses as they
-arrive and restores the composer after each completed turn. Hosted Copilot and
-OMLX sessions retain the `ask_user`, `skill`, and `web_fetch` built-ins
-alongside custom tools and tools discovered from configured MCP servers.
-Workspace MCP permission requests remain denied until Vivi has an explicit
-approval flow, and the built-in GitHub MCP server is not enabled by default.
-Vivi enables ambient workspace configuration discovery, including workspace
-MCP configuration and project skill directories. Copilot also loads the
-workspace's instruction files, including top-level `AGENTS.md`. Skills marked
-`user-invocable: true` appear in the `/` menu and run through Copilot's skill
-prompt when selected. The SDK supplies `ask_user`, while Vivi supplies exactly
-four custom tools: `read`, `bash`, `edit`, and `write`. Bash action `run` is the
-default synchronous command path. Its `start`, `list`, `read`, `write`, and
-`stop` actions manage persistent PTY sessions through later finite tool calls.
-PTY output is retained in a bounded buffer, reads wait only for a
-caller-selected bounded interval, and the workspace service stops all of its
-shells during resume or shutdown. The terminal presents questions in a separate
-decision panel with arrow-key choice selection. Typed choice numbers, exact
-choice text, and free-form input when allowed remain supported.
-Synchronous tool output is returned whole; Copilot owns any large-result
-handling.
+`./scripts/check.sh` runs formatting, tests, CLI smoke checks, and Linux and
+Windows cross-builds.
 
-Vivi keeps personal Copilot customization separate from Copilot CLI by using
-`~/.vivi/copilot/` as its runtime configuration directory. Personal extensions
-therefore live under `~/.vivi/copilot/extensions/`, and plugin installation and
-enablement state does not inherit from `~/.copilot/`.
+## Chat
 
-Mouse-wheel bursts are processed in bounded batches with one redraw per batch,
-so rapid scrolling does not replay a separate frame for every queued tick.
-
-Press **Ctrl-V** (or **Alt-V** if your terminal intercepts Ctrl-V) to paste an
-image from the system clipboard. Vivi saves it as a private temporary PNG and
-inserts its quoted file path at the cursor. Enter and Ctrl-Enter submit the
-image as a Copilot attachment along with your message, including steering and
-queued follow-ups. You can paste several images, or send just an image.
-Images are snapshotted when you submit, so later file changes cannot alter a
-queued message. Each image and the combined image payload for one message may
-be up to 20 MiB, with at most 32 images in one message.
-Removing a pasted path from the composer excludes that image from the send;
-there are no hidden attachment placeholders. Use a vision-capable model.
-
-Use your terminal's usual paste command for text (for example, Cmd-V on
-macOS). Bracketed text paste does not submit embedded newlines or execute
-shortcuts. Bitmap paste reads the clipboard on the machine running Vivi;
-it does not transfer your desktop clipboard over SSH. macOS uses AppKit,
-Linux requires `wl-paste` on Wayland or `xclip` on X11, and Windows uses
-Windows PowerShell's clipboard support. Clipboard errors leave the draft intact.
-Pasted files stay available for the lifetime of the chat, including queued
-messages and tool reads, and are removed on normal exit. Their temporary paths
-are not durable references for later `/resume` sessions.
-
-The macOS app exposes the same typed image submission path through the
-composer's attachment menu. **Choose Image…** accepts PNG, JPEG, GIF, and WebP
-files, while **Paste Image** snapshots compatible pasteboard content. Selected
-images appear as removable preview chips and remain selected when acquisition
-or submission fails. AppKit reads each source once; after the backend accepts a
-message, the conversation owns an immutable copy.
-
-The `read` tool also returns PNG, JPEG, GIF, and WebP files as image content
-to the model, detecting their format from the bytes rather than the extension.
-Image reads show a short file/MIME summary in the transcript, never base64.
-`offset` and `limit` apply only to text and are rejected for images.
-Expand an image-read result to see a bounded, aspect-preserving preview using
-libvaxis's built-in Kitty graphics support. It scrolls and clips with the tool
-details. Terminals without Kitty graphics retain the summary; unsupported
-preview formats show a notice without changing the image sent to the model.
-The current libvaxis decoder supports PNG, JPEG, and GIF previews, but not WebP.
-Preview decoding and encoding share a 64 MiB scratch-memory budget, with a
-16,777,216-pixel limit; exceeding either shows an unavailable notice without
-changing the image sent to the model.
-
-In the terminal transcript, tool calls start collapsed. Click a tool row
-(marked `▸`) to expand its complete actual input and output; click it again
-to collapse (`▾`). Expanded running calls show their output when they finish,
-including failures. For keyboard access, press F6 from the composer to focus
-the first visible tool (or the first tool if none is visible), use Up/Down to
-move between tools, and Enter or Space to expand/collapse. A `>` marker and
-highlighted summary identify focus; navigation scrolls the tool into view.
-Escape or F6 returns to the unchanged composer. Menus and pending questions
-retain their own keys; Page Up/Down and mouse scrolling still work.
-Details wrap with the terminal width and scroll with the
-transcript, on a subtly contrasting background. Input arguments use readable
-labels with decoded strings and line breaks, including all additional fields;
-nested objects and arrays use indentation and indexed items. Invalid JSON is
-explicitly labeled and shown as unparsed input. Output is not JSON-decoded;
-successful Markdown file reads are rendered as Markdown, while other output
-stays literal. Complete terminal control sequences are stripped, while
-malformed or unterminated controls are visibly escaped.
-
-`vivi models` lists the authenticated Copilot model catalog alongside OMLX
-models discovered from `http://localhost:8000/v1/models/status`. Each row
-reports its qualified ID, context window, maximum output tokens, and vision
-capability when known, plus its selectable reasoning levels and advertised
-default. Start chat with an explicit hosted model using
-`vivi chat --model copilot/<model-id> --reasoning high` or a discovered local
-model using `vivi chat --model omlx/<model-id> --reasoning xhigh`. `off` sends
-no explicit reasoning effort and delegates to the model default. Hosted models
-use the levels advertised by GitHub; local models expose
-`off,low,medium,high,xhigh`. Set `OMLX_BASE_URL` and `OMLX_API_KEY` to
-override the local endpoint and credential. Vivi passes OMLX's
-`max_context_window` and `max_tokens` values into the Copilot SDK provider
-configuration; missing values default to 131072 and 32768 respectively.
-The most recently selected model and reasoning pair is stored in
-`~/.vivi/settings.json` and used by new chats. Explicit `--model` and
-`--reasoning` values override that default for one launch without changing the
-stored preference.
-
-Vivi launches Copilot CLI with a private home at `~/.vivi/copilot/`. This keeps
-Copilot sessions, installed extensions, plugin state, and related runtime
-configuration separate from the user's normal `~/.copilot/` installation while
-still allowing ambient configuration from the active workspace. Workspace MCP
-tools are discovered but denied when they request permission until Vivi has an
-explicit user-approval flow. The built-in GitHub MCP server is not enabled by
-default; `web_fetch` remains available as the narrow built-in web tool.
-
-During an active chat, type `/` to open Vivi's slash-command menu. The menu
-refreshes the Copilot SDK command catalog each time it opens so commands from
-late-registering extensions can appear without restarting Vivi. Select
-`/model` to switch among each valid model and reasoning combination for the
-Copilot default, authenticated Copilot models, and discovered OMLX models.
-Selecting the active pair is a no-op. A successful switch keeps the visible
-Vivi transcript but starts a fresh server-side session, so prior turns are not
-part of the replacement model's context. Vivi currently executes
-`/model` with Vivi's model picker. Select `/new` to start a fresh conversation
-in the current workspace. The terminal replaces its active transcript, while
-the native app preserves the previous conversation in the sidebar and selects
-the new one. Select `/resume` to filter sessions stored
-by Copilot CLI in Vivi's private home and continue one from any workspace.
-Resume rows show the saved title and working directory without exposing
-Copilot's session IDs. A successful resume uses the currently selected model
-and reasoning effort, replaces the terminal transcript with the persisted
-Copilot message history, then reports success. A failed resume leaves the
-current chat and transcript active. Compatible SDK-contributed commands,
-including session-mode commands such as `/autopilot`, execute through
-Copilot's command API.
-
-Use Page Up and Page Down to inspect the transcript. Press Ctrl-C to stop. If
-Copilot is blocked and cannot reach an SDK event boundary, press Ctrl-C again
-to restore the terminal and force exit.
-
-Installed artifacts are written to `zig-out/`:
-
-- `bin/vivi`
-- `lib/libvivi_backend.a`
-- `include/vivi_backend.h`
-- `include/module.modulemap`
-
-Inspect the pinned SDK directly through the root build graph:
+Running `vivi` with no command starts the full-screen chat. The interface
+includes a scrolling transcript, workspace context, streaming responses,
+reasoning and tool activity, slash commands, model selection, session resume,
+and a compact bottom composer.
 
 ```sh
+vivi
+vivi chat
+vivi chat --model copilot/<model-id> --reasoning high
+vivi chat --model omlx/<model-id> --reasoning xhigh
+```
+
+Hosted Copilot and OMLX sessions retain the `ask_user`, `skill`, and
+`web_fetch` built-ins alongside configured MCP tools and four Vivi tools:
+`read`, `bash`, `edit`, and `write`. Ambient workspace MCP permission requests
+remain denied until Vivi has an explicit approval flow.
+
+Vivi keeps its Copilot runtime state under `~/.vivi/copilot/`, separate from
+the standalone Copilot CLI's `~/.copilot/` directory. The selected model and
+reasoning level are stored in `~/.vivi/settings.json`.
+
+Use `/model` to switch models, `/new` to replace the active conversation, and
+`/resume` to continue a session from Vivi's private Copilot store. Press
+Ctrl-C once for cooperative shutdown and again only if Copilot remains blocked.
+
+## Images
+
+Press **Ctrl-V** or **Alt-V** to paste an image from the system clipboard.
+Vivi snapshots the image to a private temporary file and submits it as a typed
+attachment when its quoted path remains in the composer. macOS uses AppKit,
+Linux uses `wl-paste` or `xclip`, and Windows uses PowerShell clipboard support.
+
+The `read` tool accepts PNG, JPEG, GIF, and WebP images. Supported terminals
+can expand PNG, JPEG, and GIF results with Kitty graphics; other terminals
+retain the text summary.
+
+## Models
+
+`vivi models` lists authenticated Copilot models and OMLX models discovered
+from `http://localhost:8000/v1/models/status`. Set `OMLX_BASE_URL` and
+`OMLX_API_KEY` to override the local endpoint and credential.
+
+## Development
+
+```sh
+zig fmt build.zig backend cli
 zigdoc copilot_sdk.Client
 ```
 
-## Build the macOS app
-
-```sh
-zig build native
-zig build native-run
-```
-
-`zig build native` builds the Debug app from the current worktree at
-`zig-out/xcode/Debug/Vivi.app`. `zig build native-run` also builds the CLI and
-launches that exact bundle with the current worktree as its workspace. This
-avoids `vivi chat --native` falling back to a stale app registered with Launch
-Services when the current worktree's bundle has not been built yet. Both
-commands fail explicitly on hosts other than macOS.
-
-For troubleshooting and CI, the underlying Xcode build is:
-
-```sh
-xcodebuild \
-  -project macos/Vivi.xcodeproj \
-  -scheme Vivi \
-  -configuration Debug \
-  -destination 'platform=macOS' \
-  CODE_SIGNING_ALLOWED=NO \
-  build
-```
-
-Opening `macos/Vivi.xcodeproj` and running the shared `Vivi` scheme invokes
-the same Zig build through an aggregate target before linking the app.
-
-The app presents live conversations in one native window. Each
-`vivi chat --native` launch adds and selects a fresh sidebar conversation for
-the invoking workspace, even when that workspace is already open. Closing the
-window keeps those conversations alive; clicking Vivi in the Dock restores the
-same conversation list and selection. Quitting Vivi waits for every live
-conversation to close.
-
-## Native platform applications
-
-- `macos/` contains the current SwiftUI app, using AppKit where native
-  integration requires it.
-- `windows/` defines the future WinUI 3 application boundary.
-- `linux/` defines the future GNOME application boundary using GTK 4 and
-  libadwaita.
-
-Each native build owns its toolkit, packaging, and OS integration. Native apps
-consume the C ABI; shared product and Copilot behavior stays in Zig.
-`./scripts/check.sh` also cross-builds the Linux shared object and Windows
-x64/ARM64 DLLs without claiming that those GUI applications exist yet.
-
-## Web presentation foundation
-
-`web/` contains the browser-testable React, TypeScript, and Vite presentation.
-The shared Xcode scheme also builds a production Vite entry into a dedicated
-`SKIP_INSTALL` `ViviWebHostTests.xctest` bundle. The local-only WKWebView,
-typed V1 bridge, and generated asset manifest are test sources/resources; they
-are not compiled or copied into `Vivi.app`, and the shipping SwiftUI window
-path remains unchanged.
-
-```sh
-cd web
-pnpm install --frozen-lockfile
-pnpm dev
-pnpm storybook
-pnpm check
-```
-
-See [`web/README.md`](web/README.md) for the explicit host contract, strict CSP,
-Playwright evidence, and layer 2 WKWebView responsibilities.
-
-## Check the repository
-
-```sh
-./scripts/check.sh
-```
-
-The full check composes four independently runnable CI domains:
-
-```sh
-./scripts/check-zig.sh
-./scripts/check-c-api-cross.sh
-./scripts/check-macos.sh
-./scripts/check-web.sh
-```
+Release CLIs target glibc 2.17 on Linux and macOS 14.0 on Apple silicon.
+Explicit macOS targets require both `--sysroot` and `-Dmacos-sdk` from
+`xcrun --sdk macosx --show-sdk-path`.
 
 Architecture and ownership decisions are documented in
 [`docs/architecture.md`](docs/architecture.md).
