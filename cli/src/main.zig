@@ -240,7 +240,7 @@ fn usableHome(value: ?[]const u8) ?[]const u8 {
 
 fn writeHelp(writer: *std.Io.Writer) !void {
     try writer.writeAll(
-        \\Usage: vivi [--help] [--version] [models] [chat [--native] [--model MODEL] [--reasoning LEVEL]]
+        \\Usage: vivi [--help] [--version] [models] [chat] [--native] [--model MODEL] [--reasoning LEVEL]
         \\
         \\Vivi command-line interface. Running vivi with no command starts chat.
         \\
