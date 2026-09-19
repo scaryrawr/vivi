@@ -1,6 +1,5 @@
 const std = @import("std");
 const builtin = @import("builtin");
-pub const canvas = @import("canvas.zig");
 const presentation = @import("presentation.zig");
 const build_options = @import("build_options");
 const copilot = @import("copilot_sdk");
@@ -19,8 +18,6 @@ const private_directory_permissions: std.Io.Dir.Permissions =
         .fromMode(0o700);
 
 pub const version = build_options.version;
-pub const abi_version: u32 = 10;
-pub const max_session_title_characters = session_title.max_characters;
 pub const Conversation = conversation.Conversation;
 pub const ConversationEvent = conversation.Event;
 pub const ConversationWake = conversation.Wake;
@@ -109,19 +106,12 @@ pub const presentToolResult = presentation.presentToolResult;
 pub const PresentationKind = presentation.PresentationKind;
 pub const syntax = presentation.syntax;
 
-pub const CopilotCliLaunch = enum {
-    sdk_default,
-    explicit_path,
-};
-
 pub const ConversationOptions = struct {
     working_directory: []const u8,
     model: ?[]const u8 = null,
     reasoning: ?ReasoningEffort = null,
     settings_path: []const u8,
-    copilot_cli_path: ?[]const u8 = null,
     omlx: OmlxOptions = .{},
-    copilot_cli_launch: CopilotCliLaunch = .sdk_default,
 };
 
 const ConversationContext = struct {
@@ -129,10 +119,8 @@ const ConversationContext = struct {
     model: ?[]u8,
     reasoning: ?ReasoningEffort,
     settings_path: []u8,
-    copilot_cli_path: ?[]u8,
     omlx_base_url: []u8,
     omlx_api_key: ?[]u8,
-    copilot_cli_launch: CopilotCliLaunch,
 
     fn init(
         allocator: std.mem.Allocator,
@@ -153,21 +141,13 @@ const ConversationContext = struct {
         errdefer if (model) |value| allocator.free(value);
         const settings_path = try allocator.dupe(u8, options.settings_path);
         errdefer allocator.free(settings_path);
-        const copilot_cli_path = if (options.copilot_cli_path) |value|
-            try allocator.dupe(u8, value)
-        else
-            null;
-        errdefer if (copilot_cli_path) |value| allocator.free(value);
-
         context.* = .{
             .working_directory = working_directory,
             .model = model,
             .reasoning = options.reasoning,
             .settings_path = settings_path,
-            .copilot_cli_path = copilot_cli_path,
             .omlx_base_url = undefined,
             .omlx_api_key = null,
-            .copilot_cli_launch = options.copilot_cli_launch,
         };
         context.omlx_base_url = try allocator.dupe(
             u8,
@@ -189,7 +169,6 @@ const ConversationContext = struct {
         allocator.free(self.working_directory);
         if (self.model) |model| allocator.free(model);
         allocator.free(self.settings_path);
-        if (self.copilot_cli_path) |path| allocator.free(path);
         allocator.free(self.omlx_base_url);
         if (self.omlx_api_key) |api_key| {
             std.crypto.secureZero(u8, api_key);
@@ -222,8 +201,6 @@ pub fn discoverModels(
         io,
         MinimalCodingAgent.clientOptions(
             working_directory,
-            .sdk_default,
-            null,
             copilot_home,
         ),
     ) catch {
@@ -275,7 +252,6 @@ test "conversation contexts retain their explicit working directories" {
 
 const MinimalCodingAgent = struct {
     const direct_cli_args = [_][]const u8{};
-    const path_lookup_cli_args = [_][]const u8{"copilot"};
 
     const available_tools = [_][]const u8{
         "custom:*",
@@ -328,15 +304,12 @@ const MinimalCodingAgent = struct {
 
     fn clientOptions(
         working_directory: []const u8,
-        launch: CopilotCliLaunch,
-        copilot_cli_path: ?[]const u8,
         copilot_home: []const u8,
     ) copilot.ClientOptions {
-        const command = copilotCommand(launch, copilot_cli_path);
-        var options: copilot.ClientOptions = .{
+        return .{
             .working_directory = working_directory,
             .base_directory = copilot_home,
-            .cli_args = command.args,
+            .cli_args = &direct_cli_args,
             .client_info = .{
                 .application_name = "vivi",
                 .application_version = version,
@@ -344,10 +317,6 @@ const MinimalCodingAgent = struct {
                 .integration_version = version,
             },
         };
-        if (launch == .explicit_path) {
-            options.cli_path = command.executable;
-        }
-        return options;
     }
 
     fn sessionConfig(
@@ -402,27 +371,6 @@ const MinimalCodingAgent = struct {
         return result;
     }
 };
-
-const CopilotCommand = struct {
-    executable: []const u8,
-    args: []const []const u8,
-};
-
-fn copilotCommand(
-    launch: CopilotCliLaunch,
-    copilot_cli_path: ?[]const u8,
-) CopilotCommand {
-    return switch (launch) {
-        .sdk_default => .{
-            .executable = "copilot",
-            .args = &MinimalCodingAgent.direct_cli_args,
-        },
-        .explicit_path => .{
-            .executable = copilot_cli_path orelse "",
-            .args = &MinimalCodingAgent.direct_cli_args,
-        },
-    };
-}
 
 const hosted_model_id = "copilot/default";
 
@@ -3123,8 +3071,6 @@ fn runSdkConversation(
         worker.io(),
         MinimalCodingAgent.clientOptions(
             active_working_directory,
-            context.copilot_cli_launch,
-            context.copilot_cli_path,
             copilot_home,
         ),
     ) catch |err| {
@@ -4464,8 +4410,6 @@ test "minimal coding agent limits hosted tools to simplified subset" {
 
     const options = MinimalCodingAgent.clientOptions(
         "/workspace",
-        .sdk_default,
-        null,
         "/home/user/.vivi/copilot",
     );
     try std.testing.expectEqualStrings(
@@ -4494,42 +4438,6 @@ test "minimal coding agent limits hosted tools to simplified subset" {
             null,
             .{},
         ).available_tools.?,
-    );
-}
-
-test "native launch uses the host-resolved Copilot path" {
-    const options = MinimalCodingAgent.clientOptions(
-        "/workspace",
-        .explicit_path,
-        "/opt/homebrew/bin/copilot",
-        "/home/user/.vivi/copilot",
-    );
-    try std.testing.expectEqualStrings("/opt/homebrew/bin/copilot", options.cli_path);
-    try std.testing.expectEqualSlices(
-        []const u8,
-        &.{},
-        options.cli_args,
-    );
-}
-
-test "terminal launch preserves SDK default command" {
-    const conversation_options: ConversationOptions = .{
-        .working_directory = "/workspace",
-        .settings_path = "/home/user/.vivi/settings.json",
-    };
-    try std.testing.expectEqual(
-        CopilotCliLaunch.sdk_default,
-        conversation_options.copilot_cli_launch,
-    );
-    const command = copilotCommand(
-        conversation_options.copilot_cli_launch,
-        conversation_options.copilot_cli_path,
-    );
-    try std.testing.expectEqualStrings("copilot", command.executable);
-    try std.testing.expectEqualSlices(
-        []const u8,
-        &.{},
-        command.args,
     );
 }
 

@@ -5,6 +5,4 @@ repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$repo_root"
 
 ./scripts/check-zig.sh
-./scripts/check-c-api-cross.sh
-./scripts/check-web.sh
-./scripts/check-macos.sh
+./scripts/check-cli-cross.sh
