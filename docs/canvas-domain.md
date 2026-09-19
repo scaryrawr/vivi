@@ -39,9 +39,11 @@ and HostPort transport are intentionally unchanged.
 
 Identity values are nominal, fixed-capacity UTF-8 values. Construction rejects
 empty, invalid, or over-limit input before it reaches domain state. Composite
-keys enforce an aggregate byte limit. Replacement registry size and
-incremental registry operation count are bounded independently, so repeated
-upserts or removals cannot bypass the final-size limit.
+keys enforce an aggregate byte limit, and every public operation validates its
+borrowed key before lookup, capacity, or allocation decisions. Replacement
+registry size and incremental registry operation count are bounded
+independently, so repeated upserts or removals cannot bypass the final-size
+limit.
 
 JSON remains at the extension boundary, but there is no generic JSON envelope:
 

@@ -266,9 +266,13 @@ fn cloneText(
     value: []const u8,
     limits: Limits,
 ) ![]u8 {
+    try validateText(value, limits);
+    return allocator.dupe(u8, value);
+}
+
+fn validateText(value: []const u8, limits: Limits) !void {
     if (value.len > limits.max_text_bytes) return error.TextTooLong;
     if (!std.unicode.utf8ValidateSlice(value)) return error.InvalidTextUtf8;
-    return allocator.dupe(u8, value);
 }
 
 pub const ActionDeclarationInput = struct {
@@ -1143,12 +1147,14 @@ pub const Domain = struct {
         publisher: EffectPublisher,
     ) !OperationToken {
         try self.requireOperational();
+        const validated_key = try InstanceKey.init(request.key, self.limits);
+        const key = validated_key.view();
         if (self.capability != .supported) return error.CanvasUnsupported;
         if (self.registry.find(.{
-            .extension_id = request.key.extension_id,
-            .canvas_id = request.key.canvas_id,
+            .extension_id = key.extension_id,
+            .canvas_id = key.canvas_id,
         }) == null) return error.CanvasUnavailable;
-        const existing_index = self.findInstance(request.key);
+        const existing_index = self.findInstance(key);
         if (existing_index) |index| switch (self.instances.items[index].runtime) {
             .opened => return error.CanvasAlreadyOpen,
             .closing => return error.CanvasClosing,
@@ -1170,7 +1176,7 @@ pub const Domain = struct {
         var candidate = if (existing_index) |index|
             try self.instances.items[index].clone(self.allocator, self.limits)
         else
-            try Instance.init(request.key, self.limits);
+            Instance{ .key = validated_key };
         errdefer candidate.deinit(self.allocator);
         const reclaimed_index = if (existing_index == null and
             self.instances.items.len >= self.limits.max_instances)
@@ -1213,12 +1219,7 @@ pub const Domain = struct {
 
         try publisher.publishAtomic(effects.items);
         self.commitOpenToken();
-        if (existing_index orelse reclaimed_index) |index| {
-            self.instances.items[index].deinit(self.allocator);
-            self.instances.items[index] = candidate;
-        } else {
-            self.instances.appendAssumeCapacity(candidate);
-        }
+        self.commitPreparedInstance(candidate, existing_index, reclaimed_index);
         return token;
     }
 
@@ -1228,7 +1229,8 @@ pub const Domain = struct {
         publisher: EffectPublisher,
     ) !OperationToken {
         try self.requireOperational();
-        const index = self.findInstance(request.key) orelse
+        const validated_key = try InstanceKey.init(request.key, self.limits);
+        const index = self.findInstance(validated_key.view()) orelse
             return error.CanvasNotOpen;
         if (self.instances.items[index].runtime.tag() != .opened)
             return error.CanvasNotOpen;
@@ -1277,15 +1279,17 @@ pub const Domain = struct {
         publisher: EffectPublisher,
     ) !OperationToken {
         try self.requireOperational();
+        const validated_key = try InstanceKey.init(request.key, self.limits);
+        const key = validated_key.view();
         const name = try ActionName.init(request.action_name, self.limits);
         const declaration_index = self.registry.find(.{
-            .extension_id = request.key.extension_id,
-            .canvas_id = request.key.canvas_id,
+            .extension_id = key.extension_id,
+            .canvas_id = key.canvas_id,
         }) orelse return error.CanvasUnavailable;
         if (!self.registry.entries.items[declaration_index].hasAction(
             name.bytes(),
         )) return error.ActionUnavailable;
-        const index = self.findInstance(request.key) orelse
+        const index = self.findInstance(key) orelse
             return error.CanvasNotOpen;
         if (self.instances.items[index].runtime.tag() != .opened)
             return error.CanvasNotOpen;
@@ -1466,7 +1470,9 @@ pub const Domain = struct {
         publisher: EffectPublisher,
     ) !void {
         try self.requireOperational();
-        const index = self.findInstance(key) orelse {
+        const validated_key = try InstanceKey.init(key, self.limits);
+        const validated_view = validated_key.view();
+        const index = self.findInstance(validated_view) orelse {
             const reclaimed_index = if (self.instances.items.len >=
                 self.limits.max_instances)
                 self.findReclaimableInstance()
@@ -1477,17 +1483,13 @@ pub const Domain = struct {
             {
                 return error.TooManyInstances;
             }
-            var instance = try Instance.init(key, self.limits);
+            var instance = Instance{ .key = validated_key };
             errdefer instance.deinit(self.allocator);
             instance.runtime = .unavailable;
             instance.degradation = .declaration_removed;
-            if (reclaimed_index) |reclaimed| {
-                self.instances.items[reclaimed].deinit(self.allocator);
-                self.instances.items[reclaimed] = instance;
-            } else {
+            if (reclaimed_index == null)
                 try self.instances.ensureUnusedCapacity(self.allocator, 1);
-                self.instances.appendAssumeCapacity(instance);
-            }
+            self.commitPreparedInstance(instance, null, reclaimed_index);
             return;
         };
         var candidate = try self.instances.items[index].clone(
@@ -1513,7 +1515,11 @@ pub const Domain = struct {
         input: ?*const OpenInputDocument,
     ) !void {
         try self.requireOperational();
-        const index = self.findInstance(key) orelse {
+        const validated_key = try InstanceKey.init(key, self.limits);
+        const validated_view = validated_key.view();
+        if (title) |value| try validateText(value, self.limits);
+        if (input) |value| try value.validate(self.allocator, self.limits);
+        const index = self.findInstance(validated_view) orelse {
             const reclaimed_index = if (self.instances.items.len >=
                 self.limits.max_instances)
                 self.findReclaimableInstance()
@@ -1524,7 +1530,7 @@ pub const Domain = struct {
             {
                 return error.TooManyInstances;
             }
-            var instance = try Instance.init(key, self.limits);
+            var instance = Instance{ .key = validated_key };
             errdefer instance.deinit(self.allocator);
             instance.record = .{ .recorded = try RecordedState.init(
                 self.allocator,
@@ -1532,13 +1538,9 @@ pub const Domain = struct {
                 input,
                 self.limits,
             ) };
-            if (reclaimed_index) |reclaimed| {
-                self.instances.items[reclaimed].deinit(self.allocator);
-                self.instances.items[reclaimed] = instance;
-            } else {
+            if (reclaimed_index == null)
                 try self.instances.ensureUnusedCapacity(self.allocator, 1);
-                self.instances.appendAssumeCapacity(instance);
-            }
+            self.commitPreparedInstance(instance, null, reclaimed_index);
             return;
         };
         var candidate = try self.instances.items[index].clone(
@@ -1560,7 +1562,8 @@ pub const Domain = struct {
 
     pub fn removeRecord(self: *Domain, key: KeyView) !void {
         try self.requireOperational();
-        const index = self.findInstance(key) orelse return;
+        const validated_key = try InstanceKey.init(key, self.limits);
+        const index = self.findInstance(validated_key.view()) orelse return;
         self.instances.items[index].record.deinit(self.allocator);
         self.instances.items[index].record = .removed;
     }
@@ -1743,6 +1746,24 @@ pub const Domain = struct {
         return null;
     }
 
+    fn commitPreparedInstance(
+        self: *Domain,
+        candidate: Instance,
+        existing_index: ?usize,
+        reclaimed_index: ?usize,
+    ) void {
+        if (existing_index) |index| {
+            self.instances.items[index].deinit(self.allocator);
+            self.instances.items[index] = candidate;
+        } else if (reclaimed_index) |index| {
+            var reclaimed = self.instances.orderedRemove(index);
+            reclaimed.deinit(self.allocator);
+            self.instances.appendAssumeCapacity(candidate);
+        } else {
+            self.instances.appendAssumeCapacity(candidate);
+        }
+    }
+
     const TokenLocation = struct {
         instance_index: usize,
         kind: OperationKind,
@@ -1854,6 +1875,9 @@ pub const Domain = struct {
         ) catch return error.TooManyRegistryOperations;
         if (operation_count > self.limits.max_registry_operations)
             return error.TooManyRegistryOperations;
+        for (delta.removed) |removed| {
+            _ = try CanvasKey.init(removed, self.limits);
+        }
         var result = try self.registry.clone(self.allocator, self.limits);
         errdefer result.deinit(self.allocator);
         for (delta.removed) |removed| {
@@ -2275,6 +2299,95 @@ test "instance capacity reclaims stable unrecorded entries" {
         publisher.publisher(),
     );
     try std.testing.expect(domain.runtimeTag(fourth_key) == null);
+}
+
+test "instance reclamation preserves oldest-first ordering" {
+    var domain = Domain.init(
+        std.testing.allocator,
+        .{ .max_instances = 2 },
+    );
+    defer domain.deinit();
+    const first = KeyView{
+        .extension_id = "fixture.extension",
+        .canvas_id = "review",
+        .instance_id = "first",
+    };
+    const second = KeyView{
+        .extension_id = "fixture.extension",
+        .canvas_id = "review",
+        .instance_id = "second",
+    };
+    const third = KeyView{
+        .extension_id = "fixture.extension",
+        .canvas_id = "review",
+        .instance_id = "third",
+    };
+    const fourth = KeyView{
+        .extension_id = "fixture.extension",
+        .canvas_id = "review",
+        .instance_id = "fourth",
+    };
+
+    try domain.record(first, "First", null);
+    try domain.record(second, "Second", null);
+    try domain.removeRecord(first);
+    try domain.removeRecord(second);
+    try domain.record(third, "Third", null);
+    try domain.removeRecord(third);
+    try domain.record(fourth, "Fourth", null);
+
+    try std.testing.expect(domain.runtimeTag(first) == null);
+    try std.testing.expect(domain.runtimeTag(second) == null);
+    try std.testing.expect(domain.runtimeTag(third) != null);
+    try std.testing.expect(domain.runtimeTag(fourth) != null);
+}
+
+test "public operation keys are validated before lookup and capacity" {
+    var domain = try fixtureDomain(std.testing.allocator);
+    defer domain.deinit();
+    var publisher: TestPublisher = .{};
+    const invalid_key = KeyView{
+        .extension_id = "fixture.extension",
+        .canvas_id = "review",
+        .instance_id = "x" ** 257,
+    };
+
+    try std.testing.expectError(
+        error.IdentifierTooLong,
+        domain.open(.{ .key = invalid_key }, publisher.publisher()),
+    );
+    try std.testing.expectError(
+        error.IdentifierTooLong,
+        domain.close(.{ .key = invalid_key }, publisher.publisher()),
+    );
+    try std.testing.expectError(
+        error.IdentifierTooLong,
+        domain.invokeAction(.{
+            .key = invalid_key,
+            .action_name = "refresh",
+        }, publisher.publisher()),
+    );
+    try std.testing.expectError(
+        error.IdentifierTooLong,
+        domain.markUnavailable(invalid_key, publisher.publisher()),
+    );
+    try std.testing.expectError(
+        error.IdentifierTooLong,
+        domain.record(invalid_key, null, null),
+    );
+    try std.testing.expectError(
+        error.IdentifierTooLong,
+        domain.removeRecord(invalid_key),
+    );
+    try std.testing.expectError(
+        error.IdentifierTooLong,
+        domain.applyRegistry(.{ .incremental = .{
+            .removed = &.{.{
+                .extension_id = "fixture.extension",
+                .canvas_id = "x" ** 257,
+            }},
+        } }),
+    );
 }
 
 test "operation boundaries revalidate mutable document storage" {
