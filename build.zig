@@ -160,6 +160,17 @@ pub fn build(b: *std.Build) void {
     const backend_tests = b.addTest(.{ .root_module = backend, .use_llvm = use_llvm });
     const run_backend_tests = b.addRunArtifact(backend_tests);
 
+    const canvas_tests_module = b.createModule(.{
+        .root_source_file = b.path("backend/src/canvas.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const canvas_tests = b.addTest(.{
+        .root_module = canvas_tests_module,
+        .use_llvm = use_llvm,
+    });
+    const run_canvas_tests = b.addRunArtifact(canvas_tests);
+
     const c_api_tests = b.addTest(.{ .root_module = c_api, .use_llvm = use_llvm });
     const run_c_api_tests = b.addRunArtifact(c_api_tests);
 
@@ -244,6 +255,7 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_backend_tests.step);
+    test_step.dependOn(&run_canvas_tests.step);
     test_step.dependOn(&run_c_api_tests.step);
     test_step.dependOn(&run_cli_tests.step);
     test_step.dependOn(&run_chat_tests.step);
