@@ -89,13 +89,14 @@ Preconditions:
 ## Gotchas
 
 - This recipe calls the live Copilot service and may take longer than the
-  fixed wait on a slow connection. Increase both 20-second waits in the helper
-  together when diagnosing latency.
+  capture waits on a slow connection. The VHS drive waits 45 seconds; the PTY
+  drive polls its transcript for the expected response for up to 90 seconds.
+  Increase both limits together when diagnosing latency.
 - Raw vaxis transcripts contain cursor-control sequences and may visually
   collapse spaces. Assert the no-space marker, not screen-line formatting.
-- The first Ctrl-C may arrive after the response completes, which is valid
-  cooperative shutdown. The second Ctrl-C is harmless if the shell is already
-  idle.
+- The single Ctrl-C may arrive after the response completes, which is valid
+  cooperative shutdown. The PTY drive then waits for Vivi to exit and fails
+  instead of sending a second Ctrl-C that could mask a shutdown hang.
 - A retained GIF is for presentation only. It does not replace normalized text
   assertions or a passing frame review.
 - Steering is best effort. If the active turn reaches idle before Vivi forwards

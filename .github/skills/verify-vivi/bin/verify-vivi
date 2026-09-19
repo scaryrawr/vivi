@@ -13,6 +13,8 @@ Usage:
   verify-vivi cli-discovery <run-id>
   verify-vivi chat-streaming <run-id>
   verify-vivi chat-streaming-input <run-id>
+  verify-vivi chat-default <run-id>
+  verify-vivi chat-implicit <run-id>
   verify-vivi chat-attachments <run-id>
   verify-vivi chat-async-bash <run-id>
   verify-vivi chat-markdown <run-id>
@@ -23,8 +25,8 @@ Usage:
   verify-vivi chat-customization <run-id>
   verify-vivi chat-session-resume <run-id>
   verify-vivi chat-shutdown <run-id>
-  verify-vivi extract-frames <run-id> <chat-streaming|chat-streaming-input|chat-attachments|chat-async-bash|chat-markdown|chat-markdown-read|chat-ask-user|chat-file-picker|chat-model-menu|chat-customization|chat-session-resume|chat-shutdown>
-  verify-vivi frame-check <run-id> <chat-streaming|chat-streaming-input|chat-attachments|chat-async-bash|chat-markdown|chat-markdown-read|chat-ask-user|chat-file-picker|chat-model-menu|chat-customization|chat-session-resume|chat-shutdown>
+  verify-vivi extract-frames <run-id> <chat-streaming|chat-streaming-input|chat-default|chat-implicit|chat-attachments|chat-async-bash|chat-markdown|chat-markdown-read|chat-ask-user|chat-file-picker|chat-model-menu|chat-customization|chat-session-resume|chat-shutdown>
+  verify-vivi frame-check <run-id> <chat-streaming|chat-streaming-input|chat-default|chat-implicit|chat-attachments|chat-async-bash|chat-markdown|chat-markdown-read|chat-ask-user|chat-file-picker|chat-model-menu|chat-customization|chat-session-resume|chat-shutdown>
   verify-vivi cleanup <run-id>
 EOF
 }
@@ -168,9 +170,9 @@ cli_discovery() {
 
 validate_capture_name() {
     case "$1" in
-        chat-streaming|chat-streaming-input|chat-attachments|chat-async-bash|chat-markdown|chat-markdown-read|chat-ask-user|chat-file-picker|chat-model-menu|chat-customization|chat-session-resume|chat-shutdown) ;;
+        chat-streaming|chat-streaming-input|chat-default|chat-implicit|chat-attachments|chat-async-bash|chat-markdown|chat-markdown-read|chat-ask-user|chat-file-picker|chat-model-menu|chat-customization|chat-session-resume|chat-shutdown) ;;
         *)
-            printf 'capture must be chat-streaming, chat-streaming-input, chat-attachments, chat-async-bash, chat-markdown, chat-markdown-read, chat-ask-user, chat-file-picker, chat-model-menu, chat-customization, chat-session-resume, or chat-shutdown\n' >&2
+            printf 'capture must be chat-streaming, chat-streaming-input, chat-default, chat-implicit, chat-attachments, chat-async-bash, chat-markdown, chat-markdown-read, chat-ask-user, chat-file-picker, chat-model-menu, chat-customization, chat-session-resume, or chat-shutdown\n' >&2
             exit 1
             ;;
     esac
@@ -269,10 +271,17 @@ frame_check() {
     fi
 }
 
+shell_quote() {
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
 write_streaming_tape() {
     run_dir=$1
-    cat >"$run_dir/chat-streaming.tape" <<EOF
-Output "$run_dir/chat-streaming.gif"
+    capture=$2
+    launch=$3
+    prompt_word=$4
+    cat >"$run_dir/$capture.tape" <<EOF
+Output "$run_dir/$capture.gif"
 Require copilot
 Set Shell "bash"
 Set Width 1200
@@ -280,39 +289,92 @@ Set Height 720
 Set FontSize 22
 Set TypingSpeed 20ms
 
-Type "./zig-out/bin/vivi chat"
+Type "$launch"
 Enter
 Sleep 3s
-Type "Return the uppercase spelling of vivi_stream_ok and nothing else."
+Type "Return the uppercase spelling of $prompt_word and nothing else."
 Enter
-Sleep 20s
+Sleep 45s
 Ctrl+C
-Sleep 3s
-Ctrl+C
-Sleep 1s
+Sleep 4s
 EOF
 }
 
-chat_streaming() {
-    run_dir=$(prepare_run "$1")
+streaming_drive() {
+    run_id=$1
+    run_dir=$(prepare_run "$run_id")
+    capture=$2
+    prompt_word=$3
+    shift 3
+    launch_display="./zig-out/bin/vivi"
+    for arg in "$@"; do
+        launch_display="$launch_display $(shell_quote "$arg")"
+    done
+    expected_response=$(printf '%s' "$prompt_word" | tr 'a-z' 'A-Z')
     build_vivi
-    write_streaming_tape "$run_dir"
+    write_streaming_tape "$run_dir" "$capture" "$launch_display" "$prompt_word"
 
-    (cd "$repo_root" && "$vhs_command" "$run_dir/chat-streaming.tape")
-    extract_frames "$1" chat-streaming
+    (cd "$repo_root" && "$vhs_command" "$run_dir/$capture.tape")
+    extract_frames "$run_id" "$capture"
 
-    (
-        sleep 3
-        printf 'Return the uppercase spelling of vivi_stream_ok and nothing else.\r'
-        sleep 20
-        printf '\003'
-        sleep 3
-        printf '\003'
-    ) | script -q "$run_dir/chat-streaming.terminal.log" sh -c \
-        "stty cols 100 rows 30; '$binary' chat" &
+    input_fifo="$run_dir/$capture.input"
+    rm -f "$input_fifo"
+    mkfifo "$input_fifo"
+    pty_command="stty cols 100 rows 30; exec $(shell_quote "$binary")"
+    for arg in "$@"; do
+        pty_command="$pty_command $(shell_quote "$arg")"
+    done
+    case "$(uname -s)" in
+        Darwin)
+            cat "$input_fifo" |
+                script -q "$run_dir/$capture.terminal.log" sh -c "$pty_command" &
+            ;;
+        Linux)
+            cat "$input_fifo" |
+                script -q -e -c "$pty_command" -- "$run_dir/$capture.terminal.log" &
+            ;;
+        *)
+            printf 'streaming verification requires BSD or util-linux script\n' >&2
+            rm -f "$input_fifo"
+            return 1
+            ;;
+    esac
     pty_pid=$!
     printf '%s\n' "$pty_pid" >"$run_dir/pty.pid"
-    trap 'kill "$pty_pid" 2>/dev/null || true; wait "$pty_pid" 2>/dev/null || true' EXIT INT TERM
+    trap 'kill "$pty_pid" 2>/dev/null || true; wait "$pty_pid" 2>/dev/null || true; rm -f "$input_fifo"' EXIT INT TERM
+
+    exec 3>"$input_fifo"
+    (
+        sleep 3
+        printf 'Return the uppercase spelling of %s and nothing else.\r' "$prompt_word" >&3
+        # Wait for the streamed answer instead of a blind sleep; Copilot
+        # latency varies and Ctrl-C before the answer loses the evidence.
+        i=0
+        while test "$i" -lt 90; do
+            sleep 1
+            kill -0 "$pty_pid" 2>/dev/null || exit 1
+            grep -a -q "$expected_response" "$run_dir/$capture.terminal.log" && break
+            i=$((i + 1))
+        done
+        sleep 2
+        printf '\003' >&3
+    ) &
+    writer_pid=$!
+
+    wait "$writer_pid"
+    i=0
+    while kill -0 "$pty_pid" 2>/dev/null && test "$i" -lt 15; do
+        sleep 1
+        i=$((i + 1))
+    done
+    if kill -0 "$pty_pid" 2>/dev/null; then
+        kill "$pty_pid"
+        exec 3>&-
+        rm -f "$input_fifo"
+        printf 'vivi did not exit after one Ctrl-C\n' >&2
+        return 1
+    fi
+    exec 3>&-
 
     if wait "$pty_pid"; then
         status=0
@@ -320,25 +382,27 @@ chat_streaming() {
         status=$?
     fi
     rm -f "$run_dir/pty.pid"
+    rm -f "$input_fifo"
     trap - EXIT INT TERM
 
     perl -0pe \
         's/\e\[[0-?]*[ -\/]*[@-~]//g; s/\e\][^\a]*(?:\a|\e\\)//g' \
-        "$run_dir/chat-streaming.terminal.log" |
-        tr -d '\r\b' >"$run_dir/chat-streaming.normalized.txt"
+        "$run_dir/$capture.terminal.log" |
+        tr -d '\r\b' >"$run_dir/$capture.normalized.txt"
 
     session_title=$(
         perl -0ne \
             'if (/\e\]2;vivi — ([^\e\a]*)\e\\/) { print $1; exit }' \
-            "$run_dir/chat-streaming.terminal.log"
+            "$run_dir/$capture.terminal.log"
     )
     expected_title_osc=$(printf '\033]2;vivi — %s\033\\' "$session_title")
 
     {
         printf 'exit=%s\n' "$status"
-        printf 'expected_response=VIVI_STREAM_OK\n'
+        printf 'launch=%s\n' "$launch_display"
+        printf 'expected_response=%s\n' "$expected_response"
         printf 'response_seen='
-        if grep -q 'VIVI_STREAM_OK' "$run_dir/chat-streaming.normalized.txt"; then
+        if grep -q "$expected_response" "$run_dir/$capture.normalized.txt"; then
             printf 'yes\n'
         else
             printf 'no\n'
@@ -346,7 +410,7 @@ chat_streaming() {
         printf 'session_title_seen='
         if test -n "$session_title" &&
             grep -F -q "Session title: $session_title" \
-                "$run_dir/chat-streaming.normalized.txt"
+                "$run_dir/$capture.normalized.txt"
         then
             printf 'yes\n'
         else
@@ -355,41 +419,67 @@ chat_streaming() {
         printf 'terminal_title_osc_seen='
         if test -n "$session_title" &&
             grep -a -F -q "$expected_title_osc" \
-                "$run_dir/chat-streaming.terminal.log"
+                "$run_dir/$capture.terminal.log"
         then
             printf 'yes\n'
         else
             printf 'no\n'
         fi
         printf 'frames_extracted='
-        if test -s "$run_dir/chat-streaming.frames.txt"; then
+        if test -s "$run_dir/$capture.frames.txt"; then
             printf 'yes\n'
         else
             printf 'no\n'
         fi
         printf 'contact_sheet_nonempty='
-        if test -s "$run_dir/chat-streaming.contact-sheet.png"; then
+        if test -s "$run_dir/$capture.contact-sheet.png"; then
             printf 'yes\n'
         else
             printf 'no\n'
         fi
         printf 'recording_retained='
-        if test -s "$run_dir/chat-streaming.gif"; then
+        if test -s "$run_dir/$capture.gif"; then
             printf 'yes\n'
         else
             printf 'no\n'
         fi
-    } >"$run_dir/chat-streaming.assertions.txt"
+    } >"$run_dir/$capture.assertions.txt"
 
     test "$status" -eq 0
-    grep -q 'VIVI_STREAM_OK' "$run_dir/chat-streaming.normalized.txt"
+    grep -q "$expected_response" "$run_dir/$capture.normalized.txt"
     test -n "$session_title"
     grep -F -q "Session title: $session_title" \
-        "$run_dir/chat-streaming.normalized.txt"
+        "$run_dir/$capture.normalized.txt"
     grep -a -F -q "$expected_title_osc" \
-        "$run_dir/chat-streaming.terminal.log"
-    test -s "$run_dir/chat-streaming.frames.txt"
-    test -s "$run_dir/chat-streaming.contact-sheet.png"
+        "$run_dir/$capture.terminal.log"
+    test -s "$run_dir/$capture.frames.txt"
+    test -s "$run_dir/$capture.contact-sheet.png"
+}
+
+chat_streaming() {
+    streaming_drive "$1" chat-streaming vivi_stream_ok chat
+}
+
+chat_default() {
+    streaming_drive "$1" chat-default vivi_default_ok
+}
+
+chat_implicit() {
+    build_vivi
+    model_line=$("$binary" models |
+        grep -v -E '^copilot/(default|auto)	' |
+        grep -m 1 '^copilot/' || true)
+    model=${model_line%%	*}
+    display=${model_line#*	}
+    display=${display%%	*}
+    test -n "$model" || {
+        printf 'no copilot model found for the implicit launch\n' >&2
+        exit 1
+    }
+    streaming_drive "$1" chat-implicit vivi_implicit_ok --model "$model"
+    # The status bar must show the model selected through the implicit flag
+    # (vivi renders the catalog display name, not the catalog id).
+    grep -a -qF -- "$display" "$artifact_root/$1/chat-implicit.terminal.log"
 }
 
 prepare_attachment_clipboard() {
@@ -1715,6 +1805,20 @@ case "${1:-}" in
             exit 2
         }
         chat_streaming_input "$2"
+        ;;
+    chat-default)
+        test "$#" -eq 2 || {
+            usage >&2
+            exit 2
+        }
+        chat_default "$2"
+        ;;
+    chat-implicit)
+        test "$#" -eq 2 || {
+            usage >&2
+            exit 2
+        }
+        chat_implicit "$2"
         ;;
     chat-attachments)
         test "$#" -eq 2 || {

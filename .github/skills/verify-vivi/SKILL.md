@@ -61,6 +61,8 @@ Use the executable helper:
 .github/skills/verify-vivi/bin/verify-vivi cli-discovery <run-id>
 .github/skills/verify-vivi/bin/verify-vivi chat-streaming <run-id>
 .github/skills/verify-vivi/bin/verify-vivi chat-streaming-input <run-id>
+.github/skills/verify-vivi/bin/verify-vivi chat-default <run-id>
+.github/skills/verify-vivi/bin/verify-vivi chat-implicit <run-id>
 .github/skills/verify-vivi/bin/verify-vivi chat-attachments <run-id>
 .github/skills/verify-vivi/bin/verify-vivi chat-async-bash <run-id>
 .github/skills/verify-vivi/bin/verify-vivi chat-markdown <run-id>
@@ -73,6 +75,13 @@ Use the executable helper:
 .github/skills/verify-vivi/bin/verify-vivi chat-shutdown <run-id>
 .github/skills/verify-vivi/bin/verify-vivi frame-check <run-id> chat-markdown
 ```
+
+`chat-default` launches bare `vivi` and proves that it enters chat.
+`chat-implicit` launches a chat flag without the `chat` subcommand and proves
+that the selected model display name reaches the TUI. Both drives retain the
+same PTY transcript, normalized text, assertions, frames, contact sheet, and
+visual-review evidence as `chat-streaming`, and both names are accepted by
+`extract-frames` and `frame-check`.
 
 `<run-id>` must contain only letters, digits, dots, underscores, or hyphens.
 Each command writes to `.verify/vivi/<run-id>/`, so concurrent runs do not
@@ -185,6 +194,8 @@ doctor
 cli-discovery <run-id>
 chat-streaming <run-id>
 chat-streaming-input <run-id>
+chat-default <run-id>
+chat-implicit <run-id>
 chat-markdown <run-id>
 chat-markdown-read <run-id>
 chat-ask-user <run-id>
@@ -193,8 +204,8 @@ chat-model-menu <run-id>
 chat-customization <run-id>
 chat-session-resume <run-id>
 chat-shutdown <run-id>
-extract-frames <run-id> <chat-streaming|chat-streaming-input|chat-attachments|chat-async-bash|chat-markdown|chat-markdown-read|chat-ask-user|chat-file-picker|chat-model-menu|chat-customization|chat-session-resume|chat-shutdown>
-frame-check <run-id> <chat-streaming|chat-streaming-input|chat-attachments|chat-async-bash|chat-markdown|chat-markdown-read|chat-ask-user|chat-file-picker|chat-model-menu|chat-customization|chat-session-resume|chat-shutdown>
+extract-frames <run-id> <chat-streaming|chat-streaming-input|chat-default|chat-implicit|chat-attachments|chat-async-bash|chat-markdown|chat-markdown-read|chat-ask-user|chat-file-picker|chat-model-menu|chat-customization|chat-session-resume|chat-shutdown>
+frame-check <run-id> <chat-streaming|chat-streaming-input|chat-default|chat-implicit|chat-attachments|chat-async-bash|chat-markdown|chat-markdown-read|chat-ask-user|chat-file-picker|chat-model-menu|chat-customization|chat-session-resume|chat-shutdown>
 cleanup <run-id>
 ```
 
