@@ -45,6 +45,8 @@ final class NativeHostRuntime {
   private let adapter: any WebHostDomainAdapter
   private var requestIDSet: Set<UUID> = []
   private let maximumRememberedRequestIDs = 512
+  private var retiredBridgeSessionIDs: Set<UUID> = []
+  private let maximumRetiredBridgeSessions = 64
   private var state = State.awaitingConnect
 
   init(adapter: any WebHostDomainAdapter) {
@@ -52,10 +54,32 @@ final class NativeHostRuntime {
   }
 
   func handle(_ request: HostWireV1.Request) -> [[String: Any]] {
-    if case .disconnected(let previousBridgeSessionID) = state,
-      request.command == .connect,
-      request.bridgeSessionID != previousBridgeSessionID
-    {
+    if retiredBridgeSessionIDs.contains(request.bridgeSessionID) {
+      let error = HostWireV1.ValidationError(
+        code: .staleSession,
+        path: "request.bridgeSessionId",
+        reason: "bridge session was retired")
+      return [HostWireV1.failure(bridgeSessionID: request.bridgeSessionID, error: error)]
+    }
+    let previousBridgeSessionID: UUID?
+    switch state {
+    case .connected(let currentBridgeSessionID), .disconnected(let currentBridgeSessionID):
+      previousBridgeSessionID =
+        request.command == .connect && request.bridgeSessionID != currentBridgeSessionID
+        ? currentBridgeSessionID
+        : nil
+    case .awaitingConnect:
+      previousBridgeSessionID = nil
+    }
+    if let previousBridgeSessionID {
+      guard retiredBridgeSessionIDs.count < maximumRetiredBridgeSessions else {
+        let error = HostWireV1.ValidationError(
+          code: .capacityExceeded,
+          path: "request.bridgeSessionId",
+          reason: "retired bridge session ledger is full")
+        return [HostWireV1.failure(bridgeSessionID: request.bridgeSessionID, error: error)]
+      }
+      _ = retiredBridgeSessionIDs.insert(previousBridgeSessionID)
       requestIDSet.removeAll(keepingCapacity: true)
       state = .awaitingConnect
     }

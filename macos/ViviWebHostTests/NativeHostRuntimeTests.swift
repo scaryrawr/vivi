@@ -105,6 +105,25 @@ final class NativeHostRuntimeTests: XCTestCase {
     XCTAssertEqual(snapshot?["revision"] as? Int, 2)
   }
 
+  func testFreshConnectTakesOverAnActiveBridgeWithoutReplayingItsID() {
+    let adapter = DeterministicWebHostAdapter()
+    let runtime = NativeHostRuntime(adapter: adapter)
+    let firstBridge = UUID()
+    _ = runtime.handle(request(bridge: firstBridge, command: .connect))
+    XCTAssertEqual(adapter.createConversation(projectPath: "/test/vivi"), .accepted)
+
+    let secondBridge = UUID()
+    let reconnect = runtime.handle(request(bridge: secondBridge, command: .connect))
+    XCTAssertEqual(
+      reconnect.map { $0["kind"] as? String },
+      ["snapshot", "connection", "response"])
+    let snapshot = reconnect.first?["snapshot"] as? [String: Any]
+    XCTAssertEqual(snapshot?["revision"] as? Int, 2)
+    XCTAssertEqual(
+      errorCode(runtime.handle(request(bridge: firstBridge, command: .connect))),
+      "stale_session")
+  }
+
   func testDeliveryFailureClosesConnectedSession() {
     let runtime = NativeHostRuntime(adapter: DeterministicWebHostAdapter())
     let bridge = UUID()

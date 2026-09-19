@@ -29,6 +29,53 @@ const bridgeFailureCodes = new Set([
   "disconnected",
   "capacity_exceeded",
 ]);
+const maximumRetiredBridgeSessions = 64;
+const retiredBridgeSessions = new Set<string>();
+const retiredBridgeSessionOrder: string[] = [];
+let activeConnection: NativeConnectedViviHost | undefined;
+
+function registerConnection(connection: NativeConnectedViviHost) {
+  activeConnection = connection;
+  retiredBridgeSessions.delete(connection.bridgeSessionId);
+  window.__viviHostV1Receive = routeNativeMessage;
+}
+
+function retireConnection(connection: NativeConnectedViviHost) {
+  rememberRetiredBridgeSession(connection.bridgeSessionId);
+  if (activeConnection !== connection) return;
+  activeConnection = undefined;
+  delete window.__viviHostV1Receive;
+}
+
+function rememberRetiredBridgeSession(bridgeSessionId: string) {
+  if (retiredBridgeSessions.has(bridgeSessionId)) return;
+  retiredBridgeSessions.add(bridgeSessionId);
+  retiredBridgeSessionOrder.push(bridgeSessionId);
+  if (retiredBridgeSessionOrder.length <= maximumRetiredBridgeSessions) return;
+  const expired = retiredBridgeSessionOrder.shift();
+  if (expired) retiredBridgeSessions.delete(expired);
+}
+
+function routeNativeMessage(message: unknown) {
+  let bridgeSessionId: string | undefined;
+  if (
+    typeof message === "object" &&
+    message !== null &&
+    !Array.isArray(message)
+  ) {
+    const candidate = (message as Record<string, unknown>).bridgeSessionId;
+    if (typeof candidate === "string") bridgeSessionId = candidate;
+  }
+  if (bridgeSessionId && retiredBridgeSessions.has(bridgeSessionId)) return;
+  activeConnection?.receiveFromNative(message);
+}
+
+function resetConnectionRouter() {
+  activeConnection = undefined;
+  retiredBridgeSessions.clear();
+  retiredBridgeSessionOrder.length = 0;
+  delete window.__viviHostV1Receive;
+}
 const maximumSafeInteger = Number.MAX_SAFE_INTEGER;
 
 type CommandName =
@@ -106,7 +153,7 @@ export class NativeViviHostPort implements ViviHostPort {
 
 class NativeConnectedViviHost implements ConnectedViviHost {
   private readonly handler: { postMessage(message: unknown): void };
-  private readonly bridgeSessionId: string;
+  readonly bridgeSessionId: string;
   private snapshot: HostSnapshot = {
     schemaVersion: 1,
     revision: 0,
@@ -139,7 +186,7 @@ class NativeConnectedViviHost implements ConnectedViviHost {
   }
 
   async start() {
-    window.__viviHostV1Receive = (message) => this.receive(message);
+    registerConnection(this);
     const result = await this.command("connect", {});
     if (result.kind !== "accepted") {
       const error = new NativeHostBridgeError(
@@ -184,8 +231,8 @@ class NativeConnectedViviHost implements ConnectedViviHost {
   disconnect() {
     if (this.disconnected) return;
     this.disconnected = true;
+    retireConnection(this);
     this.handler.postMessage(this.request("disconnect", {}));
-    delete window.__viviHostV1Receive;
     const error = new NativeHostBridgeError(
       "disconnected",
       "The native host bridge disconnected.",
@@ -230,6 +277,10 @@ class NativeConnectedViviHost implements ConnectedViviHost {
     };
   }
 
+  receiveFromNative(message: unknown) {
+    this.receive(message);
+  }
+
   private receive(input: unknown) {
     try {
       const message = record(input, "message");
@@ -254,6 +305,7 @@ class NativeConnectedViviHost implements ConnectedViviHost {
           "The native host protocol or version does not match.",
         );
       }
+
       if (message.bridgeSessionId !== this.bridgeSessionId) {
         throw new NativeHostBridgeError(
           "stale-session",
@@ -376,7 +428,7 @@ class NativeConnectedViviHost implements ConnectedViviHost {
     this.pending.clear();
     this.emit();
     this.listeners.clear();
-    delete window.__viviHostV1Receive;
+    retireConnection(this);
     this.handler.postMessage(this.request("disconnect", {}));
   }
 
@@ -753,4 +805,5 @@ function invalid(path: string, reason: string): never {
 export const nativeHostTesting = {
   parseSnapshot,
   parseCommandResult,
+  resetConnectionRouter,
 };

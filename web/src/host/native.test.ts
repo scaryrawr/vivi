@@ -8,7 +8,7 @@ import {
 
 afterEach(() => {
   delete window.webkit;
-  delete window.__viviHostV1Receive;
+  nativeHostTesting.resetConnectionRouter();
 });
 
 describe("NativeViviHostPort", () => {
@@ -242,6 +242,58 @@ describe("NativeViviHostPort", () => {
       code: "invalid-message",
     });
   });
+
+  it("ignores late responses from a disconnected bridge after reconnect", async () => {
+    const posted: Record<string, unknown>[] = [];
+    window.webkit = {
+      messageHandlers: {
+        viviHostV1: {
+          postMessage: (message) =>
+            posted.push(message as Record<string, unknown>),
+        },
+      },
+    };
+
+    const firstConnecting = new NativeViviHostPort().connect();
+    const firstConnect = posted[0];
+    publishCompleteHandshake(firstConnect);
+    const first = await firstConnecting;
+    const oldPending = first.selectSession(
+      "0c8f9cc7-4767-4cec-92a3-9d7759e89a01" as never,
+    );
+    const oldRequest = posted.at(-1)!;
+    first.disconnect();
+    await expect(oldPending).rejects.toMatchObject({ code: "disconnected" });
+
+    const secondConnecting = new NativeViviHostPort().connect();
+    const secondConnect = posted.at(-1)!;
+    publishCompleteHandshake(secondConnect);
+    const second = await secondConnecting;
+
+    window.__viviHostV1Receive?.({
+      protocol: "vivi.host",
+      version: 1,
+      bridgeSessionId: oldRequest.bridgeSessionId,
+      kind: "response",
+      requestId: oldRequest.requestId,
+      result: { kind: "accepted" },
+    });
+    expect(second.getConnectionState()).toEqual({ kind: "connected" });
+
+    const currentPending = second.selectSession(
+      "0c8f9cc7-4767-4cec-92a3-9d7759e89a01" as never,
+    );
+    const currentRequest = posted.at(-1)!;
+    window.__viviHostV1Receive?.({
+      protocol: "vivi.host",
+      version: 1,
+      bridgeSessionId: currentRequest.bridgeSessionId,
+      kind: "response",
+      requestId: currentRequest.requestId,
+      result: { kind: "accepted" },
+    });
+    await expect(currentPending).resolves.toEqual({ kind: "accepted" });
+  });
 });
 
 describe("native host validation", () => {
@@ -366,4 +418,10 @@ function publishHandshake(
         result: { kind: "accepted" },
       });
   }
+}
+
+function publishCompleteHandshake(connect: Record<string, unknown>) {
+  publishHandshake(connect, "snapshot");
+  publishHandshake(connect, "connection");
+  publishHandshake(connect, "response");
 }
