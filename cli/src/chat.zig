@@ -3433,25 +3433,7 @@ const ChatUi = struct {
                     },
                     else => return err,
                 };
-                self.input.clearRetainingCapacity();
-                switch (activation) {
-                    .execute => {
-                        self.menu_mode = .closed;
-                        self.phase = .running_command;
-                    },
-                    .models => {
-                        self.menu_mode = .loading_models;
-                        self.phase = .running_command;
-                    },
-                    .new_session => {
-                        self.menu_mode = .closed;
-                        self.phase = .starting_new_session;
-                    },
-                    .sessions => {
-                        self.menu_mode = .loading_sessions;
-                        self.phase = .resuming;
-                    },
-                }
+                self.beginCommandActivation(activation);
             },
             .files => {
                 const contents = try self.input.toOwnedContents(self.allocator);
@@ -3509,6 +3491,33 @@ const ChatUi = struct {
                 self.phase = .resuming;
             },
             .closed, .loading_models, .loading_sessions => {},
+        }
+    }
+
+    fn beginCommandActivation(
+        self: *ChatUi,
+        activation: CommandActivation,
+    ) void {
+        switch (activation) {
+            .execute => {
+                self.input.clearRetainingCapacity();
+                self.menu_mode = .closed;
+                self.phase = .running_command;
+            },
+            .models => {
+                self.input.clearRetainingCapacity();
+                self.menu_mode = .loading_models;
+                self.phase = .running_command;
+            },
+            .new_session => {
+                self.menu_mode = .closed;
+                self.phase = .starting_new_session;
+            },
+            .sessions => {
+                self.input.clearRetainingCapacity();
+                self.menu_mode = .loading_sessions;
+                self.phase = .resuming;
+            },
         }
     }
 
@@ -3828,7 +3837,10 @@ const ChatUi = struct {
                                             self.menu_mode = .closed;
                                         }
                                     },
-                                    .start_new_session, .execute => {},
+                                    .start_new_session => {
+                                        try self.syncComposerMenu();
+                                    },
+                                    .execute => {},
                                 }
                             }
                         }
@@ -6611,6 +6623,10 @@ test "new session replaces transcript and commands while preserving cwd" {
     defer ui.deinit();
     try ui.input.insertSliceAtCursor("/new");
     try ui.transcript.append(std.testing.allocator, .user, "old prompt");
+    ui.beginCommandActivation(.new_session);
+    const pending_input = try ui.input.toOwnedContents(std.testing.allocator);
+    defer std.testing.allocator.free(pending_input);
+    try std.testing.expectEqualStrings("/new", pending_input);
 
     const commands = try std.testing.allocator.alloc(backend.CommandInfo, 1);
     commands[0] = .{
@@ -6656,7 +6672,7 @@ test "new session replaces transcript and commands while preserving cwd" {
     try std.testing.expectEqualStrings("fresh transcript", restored);
 }
 
-test "new session failure keeps command retry available" {
+test "typed new session failure keeps input and command retry available" {
     const commands = try std.testing.allocator.alloc(backend.CommandInfo, 1);
     commands[0] = .{
         .key = .{
@@ -6684,13 +6700,20 @@ test "new session failure keeps command retry available" {
     };
     defer ui.deinit();
     try ui.input.insertSliceAtCursor("/new");
+    ui.beginCommandActivation(.new_session);
+    const pending_input = try ui.input.toOwnedContents(std.testing.allocator);
+    defer std.testing.allocator.free(pending_input);
+    try std.testing.expectEqualStrings("/new", pending_input);
 
-    var event: backend.ConversationEvent = .{ .new_session = .{
-        .failed = try backend.OwnedText.init(
-            std.testing.allocator,
-            "Unable to start a new session.",
-        ),
-    } };
+    var event: backend.ConversationEvent = .{
+        .command_completed = .{ .failed = .{
+            .key = commands[0].key,
+            .message = try backend.OwnedText.init(
+                std.testing.allocator,
+                "Unable to start a new session.",
+            ),
+        } },
+    };
     defer event.deinit();
 
     _ = try ui.applyConversationEvent(&event);
@@ -6700,6 +6723,29 @@ test "new session failure keeps command retry available" {
     const input = try ui.input.toOwnedContents(std.testing.allocator);
     defer std.testing.allocator.free(input);
     try std.testing.expectEqualStrings("/new", input);
+}
+
+test "non-new command activations clear input immediately" {
+    var ui: ChatUi = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .input = TextInput.init(std.testing.allocator),
+        .cwd = try std.testing.allocator.dupe(u8, "/current"),
+    };
+    defer ui.deinit();
+
+    const activations = [_]CommandActivation{
+        .execute,
+        .models,
+        .sessions,
+    };
+    for (activations) |activation| {
+        try ui.input.insertSliceAtCursor("/command");
+        ui.beginCommandActivation(activation);
+        const input = try ui.input.toOwnedContents(std.testing.allocator);
+        defer std.testing.allocator.free(input);
+        try std.testing.expectEqualStrings("", input);
+    }
 }
 
 test "empty assistant completion does not create or clear a draft" {
