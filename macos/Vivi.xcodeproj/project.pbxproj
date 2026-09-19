@@ -18,6 +18,12 @@
 		A20000000000000000000009 /* MainWindowControllerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3000000000000000000000C /* MainWindowControllerTests.swift */; };
 		A2000000000000000000000A /* WorkspaceChooser.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3000000000000000000000D /* WorkspaceChooser.swift */; };
 		A2000000000000000000000B /* ComposerAttachments.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3000000000000000000000E /* ComposerAttachments.swift */; };
+		D20000000000000000000001 /* HostWireV1.swift in Sources */ = {isa = PBXBuildFile; fileRef = D30000000000000000000001 /* HostWireV1.swift */; };
+		D20000000000000000000002 /* NativeHostRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = D30000000000000000000002 /* NativeHostRuntime.swift */; };
+		D20000000000000000000003 /* WebHostHarness.swift in Sources */ = {isa = PBXBuildFile; fileRef = D30000000000000000000003 /* WebHostHarness.swift */; };
+		D20000000000000000000004 /* HostWireV1Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D30000000000000000000004 /* HostWireV1Tests.swift */; };
+		D20000000000000000000005 /* NativeHostRuntimeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D30000000000000000000005 /* NativeHostRuntimeTests.swift */; };
+		D20000000000000000000006 /* WebHostHarnessTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D30000000000000000000006 /* WebHostHarnessTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -29,6 +35,13 @@
 			remoteInfo = BuildViviBackend;
 		};
 		A40000000000000000000002 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = A50000000000000000000001 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = A10000000000000000000001;
+			remoteInfo = Vivi;
+		};
+		D40000000000000000000001 /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
 			containerPortal = A50000000000000000000001 /* Project object */;
 			proxyType = 1;
@@ -52,6 +65,13 @@
 		A3000000000000000000000C /* MainWindowControllerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MainWindowControllerTests.swift; sourceTree = "<group>"; };
 		A3000000000000000000000D /* WorkspaceChooser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceChooser.swift; sourceTree = "<group>"; };
 		A3000000000000000000000E /* ComposerAttachments.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ComposerAttachments.swift; sourceTree = "<group>"; };
+		D30000000000000000000001 /* HostWireV1.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HostWireV1.swift; sourceTree = "<group>"; };
+		D30000000000000000000002 /* NativeHostRuntime.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeHostRuntime.swift; sourceTree = "<group>"; };
+		D30000000000000000000003 /* WebHostHarness.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebHostHarness.swift; sourceTree = "<group>"; };
+		D30000000000000000000004 /* HostWireV1Tests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HostWireV1Tests.swift; sourceTree = "<group>"; };
+		D30000000000000000000005 /* NativeHostRuntimeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeHostRuntimeTests.swift; sourceTree = "<group>"; };
+		D30000000000000000000006 /* WebHostHarnessTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebHostHarnessTests.swift; sourceTree = "<group>"; };
+		D30000000000000000000007 /* ViviWebHostTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = ViviWebHostTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -69,6 +89,13 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		D60000000000000000000001 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -77,6 +104,7 @@
 			children = (
 				A70000000000000000000002 /* Vivi */,
 				A70000000000000000000003 /* ViviTests */,
+				D70000000000000000000001 /* ViviWebHostTests */,
 				A70000000000000000000004 /* Config */,
 				A70000000000000000000005 /* Products */,
 			);
@@ -107,6 +135,19 @@
 			path = ViviTests;
 			sourceTree = "<group>";
 		};
+		D70000000000000000000001 /* ViviWebHostTests */ = {
+			isa = PBXGroup;
+			children = (
+				D30000000000000000000001 /* HostWireV1.swift */,
+				D30000000000000000000002 /* NativeHostRuntime.swift */,
+				D30000000000000000000003 /* WebHostHarness.swift */,
+				D30000000000000000000004 /* HostWireV1Tests.swift */,
+				D30000000000000000000005 /* NativeHostRuntimeTests.swift */,
+				D30000000000000000000006 /* WebHostHarnessTests.swift */,
+			);
+			path = ViviWebHostTests;
+			sourceTree = "<group>";
+		};
 		A70000000000000000000004 /* Config */ = {
 			isa = PBXGroup;
 			children = (
@@ -120,6 +161,7 @@
 			children = (
 				A30000000000000000000005 /* Vivi.app */,
 				A30000000000000000000006 /* ViviTests.xctest */,
+				D30000000000000000000007 /* ViviWebHostTests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -163,6 +205,25 @@
 			productReference = A30000000000000000000006 /* ViviTests.xctest */;
 			productType = "com.apple.product-type.bundle.unit-test";
 		};
+		D10000000000000000000001 /* ViviWebHostTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = D80000000000000000000001 /* Build configuration list for PBXNativeTarget "ViviWebHostTests" */;
+			buildPhases = (
+				D90000000000000000000001 /* Sources */,
+				D60000000000000000000001 /* Frameworks */,
+				D90000000000000000000002 /* Resources */,
+				DB0000000000000000000001 /* Build test-only web assets */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				DA0000000000000000000001 /* PBXTargetDependency */,
+			);
+			name = ViviWebHostTests;
+			productName = ViviWebHostTests;
+			productReference = D30000000000000000000007 /* ViviWebHostTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -177,6 +238,10 @@
 						CreatedOnToolsVersion = 26.6;
 					};
 					A10000000000000000000002 = {
+						CreatedOnToolsVersion = 26.6;
+						TestTargetID = A10000000000000000000001;
+					};
+					D10000000000000000000001 = {
 						CreatedOnToolsVersion = 26.6;
 						TestTargetID = A10000000000000000000001;
 					};
@@ -198,6 +263,7 @@
 				A10000000000000000000003 /* BuildViviBackend */,
 				A10000000000000000000001 /* Vivi */,
 				A10000000000000000000002 /* ViviTests */,
+				D10000000000000000000001 /* ViviWebHostTests */,
 			);
 		};
 /* End PBXProject section */
@@ -211,6 +277,13 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 		A90000000000000000000004 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		D90000000000000000000002 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -240,6 +313,26 @@
 			shellPath = /bin/sh;
 			shellScript = "\"$SRCROOT/../scripts/build-zig-for-xcode.sh\"\n";
 		};
+		DB0000000000000000000001 /* Build test-only web assets */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Build test-only web assets";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/ViviWebAssets/asset-manifest.json",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "\"$SRCROOT/../scripts/build-web-host-assets.sh\"\n";
+		};
 /* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
@@ -268,6 +361,19 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		D90000000000000000000001 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				D20000000000000000000001 /* HostWireV1.swift in Sources */,
+				D20000000000000000000002 /* NativeHostRuntime.swift in Sources */,
+				D20000000000000000000003 /* WebHostHarness.swift in Sources */,
+				D20000000000000000000004 /* HostWireV1Tests.swift in Sources */,
+				D20000000000000000000005 /* NativeHostRuntimeTests.swift in Sources */,
+				D20000000000000000000006 /* WebHostHarnessTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
@@ -280,6 +386,11 @@
 			isa = PBXTargetDependency;
 			target = A10000000000000000000001 /* Vivi */;
 			targetProxy = A40000000000000000000002 /* PBXContainerItemProxy */;
+		};
+		DA0000000000000000000001 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = A10000000000000000000001 /* Vivi */;
+			targetProxy = D40000000000000000000001 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -402,6 +513,38 @@
 			};
 			name = Release;
 		};
+		DC0000000000000000000001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = A30000000000000000000007 /* Base.xcconfig */;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				GENERATE_INFOPLIST_FILE = YES;
+				OTHER_LDFLAGS = "";
+				PRODUCT_BUNDLE_IDENTIFIER = com.scaryrawr.vivi.web-host-tests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SKIP_INSTALL = YES;
+				SWIFT_VERSION = 6.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Vivi.app/Contents/MacOS/Vivi";
+			};
+			name = Debug;
+		};
+		DC0000000000000000000002 /* Release */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = A30000000000000000000007 /* Base.xcconfig */;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				GENERATE_INFOPLIST_FILE = YES;
+				OTHER_LDFLAGS = "";
+				PRODUCT_BUNDLE_IDENTIFIER = com.scaryrawr.vivi.web-host-tests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SKIP_INSTALL = YES;
+				SWIFT_VERSION = 6.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Vivi.app/Contents/MacOS/Vivi";
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -437,6 +580,15 @@
 			buildConfigurations = (
 				AC0000000000000000000007 /* Debug */,
 				AC0000000000000000000008 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		D80000000000000000000001 /* Build configuration list for PBXNativeTarget "ViviWebHostTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				DC0000000000000000000001 /* Debug */,
+				DC0000000000000000000002 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

@@ -242,9 +242,12 @@ x64/ARM64 DLLs without claiming that those GUI applications exist yet.
 
 ## Web presentation foundation
 
-`web/` contains the browser-testable React, TypeScript, and Vite presentation
-foundation for a future native webview host. It currently runs only against a
-deterministic in-browser host and does not change the shipping macOS window.
+`web/` contains the browser-testable React, TypeScript, and Vite presentation.
+The shared Xcode scheme also builds a production Vite entry into a dedicated
+`SKIP_INSTALL` `ViviWebHostTests.xctest` bundle. The local-only WKWebView,
+typed V1 bridge, and generated asset manifest are test sources/resources; they
+are not compiled or copied into `Vivi.app`, and the shipping SwiftUI window
+path remains unchanged.
 
 ```sh
 cd web

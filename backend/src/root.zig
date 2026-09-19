@@ -1624,28 +1624,24 @@ fn projectTranscriptSnapshot(
         for (items.items) |*item| item.deinit();
         items.deinit(allocator);
     }
-    try items.ensureTotalCapacity(allocator, history.events.len);
     for (history.events) |event| switch (event) {
-        .user_message => |message| items.appendAssumeCapacity(
-            try conversation.TranscriptItem.init(
-                allocator,
-                .user,
-                message.data.content,
-            ),
+        .user_message => |message| try appendTranscriptSnapshotItem(
+            allocator,
+            &items,
+            .user,
+            message.data.content,
         ),
-        .assistant_message => |message| items.appendAssumeCapacity(
-            try conversation.TranscriptItem.init(
-                allocator,
-                .assistant,
-                message.content,
-            ),
+        .assistant_message => |message| try appendAssistantSnapshotItems(
+            allocator,
+            &items,
+            message.reasoning_text,
+            message.content,
         ),
-        .assistant_reasoning => |reasoning| items.appendAssumeCapacity(
-            try conversation.TranscriptItem.init(
-                allocator,
-                .reasoning,
-                reasoning.content,
-            ),
+        .assistant_reasoning => |reasoning| try appendTranscriptSnapshotItem(
+            allocator,
+            &items,
+            .reasoning,
+            reasoning.content,
         ),
         else => {},
     };
@@ -1653,6 +1649,39 @@ fn projectTranscriptSnapshot(
         .allocator = allocator,
         .items = try items.toOwnedSlice(allocator),
     };
+}
+
+fn appendTranscriptSnapshotItem(
+    allocator: std.mem.Allocator,
+    items: *std.ArrayList(conversation.TranscriptItem),
+    role: conversation.TranscriptRole,
+    text: []const u8,
+) !void {
+    var item = try conversation.TranscriptItem.init(allocator, role, text);
+    errdefer item.deinit();
+    try items.append(allocator, item);
+}
+
+fn appendAssistantSnapshotItems(
+    allocator: std.mem.Allocator,
+    items: *std.ArrayList(conversation.TranscriptItem),
+    reasoning: ?[]const u8,
+    content: []const u8,
+) !void {
+    if (reasoning) |text| {
+        try appendTranscriptSnapshotItem(
+            allocator,
+            items,
+            .reasoning,
+            text,
+        );
+    }
+    try appendTranscriptSnapshotItem(
+        allocator,
+        items,
+        .assistant,
+        content,
+    );
 }
 
 fn projectTranscriptSnapshotFromRawHistory(
@@ -1682,21 +1711,38 @@ fn projectTranscriptSnapshotFromRawHistory(
             .string => |value| value,
             else => continue,
         };
-        const role: conversation.TranscriptRole = if (std.mem.eql(
-            u8,
-            event_type,
-            "user.message",
-        ))
-            .user
-        else if (std.mem.eql(u8, event_type, "assistant.message"))
-            .assistant
-        else if (std.mem.eql(u8, event_type, "assistant.reasoning"))
-            .reasoning
-        else
-            continue;
-        items.appendAssumeCapacity(
-            try conversation.TranscriptItem.init(allocator, role, content),
-        );
+        if (std.mem.eql(u8, event_type, "assistant.message")) {
+            const reasoning: ?[]const u8 = if (data.get("reasoningText")) |value|
+                switch (value) {
+                    .string => |text| text,
+                    else => null,
+                }
+            else
+                null;
+            try appendAssistantSnapshotItems(
+                allocator,
+                &items,
+                reasoning,
+                content,
+            );
+        } else {
+            const role: conversation.TranscriptRole = if (std.mem.eql(
+                u8,
+                event_type,
+                "user.message",
+            ))
+                .user
+            else if (std.mem.eql(u8, event_type, "assistant.reasoning"))
+                .reasoning
+            else
+                continue;
+            try appendTranscriptSnapshotItem(
+                allocator,
+                &items,
+                role,
+                content,
+            );
+        }
     }
     return .{
         .allocator = allocator,
@@ -1733,7 +1779,7 @@ test "raw history projection ignores malformed events" {
     const parsed = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
-        \\{"events":[{"type":"user.message","data":{"content":"question"}},{"type":"assistant.message","data":{"content":"answer"}},{"type":"assistant.message","data":{"missing":"content"}},{"type":"tool.execution_start","data":{"toolName":"read"}}]}
+        \\{"events":[{"type":"user.message","data":{"content":"question"}},{"type":"assistant.message","data":{"content":"","reasoningText":"before tool","toolRequests":[{"toolCallId":"call-1","name":"read"}]}},{"type":"tool.execution_start","data":{"toolCallId":"call-1","toolName":"read"}},{"type":"tool.execution_complete","data":{"toolCallId":"call-1","success":true}},{"type":"assistant.message","data":{"content":"answer","reasoningText":"after tool","toolRequests":[]}},{"type":"assistant.message","data":{"missing":"content","reasoningText":"ignored"}},{"type":"tool.execution_start","data":{"toolName":"read"}}]}
     ,
         .{},
     );
@@ -1744,11 +1790,17 @@ test "raw history projection ignores malformed events" {
         events,
     );
     defer snapshot.deinit();
-    try std.testing.expectEqual(@as(usize, 2), snapshot.items.len);
+    try std.testing.expectEqual(@as(usize, 5), snapshot.items.len);
     try std.testing.expectEqual(.user, snapshot.items[0].role);
     try std.testing.expectEqualStrings("question", snapshot.items[0].text);
-    try std.testing.expectEqual(.assistant, snapshot.items[1].role);
-    try std.testing.expectEqualStrings("answer", snapshot.items[1].text);
+    try std.testing.expectEqual(.reasoning, snapshot.items[1].role);
+    try std.testing.expectEqualStrings("before tool", snapshot.items[1].text);
+    try std.testing.expectEqual(.assistant, snapshot.items[2].role);
+    try std.testing.expectEqualStrings("", snapshot.items[2].text);
+    try std.testing.expectEqual(.reasoning, snapshot.items[3].role);
+    try std.testing.expectEqualStrings("after tool", snapshot.items[3].text);
+    try std.testing.expectEqual(.assistant, snapshot.items[4].role);
+    try std.testing.expectEqualStrings("answer", snapshot.items[4].text);
 }
 
 test "broader resume canonicalizes SDK session titles" {
