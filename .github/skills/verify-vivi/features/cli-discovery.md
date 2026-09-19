@@ -43,7 +43,7 @@ Preconditions:
   `.github/skills/verify-vivi/bin/verify-vivi chat-implicit <run-id>`.
   It launches `./zig-out/bin/vivi --model <first catalogued copilot
   model>`, asserts the `VIVI_IMPLICIT_OK` response streams, the chosen
-  model id appears in the status bar, and Ctrl-C exits cleanly.
+  model display name appears in the status bar, and Ctrl-C exits cleanly.
 - **Proof.** Retain `help.stdout`, `help.stderr`, `version.stdout`,
   `version.stderr`, `models.stdout`, `models.stderr`, and
   `cli-discovery.assertions.txt` under the run directory. For the

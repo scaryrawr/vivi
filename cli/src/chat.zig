@@ -5139,14 +5139,10 @@ const App = struct {
     }
 
     fn deinit(self: *App) void {
-        // Ask the vaxis input loop to quit and wake its blocked tty read by
-        // raising SIGWINCH: Loop.stop() alone wakes the read with a DSR
-        // round-trip and hangs forever when no terminal emulator answers
-        // (for example a piped test harness). The WINCH handler is installed
-        // without SA_RESTART, so the read returns EINTR and the join lands.
         self.loop.should_quit = true;
-        if (@import("builtin").os.tag != .windows) {
-            std.posix.raise(.WINCH) catch {};
+        if (self.loop.thread) |*thread| {
+            thread.cancel(self.io);
+            self.loop.thread = null;
         }
         self.file_picker.deinit();
         self.conversation.deinit();
@@ -5154,7 +5150,6 @@ const App = struct {
         self.render_memory.deinit(self.vx.window());
         self.ui.deinit();
         self.terminal_title.deinit();
-        self.loop.stop();
         self.vx.deinit(self.allocator, self.tty.writer());
         self.tty.deinit();
         self.* = undefined;

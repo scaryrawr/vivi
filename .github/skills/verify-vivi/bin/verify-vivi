@@ -292,9 +292,7 @@ Type "Return the uppercase spelling of $prompt_word and nothing else."
 Enter
 Sleep 45s
 Ctrl+C
-Sleep 3s
-Ctrl+C
-Sleep 1s
+Sleep 4s
 EOF
 }
 
@@ -315,26 +313,47 @@ streaming_drive() {
     (cd "$repo_root" && "$vhs_command" "$run_dir/$capture.tape")
     extract_frames "$run_id" "$capture"
 
+    input_fifo="$run_dir/$capture.input"
+    rm -f "$input_fifo"
+    mkfifo "$input_fifo"
+    cat "$input_fifo" | script -q "$run_dir/$capture.terminal.log" sh -c \
+        "stty cols 100 rows 30; $pty_launch" &
+    pty_pid=$!
+    printf '%s\n' "$pty_pid" >"$run_dir/pty.pid"
+    trap 'kill "$pty_pid" 2>/dev/null || true; wait "$pty_pid" 2>/dev/null || true; rm -f "$input_fifo"' EXIT INT TERM
+
+    exec 3>"$input_fifo"
     (
         sleep 3
-        printf 'Return the uppercase spelling of %s and nothing else.\r' "$prompt_word"
+        printf 'Return the uppercase spelling of %s and nothing else.\r' "$prompt_word" >&3
         # Wait for the streamed answer instead of a blind sleep; Copilot
         # latency varies and Ctrl-C before the answer loses the evidence.
         i=0
         while test "$i" -lt 90; do
             sleep 1
+            kill -0 "$pty_pid" 2>/dev/null || exit 1
             grep -a -q "$expected_response" "$run_dir/$capture.terminal.log" && break
             i=$((i + 1))
         done
         sleep 2
-        printf '\003'
-        sleep 3
-        printf '\003'
-    ) | script -q "$run_dir/$capture.terminal.log" sh -c \
-        "stty cols 100 rows 30; $pty_launch" &
-    pty_pid=$!
-    printf '%s\n' "$pty_pid" >"$run_dir/pty.pid"
-    trap 'kill "$pty_pid" 2>/dev/null || true; wait "$pty_pid" 2>/dev/null || true' EXIT INT TERM
+        printf '\003' >&3
+    ) &
+    writer_pid=$!
+
+    wait "$writer_pid"
+    i=0
+    while kill -0 "$pty_pid" 2>/dev/null && test "$i" -lt 15; do
+        sleep 1
+        i=$((i + 1))
+    done
+    if kill -0 "$pty_pid" 2>/dev/null; then
+        kill "$pty_pid"
+        exec 3>&-
+        rm -f "$input_fifo"
+        printf 'vivi did not exit after one Ctrl-C\n' >&2
+        return 1
+    fi
+    exec 3>&-
 
     if wait "$pty_pid"; then
         status=0
@@ -342,6 +361,7 @@ streaming_drive() {
         status=$?
     fi
     rm -f "$run_dir/pty.pid"
+    rm -f "$input_fifo"
     trap - EXIT INT TERM
 
     perl -0pe \
@@ -424,6 +444,7 @@ chat_default() {
 }
 
 chat_implicit() {
+    build_vivi
     model_line=$("$binary" models |
         grep -v -E '^copilot/(default|auto)	' |
         grep -m 1 '^copilot/' || true)
@@ -437,7 +458,7 @@ chat_implicit() {
     streaming_drive "$1" chat-implicit vivi_implicit_ok --model "$model"
     # The status bar must show the model selected through the implicit flag
     # (vivi renders the catalog display name, not the catalog id).
-    grep -qF -- "$display" "$artifact_root/$1/chat-implicit.normalized.txt"
+    grep -a -qF -- "$display" "$artifact_root/$1/chat-implicit.terminal.log"
 }
 
 prepare_attachment_clipboard() {
