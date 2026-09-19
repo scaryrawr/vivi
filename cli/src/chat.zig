@@ -2622,6 +2622,7 @@ const ChatUi = struct {
     sessions: ?backend.SessionCatalog = null,
     pending_user_input: ?backend.UserInputRequest = null,
     saved_input: ?TextInput = null,
+    command_ui_owner: ?backend.CommandKey = null,
     selected_user_input_choice: usize = 0,
     invalid_user_input: bool = false,
     menu_mode: MenuMode = .closed,
@@ -2857,6 +2858,7 @@ const ChatUi = struct {
                 error.Busy => return,
                 else => return err,
             };
+            self.command_ui_owner = null;
             self.phase = .loading_commands;
         }
     }
@@ -2883,6 +2885,11 @@ const ChatUi = struct {
             },
         };
         try self.transcript.append(self.allocator, if (delivery == .enqueue) .queued else .user, text);
+        self.beginPromptResponse();
+    }
+
+    fn beginPromptResponse(self: *ChatUi) void {
+        self.command_ui_owner = null;
         self.input.clearRetainingCapacity();
         self.phase = .responding;
         self.followTail();
@@ -3433,7 +3440,7 @@ const ChatUi = struct {
                     },
                     else => return err,
                 };
-                self.beginCommandActivation(activation);
+                self.beginCommandActivation(command.key, activation);
             },
             .files => {
                 const contents = try self.input.toOwnedContents(self.allocator);
@@ -3475,9 +3482,7 @@ const ChatUi = struct {
                     error.Busy => return,
                     else => return err,
                 };
-                self.input.clearRetainingCapacity();
-                self.menu_mode = .closed;
-                self.phase = .switching;
+                self.beginModelSwitch();
             },
             .sessions => {
                 const catalog = self.sessions orelse return;
@@ -3486,18 +3491,32 @@ const ChatUi = struct {
                     error.Busy => return,
                     else => return err,
                 };
-                self.input.clearRetainingCapacity();
-                self.menu_mode = .closed;
-                self.phase = .resuming;
+                self.beginSessionResume();
             },
             .closed, .loading_models, .loading_sessions => {},
         }
     }
 
+    fn beginModelSwitch(self: *ChatUi) void {
+        self.command_ui_owner = null;
+        self.input.clearRetainingCapacity();
+        self.menu_mode = .closed;
+        self.phase = .switching;
+    }
+
+    fn beginSessionResume(self: *ChatUi) void {
+        self.command_ui_owner = null;
+        self.input.clearRetainingCapacity();
+        self.menu_mode = .closed;
+        self.phase = .resuming;
+    }
+
     fn beginCommandActivation(
         self: *ChatUi,
+        key: backend.CommandKey,
         activation: CommandActivation,
     ) void {
+        self.command_ui_owner = key;
         switch (activation) {
             .execute => {
                 self.input.clearRetainingCapacity();
@@ -3521,14 +3540,18 @@ const ChatUi = struct {
         }
     }
 
-    fn completeCommandPhase(self: *ChatUi) bool {
+    fn completeCommandPhase(
+        self: *ChatUi,
+        key: backend.CommandKey,
+    ) bool {
+        const owner = self.command_ui_owner orelse return false;
+        if (!std.meta.eql(owner, key)) return false;
+        self.command_ui_owner = null;
         switch (self.phase) {
-            .running_command, .starting_new_session, .resuming => {
-                self.phase = .ready;
-                return true;
-            },
-            else => return false,
+            .stopping => {},
+            else => self.phase = .ready,
         }
+        return true;
     }
 
     fn applyConversationEvent(
@@ -3827,7 +3850,10 @@ const ChatUi = struct {
                 self.followTail();
             },
             .command_completed => |result| {
-                const owns_ui = self.completeCommandPhase();
+                const key = switch (result) {
+                    inline else => |outcome| outcome.key,
+                };
+                const owns_ui = self.completeCommandPhase(key);
                 const message = switch (result) {
                     .completed => |outcome| if (outcome.message) |text|
                         text.bytes
@@ -6639,17 +6665,18 @@ test "new session replaces transcript and commands while preserving cwd" {
     defer ui.deinit();
     try ui.input.insertSliceAtCursor("/new");
     try ui.transcript.append(std.testing.allocator, .user, "old prompt");
-    ui.beginCommandActivation(.new_session);
+    const key: backend.CommandKey = .{
+        .generation = @enumFromInt(1),
+        .slot = @enumFromInt(1),
+    };
+    ui.beginCommandActivation(key, .new_session);
     const pending_input = try ui.input.toOwnedContents(std.testing.allocator);
     defer std.testing.allocator.free(pending_input);
     try std.testing.expectEqualStrings("/new", pending_input);
 
     const commands = try std.testing.allocator.alloc(backend.CommandInfo, 1);
     commands[0] = .{
-        .key = .{
-            .generation = @enumFromInt(1),
-            .slot = @enumFromInt(1),
-        },
+        .key = key,
         .name = try std.testing.allocator.dupe(u8, "new"),
         .display_name = try std.testing.allocator.dupe(u8, "new"),
         .description = try std.testing.allocator.dupe(u8, "Start fresh"),
@@ -6716,7 +6743,7 @@ test "typed new session failure keeps input and command retry available" {
     };
     defer ui.deinit();
     try ui.input.insertSliceAtCursor("/new");
-    ui.beginCommandActivation(.new_session);
+    ui.beginCommandActivation(commands[0].key, .new_session);
     const pending_input = try ui.input.toOwnedContents(std.testing.allocator);
     defer std.testing.allocator.free(pending_input);
     try std.testing.expectEqualStrings("/new", pending_input);
@@ -6757,7 +6784,10 @@ test "non-new command activations clear input immediately" {
     };
     for (activations) |activation| {
         try ui.input.insertSliceAtCursor("/command");
-        ui.beginCommandActivation(activation);
+        ui.beginCommandActivation(.{
+            .generation = @enumFromInt(1),
+            .slot = @enumFromInt(1),
+        }, activation);
         const input = try ui.input.toOwnedContents(std.testing.allocator);
         defer std.testing.allocator.free(input);
         try std.testing.expectEqualStrings("", input);
@@ -9202,8 +9232,7 @@ test "failed injected commands close their loading menus" {
         .commands = commands,
     };
 
-    ui.phase = .running_command;
-    ui.menu_mode = .loading_models;
+    ui.beginCommandActivation(commands[0].key, .models);
     var model_failure: backend.ConversationEvent = .{
         .command_completed = .{ .failed = .{
             .key = commands[0].key,
@@ -9218,8 +9247,7 @@ test "failed injected commands close their loading menus" {
     try std.testing.expectEqual(UiPhase.ready, ui.phase);
     try std.testing.expectEqual(MenuMode.closed, ui.menu_mode);
 
-    ui.phase = .resuming;
-    ui.menu_mode = .loading_sessions;
+    ui.beginCommandActivation(commands[1].key, .sessions);
     var resume_failure: backend.ConversationEvent = .{
         .command_completed = .{ .failed = .{
             .key = commands[1].key,
@@ -9264,8 +9292,8 @@ test "command terminals preserve a newer responding prompt phase" {
         .allocator = std.testing.allocator,
         .commands = commands,
     };
-    ui.phase = .responding;
-    ui.menu_mode = .closed;
+    ui.beginCommandActivation(key, .execute);
+    ui.beginPromptResponse();
 
     var completed: backend.ConversationEvent = .{
         .command_completed = .{ .completed = .{
@@ -9293,6 +9321,87 @@ test "command terminals preserve a newer responding prompt phase" {
     defer failed.deinit();
     _ = try ui.applyConversationEvent(&failed);
     try std.testing.expectEqual(UiPhase.responding, ui.phase);
+    try std.testing.expectEqual(MenuMode.closed, ui.menu_mode);
+}
+
+test "late resume command terminal preserves selected session resume" {
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    var ui = try ChatUi.init(
+        std.testing.allocator,
+        std.testing.io,
+        &environment,
+    );
+    defer ui.deinit();
+
+    const key: backend.CommandKey = .{
+        .generation = @enumFromInt(1),
+        .slot = @enumFromInt(1),
+    };
+    const commands = try std.testing.allocator.alloc(backend.CommandInfo, 1);
+    commands[0] = .{
+        .key = key,
+        .name = try std.testing.allocator.dupe(u8, "resume"),
+        .display_name = try std.testing.allocator.dupe(u8, "resume"),
+        .description = try std.testing.allocator.dupe(u8, "Resume a session"),
+        .hint = null,
+        .source = .vivi,
+        .action = .open_session_history,
+        .argument_policy = .none,
+    };
+    ui.commands = .{
+        .allocator = std.testing.allocator,
+        .commands = commands,
+    };
+    ui.beginCommandActivation(key, .sessions);
+
+    var catalog: backend.ConversationEvent = .{
+        .session_catalog = .{
+            .allocator = std.testing.allocator,
+            .sessions = try std.testing.allocator.alloc(
+                backend.SessionSummary,
+                0,
+            ),
+        },
+    };
+    defer catalog.deinit();
+    _ = try ui.applyConversationEvent(&catalog);
+    try std.testing.expectEqual(UiPhase.ready, ui.phase);
+    try std.testing.expectEqual(MenuMode.sessions, ui.menu_mode);
+
+    ui.beginSessionResume();
+    try std.testing.expectEqual(UiPhase.resuming, ui.phase);
+    try std.testing.expectEqual(MenuMode.closed, ui.menu_mode);
+
+    var terminal: backend.ConversationEvent = .{
+        .command_completed = .{ .completed = .{
+            .key = key,
+            .message = try backend.OwnedText.init(
+                std.testing.allocator,
+                "Session picker opened.",
+            ),
+        } },
+    };
+    defer terminal.deinit();
+    _ = try ui.applyConversationEvent(&terminal);
+    try std.testing.expectEqual(UiPhase.resuming, ui.phase);
+    try std.testing.expectEqual(MenuMode.closed, ui.menu_mode);
+
+    ui.beginCommandActivation(key, .sessions);
+    _ = try ui.applyConversationEvent(&catalog);
+    ui.beginSessionResume();
+    var failed_terminal: backend.ConversationEvent = .{
+        .command_completed = .{ .failed = .{
+            .key = key,
+            .message = try backend.OwnedText.init(
+                std.testing.allocator,
+                "Session picker failed.",
+            ),
+        } },
+    };
+    defer failed_terminal.deinit();
+    _ = try ui.applyConversationEvent(&failed_terminal);
+    try std.testing.expectEqual(UiPhase.resuming, ui.phase);
     try std.testing.expectEqual(MenuMode.closed, ui.menu_mode);
 }
 
