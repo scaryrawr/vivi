@@ -62,6 +62,98 @@ final class ViviBackendRuntimeTests: XCTestCase {
       [.status(id: store.transcript[0].id, text: "Chat is busy.")])
   }
 
+  func testNewCommandCreatesConversationWithoutSubmittingPrompt() {
+    let driver = FakeConversationDriver()
+    var requestedWorkspace: WorkspaceIdentity?
+    let store = NativeChatStore(
+      workspace: "/tmp/work",
+      driver: driver,
+      requestNewConversation: { workspace in
+        requestedWorkspace = workspace
+        return true
+      })
+
+    store.reduce(.ready)
+    store.reduce(.modelCatalog(testCatalog()))
+    store.draft = " /NEW "
+    store.submit()
+
+    XCTAssertEqual(requestedWorkspace?.canonicalPath, "/tmp/work")
+    XCTAssertTrue(driver.submittedPrompts.isEmpty)
+    XCTAssertTrue(store.draft.isEmpty)
+    XCTAssertTrue(store.transcript.isEmpty)
+  }
+
+  func testRejectedNewCommandPreservesDraft() {
+    let driver = FakeConversationDriver()
+    let store = NativeChatStore(
+      workspace: "/tmp/work",
+      driver: driver,
+      requestNewConversation: { _ in false })
+
+    store.reduce(.ready)
+    store.reduce(.modelCatalog(testCatalog()))
+    store.draft = "/new"
+    store.submit()
+
+    XCTAssertTrue(driver.submittedPrompts.isEmpty)
+    XCTAssertEqual(store.draft, "/new")
+    XCTAssertTrue(store.transcript.isEmpty)
+  }
+
+  func testNewCommandWithArgumentsUsesNormalSubmission() {
+    let driver = FakeConversationDriver()
+    var requestCount = 0
+    let store = NativeChatStore(
+      workspace: "/tmp/work",
+      driver: driver,
+      requestNewConversation: { _ in
+        requestCount += 1
+        return true
+      })
+
+    store.reduce(.ready)
+    store.reduce(.modelCatalog(testCatalog()))
+    store.draft = "/new extra"
+    store.submit()
+
+    XCTAssertEqual(requestCount, 0)
+    XCTAssertEqual(driver.submittedPrompts, ["/new extra"])
+    XCTAssertEqual(driver.submittedAttachments, [[]])
+    XCTAssertTrue(store.draft.isEmpty)
+    XCTAssertEqual(store.transcript.first?.text, "/new extra")
+    XCTAssertEqual(store.lifecycle, .responding)
+  }
+
+  func testNewCommandWithAttachmentUsesNormalSubmission() async {
+    let driver = FakeConversationDriver()
+    let attachment = testAttachment(name: "context.png")
+    let acquirer = FakeAttachmentAcquirer(pasted: attachment)
+    var requestCount = 0
+    let store = NativeChatStore(
+      workspace: "/tmp/work",
+      driver: driver,
+      attachmentAcquirer: acquirer,
+      requestNewConversation: { _ in
+        requestCount += 1
+        return true
+      })
+
+    store.reduce(.ready)
+    store.reduce(.modelCatalog(testCatalog()))
+    store.draft = "/new"
+    store.pasteAttachment()
+    await store.waitForAttachmentAcquisition()
+    store.submit()
+
+    XCTAssertEqual(requestCount, 0)
+    XCTAssertEqual(driver.submittedPrompts, ["/new"])
+    XCTAssertEqual(driver.submittedAttachments, [[attachment]])
+    XCTAssertTrue(store.draft.isEmpty)
+    XCTAssertTrue(store.attachments.isEmpty)
+    XCTAssertEqual(store.lifecycle, .responding)
+  }
+
   func testAttachmentOnlySubmitClearsSelectionAfterAcceptance() async {
     let driver = FakeConversationDriver()
     let attachment = testAttachment(name: "diagram.png")
