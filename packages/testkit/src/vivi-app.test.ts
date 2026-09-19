@@ -18,7 +18,7 @@ test("streams one response and stops through ViviApp", async () => {
   });
 });
 
-test("preserves a partial response and closes the port once", async () => {
+test("preserves a partial response during reentrant shutdown", async () => {
   let releaseResponse: (() => void) | undefined;
   let responseStarted: (() => void) | undefined;
   const started = new Promise<void>((resolve) => {
@@ -43,8 +43,14 @@ test("preserves a partial response and closes the port once", async () => {
   const app = createViviApp(port);
   const response = app.dispatch({ type: "submit-prompt", text: "greet" });
   await started;
+  let reentrantClose: Promise<void> | undefined;
+  app.subscribe((state) => {
+    if (state.phase === "shutting-down") reentrantClose = app.close();
+  });
 
   await Promise.all([app.close(), app.close()]);
+  expect(reentrantClose).toBeDefined();
+  await reentrantClose;
   await response;
 
   expect(closeCalls).toBe(1);

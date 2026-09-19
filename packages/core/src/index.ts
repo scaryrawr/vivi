@@ -145,17 +145,23 @@ export function createViviApp(port: CopilotPort): ViviApp {
   const stopPort = (): Promise<void> => {
     if (closePromise) return closePromise;
 
+    let beginClose!: () => void;
+    const closeGate = new Promise<void>((resolve) => {
+      beginClose = resolve;
+    });
+    closePromise = (async () => {
+      await closeGate;
+      await port.close();
+      publish({ type: "shutdown-completed" });
+    })();
+
     const messages =
       current.phase === "responding"
         ? [...current.messages, current.assistantMessage]
         : current.messages;
     current = { phase: "shutting-down", messages };
     for (const listener of listeners) listener(current);
-
-    closePromise = (async () => {
-      await port.close();
-      publish({ type: "shutdown-completed" });
-    })();
+    beginClose();
     return closePromise;
   };
 
