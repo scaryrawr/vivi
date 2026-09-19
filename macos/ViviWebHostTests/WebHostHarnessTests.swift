@@ -3,6 +3,34 @@ import XCTest
 
 @MainActor
 final class WebHostHarnessTests: XCTestCase {
+  func testScriptMessagesRemainFIFOWhileEarlierDeliveryIsSuspended() async {
+    let queue = OrderedMainActorTaskQueue()
+    var events: [Int] = []
+    var releaseFirst: CheckedContinuation<Void, Never>?
+
+    queue.enqueue {
+      await withCheckedContinuation { continuation in
+        releaseFirst = continuation
+      }
+      events.append(1)
+    }
+    queue.enqueue {
+      events.append(2)
+    }
+
+    while releaseFirst == nil {
+      await Task.yield()
+    }
+    await Task.yield()
+    XCTAssertEqual(events, [])
+
+    releaseFirst?.resume()
+    for _ in 0..<20 where events.count < 2 {
+      await Task.yield()
+    }
+    XCTAssertEqual(events, [1, 2])
+  }
+
   func testScriptMessagePolicyRejectsWrongHandlerOriginAndFrame() {
     assertPolicyRejection(context(name: "other"), equals: .wrongHandler)
     assertPolicyRejection(context(isMainFrame: false), equals: .nonMainFrame)

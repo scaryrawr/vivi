@@ -43,6 +43,7 @@ final class WebHostHarness: NSObject {
   private let runtime: NativeHostRuntime
   private let resourceBundle: Bundle
   private var assetSchemeHandler: LocalAssetSchemeHandler?
+  private var scriptMessageHandler: WeakScriptMessageHandler?
   private(set) var bridgeSessionID: UUID?
   private var loadContinuation: CheckedContinuation<Void, Error>?
   private var isRunning = false
@@ -72,7 +73,9 @@ final class WebHostHarness: NSObject {
     let controller = WKUserContentController()
     let rule = try await compileNetworkDenyRule()
     controller.add(rule)
-    controller.add(WeakScriptMessageHandler(owner: self), name: Self.handlerName)
+    let scriptMessageHandler = WeakScriptMessageHandler(owner: self)
+    controller.add(scriptMessageHandler, name: Self.handlerName)
+    self.scriptMessageHandler = scriptMessageHandler
     hasInstalledScriptHandlers = true
     configuration.userContentController = controller
     let assetSchemeHandler = LocalAssetSchemeHandler(assets: assets)
@@ -105,6 +108,8 @@ final class WebHostHarness: NSObject {
     guard let webView else { return }
     webView.stopLoading()
     webView.configuration.userContentController.removeAllScriptMessageHandlers()
+    scriptMessageHandler?.invalidate()
+    scriptMessageHandler = nil
     hasInstalledScriptHandlers = false
     webView.configuration.userContentController.removeAllContentRuleLists()
     webView.navigationDelegate = nil
@@ -293,7 +298,45 @@ final class WebHostHarness: NSObject {
   }
 }
 
+final class OrderedMainActorTaskQueue: @unchecked Sendable {
+  private let lock = NSLock()
+  private var generation = 0
+  private var tail: Task<Void, Never>?
+
+  func enqueue(_ operation: @escaping @MainActor @Sendable () async -> Void) {
+    lock.lock()
+    let previous = tail
+    let generation = generation
+    let task = Task { @MainActor [weak self] in
+      await previous?.value
+      guard self?.isCurrent(generation) == true else { return }
+      await operation()
+    }
+    tail = task
+    lock.unlock()
+  }
+
+  func invalidate() {
+    lock.lock()
+    generation += 1
+    tail?.cancel()
+    tail = nil
+    lock.unlock()
+  }
+
+  private func isCurrent(_ candidate: Int) -> Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return candidate == generation
+  }
+}
+
 private final class WeakScriptMessageHandler: NSObject, WKScriptMessageHandler {
+  private struct Message: @unchecked Sendable {
+    let value: WKScriptMessage
+  }
+
+  private let queue = OrderedMainActorTaskQueue()
   weak var owner: WebHostHarness?
 
   init(owner: WebHostHarness) {
@@ -304,9 +347,15 @@ private final class WeakScriptMessageHandler: NSObject, WKScriptMessageHandler {
     _ userContentController: WKUserContentController,
     didReceive message: WKScriptMessage
   ) {
-    Task { @MainActor [weak owner] in
-      await owner?.receive(message)
+    let message = Message(value: message)
+    queue.enqueue { @MainActor [weak owner] in
+      await owner?.receive(message.value)
     }
+  }
+
+  func invalidate() {
+    owner = nil
+    queue.invalidate()
   }
 }
 
