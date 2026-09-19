@@ -7,7 +7,7 @@
   ],
   "scripts": {
     "boundary-check": "bun scripts/check-boundaries.ts",
-    "typecheck": "tsc -b",
+    "typecheck": "tsc -b && tsc -p scripts/tsconfig.json",
     "test": "bun test",
     "probe:runtime": "bun scripts/runtime-probe.ts",
     "check": "bun run boundary-check && bun run typecheck && bun run test"
