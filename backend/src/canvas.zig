@@ -3317,6 +3317,7 @@ test "shutdown publication failure preserves opened and closing renderers" {
 
 const ReentrantPublisher = struct {
     domain: *Domain,
+    entry_point: enum { record, apply_registry } = .record,
     reentrant_error: ?anyerror = null,
 
     fn publisher(self: *ReentrantPublisher) EffectPublisher {
@@ -3332,7 +3333,13 @@ const ReentrantPublisher = struct {
     ) PublishError!void {
         _ = effects;
         const self: *ReentrantPublisher = @ptrCast(@alignCast(context));
-        self.domain.record(fixture_key, "reentrant", null) catch |err| {
+        const result = switch (self.entry_point) {
+            .record => self.domain.record(fixture_key, "reentrant", null),
+            .apply_registry => self.domain.applyRegistry(.{
+                .replacement = &.{fixture_declaration},
+            }),
+        };
+        result catch |err| {
             self.reentrant_error = err;
         };
     }
@@ -3364,6 +3371,32 @@ test "publication cannot reenter the domain" {
     try std.testing.expectEqual(
         RecordTag.recorded,
         domain.recordTag(fixture_key).?,
+    );
+
+    var unavailable_domain = try fixtureDomain(std.testing.allocator);
+    defer unavailable_domain.deinit();
+    var publisher: TestPublisher = .{};
+    const opened_token = try unavailable_domain.open(
+        .{ .key = fixture_key },
+        publisher.publisher(),
+    );
+    _ = try unavailable_domain.completeOpen(opened_token, .{ .succeeded = .{} });
+    var registry_reentrant: ReentrantPublisher = .{
+        .domain = &unavailable_domain,
+        .entry_point = .apply_registry,
+    };
+    try unavailable_domain.markUnavailable(
+        fixture_key,
+        .provider_unavailable,
+        registry_reentrant.publisher(),
+    );
+    try std.testing.expectEqual(
+        @as(anyerror, error.ReentrantDomainCall),
+        registry_reentrant.reentrant_error.?,
+    );
+    try std.testing.expectEqual(
+        RuntimeTag.unavailable,
+        unavailable_domain.runtimeTag(fixture_key).?,
     );
 }
 
@@ -3439,6 +3472,17 @@ test "open completion validates result text before cloning" {
     } });
     domain.allocator = original_allocator;
     try std.testing.expectError(error.InvalidTextUtf8, result);
+
+    domain.allocator = fixed.allocator();
+    const long_title = domain.completeOpen(token, .{ .succeeded = .{
+        .title = "t" ** 4097,
+    } });
+    const invalid_location = domain.completeOpen(token, .{ .succeeded = .{
+        .location = "\xff",
+    } });
+    domain.allocator = original_allocator;
+    try std.testing.expectError(error.TextTooLong, long_title);
+    try std.testing.expectError(error.InvalidTextUtf8, invalid_location);
     try std.testing.expectEqual(
         RuntimeTag.opening,
         domain.runtimeTag(fixture_key).?,
