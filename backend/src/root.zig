@@ -2579,11 +2579,31 @@ fn runSdkConversation(
                 resume_generation = next_generation;
             },
             .start_new_session => {
+                var candidate_tools = tools.Service.init(
+                    worker.allocator(),
+                    worker.io(),
+                    active_working_directory,
+                ) catch |err| {
+                    worker.completeNewSession(.{
+                        .failed = conversation.OwnedText.init(
+                            worker.allocator(),
+                            @errorName(err),
+                        ) catch {
+                            worker.closeFailure(.stream, @errorName(err));
+                            return;
+                        },
+                    }) catch {
+                        worker.closeFailure(.stream, "Unable to report new session failure.");
+                        return;
+                    };
+                    continue;
+                };
                 const candidate_prompt = std.fmt.allocPrint(
                     worker.allocator(),
                     MinimalCodingAgent.system_prompt,
                     .{active_working_directory},
                 ) catch |err| {
+                    candidate_tools.deinit();
                     worker.closeFailure(.stream, @errorName(err));
                     return;
                 };
@@ -2596,6 +2616,7 @@ fn runSdkConversation(
                     &active_plan,
                     context.omlx_api_key,
                 ) catch |err| {
+                    candidate_tools.deinit();
                     worker.completeNewSession(.{
                         .failed = conversation.OwnedText.init(
                             worker.allocator(),
@@ -2618,6 +2639,7 @@ fn runSdkConversation(
                     worker.allocator(),
                 ) catch |err| {
                     candidate.disconnect() catch {};
+                    candidate_tools.deinit();
                     worker.completeNewSession(.{
                         .failed = conversation.OwnedText.init(
                             worker.allocator(),
@@ -2634,8 +2656,10 @@ fn runSdkConversation(
                 };
 
                 const previous_session = session;
+                var previous_tools = tool_service;
                 session_connected = false;
                 session = candidate;
+                tool_service = candidate_tools;
                 session_connected = true;
                 if (resume_targets) |*targets| targets.deinit(worker.allocator());
                 resume_targets = null;
@@ -2644,6 +2668,7 @@ fn runSdkConversation(
                     false
                 else |_|
                     true;
+                previous_tools.deinit();
                 worker.completeNewSession(.{ .started = .{
                     .commands = candidate_commands,
                     .cleanup_failed = cleanup_failed,
