@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import XCTest
 
 @testable import Vivi
@@ -62,14 +63,18 @@ final class NativeApplicationCoordinatorTests: XCTestCase {
     harness.coordinator.requestNewConversation()
     XCTAssertEqual(harness.coordinator.presentation.workspaceChoice, .choosing)
     XCTAssertEqual(harness.choosers.count, 1)
-    await Task.yield()
-    harness.choosers[0].finish(workspace)
-    await Task.yield()
+    await finishWorkspaceChoice(
+      harness.choosers[0],
+      with: workspace,
+      expecting: .idle,
+      in: harness.coordinator.presentation)
 
     harness.coordinator.requestNewConversation()
-    await Task.yield()
-    harness.choosers[1].finish(workspace)
-    await Task.yield()
+    await finishWorkspaceChoice(
+      harness.choosers[1],
+      with: workspace,
+      expecting: .idle,
+      in: harness.coordinator.presentation)
 
     XCTAssertEqual(harness.coordinator.conversations.records.count, 2)
     XCTAssertEqual(Set(harness.coordinator.conversations.records.map(\.id)).count, 2)
@@ -92,9 +97,11 @@ final class NativeApplicationCoordinatorTests: XCTestCase {
 
     harness.coordinator.open([URL(string: "vivi://chat?workspace=/tmp/from-url")!])
     harness.coordinator.requestNewConversation()
-    await Task.yield()
-    harness.choosers[0].finish(chosenWorkspace)
-    await Task.yield()
+    await finishWorkspaceChoice(
+      harness.choosers[0],
+      with: chosenWorkspace,
+      expecting: .idle,
+      in: harness.coordinator.presentation)
 
     XCTAssertEqual(
       harness.creationRequests.map(\.workspace.canonicalPath),
@@ -108,9 +115,11 @@ final class NativeApplicationCoordinatorTests: XCTestCase {
     let harness = CoordinatorHarness()
 
     harness.coordinator.requestNewConversation()
-    await Task.yield()
-    harness.choosers[0].finish(nil)
-    await Task.yield()
+    await finishWorkspaceChoice(
+      harness.choosers[0],
+      with: nil,
+      expecting: .idle,
+      in: harness.coordinator.presentation)
 
     XCTAssertTrue(harness.coordinator.conversations.records.isEmpty)
     XCTAssertTrue(harness.windows.isEmpty)
@@ -125,9 +134,11 @@ final class NativeApplicationCoordinatorTests: XCTestCase {
     defer { try? FileManager.default.removeItem(at: file) }
 
     harness.coordinator.requestNewConversation()
-    await Task.yield()
-    harness.choosers[0].finish(file)
-    await Task.yield()
+    await finishWorkspaceChoice(
+      harness.choosers[0],
+      with: file,
+      expecting: .failure("Choose an existing folder with an absolute path."),
+      in: harness.coordinator.presentation)
 
     XCTAssertTrue(harness.coordinator.conversations.records.isEmpty)
     XCTAssertEqual(
@@ -148,9 +159,11 @@ final class NativeApplicationCoordinatorTests: XCTestCase {
 
     for invalidChoice in invalidChoices {
       harness.coordinator.requestNewConversation()
-      await Task.yield()
-      harness.choosers.last?.finish(invalidChoice)
-      await Task.yield()
+      await finishWorkspaceChoice(
+        harness.choosers.last!,
+        with: invalidChoice,
+        expecting: .failure("Choose an existing folder with an absolute path."),
+        in: harness.coordinator.presentation)
 
       XCTAssertEqual(
         harness.coordinator.presentation.workspaceChoice,
@@ -397,6 +410,23 @@ final class NativeApplicationCoordinatorTests: XCTestCase {
 
     XCTAssertEqual(disposition, .terminateNow)
     XCTAssertFalse(replied)
+  }
+
+  private func finishWorkspaceChoice(
+    _ chooser: ControllableWorkspaceChooser,
+    with url: URL?,
+    expecting expectedPresentation: WorkspaceChoicePresentation,
+    in presentation: NativeApplicationPresentation
+  ) async {
+    let completed = expectation(description: "Workspace choice completed")
+    let observation = presentation.$workspaceChoice
+      .filter { $0 == expectedPresentation }
+      .prefix(1)
+      .sink { _ in completed.fulfill() }
+
+    chooser.finish(url)
+    await fulfillment(of: [completed], timeout: 1)
+    withExtendedLifetime(observation) {}
   }
 }
 
