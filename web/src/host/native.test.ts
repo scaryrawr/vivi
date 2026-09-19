@@ -243,7 +243,7 @@ describe("NativeViviHostPort", () => {
     });
   });
 
-  it("ignores late responses from a disconnected bridge after reconnect", async () => {
+  it("retires an active bridge before routing a replacement", async () => {
     const posted: Record<string, unknown>[] = [];
     window.webkit = {
       messageHandlers: {
@@ -262,11 +262,11 @@ describe("NativeViviHostPort", () => {
       "0c8f9cc7-4767-4cec-92a3-9d7759e89a01" as never,
     );
     const oldRequest = posted.at(-1)!;
-    first.disconnect();
-    await expect(oldPending).rejects.toMatchObject({ code: "disconnected" });
 
     const secondConnecting = new NativeViviHostPort().connect();
     const secondConnect = posted.at(-1)!;
+    await expect(oldPending).rejects.toMatchObject({ code: "disconnected" });
+    expect(first.getConnectionState()).toEqual({ kind: "disconnected" });
     publishCompleteHandshake(secondConnect);
     const second = await secondConnecting;
 

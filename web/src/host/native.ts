@@ -35,6 +35,9 @@ const retiredBridgeSessionOrder: string[] = [];
 let activeConnection: NativeConnectedViviHost | undefined;
 
 function registerConnection(connection: NativeConnectedViviHost) {
+  if (activeConnection && activeConnection !== connection) {
+    activeConnection.retireForReplacement();
+  }
   activeConnection = connection;
   retiredBridgeSessions.delete(connection.bridgeSessionId);
   window.__viviHostV1Receive = routeNativeMessage;
@@ -242,6 +245,18 @@ class NativeConnectedViviHost implements ConnectedViviHost {
       "The native host bridge disconnected.",
     );
     this.terminate(error, { kind: "disconnected" }, true);
+  }
+
+  retireForReplacement() {
+    if (this.disconnected) return;
+    this.terminate(
+      new NativeHostBridgeError(
+        "disconnected",
+        "The native host bridge was replaced by a newer connection.",
+      ),
+      { kind: "disconnected" },
+      false,
+    );
   }
 
   private command(
@@ -821,7 +836,8 @@ function boundedString(
 ): string {
   const value = string(input, path);
   const byteLength = new TextEncoder().encode(value).byteLength;
-  if ((!allowEmpty && byteLength === 0) || byteLength > maximumLength)
+  if (!allowEmpty && byteLength === 0) invalid(path, "must not be empty");
+  if (byteLength > maximumLength)
     invalid(path, `must contain at most ${maximumLength} UTF-8 bytes`);
   return value;
 }
