@@ -92,7 +92,9 @@ final class NativeHostRuntimeTests: XCTestCase {
     let firstBridge = UUID()
     _ = runtime.handle(request(bridge: firstBridge, command: .connect))
     XCTAssertEqual(adapter.createConversation(projectPath: "/test/vivi"), .accepted)
-    _ = runtime.handle(request(bridge: firstBridge, command: .disconnect))
+    let disconnectRequest = request(bridge: firstBridge, command: .disconnect)
+    _ = runtime.handle(disconnectRequest)
+    XCTAssertEqual(errorCode(runtime.handle(disconnectRequest)), "duplicate_request")
 
     let secondBridge = UUID()
     let reconnect = runtime.handle(request(bridge: secondBridge, command: .connect))

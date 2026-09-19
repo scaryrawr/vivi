@@ -57,6 +57,10 @@ final class HostWireV1Tests: XCTestCase {
       code: .protocolMismatch)
     assertInvalid(valid.merging(["version": 9_007_199_254_740_992]) { _, new in new })
     assertInvalid(valid.merging(["requestId": "not-a-uuid"]) { _, new in new })
+    assertInvalid(
+      valid.merging(["requestId": "00000000-0000-0000-0000-000000000000"]) {
+        _, new in new
+      })
     assertInvalid(valid.merging(["command": "runAnything"]) { _, new in new })
     assertInvalid(
       valid.merging([

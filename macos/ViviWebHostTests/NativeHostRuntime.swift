@@ -52,7 +52,10 @@ final class NativeHostRuntime {
   }
 
   func handle(_ request: HostWireV1.Request) -> [[String: Any]] {
-    if case .disconnected = state, request.command == .connect {
+    if case .disconnected(let previousBridgeSessionID) = state,
+      request.command == .connect,
+      request.bridgeSessionID != previousBridgeSessionID
+    {
       requestIDSet.removeAll(keepingCapacity: true)
       state = .awaitingConnect
     }

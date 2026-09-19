@@ -148,6 +148,11 @@ describe("NativeViviHostPort", () => {
       code: "invalid-message",
     });
     expect(host.getConnectionState()).toMatchObject({ kind: "failed" });
+    expect(posted.at(-1)).toMatchObject({ command: "disconnect" });
+    await expect(
+      host.createConversation("/test/vivi" as never),
+    ).rejects.toMatchObject({ code: "disconnected" });
+    expect(window.__viviHostV1Receive).toBeUndefined();
   });
 
   it("rejects stale bridge sessions", async () => {

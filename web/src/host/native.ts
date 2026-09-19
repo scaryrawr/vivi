@@ -357,11 +357,15 @@ class NativeConnectedViviHost implements ConnectedViviHost {
 
   private fail(error: NativeHostBridgeError) {
     if (this.disconnected) return;
+    this.disconnected = true;
     this.connectionState = { kind: "failed", message: error.message };
     if (this.connectResponseAccepted) this.readyReject(error);
     for (const pending of this.pending.values()) pending.reject(error);
     this.pending.clear();
     this.emit();
+    this.listeners.clear();
+    delete window.__viviHostV1Receive;
+    this.handler.postMessage(this.request("disconnect", {}));
   }
 
   private emit() {

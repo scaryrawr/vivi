@@ -75,7 +75,7 @@ final class WebHostHarness: NSObject {
     controller.add(WeakScriptMessageHandler(owner: self), name: Self.handlerName)
     hasInstalledScriptHandlers = true
     configuration.userContentController = controller
-    let assetSchemeHandler = LocalAssetSchemeHandler(root: assets)
+    let assetSchemeHandler = LocalAssetSchemeHandler(assets: assets)
     configuration.setURLSchemeHandler(assetSchemeHandler, forURLScheme: "vivi-test")
     self.assetSchemeHandler = assetSchemeHandler
 
@@ -123,7 +123,7 @@ final class WebHostHarness: NSObject {
       && navigationType == .other
   }
 
-  private func verifiedAssetsDirectory() throws -> URL {
+  private func verifiedAssetsDirectory() throws -> VerifiedAssets {
     guard let assets = resourceBundle.resourceURL?.appending(path: "ViviWebAssets"),
       FileManager.default.fileExists(atPath: assets.path),
       let manifestURL = resourceBundle.url(
@@ -136,6 +136,7 @@ final class WebHostHarness: NSObject {
     else {
       throw AssetError.missing
     }
+    var verifiedFiles: [String: Data] = [:]
     for (relativePath, expectedDigest) in manifest {
       guard relativePath != "asset-manifest.json",
         !relativePath.hasPrefix("/"),
@@ -146,15 +147,20 @@ final class WebHostHarness: NSObject {
       guard digest == expectedDigest else {
         throw AssetError.digestMismatch(relativePath)
       }
+      verifiedFiles[relativePath] = data
     }
-    let index = try String(contentsOf: assets.appending(path: "native.html"), encoding: .utf8)
+    guard let indexData = verifiedFiles["native.html"],
+      let index = String(data: indexData, encoding: .utf8)
+    else {
+      throw AssetError.missing
+    }
     let decodedIndex = index.replacingOccurrences(of: "&#39;", with: "'")
     guard decodedIndex.components(separatedBy: Self.contentSecurityPolicy).count == 2,
       decodedIndex.contains("http-equiv=\"Content-Security-Policy\"")
     else {
       throw AssetError.contentSecurityPolicyMismatch
     }
-    return assets
+    return VerifiedAssets(files: verifiedFiles)
   }
 
   private func compileNetworkDenyRule() async throws -> WKContentRuleList {
@@ -280,6 +286,10 @@ final class WebHostHarness: NSObject {
     case contentSecurityPolicyMismatch
     case ruleCompilation
   }
+
+  struct VerifiedAssets {
+    let files: [String: Data]
+  }
 }
 
 private final class WeakScriptMessageHandler: NSObject, WKScriptMessageHandler {
@@ -300,10 +310,10 @@ private final class WeakScriptMessageHandler: NSObject, WKScriptMessageHandler {
 }
 
 private final class LocalAssetSchemeHandler: NSObject, WKURLSchemeHandler, @unchecked Sendable {
-  private let root: URL
+  private let assets: WebHostHarness.VerifiedAssets
 
-  init(root: URL) {
-    self.root = root
+  init(assets: WebHostHarness.VerifiedAssets) {
+    self.assets = assets
   }
 
   func webView(_ webView: WKWebView, start urlSchemeTask: any WKURLSchemeTask) {
@@ -319,26 +329,20 @@ private final class LocalAssetSchemeHandler: NSObject, WKURLSchemeHandler, @unch
       urlSchemeTask.didFailWithError(URLError(.noPermissionsToReadFile))
       return
     }
-    let file = components.reduce(root) { partial, component in
-      partial.appending(path: String(component))
-    }
-    guard file.standardizedFileURL.path.hasPrefix(root.standardizedFileURL.path + "/") else {
-      urlSchemeTask.didFailWithError(URLError(.noPermissionsToReadFile))
+    let relativePath = components.joined(separator: "/")
+    guard let data = assets.files[relativePath] else {
+      urlSchemeTask.didFailWithError(URLError(.fileDoesNotExist))
       return
     }
-    do {
-      let data = try Data(contentsOf: file)
-      let response = URLResponse(
-        url: url,
-        mimeType: mimeType(for: file.pathExtension),
-        expectedContentLength: data.count,
-        textEncodingName: file.pathExtension == "html" ? "utf-8" : nil)
-      urlSchemeTask.didReceive(response)
-      urlSchemeTask.didReceive(data)
-      urlSchemeTask.didFinish()
-    } catch {
-      urlSchemeTask.didFailWithError(error)
-    }
+    let pathExtension = URL(fileURLWithPath: relativePath).pathExtension
+    let response = URLResponse(
+      url: url,
+      mimeType: mimeType(for: pathExtension),
+      expectedContentLength: data.count,
+      textEncodingName: pathExtension == "html" ? "utf-8" : nil)
+    urlSchemeTask.didReceive(response)
+    urlSchemeTask.didReceive(data)
+    urlSchemeTask.didFinish()
   }
 
   func webView(_ webView: WKWebView, stop urlSchemeTask: any WKURLSchemeTask) {}

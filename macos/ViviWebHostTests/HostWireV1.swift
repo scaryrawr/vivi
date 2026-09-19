@@ -217,7 +217,13 @@ enum HostWireV1 {
 
   private static func uuid(_ value: Any?, path: String) throws -> UUID {
     let value = try string(value, path: path)
-    guard let uuid = UUID(uuidString: value) else {
+    let range = NSRange(value.startIndex..<value.endIndex, in: value)
+    let pattern =
+      "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+    guard value.range(of: pattern, options: .regularExpression) != nil,
+      range.length == 36,
+      let uuid = UUID(uuidString: value)
+    else {
       throw ValidationError(code: .invalidMessage, path: path, reason: "must be a UUID")
     }
     return uuid
