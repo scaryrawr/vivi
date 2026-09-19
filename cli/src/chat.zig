@@ -117,6 +117,21 @@ fn commandArgumentSuffix(input: []const u8) []const u8 {
     return if (separator) |index| input[index..] else "";
 }
 
+fn commandValidationMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.CommandTakesNoArguments => "This command does not accept arguments.",
+        error.CommandRequiresArguments => "This command requires an argument.",
+        error.CommandArgumentsTooLong => "Command arguments are too long.",
+        error.InvalidCommandArgumentsUtf8 => "Command arguments must be valid UTF-8.",
+        error.InvalidCommandKey,
+        error.StaleCommandKey,
+        => "The command catalog changed. Open the command palette and try again.",
+        error.CommandCatalogUnavailable => "Commands are not available yet. Refresh the command palette and try again.",
+        error.CommandAlreadyActive => "Another command is still running.",
+        else => "The command could not be executed.",
+    };
+}
+
 const NewCommandAction = enum {
     start_session,
     submit_prompt,
@@ -153,18 +168,6 @@ fn fileReferenceQuery(input: []const u8, cursor: usize) ?FileReferenceQuery {
         .end = end,
         .query = input[start + 1 .. cursor],
     };
-}
-
-fn buildCommandInput(
-    allocator: std.mem.Allocator,
-    command_name: []const u8,
-    composer_input: []const u8,
-) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
-        "{s}{s}",
-        .{ command_name, commandArgumentSuffix(composer_input) },
-    );
 }
 
 fn visibleSelectionRange(
@@ -2565,6 +2568,22 @@ const MenuMode = enum {
     sessions,
 };
 
+const CommandActivation = enum {
+    execute,
+    models,
+    new_session,
+    sessions,
+};
+
+fn commandActivation(action: backend.CommandAction) CommandActivation {
+    return switch (action) {
+        .execute => .execute,
+        .open_model_selection => .models,
+        .start_new_session => .new_session,
+        .open_session_history => .sessions,
+    };
+}
+
 fn userInputAnswer(
     request: backend.UserInputRequest,
     raw_answer: []const u8,
@@ -2603,6 +2622,7 @@ const ChatUi = struct {
     sessions: ?backend.SessionCatalog = null,
     pending_user_input: ?backend.UserInputRequest = null,
     saved_input: ?TextInput = null,
+    command_ui_owner: ?backend.CommandKey = null,
     selected_user_input_choice: usize = 0,
     invalid_user_input: bool = false,
     menu_mode: MenuMode = .closed,
@@ -2838,6 +2858,7 @@ const ChatUi = struct {
                 error.Busy => return,
                 else => return err,
             };
+            self.command_ui_owner = null;
             self.phase = .loading_commands;
         }
     }
@@ -2864,6 +2885,11 @@ const ChatUi = struct {
             },
         };
         try self.transcript.append(self.allocator, if (delivery == .enqueue) .queued else .user, text);
+        self.beginPromptResponse();
+    }
+
+    fn beginPromptResponse(self: *ChatUi) void {
+        self.command_ui_owner = null;
         self.input.clearRetainingCapacity();
         self.phase = .responding;
         self.followTail();
@@ -3294,7 +3320,7 @@ const ChatUi = struct {
             entries[index] = .{
                 .identity = .{ .text = command.name },
                 .key = command.name,
-                .primary = command.name,
+                .primary = command.display_name,
                 .detail = .{ .text = command.description },
                 .source_index = index,
             };
@@ -3374,65 +3400,47 @@ const ChatUi = struct {
             .commands => {
                 const catalog = self.commands orelse return;
                 const command = catalog.commands[selected.source_index];
-                if (std.ascii.eqlIgnoreCase(command.name, "new")) {
+                const contents = try self.input.toOwnedContents(
+                    self.allocator,
+                );
+                defer self.allocator.free(contents);
+                const activation = commandActivation(command.action);
+                if (activation == .new_session and
+                    newCommandAction(contents) == .submit_prompt)
+                {
                     self.menu_mode = .closed;
-                    const contents = try self.input.toOwnedContents(
-                        self.allocator,
-                    );
-                    defer self.allocator.free(contents);
-                    if (newCommandAction(contents) == .submit_prompt) {
-                        try self.submitPrompt(conversation, .immediate);
-                        return;
-                    }
-                    conversation.startNewSession() catch |err| switch (err) {
-                        error.Busy => return,
-                        else => return err,
-                    };
-                    self.phase = .starting_new_session;
+                    try self.submitPrompt(conversation, .immediate);
                     return;
                 }
-                if (std.ascii.eqlIgnoreCase(command.name, "resume")) {
-                    self.input.clearRetainingCapacity();
-                    self.menu_mode = .loading_sessions;
-                    conversation.refreshSessions() catch |err| switch (err) {
-                        error.Busy => {
-                            self.menu_mode = .closed;
-                            return;
-                        },
-                        else => return err,
-                    };
-                    self.phase = .resuming;
-                    return;
-                }
-                if (!std.ascii.eqlIgnoreCase(command.name, "model")) {
-                    const contents = try self.input.toOwnedContents(
-                        self.allocator,
-                    );
-                    defer self.allocator.free(contents);
-                    const command_input = try buildCommandInput(
-                        self.allocator,
-                        command.name,
-                        contents,
-                    );
-                    defer self.allocator.free(command_input);
-                    conversation.executeCommand(command_input) catch |err| switch (err) {
-                        error.EmptyCommand, error.Busy => return,
-                        else => return err,
-                    };
-                    self.input.clearRetainingCapacity();
-                    self.menu_mode = .closed;
-                    self.phase = .running_command;
-                    return;
-                }
-                self.input.clearRetainingCapacity();
-                self.menu_mode = .loading_models;
-                conversation.refreshModels() catch |err| switch (err) {
-                    error.Busy => {
-                        self.menu_mode = .closed;
+                conversation.executeCommand(
+                    command.key,
+                    commandArgumentSuffix(contents),
+                ) catch |err| switch (err) {
+                    error.Busy => return,
+                    error.CommandTakesNoArguments,
+                    error.CommandRequiresArguments,
+                    error.CommandArgumentsTooLong,
+                    error.InvalidCommandArgumentsUtf8,
+                    error.InvalidCommandKey,
+                    error.StaleCommandKey,
+                    error.CommandCatalogUnavailable,
+                    error.CommandAlreadyActive,
+                    => {
+                        if (err == error.StaleCommandKey) {
+                            conversation.refreshCommands() catch {};
+                            self.phase = .loading_commands;
+                        }
+                        try self.transcript.append(
+                            self.allocator,
+                            .status,
+                            commandValidationMessage(err),
+                        );
+                        self.followTail();
                         return;
                     },
                     else => return err,
                 };
+                self.beginCommandActivation(command.key, activation);
             },
             .files => {
                 const contents = try self.input.toOwnedContents(self.allocator);
@@ -3474,9 +3482,7 @@ const ChatUi = struct {
                     error.Busy => return,
                     else => return err,
                 };
-                self.input.clearRetainingCapacity();
-                self.menu_mode = .closed;
-                self.phase = .switching;
+                self.beginModelSwitch();
             },
             .sessions => {
                 const catalog = self.sessions orelse return;
@@ -3485,12 +3491,67 @@ const ChatUi = struct {
                     error.Busy => return,
                     else => return err,
                 };
-                self.input.clearRetainingCapacity();
-                self.menu_mode = .closed;
-                self.phase = .resuming;
+                self.beginSessionResume();
             },
             .closed, .loading_models, .loading_sessions => {},
         }
+    }
+
+    fn beginModelSwitch(self: *ChatUi) void {
+        self.command_ui_owner = null;
+        self.input.clearRetainingCapacity();
+        self.menu_mode = .closed;
+        self.phase = .switching;
+    }
+
+    fn beginSessionResume(self: *ChatUi) void {
+        self.command_ui_owner = null;
+        self.input.clearRetainingCapacity();
+        self.menu_mode = .closed;
+        self.phase = .resuming;
+    }
+
+    fn beginCommandActivation(
+        self: *ChatUi,
+        key: backend.CommandKey,
+        activation: CommandActivation,
+    ) void {
+        self.command_ui_owner = key;
+        switch (activation) {
+            .execute => {
+                self.input.clearRetainingCapacity();
+                self.menu_mode = .closed;
+                self.phase = .running_command;
+            },
+            .models => {
+                self.input.clearRetainingCapacity();
+                self.menu_mode = .loading_models;
+                self.phase = .running_command;
+            },
+            .new_session => {
+                self.menu_mode = .closed;
+                self.phase = .starting_new_session;
+            },
+            .sessions => {
+                self.input.clearRetainingCapacity();
+                self.menu_mode = .loading_sessions;
+                self.phase = .resuming;
+            },
+        }
+    }
+
+    fn completeCommandPhase(
+        self: *ChatUi,
+        key: backend.CommandKey,
+    ) bool {
+        const owner = self.command_ui_owner orelse return false;
+        if (!std.meta.eql(owner, key)) return false;
+        self.command_ui_owner = null;
+        switch (self.phase) {
+            .stopping => {},
+            else => self.phase = .ready,
+        }
+        return true;
     }
 
     fn applyConversationEvent(
@@ -3788,13 +3849,50 @@ const ChatUi = struct {
                 self.phase = .awaiting_input;
                 self.followTail();
             },
-            .command_completed => |message| {
-                self.phase = .ready;
-                try self.transcript.append(
-                    self.allocator,
-                    .status,
-                    message.bytes,
-                );
+            .command_completed => |result| {
+                const key = switch (result) {
+                    inline else => |outcome| outcome.key,
+                };
+                const owns_ui = self.completeCommandPhase(key);
+                const message = switch (result) {
+                    .completed => |outcome| if (outcome.message) |text|
+                        text.bytes
+                    else
+                        "Command completed.",
+                    .failed => |outcome| failure: {
+                        if (self.commands) |catalog| {
+                            if (catalog.find(outcome.key)) |command| {
+                                switch (command.action) {
+                                    .open_model_selection => {
+                                        if (owns_ui and
+                                            self.menu_mode == .loading_models)
+                                        {
+                                            self.menu_mode = .closed;
+                                        }
+                                    },
+                                    .open_session_history => {
+                                        if (owns_ui and
+                                            self.menu_mode == .loading_sessions)
+                                        {
+                                            self.menu_mode = .closed;
+                                        }
+                                    },
+                                    .start_new_session => {
+                                        if (owns_ui) {
+                                            try self.syncComposerMenu();
+                                        }
+                                    },
+                                    .execute => {},
+                                }
+                            }
+                        }
+                        break :failure if (outcome.message) |text|
+                            text.bytes
+                        else
+                            "Command failed.";
+                    },
+                };
+                try self.transcript.append(self.allocator, .status, message);
             },
             .idle => {
                 self.transcript.endTurn();
@@ -3806,7 +3904,7 @@ const ChatUi = struct {
                     .failed => |failure| try self.transcript.append(
                         self.allocator,
                         .status,
-                        failure.message.bytes,
+                        failure.messageText(),
                     ),
                 }
                 return .close;
@@ -6567,11 +6665,25 @@ test "new session replaces transcript and commands while preserving cwd" {
     defer ui.deinit();
     try ui.input.insertSliceAtCursor("/new");
     try ui.transcript.append(std.testing.allocator, .user, "old prompt");
+    const key: backend.CommandKey = .{
+        .generation = @enumFromInt(1),
+        .slot = @enumFromInt(1),
+    };
+    ui.beginCommandActivation(key, .new_session);
+    const pending_input = try ui.input.toOwnedContents(std.testing.allocator);
+    defer std.testing.allocator.free(pending_input);
+    try std.testing.expectEqualStrings("/new", pending_input);
 
     const commands = try std.testing.allocator.alloc(backend.CommandInfo, 1);
     commands[0] = .{
+        .key = key,
         .name = try std.testing.allocator.dupe(u8, "new"),
+        .display_name = try std.testing.allocator.dupe(u8, "new"),
         .description = try std.testing.allocator.dupe(u8, "Start fresh"),
+        .hint = null,
+        .source = .vivi,
+        .action = .start_new_session,
+        .argument_policy = .none,
     };
     var event: backend.ConversationEvent = .{ .new_session = .{
         .started = .{
@@ -6603,11 +6715,20 @@ test "new session replaces transcript and commands while preserving cwd" {
     try std.testing.expectEqualStrings("fresh transcript", restored);
 }
 
-test "new session failure keeps command retry available" {
+test "typed new session failure keeps input and command retry available" {
     const commands = try std.testing.allocator.alloc(backend.CommandInfo, 1);
     commands[0] = .{
+        .key = .{
+            .generation = @enumFromInt(1),
+            .slot = @enumFromInt(1),
+        },
         .name = try std.testing.allocator.dupe(u8, "new"),
+        .display_name = try std.testing.allocator.dupe(u8, "new"),
         .description = try std.testing.allocator.dupe(u8, "Start fresh"),
+        .hint = null,
+        .source = .vivi,
+        .action = .start_new_session,
+        .argument_policy = .none,
     };
     var ui: ChatUi = .{
         .allocator = std.testing.allocator,
@@ -6622,13 +6743,20 @@ test "new session failure keeps command retry available" {
     };
     defer ui.deinit();
     try ui.input.insertSliceAtCursor("/new");
+    ui.beginCommandActivation(commands[0].key, .new_session);
+    const pending_input = try ui.input.toOwnedContents(std.testing.allocator);
+    defer std.testing.allocator.free(pending_input);
+    try std.testing.expectEqualStrings("/new", pending_input);
 
-    var event: backend.ConversationEvent = .{ .new_session = .{
-        .failed = try backend.OwnedText.init(
-            std.testing.allocator,
-            "Unable to start a new session.",
-        ),
-    } };
+    var event: backend.ConversationEvent = .{
+        .command_completed = .{ .failed = .{
+            .key = commands[0].key,
+            .message = try backend.OwnedText.init(
+                std.testing.allocator,
+                "Unable to start a new session.",
+            ),
+        } },
+    };
     defer event.deinit();
 
     _ = try ui.applyConversationEvent(&event);
@@ -6638,6 +6766,32 @@ test "new session failure keeps command retry available" {
     const input = try ui.input.toOwnedContents(std.testing.allocator);
     defer std.testing.allocator.free(input);
     try std.testing.expectEqualStrings("/new", input);
+}
+
+test "non-new command activations clear input immediately" {
+    var ui: ChatUi = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .input = TextInput.init(std.testing.allocator),
+        .cwd = try std.testing.allocator.dupe(u8, "/current"),
+    };
+    defer ui.deinit();
+
+    const activations = [_]CommandActivation{
+        .execute,
+        .models,
+        .sessions,
+    };
+    for (activations) |activation| {
+        try ui.input.insertSliceAtCursor("/command");
+        ui.beginCommandActivation(.{
+            .generation = @enumFromInt(1),
+            .slot = @enumFromInt(1),
+        }, activation);
+        const input = try ui.input.toOwnedContents(std.testing.allocator);
+        defer std.testing.allocator.free(input);
+        try std.testing.expectEqualStrings("", input);
+    }
 }
 
 test "empty assistant completion does not create or clear a draft" {
@@ -8528,15 +8682,31 @@ test "slash command parsing preserves argument suffixes" {
         NewCommandAction.submit_prompt,
         newCommandAction("/ew"),
     );
-    const command_input = try buildCommandInput(
-        std.testing.allocator,
-        "autopilot",
-        "/auto thorough",
-    );
-    defer std.testing.allocator.free(command_input);
-    try std.testing.expectEqualStrings("autopilot thorough", command_input);
     try std.testing.expectEqualStrings("", slashCommandQuery("/").?);
     try std.testing.expect(slashCommandQuery("not-a-command") == null);
+}
+
+test "command actions dispatch without name-based special cases" {
+    try std.testing.expectEqual(
+        CommandActivation.execute,
+        commandActivation(.execute),
+    );
+    try std.testing.expectEqual(
+        CommandActivation.models,
+        commandActivation(.open_model_selection),
+    );
+    try std.testing.expectEqual(
+        CommandActivation.new_session,
+        commandActivation(.start_new_session),
+    );
+    try std.testing.expectEqual(
+        CommandActivation.sessions,
+        commandActivation(.open_session_history),
+    );
+    try std.testing.expectEqualStrings(
+        "This command does not accept arguments.",
+        commandValidationMessage(error.CommandTakesNoArguments),
+    );
 }
 
 test "file reference query follows the active composer token" {
@@ -9018,6 +9188,221 @@ test "session catalog failure closes stale cached finder" {
         "Unable to load saved sessions.",
         ui.transcript.messageAt(0).text.items,
     );
+}
+
+test "failed injected commands close their loading menus" {
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    var ui = try ChatUi.init(
+        std.testing.allocator,
+        std.testing.io,
+        &environment,
+    );
+    defer ui.deinit();
+
+    const commands = try std.testing.allocator.alloc(backend.CommandInfo, 2);
+    commands[0] = .{
+        .key = .{
+            .generation = @enumFromInt(1),
+            .slot = @enumFromInt(1),
+        },
+        .name = try std.testing.allocator.dupe(u8, "model"),
+        .display_name = try std.testing.allocator.dupe(u8, "model"),
+        .description = try std.testing.allocator.dupe(u8, "Choose a model"),
+        .hint = null,
+        .source = .vivi,
+        .action = .open_model_selection,
+        .argument_policy = .none,
+    };
+    commands[1] = .{
+        .key = .{
+            .generation = @enumFromInt(1),
+            .slot = @enumFromInt(2),
+        },
+        .name = try std.testing.allocator.dupe(u8, "resume"),
+        .display_name = try std.testing.allocator.dupe(u8, "resume"),
+        .description = try std.testing.allocator.dupe(u8, "Choose a session"),
+        .hint = null,
+        .source = .vivi,
+        .action = .open_session_history,
+        .argument_policy = .none,
+    };
+    ui.commands = .{
+        .allocator = std.testing.allocator,
+        .commands = commands,
+    };
+
+    ui.beginCommandActivation(commands[0].key, .models);
+    var model_failure: backend.ConversationEvent = .{
+        .command_completed = .{ .failed = .{
+            .key = commands[0].key,
+            .message = try backend.OwnedText.init(
+                std.testing.allocator,
+                "model failure",
+            ),
+        } },
+    };
+    defer model_failure.deinit();
+    _ = try ui.applyConversationEvent(&model_failure);
+    try std.testing.expectEqual(UiPhase.ready, ui.phase);
+    try std.testing.expectEqual(MenuMode.closed, ui.menu_mode);
+
+    ui.beginCommandActivation(commands[1].key, .sessions);
+    var resume_failure: backend.ConversationEvent = .{
+        .command_completed = .{ .failed = .{
+            .key = commands[1].key,
+            .message = try backend.OwnedText.init(
+                std.testing.allocator,
+                "resume failure",
+            ),
+        } },
+    };
+    defer resume_failure.deinit();
+    _ = try ui.applyConversationEvent(&resume_failure);
+    try std.testing.expectEqual(UiPhase.ready, ui.phase);
+    try std.testing.expectEqual(MenuMode.closed, ui.menu_mode);
+}
+
+test "command terminals preserve a newer responding prompt phase" {
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    var ui = try ChatUi.init(
+        std.testing.allocator,
+        std.testing.io,
+        &environment,
+    );
+    defer ui.deinit();
+
+    const key: backend.CommandKey = .{
+        .generation = @enumFromInt(1),
+        .slot = @enumFromInt(1),
+    };
+    const commands = try std.testing.allocator.alloc(backend.CommandInfo, 1);
+    commands[0] = .{
+        .key = key,
+        .name = try std.testing.allocator.dupe(u8, "agent"),
+        .display_name = try std.testing.allocator.dupe(u8, "agent"),
+        .description = try std.testing.allocator.dupe(u8, "Run an agent"),
+        .hint = null,
+        .source = .sdk_builtin,
+        .action = .execute,
+        .argument_policy = .none,
+    };
+    ui.commands = .{
+        .allocator = std.testing.allocator,
+        .commands = commands,
+    };
+    ui.beginCommandActivation(key, .execute);
+    ui.beginPromptResponse();
+
+    var completed: backend.ConversationEvent = .{
+        .command_completed = .{ .completed = .{
+            .key = key,
+            .message = try backend.OwnedText.init(
+                std.testing.allocator,
+                "old command completed",
+            ),
+        } },
+    };
+    defer completed.deinit();
+    _ = try ui.applyConversationEvent(&completed);
+    try std.testing.expectEqual(UiPhase.responding, ui.phase);
+    try std.testing.expectEqual(MenuMode.closed, ui.menu_mode);
+
+    var failed: backend.ConversationEvent = .{
+        .command_completed = .{ .failed = .{
+            .key = key,
+            .message = try backend.OwnedText.init(
+                std.testing.allocator,
+                "old command failed",
+            ),
+        } },
+    };
+    defer failed.deinit();
+    _ = try ui.applyConversationEvent(&failed);
+    try std.testing.expectEqual(UiPhase.responding, ui.phase);
+    try std.testing.expectEqual(MenuMode.closed, ui.menu_mode);
+}
+
+test "late resume command terminal preserves selected session resume" {
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    var ui = try ChatUi.init(
+        std.testing.allocator,
+        std.testing.io,
+        &environment,
+    );
+    defer ui.deinit();
+
+    const key: backend.CommandKey = .{
+        .generation = @enumFromInt(1),
+        .slot = @enumFromInt(1),
+    };
+    const commands = try std.testing.allocator.alloc(backend.CommandInfo, 1);
+    commands[0] = .{
+        .key = key,
+        .name = try std.testing.allocator.dupe(u8, "resume"),
+        .display_name = try std.testing.allocator.dupe(u8, "resume"),
+        .description = try std.testing.allocator.dupe(u8, "Resume a session"),
+        .hint = null,
+        .source = .vivi,
+        .action = .open_session_history,
+        .argument_policy = .none,
+    };
+    ui.commands = .{
+        .allocator = std.testing.allocator,
+        .commands = commands,
+    };
+    ui.beginCommandActivation(key, .sessions);
+
+    var catalog: backend.ConversationEvent = .{
+        .session_catalog = .{
+            .allocator = std.testing.allocator,
+            .sessions = try std.testing.allocator.alloc(
+                backend.SessionSummary,
+                0,
+            ),
+        },
+    };
+    defer catalog.deinit();
+    _ = try ui.applyConversationEvent(&catalog);
+    try std.testing.expectEqual(UiPhase.ready, ui.phase);
+    try std.testing.expectEqual(MenuMode.sessions, ui.menu_mode);
+
+    ui.beginSessionResume();
+    try std.testing.expectEqual(UiPhase.resuming, ui.phase);
+    try std.testing.expectEqual(MenuMode.closed, ui.menu_mode);
+
+    var terminal: backend.ConversationEvent = .{
+        .command_completed = .{ .completed = .{
+            .key = key,
+            .message = try backend.OwnedText.init(
+                std.testing.allocator,
+                "Session picker opened.",
+            ),
+        } },
+    };
+    defer terminal.deinit();
+    _ = try ui.applyConversationEvent(&terminal);
+    try std.testing.expectEqual(UiPhase.resuming, ui.phase);
+    try std.testing.expectEqual(MenuMode.closed, ui.menu_mode);
+
+    ui.beginCommandActivation(key, .sessions);
+    _ = try ui.applyConversationEvent(&catalog);
+    ui.beginSessionResume();
+    var failed_terminal: backend.ConversationEvent = .{
+        .command_completed = .{ .failed = .{
+            .key = key,
+            .message = try backend.OwnedText.init(
+                std.testing.allocator,
+                "Session picker failed.",
+            ),
+        } },
+    };
+    defer failed_terminal.deinit();
+    _ = try ui.applyConversationEvent(&failed_terminal);
+    try std.testing.expectEqual(UiPhase.resuming, ui.phase);
+    try std.testing.expectEqual(MenuMode.closed, ui.menu_mode);
 }
 
 test "session catalog completion restores ready after finder dismissal" {
