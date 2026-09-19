@@ -68,7 +68,7 @@ async function ensureSession(lifecycle: Lifecycle): Promise<CopilotSession> {
 
 function respondWithSdk(lifecycle: Lifecycle, prompt: string): AsyncIterable<CopilotPortEvent> {
   const queue = new EventQueue<CopilotPortEvent>();
-  const start = (async () => {
+  void (async () => {
     const session = await ensureSession(lifecycle);
     let sawDelta = false;
     let responseError: string | undefined;
@@ -109,7 +109,6 @@ function respondWithSdk(lifecycle: Lifecycle, prompt: string): AsyncIterable<Cop
     queue.end();
   });
 
-  void start;
   return {
     [Symbol.asyncIterator](): AsyncIterator<CopilotPortEvent> {
       return {

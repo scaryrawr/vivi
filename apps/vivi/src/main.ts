@@ -13,7 +13,7 @@ export async function main(argv: readonly string[]): Promise<void> {
   parseCommand(argv);
   const port = createSdkCopilotPort({ workingDirectory: process.cwd() });
   const app = createViviApp(port);
-  await runChat({ app });
+  await runChat({ app, forceExit: (code) => process.exit(code) });
 }
 
 if (import.meta.main) {
