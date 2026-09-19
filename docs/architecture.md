@@ -167,8 +167,9 @@ existing unlimited behavior.
 
 `backend/src/bash_sessions.zig` is the deep, SDK-free owner of async Bash
 sessions. One manager is initialized lazily inside each workspace-scoped
-`tools.Service`; successful resume therefore stops the old workspace's
-processes, failed resume leaves them intact, and model switches preserve them.
+`tools.Service`; successful resume and `/new` session replacement therefore
+stop the previous conversation's processes, failed replacement leaves them
+intact, and model switches preserve them.
 The manager owns opaque IDs, separately allocated session state, bounded input
 and output rings, reader/writer/waiter threads, PTY endpoints, and idempotent
 stop. Reads consume up to 32 KiB after a bounded wait, output retention is
