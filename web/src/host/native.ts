@@ -221,6 +221,13 @@ class NativeConnectedViviHost implements ConnectedViviHost {
   }
 
   sendMessage(request: SendMessageRequest) {
+    if (new TextEncoder().encode(request.text).length > 1_000_000) {
+      return Promise.resolve<HostCommandResult>({
+        kind: "rejected",
+        reason: "invalid",
+        message: "Messages must not exceed 1,000,000 UTF-8 bytes.",
+      });
+    }
     return this.command("sendMessage", {
       sessionId: request.sessionId,
       submissionId: request.submissionId,
@@ -230,18 +237,11 @@ class NativeConnectedViviHost implements ConnectedViviHost {
 
   disconnect() {
     if (this.disconnected) return;
-    this.disconnected = true;
-    retireConnection(this);
-    this.handler.postMessage(this.request("disconnect", {}));
     const error = new NativeHostBridgeError(
       "disconnected",
       "The native host bridge disconnected.",
     );
-    for (const pending of this.pending.values()) pending.reject(error);
-    this.pending.clear();
-    this.connectionState = { kind: "disconnected" };
-    this.emit();
-    this.listeners.clear();
+    this.terminate(error, { kind: "disconnected" }, true);
   }
 
   private command(
@@ -360,6 +360,17 @@ class NativeConnectedViviHost implements ConnectedViviHost {
               "disconnected",
               "The native host disconnected during the handshake.",
             );
+          } else {
+            const message =
+              this.connectionState.kind === "failed"
+                ? this.connectionState.message
+                : "The native host bridge disconnected.";
+            this.terminate(
+              new NativeHostBridgeError("disconnected", message),
+              this.connectionState,
+              false,
+            );
+            return;
           }
           this.emit();
           return;
@@ -420,16 +431,24 @@ class NativeConnectedViviHost implements ConnectedViviHost {
   }
 
   private fail(error: NativeHostBridgeError) {
+    this.terminate(error, { kind: "failed", message: error.message }, true);
+  }
+
+  private terminate(
+    error: NativeHostBridgeError,
+    state: ConnectionState,
+    notifyHost: boolean,
+  ) {
     if (this.disconnected) return;
     this.disconnected = true;
-    this.connectionState = { kind: "failed", message: error.message };
+    this.connectionState = state;
     if (this.connectResponseAccepted) this.readyReject(error);
     for (const pending of this.pending.values()) pending.reject(error);
     this.pending.clear();
     this.emit();
     this.listeners.clear();
     retireConnection(this);
-    this.handler.postMessage(this.request("disconnect", {}));
+    if (notifyHost) this.handler.postMessage(this.request("disconnect", {}));
   }
 
   private emit() {
@@ -462,7 +481,7 @@ function parseSnapshot(input: unknown, path: string): HostSnapshot {
     path,
   );
   if (value.schemaVersion !== 1) invalid(`${path}.schemaVersion`, "must be 1");
-  return {
+  const snapshot: HostSnapshot = {
     schemaVersion: 1,
     revision: safeInteger(value.revision, `${path}.revision`, 0),
     projects: array(value.projects, `${path}.projects`, 100).map(
@@ -477,6 +496,69 @@ function parseSnapshot(input: unknown, path: string): HostSnapshot {
         ? null
         : parseHostError(value.applicationError, `${path}.applicationError`),
   };
+  validateSnapshotIdentity(snapshot, path);
+  return snapshot;
+}
+
+function validateSnapshotIdentity(snapshot: HostSnapshot, path: string) {
+  const projectPaths = new Set<string>();
+  const sessionIDs = new Set<string>();
+  for (const [projectIndex, project] of snapshot.projects.entries()) {
+    if (projectPaths.has(project.path)) {
+      invalid(
+        `${path}.projects[${projectIndex}].path`,
+        "duplicate project path",
+      );
+    }
+    projectPaths.add(project.path);
+    for (const [sessionIndex, session] of project.sessions.entries()) {
+      if (session.projectPath !== project.path) {
+        invalid(
+          `${path}.projects[${projectIndex}].sessions[${sessionIndex}].projectPath`,
+          "must match its containing project path",
+        );
+      }
+      if (sessionIDs.has(session.id)) {
+        invalid(
+          `${path}.projects[${projectIndex}].sessions[${sessionIndex}].id`,
+          "duplicate session ID",
+        );
+      }
+      sessionIDs.add(session.id);
+    }
+  }
+  const selected = snapshot.selectedSession;
+  if (!selected) return;
+  if (!sessionIDs.has(selected.id)) {
+    invalid(
+      `${path}.selectedSession.id`,
+      "must reference exactly one session summary",
+    );
+  }
+  if (selected.activeWorkspace !== sessionWorkspace(snapshot, selected.id)) {
+    invalid(
+      `${path}.selectedSession.activeWorkspace`,
+      "must match the selected session project path",
+    );
+  }
+  const transcriptIDs = new Set<string>();
+  for (const [index, item] of selected.transcript.entries()) {
+    if (transcriptIDs.has(item.id)) {
+      invalid(
+        `${path}.selectedSession.transcript[${index}].id`,
+        "duplicate transcript item ID",
+      );
+    }
+    transcriptIDs.add(item.id);
+  }
+}
+
+function sessionWorkspace(snapshot: HostSnapshot, id: string) {
+  for (const project of snapshot.projects) {
+    if (project.sessions.some((session) => session.id === id))
+      return project.path;
+  }
+  return undefined;
 }
 
 function parseProject(input: unknown, path: string): ProjectSnapshot {

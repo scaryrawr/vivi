@@ -294,6 +294,76 @@ describe("NativeViviHostPort", () => {
     });
     await expect(currentPending).resolves.toEqual({ kind: "accepted" });
   });
+
+  it.each([
+    [{ kind: "disconnected" }, { kind: "disconnected" }],
+    [
+      { kind: "failed", message: "native stopped" },
+      { kind: "failed", message: "native stopped" },
+    ],
+  ] as const)(
+    "makes post-handshake %j terminal",
+    async (publication, expectedState) => {
+      const posted: Record<string, unknown>[] = [];
+      window.webkit = {
+        messageHandlers: {
+          viviHostV1: {
+            postMessage: (message) =>
+              posted.push(message as Record<string, unknown>),
+          },
+        },
+      };
+      const connecting = new NativeViviHostPort().connect();
+      const connect = posted[0];
+      publishCompleteHandshake(connect);
+      const host = await connecting;
+      const pending = host.selectSession(
+        "0c8f9cc7-4767-4cec-92a3-9d7759e89a01" as never,
+      );
+      window.__viviHostV1Receive?.({
+        protocol: "vivi.host",
+        version: 1,
+        bridgeSessionId: connect.bridgeSessionId,
+        kind: "connection",
+        connectionState: publication,
+      });
+
+      await expect(pending).rejects.toMatchObject({ code: "disconnected" });
+      expect(host.getConnectionState()).toEqual(expectedState);
+      const postedAfterTerminalState = posted.length;
+      await expect(
+        host.createConversation("/test/vivi" as never),
+      ).rejects.toMatchObject({ code: "disconnected" });
+      expect(posted).toHaveLength(postedAfterTerminalState);
+      expect(window.__viviHostV1Receive).toBeUndefined();
+    },
+  );
+
+  it("rejects oversized outbound text without posting it", async () => {
+    const posted: Record<string, unknown>[] = [];
+    window.webkit = {
+      messageHandlers: {
+        viviHostV1: {
+          postMessage: (message) =>
+            posted.push(message as Record<string, unknown>),
+        },
+      },
+    };
+    const connecting = new NativeViviHostPort().connect();
+    const connect = posted[0];
+    publishCompleteHandshake(connect);
+    const host = await connecting;
+    const postedBeforeCommand = posted.length;
+
+    await expect(
+      host.sendMessage({
+        sessionId: "0c8f9cc7-4767-4cec-92a3-9d7759e89a01" as never,
+        submissionId: crypto.randomUUID() as never,
+        text: "é".repeat(500_001),
+      }),
+    ).resolves.toMatchObject({ kind: "rejected", reason: "invalid" });
+    expect(posted).toHaveLength(postedBeforeCommand);
+  });
 });
 
 describe("native host validation", () => {
@@ -368,6 +438,45 @@ describe("native host validation", () => {
         "result",
       ),
     ).toThrow(/unknown field/);
+  });
+
+  it("rejects inconsistent snapshot identity graphs", () => {
+    expect(() =>
+      nativeHostTesting.parseSnapshot(
+        {
+          ...fixtures.one,
+          projects: [fixtures.one.projects[0], fixtures.one.projects[0]],
+        },
+        "snapshot",
+      ),
+    ).toThrow(/duplicate project path/);
+    expect(() =>
+      nativeHostTesting.parseSnapshot(
+        {
+          ...fixtures.one,
+          selectedSession: {
+            ...fixtures.one.selectedSession!,
+            id: crypto.randomUUID(),
+          },
+        },
+        "snapshot",
+      ),
+    ).toThrow(/reference exactly one session summary/);
+    expect(() =>
+      nativeHostTesting.parseSnapshot(
+        {
+          ...fixtures.one,
+          selectedSession: {
+            ...fixtures.one.selectedSession!,
+            transcript: [
+              fixtures.one.selectedSession!.transcript[0],
+              fixtures.one.selectedSession!.transcript[0],
+            ],
+          },
+        },
+        "snapshot",
+      ),
+    ).toThrow(/duplicate transcript item ID/);
   });
 });
 
