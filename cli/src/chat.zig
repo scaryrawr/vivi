@@ -117,6 +117,22 @@ fn commandArgumentSuffix(input: []const u8) []const u8 {
     return if (separator) |index| input[index..] else "";
 }
 
+const NewCommandAction = enum {
+    start_session,
+    submit_prompt,
+};
+
+fn newCommandAction(input: []const u8) NewCommandAction {
+    return if (std.mem.trim(
+        u8,
+        commandArgumentSuffix(input),
+        " \t\r\n",
+    ).len == 0)
+        .start_session
+    else
+        .submit_prompt;
+}
+
 const FileReferenceQuery = struct {
     start: usize,
     end: usize,
@@ -3362,11 +3378,7 @@ const ChatUi = struct {
                         self.allocator,
                     );
                     defer self.allocator.free(contents);
-                    if (std.mem.trim(
-                        u8,
-                        commandArgumentSuffix(contents),
-                        " \t\r\n",
-                    ).len != 0) {
+                    if (newCommandAction(contents) == .submit_prompt) {
                         try self.submitPrompt(conversation, .immediate);
                         return;
                     }
@@ -3727,6 +3739,7 @@ const ChatUi = struct {
                             .status,
                             failure.bytes,
                         );
+                        try self.syncComposerMenu();
                     },
                 }
             },
@@ -6556,6 +6569,43 @@ test "new session replaces transcript and commands while preserving cwd" {
     try std.testing.expectEqual(@as(usize, 0), ui.rows_from_tail);
 }
 
+test "new session failure keeps command retry available" {
+    const commands = try std.testing.allocator.alloc(backend.CommandInfo, 1);
+    commands[0] = .{
+        .name = try std.testing.allocator.dupe(u8, "new"),
+        .description = try std.testing.allocator.dupe(u8, "Start fresh"),
+    };
+    var ui: ChatUi = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .input = TextInput.init(std.testing.allocator),
+        .cwd = try std.testing.allocator.dupe(u8, "/current"),
+        .phase = .starting_new_session,
+        .commands = .{
+            .allocator = std.testing.allocator,
+            .commands = commands,
+        },
+    };
+    defer ui.deinit();
+    try ui.input.insertSliceAtCursor("/new");
+
+    var event: backend.ConversationEvent = .{ .new_session = .{
+        .failed = try backend.OwnedText.init(
+            std.testing.allocator,
+            "Unable to start a new session.",
+        ),
+    } };
+    defer event.deinit();
+
+    _ = try ui.applyConversationEvent(&event);
+    try std.testing.expectEqual(UiPhase.ready, ui.phase);
+    try std.testing.expectEqual(MenuMode.commands, ui.menu_mode);
+    try std.testing.expectEqual(@as(usize, 1), ui.menu.matches.items.len);
+    const input = try ui.input.toOwnedContents(std.testing.allocator);
+    defer std.testing.allocator.free(input);
+    try std.testing.expectEqualStrings("/new", input);
+}
+
 test "empty assistant completion does not create or clear a draft" {
     var transcript: Transcript = .{};
     defer transcript.deinit(std.testing.allocator);
@@ -8419,6 +8469,22 @@ test "slash command parsing preserves argument suffixes" {
     try std.testing.expectEqualStrings(
         " pasted-image-token",
         commandArgumentSuffix("/new pasted-image-token"),
+    );
+    try std.testing.expectEqual(
+        NewCommandAction.start_session,
+        newCommandAction("/new"),
+    );
+    try std.testing.expectEqual(
+        NewCommandAction.start_session,
+        newCommandAction("/new \t"),
+    );
+    try std.testing.expectEqual(
+        NewCommandAction.submit_prompt,
+        newCommandAction("/new extra"),
+    );
+    try std.testing.expectEqual(
+        NewCommandAction.submit_prompt,
+        newCommandAction("/new vivi-image-1"),
     );
     const command_input = try buildCommandInput(
         std.testing.allocator,

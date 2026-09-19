@@ -101,6 +101,59 @@ final class ViviBackendRuntimeTests: XCTestCase {
     XCTAssertTrue(store.transcript.isEmpty)
   }
 
+  func testNewCommandWithArgumentsUsesNormalSubmission() {
+    let driver = FakeConversationDriver()
+    var requestCount = 0
+    let store = NativeChatStore(
+      workspace: "/tmp/work",
+      driver: driver,
+      requestNewConversation: { _ in
+        requestCount += 1
+        return true
+      })
+
+    store.reduce(.ready)
+    store.reduce(.modelCatalog(testCatalog()))
+    store.draft = "/new extra"
+    store.submit()
+
+    XCTAssertEqual(requestCount, 0)
+    XCTAssertEqual(driver.submittedPrompts, ["/new extra"])
+    XCTAssertEqual(driver.submittedAttachments, [[]])
+    XCTAssertTrue(store.draft.isEmpty)
+    XCTAssertEqual(store.transcript.first?.text, "/new extra")
+    XCTAssertEqual(store.lifecycle, .responding)
+  }
+
+  func testNewCommandWithAttachmentUsesNormalSubmission() async {
+    let driver = FakeConversationDriver()
+    let attachment = testAttachment(name: "context.png")
+    let acquirer = FakeAttachmentAcquirer(pasted: attachment)
+    var requestCount = 0
+    let store = NativeChatStore(
+      workspace: "/tmp/work",
+      driver: driver,
+      attachmentAcquirer: acquirer,
+      requestNewConversation: { _ in
+        requestCount += 1
+        return true
+      })
+
+    store.reduce(.ready)
+    store.reduce(.modelCatalog(testCatalog()))
+    store.draft = "/new"
+    store.pasteAttachment()
+    await store.waitForAttachmentAcquisition()
+    store.submit()
+
+    XCTAssertEqual(requestCount, 0)
+    XCTAssertEqual(driver.submittedPrompts, ["/new"])
+    XCTAssertEqual(driver.submittedAttachments, [[attachment]])
+    XCTAssertTrue(store.draft.isEmpty)
+    XCTAssertTrue(store.attachments.isEmpty)
+    XCTAssertEqual(store.lifecycle, .responding)
+  }
+
   func testAttachmentOnlySubmitClearsSelectionAfterAcceptance() async {
     let driver = FakeConversationDriver()
     let attachment = testAttachment(name: "diagram.png")
