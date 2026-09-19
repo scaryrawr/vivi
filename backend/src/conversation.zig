@@ -1018,16 +1018,15 @@ pub const Worker = struct {
         definitions: []const CommandDefinition,
         complete: bool,
     ) !void {
-        try self.core.mutex.lock(self.core.io);
-        const catalog = try self.core.command_registry.replace(definitions);
-        if (complete and !self.core.stop_requested) self.core.state = .idle;
-        const should_wake = self.publishLocked(.{
-            .command_catalog = catalog,
-        }) catch |err| {
-            self.core.mutex.unlock(self.core.io);
-            return err;
+        const should_wake = locked: {
+            try self.core.mutex.lock(self.core.io);
+            defer self.core.mutex.unlock(self.core.io);
+            const catalog = try self.core.command_registry.replace(definitions);
+            if (complete and !self.core.stop_requested) self.core.state = .idle;
+            break :locked try self.publishLocked(.{
+                .command_catalog = catalog,
+            });
         };
-        self.core.mutex.unlock(self.core.io);
         if (should_wake) self.core.wake.notify(self.core.wake.context);
     }
 
@@ -1047,27 +1046,23 @@ pub const Worker = struct {
         message: []const u8,
         complete: bool,
     ) !void {
-        try self.core.mutex.lock(self.core.io);
-        const catalog = try self.core.command_registry.replaceFailClosed();
-        if (complete and !self.core.stop_requested) self.core.state = .idle;
-        var should_wake = self.publishLocked(.{
-            .command_catalog = catalog,
-        }) catch |err| {
-            self.core.mutex.unlock(self.core.io);
-            return err;
+        const should_wake = locked: {
+            try self.core.mutex.lock(self.core.io);
+            defer self.core.mutex.unlock(self.core.io);
+            const catalog = try self.core.command_registry.replaceFailClosed();
+            if (complete and !self.core.stop_requested) self.core.state = .idle;
+            var should_wake = try self.publishLocked(.{
+                .command_catalog = catalog,
+            });
+            const status_message = OwnedText.init(
+                self.core.allocator,
+                message,
+            ) catch break :locked should_wake;
+            should_wake = (self.publishLocked(.{
+                .status = status_message,
+            }) catch false) or should_wake;
+            break :locked should_wake;
         };
-        const status_message = OwnedText.init(
-            self.core.allocator,
-            message,
-        ) catch {
-            self.core.mutex.unlock(self.core.io);
-            if (should_wake) self.core.wake.notify(self.core.wake.context);
-            return;
-        };
-        should_wake = (self.publishLocked(.{
-            .status = status_message,
-        }) catch false) or should_wake;
-        self.core.mutex.unlock(self.core.io);
         if (should_wake) self.core.wake.notify(self.core.wake.context);
     }
 
@@ -1330,10 +1325,11 @@ pub const Worker = struct {
             owned_closed.deinit();
             return;
         };
-        const should_wake = !self.core.wake_pending;
+        var terminal_should_wake = false;
         if (self.core.command_registry.active) |key| {
             self.core.command_registry.finish(key) catch {};
             if (self.core.command_terminal == null) {
+                terminal_should_wake = !self.core.wake_pending;
                 const message_source = switch (owned_closed) {
                     .requested => "Command stopped.",
                     .failed => |failure| failure.message.bytes,
@@ -1354,7 +1350,9 @@ pub const Worker = struct {
         self.core.state = .closed;
         self.core.mutex.unlock(self.core.io);
         self.publish(.{ .closed = owned_closed }) catch {};
-        if (should_wake) self.core.wake.notify(self.core.wake.context);
+        if (terminal_should_wake) {
+            self.core.wake.notify(self.core.wake.context);
+        }
     }
 
     fn publish(self: *Worker, event: Event) !void {
@@ -1803,6 +1801,107 @@ test "admitted commands publish one chronological terminal outcome" {
     handle.requestStop();
 }
 
+test "command catalog replacement failure releases mutex for failure completion" {
+    const Harness = struct {
+        fn run(_: *Worker) void {}
+
+        fn notify(_: *anyopaque) void {}
+    };
+
+    var failing = std.testing.FailingAllocator.init(
+        std.testing.allocator,
+        .{ .fail_index = 0 },
+    );
+    var wake_context: u8 = 0;
+    var core: Core = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .wake = .{
+            .context = &wake_context,
+            .notify = Harness.notify,
+        },
+        .runner = .{ .plain = Harness.run },
+        .state = .controlling,
+        .command_registry = command_domain.Registry.init(failing.allocator()),
+    };
+    defer {
+        for (core.commands.items) |*command| command.deinit();
+        core.commands.deinit(std.testing.allocator);
+        for (core.events.items) |*event| event.event.deinit();
+        core.events.deinit(std.testing.allocator);
+        if (core.command_terminal) |*terminal| terminal.event.deinit();
+        core.command_registry.deinit();
+    }
+    var worker: Worker = .{ .core = &core };
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        worker.commandCatalog(&.{.{
+            .name = "test",
+            .display_name = "Test",
+            .description = "Test command",
+            .source = .sdk_builtin,
+            .argument_policy = .none,
+        }}),
+    );
+
+    core.command_registry.allocator = std.testing.allocator;
+    try worker.completeCommandRefreshFailure("discovery failed");
+    try std.testing.expectEqual(State.idle, core.state);
+    try std.testing.expectEqual(@as(usize, 2), core.events.items.len);
+    try std.testing.expect(core.events.items[0].event == .command_catalog);
+    try std.testing.expect(core.events.items[1].event == .status);
+}
+
+test "ordinary close notifies wake callback once" {
+    const Script = struct {
+        fn run(worker: *Worker) void {
+            if (!(worker.ready() catch return)) return;
+            var command = worker.waitCommand();
+            command.deinit();
+            worker.closeRequested();
+        }
+    };
+    const WakeCounter = struct {
+        count: std.atomic.Value(usize) = .init(0),
+
+        fn notify(context: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            _ = self.count.fetchAdd(1, .monotonic);
+        }
+    };
+    var wake_counter: WakeCounter = .{};
+    var handle = try openWithRunner(
+        std.testing.allocator,
+        std.testing.io,
+        .{ .context = &wake_counter, .notify = WakeCounter.notify },
+        Script.run,
+    );
+    defer handle.deinit();
+
+    while (true) {
+        if (try handle.tryTakeEvent()) |event_value| {
+            var event = event_value;
+            defer event.deinit();
+            if (event == .ready) break;
+        } else try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    wake_counter.count.store(0, .monotonic);
+    handle.requestStop();
+
+    while (true) {
+        if (try handle.tryTakeEvent()) |event_value| {
+            var event = event_value;
+            defer event.deinit();
+            if (event == .closed) break;
+        } else try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        wake_counter.count.load(.monotonic),
+    );
+}
+
 test "fatal close publishes command failure before closed without duplication" {
     const Script = struct {
         fn run(worker: *Worker) void {
@@ -1852,21 +1951,31 @@ test "requested close publishes command failure before closed without duplicatio
             worker.closeRequested();
         }
     };
-    const TestWake = struct {
-        fn notify(_: *anyopaque) void {}
+    const WakeCounter = struct {
+        count: std.atomic.Value(usize) = .init(0),
+
+        fn notify(context: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            _ = self.count.fetchAdd(1, .monotonic);
+        }
     };
-    var context: u8 = 0;
+    var wake_counter: WakeCounter = .{};
     var handle = try openWithRunner(
         std.testing.allocator,
         std.testing.io,
-        .{ .context = &context, .notify = TestWake.notify },
+        .{ .context = &wake_counter, .notify = WakeCounter.notify },
         Script.run,
     );
     defer handle.deinit();
 
     const key = try waitForTestCommandKey(&handle);
+    wake_counter.count.store(0, .monotonic);
     try handle.executeCommand(key, "");
     try expectCommandTerminalBeforeClosed(&handle, key, "Command stopped.");
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        wake_counter.count.load(.monotonic),
+    );
 }
 
 fn waitForTestCommandKey(handle: *Conversation) !CommandKey {

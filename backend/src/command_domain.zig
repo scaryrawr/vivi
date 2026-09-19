@@ -130,7 +130,9 @@ pub const Catalog = struct {
     }
 
     pub fn find(self: *const Catalog, key: CommandKey) ?*const Descriptor {
-        const index = key.slot.value() - 1;
+        const slot = key.slot.value();
+        if (slot == 0) return null;
+        const index = slot - 1;
         if (index >= self.commands.len) return null;
         const command = &self.commands[index];
         if (!std.meta.eql(command.key, key)) return null;
@@ -407,6 +409,20 @@ test "catalog generations are nonzero and stale keys fail closed" {
     try std.testing.expectError(
         error.StaleCommandKey,
         registry.admit(old_key, ""),
+    );
+}
+
+test "admission rejects a zero slot in the current generation" {
+    var registry = Registry.init(std.testing.allocator);
+    defer registry.deinit();
+    var catalog = try registry.replace(&.{});
+    defer catalog.deinit();
+    try std.testing.expectError(
+        error.InvalidCommandKey,
+        registry.admit(.{
+            .generation = catalog.commands[0].key.generation,
+            .slot = @enumFromInt(0),
+        }, ""),
     );
 }
 
