@@ -3862,7 +3862,7 @@ const ChatUi = struct {
                     .failed => |failure| try self.transcript.append(
                         self.allocator,
                         .status,
-                        failure.message.bytes,
+                        failure.messageText(),
                     ),
                 }
                 return .close;

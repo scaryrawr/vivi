@@ -123,11 +123,18 @@ test "session catalog snapshots retain opaque keys and owned display text" {
 
 pub const Failure = struct {
     kind: FailureKind,
-    message: OwnedText,
+    message: ?OwnedText,
 
     pub fn deinit(self: *Failure) void {
-        self.message.deinit();
+        if (self.message) |*message| message.deinit();
         self.* = undefined;
+    }
+
+    pub fn messageText(self: *const Failure) []const u8 {
+        return if (self.message) |message|
+            message.bytes
+        else
+            "Conversation failed.";
     }
 };
 
@@ -850,6 +857,7 @@ const Core = struct {
     commands: std.ArrayList(Command) = .empty,
     events: std.ArrayList(SequencedEvent) = .empty,
     command_terminal: ?SequencedEvent = null,
+    close_event: ?SequencedEvent = null,
     next_event_sequence: u128 = 1,
     command_registry: command_domain.Registry,
     pending_user_input: ?UserInputRequest = null,
@@ -1312,10 +1320,12 @@ pub const Worker = struct {
         kind: FailureKind,
         message: []const u8,
     ) void {
-        const text = OwnedText.init(self.core.allocator, message) catch return;
         self.close(.{ .failed = .{
             .kind = kind,
-            .message = text,
+            .message = OwnedText.init(
+                self.core.allocator,
+                message,
+            ) catch null,
         } });
     }
 
@@ -1325,14 +1335,13 @@ pub const Worker = struct {
             owned_closed.deinit();
             return;
         };
-        var terminal_should_wake = false;
+        const should_wake = !self.core.wake_pending;
         if (self.core.command_registry.active) |key| {
             self.core.command_registry.finish(key) catch {};
             if (self.core.command_terminal == null) {
-                terminal_should_wake = !self.core.wake_pending;
                 const message_source = switch (owned_closed) {
                     .requested => "Command stopped.",
-                    .failed => |failure| failure.message.bytes,
+                    .failed => |failure| failure.messageText(),
                 };
                 self.core.command_terminal = .{
                     .sequence = self.takeEventSequenceLocked(),
@@ -1344,13 +1353,16 @@ pub const Worker = struct {
                         ) catch null,
                     } } },
                 };
-                self.core.wake_pending = true;
             }
         }
+        self.core.close_event = .{
+            .sequence = self.takeEventSequenceLocked(),
+            .event = .{ .closed = owned_closed },
+        };
+        self.core.wake_pending = true;
         self.core.state = .closed;
         self.core.mutex.unlock(self.core.io);
-        self.publish(.{ .closed = owned_closed }) catch {};
-        if (terminal_should_wake) {
+        if (should_wake) {
             self.core.wake.notify(self.core.wake.context);
         }
     }
@@ -1571,23 +1583,36 @@ pub const Conversation = struct {
         defer self.core.mutex.unlock(self.core.io);
 
         if (self.core.events.items.len == 0 and
-            self.core.command_terminal == null)
+            self.core.command_terminal == null and
+            self.core.close_event == null)
         {
             self.core.wake_pending = false;
             return null;
         }
-        const take_terminal = if (self.core.command_terminal) |terminal|
+        const take_command_terminal = if (self.core.command_terminal) |terminal|
             self.core.events.items.len == 0 or
                 terminal.sequence < self.core.events.items[0].sequence
         else
             false;
-        const sequenced = if (take_terminal) blk: {
+        const take_close = if (self.core.close_event) |close_event|
+            (self.core.events.items.len == 0 or
+                close_event.sequence < self.core.events.items[0].sequence) and
+                (!take_command_terminal or
+                    close_event.sequence < self.core.command_terminal.?.sequence)
+        else
+            false;
+        const sequenced = if (take_command_terminal and !take_close) blk: {
             const terminal = self.core.command_terminal.?;
             self.core.command_terminal = null;
             break :blk terminal;
+        } else if (take_close) blk: {
+            const close_event = self.core.close_event.?;
+            self.core.close_event = null;
+            break :blk close_event;
         } else self.core.events.orderedRemove(0);
         if (self.core.events.items.len == 0 and
-            self.core.command_terminal == null)
+            self.core.command_terminal == null and
+            self.core.close_event == null)
         {
             self.core.wake_pending = false;
         }
@@ -1615,6 +1640,7 @@ pub const Conversation = struct {
         for (self.core.events.items) |*event| event.event.deinit();
         self.core.events.deinit(self.core.allocator);
         if (self.core.command_terminal) |*terminal| terminal.event.deinit();
+        if (self.core.close_event) |*close_event| close_event.event.deinit();
         if (self.core.pending_user_input) |*request| request.deinit();
         self.core.command_registry.deinit();
         const allocator = self.core.allocator;
@@ -1851,6 +1877,89 @@ test "command catalog replacement failure releases mutex for failure completion"
     try std.testing.expectEqual(@as(usize, 2), core.events.items.len);
     try std.testing.expect(core.events.items[0].event == .command_catalog);
     try std.testing.expect(core.events.items[1].event == .status);
+}
+
+test "allocation failures cannot prevent one terminal close and wake" {
+    const Harness = struct {
+        fn run(_: *Worker) void {}
+    };
+    const WakeCounter = struct {
+        count: std.atomic.Value(usize) = .init(0),
+
+        fn notify(context: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            _ = self.count.fetchAdd(1, .monotonic);
+        }
+    };
+
+    var report_failing = std.testing.FailingAllocator.init(
+        std.testing.allocator,
+        .{ .fail_index = 0 },
+    );
+    var close_failing = std.testing.FailingAllocator.init(
+        std.testing.allocator,
+        .{ .fail_index = 0 },
+    );
+    var wake_counter: WakeCounter = .{};
+    var core: Core = .{
+        .allocator = close_failing.allocator(),
+        .io = std.testing.io,
+        .wake = .{
+            .context = &wake_counter,
+            .notify = WakeCounter.notify,
+        },
+        .runner = .{ .plain = Harness.run },
+        .state = .controlling,
+        .command_registry = command_domain.Registry.init(
+            report_failing.allocator(),
+        ),
+    };
+    defer {
+        for (core.commands.items) |*command| command.deinit();
+        core.commands.deinit(core.allocator);
+        for (core.events.items) |*event| event.event.deinit();
+        core.events.deinit(core.allocator);
+        if (core.command_terminal) |*terminal| terminal.event.deinit();
+        if (core.close_event) |*close_event| close_event.event.deinit();
+        core.command_registry.deinit();
+    }
+    var worker: Worker = .{ .core = &core };
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        worker.completeCommandRefreshFailure("command discovery failed"),
+    );
+    worker.closeFailure(.stream, "command discovery failed");
+    try std.testing.expectEqual(State.closed, core.state);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        wake_counter.count.load(.monotonic),
+    );
+
+    worker.closeFailure(.stream, "duplicate close");
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        wake_counter.count.load(.monotonic),
+    );
+
+    var handle: Conversation = .{ .core = &core };
+    var event = (try handle.tryTakeEvent()).?;
+    defer event.deinit();
+    switch (event) {
+        .closed => |closed| switch (closed) {
+            .requested => return error.ExpectedFailureClose,
+            .failed => |failure| {
+                try std.testing.expectEqual(FailureKind.stream, failure.kind);
+                try std.testing.expect(failure.message == null);
+                try std.testing.expectEqualStrings(
+                    "Conversation failed.",
+                    failure.messageText(),
+                );
+            },
+        },
+        else => return error.ExpectedClosedEvent,
+    }
+    try std.testing.expect(try handle.tryTakeEvent() == null);
 }
 
 test "ordinary close notifies wake callback once" {
