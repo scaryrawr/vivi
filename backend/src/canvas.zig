@@ -152,25 +152,7 @@ fn JsonDocument(comptime role: JsonRole) type {
                 return error.JsonDocumentTooLong;
             if (!std.unicode.utf8ValidateSlice(value))
                 return error.InvalidJsonUtf8;
-            const parsed = std.json.parseFromSlice(
-                std.json.Value,
-                allocator,
-                value,
-                .{},
-            ) catch |err| switch (err) {
-                error.OutOfMemory => return err,
-                else => return error.InvalidJson,
-            };
-            defer parsed.deinit();
-            try validateJsonRole(role, parsed.value);
-            var nodes: usize = 0;
-            try validateJsonBounds(
-                parsed.value,
-                1,
-                &nodes,
-                limits.max_json_depth,
-                limits.max_json_nodes,
-            );
+            try validateJson(allocator, value, role, limits);
             return .{ .bytes = try allocator.dupe(u8, value) };
         }
 
@@ -198,53 +180,59 @@ pub const OpenInputDocument = JsonDocument(.open_input);
 pub const ActionInputDocument = JsonDocument(.action_input);
 pub const ActionResultDocument = JsonDocument(.action_result);
 
-fn validateJsonRole(role: JsonRole, value: std.json.Value) !void {
-    switch (role) {
-        .schema => switch (value) {
-            .object, .bool => {},
-            else => return error.InvalidSchemaDocument,
-        },
-        .open_input, .action_input => switch (value) {
-            .object, .null => {},
-            else => return error.InvalidInputDocument,
-        },
-        .action_result => {},
-    }
-}
-
-fn validateJsonBounds(
-    value: std.json.Value,
-    depth: usize,
-    nodes: *usize,
-    max_depth: usize,
-    max_nodes: usize,
+fn validateJson(
+    allocator: std.mem.Allocator,
+    value: []const u8,
+    role: JsonRole,
+    limits: Limits,
 ) !void {
-    if (depth > max_depth) return error.JsonDepthExceeded;
-    nodes.* += 1;
-    if (nodes.* > max_nodes) return error.JsonNodeLimitExceeded;
-    switch (value) {
-        .array => |array| for (array.items) |child| {
-            try validateJsonBounds(
-                child,
-                depth + 1,
-                nodes,
-                max_depth,
-                max_nodes,
-            );
-        },
-        .object => |object| {
-            var iterator = object.iterator();
-            while (iterator.next()) |entry| {
-                try validateJsonBounds(
-                    entry.value_ptr.*,
-                    depth + 1,
-                    nodes,
-                    max_depth,
-                    max_nodes,
-                );
+    var scanner = std.json.Scanner.initCompleteInput(allocator, value);
+    defer scanner.deinit();
+    var depth: usize = 0;
+    var nodes: usize = 0;
+    var first = true;
+    while (true) {
+        const token = scanner.next() catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidJson,
+        };
+        if (first) {
+            first = false;
+            switch (role) {
+                .schema => switch (token) {
+                    .object_begin, .true, .false => {},
+                    else => return error.InvalidSchemaDocument,
+                },
+                .open_input, .action_input => switch (token) {
+                    .object_begin, .null => {},
+                    else => return error.InvalidInputDocument,
+                },
+                .action_result => if (token == .end_of_document)
+                    return error.InvalidJson,
             }
-        },
-        else => {},
+        }
+        switch (token) {
+            .object_begin, .array_begin => {
+                depth += 1;
+                if (depth > limits.max_json_depth)
+                    return error.JsonDepthExceeded;
+                nodes += 1;
+            },
+            .object_end, .array_end => depth -= 1,
+            .true, .false, .null, .number, .string => nodes += 1,
+            .end_of_document => break,
+            .partial_number,
+            .partial_string,
+            .partial_string_escaped_1,
+            .partial_string_escaped_2,
+            .partial_string_escaped_3,
+            .partial_string_escaped_4,
+            .allocated_number,
+            .allocated_string,
+            => return error.InvalidJson,
+        }
+        if (nodes > limits.max_json_nodes)
+            return error.JsonNodeLimitExceeded;
     }
 }
 
@@ -1146,7 +1134,7 @@ pub const Domain = struct {
         {
             return error.Backpressure;
         }
-        const token = try self.peekToken(.open);
+        const token = try self.peekOpenToken();
 
         var candidate = if (existing_index) |index|
             try self.instances.items[index].clone(self.allocator, self.limits)
@@ -1184,7 +1172,7 @@ pub const Domain = struct {
         } });
 
         try publisher.publishAtomic(effects.items);
-        self.commitToken();
+        self.commitOpenToken();
         if (existing_index) |index| {
             self.instances.items[index].deinit(self.allocator);
             self.instances.items[index] = candidate;
@@ -1200,9 +1188,14 @@ pub const Domain = struct {
         publisher: EffectPublisher,
     ) !OperationToken {
         try self.requireOperational();
-        try self.requirePendingCapacity(1);
         const index = self.findInstance(request.key) orelse
             return error.CanvasNotOpen;
+        const action_count = self.instances.items[index].pending_actions.items.len;
+        if (self.pendingCount() - action_count + 1 >
+            self.limits.max_pending_operations)
+        {
+            return error.Backpressure;
+        }
         var candidate = try self.instances.items[index].clone(
             self.allocator,
             self.limits,
@@ -1212,18 +1205,25 @@ pub const Domain = struct {
             .opened => |value| value,
             else => return error.CanvasNotOpen,
         };
-        const token = try self.peekToken(.close);
+        const token = try self.peekToken(.close, opened.generation);
+        var effects: std.ArrayList(EffectView) = .empty;
+        defer effects.deinit(self.allocator);
+        try effects.ensureUnusedCapacity(self.allocator, action_count + 1);
+        for (candidate.pending_actions.items) |action| {
+            effects.appendAssumeCapacity(.{ .cancel = action.token });
+        }
+        candidate.clearActions(self.allocator);
         candidate.runtime = .closed;
         candidate.replaceRuntime(self.allocator, .{ .closing = .{
             .token = token,
             .prior = opened,
         } });
-        const effect = EffectView{ .start_close = .{
+        effects.appendAssumeCapacity(.{ .start_close = .{
             .token = token,
             .key = candidate.key.view(),
-        } };
-        try publisher.publishAtomic(&.{effect});
-        self.commitToken();
+        } });
+        try publisher.publishAtomic(effects.items);
+        self.commitOperation();
         self.instances.items[index].deinit(self.allocator);
         self.instances.items[index] = candidate;
         return token;
@@ -1253,7 +1253,11 @@ pub const Domain = struct {
             self.limits,
         );
         errdefer candidate.deinit(self.allocator);
-        const token = try self.peekToken(.action);
+        const generation = switch (candidate.runtime) {
+            .opened => |value| value.generation,
+            else => unreachable,
+        };
+        const token = try self.peekToken(.action, generation);
         const name = try ActionName.init(request.action_name, self.limits);
         var input = if (request.input) |value|
             try value.clone(self.allocator, self.limits)
@@ -1277,7 +1281,7 @@ pub const Domain = struct {
             .input_json = if (pending.input) |value| value.bytes else null,
         } };
         try publisher.publishAtomic(&.{effect});
-        self.commitToken();
+        self.commitOperation();
         self.instances.items[index].deinit(self.allocator);
         self.instances.items[index] = candidate;
         return token;
@@ -1619,7 +1623,7 @@ pub const Domain = struct {
         }
     }
 
-    fn peekToken(self: Domain, kind: OperationKind) !OperationToken {
+    fn peekOpenToken(self: Domain) !OperationToken {
         if (self.next_operation_id == std.math.maxInt(u64) or
             self.next_generation == std.math.maxInt(u64))
         {
@@ -1628,13 +1632,31 @@ pub const Domain = struct {
         return .{
             .id = @enumFromInt(self.next_operation_id),
             .generation = @enumFromInt(self.next_generation),
+            .kind = .open,
+        };
+    }
+
+    fn peekToken(
+        self: Domain,
+        kind: OperationKind,
+        generation: Generation,
+    ) !OperationToken {
+        if (self.next_operation_id == std.math.maxInt(u64))
+            return error.OperationCounterExhausted;
+        return .{
+            .id = @enumFromInt(self.next_operation_id),
+            .generation = generation,
             .kind = kind,
         };
     }
 
-    fn commitToken(self: *Domain) void {
+    fn commitOpenToken(self: *Domain) void {
         self.next_operation_id += 1;
         self.next_generation += 1;
+    }
+
+    fn commitOperation(self: *Domain) void {
+        self.next_operation_id += 1;
     }
 
     fn findInstance(self: Domain, key: KeyView) ?usize {
@@ -1895,6 +1917,14 @@ test "bounded identities and role documents validate their own shapes" {
             .{ .max_json_depth = 2 },
         ),
     );
+    try std.testing.expectError(
+        error.JsonNodeLimitExceeded,
+        ActionResultDocument.init(
+            std.testing.allocator,
+            "{\"one\":1,\"two\":2}",
+            .{ .max_json_nodes = 2 },
+        ),
+    );
 }
 
 test "registry replacement and incremental update are distinct and atomic" {
@@ -1965,6 +1995,7 @@ test "fixture drives open action close and stale completion semantics" {
         .key = fixture_key,
         .action_name = "refresh",
     }, publisher.publisher());
+    try std.testing.expectEqual(open.generation, action.generation);
     var action_result = try ActionResultDocument.init(
         std.testing.allocator,
         "{\"refreshed\":true}",
@@ -1980,6 +2011,7 @@ test "fixture drives open action close and stale completion semantics" {
         .{ .key = fixture_key },
         publisher.publisher(),
     );
+    try std.testing.expectEqual(open.generation, close.generation);
     try std.testing.expectEqual(RuntimeTag.closing, domain.runtimeTag(fixture_key).?);
     try std.testing.expectEqual(
         CompletionDisposition.ignored_stale,
@@ -2211,6 +2243,37 @@ test "close and action publication failures leave stable prior state" {
     );
     try std.testing.expectEqual(RuntimeTag.opened, domain.runtimeTag(fixture_key).?);
     try std.testing.expectEqual(@as(usize, 0), domain.pendingCount());
+}
+
+test "close cancels pending actions before closing the instance" {
+    var domain = try fixtureDomain(std.testing.allocator);
+    defer domain.deinit();
+    var publisher: TestPublisher = .{};
+    const open = try domain.open(
+        .{ .key = fixture_key },
+        publisher.publisher(),
+    );
+    _ = try domain.completeOpen(open, .{ .succeeded = .{} });
+    const action = try domain.invokeAction(.{
+        .key = fixture_key,
+        .action_name = "refresh",
+    }, publisher.publisher());
+
+    const close = try domain.close(
+        .{ .key = fixture_key },
+        publisher.publisher(),
+    );
+    try std.testing.expectEqual(@as(usize, 2), publisher.effect_count);
+    try std.testing.expect(publisher.tokens[0].eql(action));
+    try std.testing.expect(publisher.tokens[1].eql(close));
+    try std.testing.expectEqual(@as(usize, 1), domain.pendingCount());
+    try std.testing.expectEqual(
+        CompletionDisposition.ignored_stale,
+        try domain.completeAction(action, .{ .failed = .cancelled }),
+    );
+    _ = try domain.completeClose(close, .succeeded);
+    try std.testing.expectEqual(@as(usize, 0), domain.pendingCount());
+    try std.testing.expectEqual(RuntimeTag.closed, domain.runtimeTag(fixture_key).?);
 }
 
 test "close failure restores the prior opened state transactionally" {
