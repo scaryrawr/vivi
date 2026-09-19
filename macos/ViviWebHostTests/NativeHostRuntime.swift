@@ -121,6 +121,12 @@ final class NativeHostRuntime {
     }
   }
 
+  func stop() {
+    if case .connected(let bridgeSessionID) = state {
+      state = .disconnected(bridgeSessionID)
+    }
+  }
+
   private func commandMessages(
     request: HostWireV1.Request,
     result: HostCommandResult

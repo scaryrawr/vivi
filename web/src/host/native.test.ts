@@ -180,6 +180,22 @@ describe("NativeViviHostPort", () => {
       }),
     );
   });
+
+  it("rejects connect when the correlated response is malformed", async () => {
+    const { connecting, connect } = startConnection();
+    window.__viviHostV1Receive?.({
+      protocol: "vivi.host",
+      version: 1,
+      bridgeSessionId: connect.bridgeSessionId,
+      kind: "response",
+      requestId: connect.requestId,
+      result: { kind: "accepted", unexpected: true },
+    });
+
+    await expect(connecting).rejects.toMatchObject({
+      code: "invalid-message",
+    });
+  });
 });
 
 describe("native host validation", () => {

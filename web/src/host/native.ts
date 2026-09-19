@@ -336,8 +336,8 @@ class NativeConnectedViviHost implements ConnectedViviHost {
         "The native host returned an unknown or duplicate response.",
       );
     }
-    this.pending.delete(requestId);
     const result = parseCommandResult(message.result, "message.result");
+    this.pending.delete(requestId);
     if (pending.command === "connect" && result.kind === "accepted") {
       this.connectResponseAccepted = true;
       this.checkReady();

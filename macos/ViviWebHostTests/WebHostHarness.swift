@@ -99,6 +99,7 @@ final class WebHostHarness: NSObject {
 
   func stop() {
     isRunning = false
+    runtime.stop()
     loadContinuation?.resume(throwing: CancellationError())
     loadContinuation = nil
     guard let webView else { return }

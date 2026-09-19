@@ -41,6 +41,14 @@ final class WebHostHarnessTests: XCTestCase {
       body: requestBody(bridge: UUID(), command: "connect", payload: [:]))
     XCTAssertEqual(harness.receivedMessageCount, receivedBeforeLateMessage)
     harness.stop()
+
+    try await harness.start()
+    let restartedWebView = try XCTUnwrap(harness.webView)
+    let restarted = try await waitForBoolean(
+      in: restartedWebView,
+      expression: "document.body.textContent.includes('Native bridge proof')")
+    XCTAssertTrue(restarted)
+    harness.stop()
   }
 
   func testNavigationPolicyRejectsNetworkAndPopupRequests() async throws {
