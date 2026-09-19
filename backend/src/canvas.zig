@@ -10,6 +10,7 @@ pub const Limits = struct {
     max_actions_per_canvas: usize = 32,
     max_registry_entries: usize = 128,
     max_registry_operations: usize = 256,
+    max_registry_bytes: usize = 4 * 1024 * 1024,
     max_instances: usize = 64,
     max_pending_operations: usize = 128,
 };
@@ -23,6 +24,11 @@ fn validateAggregateLength(lengths: []const usize, maximum: usize) !void {
             return error.KeyTooLong;
     }
     if (total > maximum) return error.KeyTooLong;
+}
+
+fn addRegistryBytes(total: usize, additional: usize) !usize {
+    return std.math.add(usize, total, additional) catch
+        return error.RegistryTooLarge;
 }
 
 fn Identifier(comptime role_name: []const u8) type {
@@ -467,10 +473,67 @@ pub const CanvasDeclaration = struct {
     }
 };
 
+fn declarationInputBytes(input: CanvasDeclarationInput) !usize {
+    var total = try addRegistryBytes(
+        input.display_name.len,
+        input.description.len,
+    );
+    if (input.input_schema_json) |json|
+        total = try addRegistryBytes(total, json.len);
+    for (input.actions) |action| {
+        total = try addRegistryBytes(total, action.display_name.len);
+        total = try addRegistryBytes(total, action.description.len);
+        if (action.input_schema_json) |json|
+            total = try addRegistryBytes(total, json.len);
+    }
+    return total;
+}
+
+fn declarationBytes(declaration: CanvasDeclaration) !usize {
+    var total = try addRegistryBytes(
+        declaration.display_name.len,
+        declaration.description.len,
+    );
+    if (declaration.input_schema) |schema|
+        total = try addRegistryBytes(total, schema.bytes.len);
+    for (declaration.actions) |action| {
+        total = try addRegistryBytes(total, action.display_name.len);
+        total = try addRegistryBytes(total, action.description.len);
+        if (action.input_schema) |schema|
+            total = try addRegistryBytes(total, schema.bytes.len);
+    }
+    return total;
+}
+
 pub const RegistryDeltaInput = struct {
     upserted: []const CanvasDeclarationInput = &.{},
     removed: []const CanvasKeyView = &.{},
 };
+
+fn canvasKeyViewEql(left: CanvasKeyView, right: CanvasKeyView) bool {
+    return std.mem.eql(u8, left.extension_id, right.extension_id) and
+        std.mem.eql(u8, left.canvas_id, right.canvas_id);
+}
+
+fn containsCanvasKey(keys: []const CanvasKeyView, key: CanvasKeyView) bool {
+    for (keys) |candidate| {
+        if (canvasKeyViewEql(candidate, key)) return true;
+    }
+    return false;
+}
+
+fn upsertsCanvasKey(
+    inputs: []const CanvasDeclarationInput,
+    key: CanvasKeyView,
+) bool {
+    for (inputs) |input| {
+        if (canvasKeyViewEql(.{
+            .extension_id = input.extension_id,
+            .canvas_id = input.canvas_id,
+        }, key)) return true;
+    }
+    return false;
+}
 
 pub const RegistryUpdate = union(enum) {
     replacement: []const CanvasDeclarationInput,
@@ -913,10 +976,23 @@ const PendingAction = struct {
 
 pub const Degradation = enum {
     declaration_removed,
+    provider_unavailable,
     invalid_signal,
     limit_exceeded,
     backpressure,
     host_failure,
+};
+
+pub const UnavailableReason = enum {
+    declaration_removed,
+    provider_unavailable,
+
+    fn degradation(self: UnavailableReason) Degradation {
+        return switch (self) {
+            .declaration_removed => .declaration_removed,
+            .provider_unavailable => .provider_unavailable,
+        };
+    }
 };
 
 const Instance = struct {
@@ -1121,6 +1197,7 @@ pub const Domain = struct {
     next_operation_id: u64 = 1,
     next_generation: u64 = 1,
     shutdown_requested: bool = false,
+    in_operation: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, limits: Limits) Domain {
         return .{ .allocator = allocator, .limits = limits };
@@ -1136,7 +1213,9 @@ pub const Domain = struct {
     pub fn setCapability(
         self: *Domain,
         capability: CapabilityState,
-    ) void {
+    ) !void {
+        try self.beginOperation();
+        defer self.endOperation();
         self.capability = capability;
     }
 
@@ -1144,6 +1223,8 @@ pub const Domain = struct {
         self: *Domain,
         update: RegistryUpdate,
     ) !void {
+        try self.beginOperation();
+        defer self.endOperation();
         if (self.shutdown_requested) return error.Shutdown;
         const candidate = switch (update) {
             .replacement => |inputs| try self.buildRegistry(inputs),
@@ -1158,6 +1239,8 @@ pub const Domain = struct {
         request: OpenRequest,
         publisher: EffectPublisher,
     ) !OperationToken {
+        try self.beginOperation();
+        defer self.endOperation();
         try self.requireOperational();
         const validated_key = try InstanceKey.init(request.key, self.limits);
         const key = validated_key.view();
@@ -1240,6 +1323,8 @@ pub const Domain = struct {
         request: CloseRequest,
         publisher: EffectPublisher,
     ) !OperationToken {
+        try self.beginOperation();
+        defer self.endOperation();
         try self.requireOperational();
         const validated_key = try InstanceKey.init(request.key, self.limits);
         const index = self.findInstance(validated_key.view()) orelse
@@ -1290,6 +1375,8 @@ pub const Domain = struct {
         request: InvokeActionRequest,
         publisher: EffectPublisher,
     ) !OperationToken {
+        try self.beginOperation();
+        defer self.endOperation();
         try self.requireOperational();
         const validated_key = try InstanceKey.init(request.key, self.limits);
         const key = validated_key.view();
@@ -1352,6 +1439,8 @@ pub const Domain = struct {
         token: OperationToken,
         publisher: EffectPublisher,
     ) !CancelDisposition {
+        try self.beginOperation();
+        defer self.endOperation();
         try self.requireOperational();
         const location = self.findToken(token) orelse return .ignored_stale;
         var candidate = try self.instances.items[location.instance_index]
@@ -1386,8 +1475,19 @@ pub const Domain = struct {
         token: OperationToken,
         outcome: OpenOutcome,
     ) !CompletionDisposition {
+        try self.beginOperation();
+        defer self.endOperation();
         const location = self.findToken(token) orelse return .ignored_stale;
         if (location.kind != .open) return .ignored_stale;
+        switch (outcome) {
+            .succeeded => |result| {
+                if (result.title) |value| try validateText(value, self.limits);
+                if (result.location) |value|
+                    try validateText(value, self.limits);
+                if (result.status) |value| try validateText(value, self.limits);
+            },
+            .failed => {},
+        }
         var candidate = try self.instances.items[location.instance_index]
             .clone(self.allocator, self.limits);
         errdefer candidate.deinit(self.allocator);
@@ -1421,6 +1521,8 @@ pub const Domain = struct {
         token: OperationToken,
         outcome: CloseOutcome,
     ) !CompletionDisposition {
+        try self.beginOperation();
+        defer self.endOperation();
         const location = self.findToken(token) orelse return .ignored_stale;
         if (location.kind != .close) return .ignored_stale;
         var candidate = try self.instances.items[location.instance_index]
@@ -1451,6 +1553,8 @@ pub const Domain = struct {
         token: OperationToken,
         outcome: ActionOutcome,
     ) !CompletionDisposition {
+        try self.beginOperation();
+        defer self.endOperation();
         const location = self.findToken(token) orelse return .ignored_stale;
         if (location.kind != .action) return .ignored_stale;
         switch (outcome) {
@@ -1479,8 +1583,11 @@ pub const Domain = struct {
     pub fn markUnavailable(
         self: *Domain,
         key: KeyView,
+        reason: UnavailableReason,
         publisher: EffectPublisher,
     ) !void {
+        try self.beginOperation();
+        defer self.endOperation();
         try self.requireOperational();
         const validated_key = try InstanceKey.init(key, self.limits);
         const validated_view = validated_key.view();
@@ -1498,7 +1605,7 @@ pub const Domain = struct {
             var instance = Instance{ .key = validated_key };
             errdefer instance.deinit(self.allocator);
             instance.runtime = .unavailable;
-            instance.degradation = .declaration_removed;
+            instance.degradation = reason.degradation();
             if (reclaimed_index == null)
                 try self.instances.ensureUnusedCapacity(self.allocator, 1);
             self.commitPreparedInstance(instance, null, reclaimed_index);
@@ -1514,7 +1621,7 @@ pub const Domain = struct {
         try self.appendSettlementEffects(&candidate, &effects);
         candidate.clearActions(self.allocator);
         candidate.replaceRuntime(self.allocator, .unavailable);
-        candidate.degradation = .declaration_removed;
+        candidate.degradation = reason.degradation();
         if (effects.items.len > 0) try publisher.publishAtomic(effects.items);
         self.instances.items[index].deinit(self.allocator);
         self.instances.items[index] = candidate;
@@ -1526,6 +1633,8 @@ pub const Domain = struct {
         title: ?[]const u8,
         input: ?*const OpenInputDocument,
     ) !void {
+        try self.beginOperation();
+        defer self.endOperation();
         try self.requireOperational();
         const validated_key = try InstanceKey.init(key, self.limits);
         const validated_view = validated_key.view();
@@ -1573,6 +1682,8 @@ pub const Domain = struct {
     }
 
     pub fn removeRecord(self: *Domain, key: KeyView) !void {
+        try self.beginOperation();
+        defer self.endOperation();
         try self.requireOperational();
         const validated_key = try InstanceKey.init(key, self.limits);
         const index = self.findInstance(validated_key.view()) orelse return;
@@ -1584,6 +1695,8 @@ pub const Domain = struct {
         self: *Domain,
         publisher: EffectPublisher,
     ) !void {
+        try self.beginOperation();
+        defer self.endOperation();
         if (self.shutdown_requested) return;
         var effects: std.ArrayList(EffectView) = .empty;
         defer effects.deinit(self.allocator);
@@ -1690,6 +1803,17 @@ pub const Domain = struct {
 
     fn requireOperational(self: Domain) !void {
         if (self.shutdown_requested) return error.Shutdown;
+    }
+
+    /// Rejects any call that reenters the domain while another operation owns
+    /// prepared state, including calls made by a publisher during publication.
+    fn beginOperation(self: *Domain) !void {
+        if (self.in_operation) return error.ReentrantDomainCall;
+        self.in_operation = true;
+    }
+
+    fn endOperation(self: *Domain) void {
+        self.in_operation = false;
     }
 
     fn requirePendingCapacity(self: Domain, additional: usize) !void {
@@ -1865,6 +1989,15 @@ pub const Domain = struct {
                 .canvas_id = input.canvas_id,
             }, self.limits);
         }
+        var budget: usize = 0;
+        for (inputs) |input| {
+            budget = try addRegistryBytes(
+                budget,
+                try declarationInputBytes(input),
+            );
+        }
+        if (budget > self.limits.max_registry_bytes)
+            return error.RegistryTooLarge;
         var result: Registry = .{};
         errdefer result.deinit(self.allocator);
         try result.entries.ensureUnusedCapacity(self.allocator, inputs.len);
@@ -1880,6 +2013,32 @@ pub const Domain = struct {
             ));
         }
         return result;
+    }
+
+    fn requireRegistryBudget(
+        self: Domain,
+        delta: RegistryDeltaInput,
+    ) !void {
+        var budget: usize = 0;
+        for (self.registry.entries.items) |entry| {
+            const key = entry.key.view();
+            if (containsCanvasKey(delta.removed, key)) continue;
+            if (upsertsCanvasKey(delta.upserted, key)) continue;
+            budget = try addRegistryBytes(budget, try declarationBytes(entry));
+        }
+        for (delta.upserted, 0..) |input, index| {
+            const key = CanvasKeyView{
+                .extension_id = input.extension_id,
+                .canvas_id = input.canvas_id,
+            };
+            if (upsertsCanvasKey(delta.upserted[index + 1 ..], key)) continue;
+            budget = try addRegistryBytes(
+                budget,
+                try declarationInputBytes(input),
+            );
+        }
+        if (budget > self.limits.max_registry_bytes)
+            return error.RegistryTooLarge;
     }
 
     fn buildIncrementalRegistry(
@@ -1902,6 +2061,7 @@ pub const Domain = struct {
                 .canvas_id = input.canvas_id,
             }, self.limits);
         }
+        try self.requireRegistryBudget(delta);
         var result = try self.registry.clone(self.allocator, self.limits);
         errdefer result.deinit(self.allocator);
         for (delta.removed) |removed| {
@@ -2032,7 +2192,7 @@ const TestPublisher = struct {
 fn fixtureDomain(allocator: std.mem.Allocator) !Domain {
     var domain = Domain.init(allocator, .{});
     errdefer domain.deinit();
-    domain.setCapability(.supported);
+    try domain.setCapability(.supported);
     try domain.applyRegistry(.{
         .replacement = &.{fixture_declaration},
     });
@@ -2312,7 +2472,7 @@ test "instance capacity reclaims stable unrecorded entries" {
         .{ .max_instances = 1 },
     );
     defer domain.deinit();
-    domain.setCapability(.supported);
+    try domain.setCapability(.supported);
     try domain.applyRegistry(.{
         .replacement = &.{fixture_declaration},
     });
@@ -2349,7 +2509,11 @@ test "instance capacity reclaims stable unrecorded entries" {
     try domain.record(third_key, "Recorded", null);
     try std.testing.expect(domain.runtimeTag(second_key) == null);
     try domain.removeRecord(third_key);
-    try domain.markUnavailable(fourth_key, publisher.publisher());
+    try domain.markUnavailable(
+        fourth_key,
+        .declaration_removed,
+        publisher.publisher(),
+    );
     try std.testing.expect(domain.runtimeTag(third_key) == null);
     try std.testing.expectEqual(
         RuntimeTag.unavailable,
@@ -2437,7 +2601,11 @@ test "public operation keys are validated before lookup and capacity" {
     );
     try std.testing.expectError(
         error.IdentifierTooLong,
-        domain.markUnavailable(invalid_key, publisher.publisher()),
+        domain.markUnavailable(
+            invalid_key,
+            .declaration_removed,
+            publisher.publisher(),
+        ),
     );
     try std.testing.expectError(
         error.IdentifierTooLong,
@@ -2656,7 +2824,7 @@ test "request validation precedes operation backpressure" {
         .{ .max_pending_operations = 1 },
     );
     defer domain.deinit();
-    domain.setCapability(.supported);
+    try domain.setCapability(.supported);
     try domain.applyRegistry(.{
         .replacement = &.{fixture_declaration},
     });
@@ -2787,7 +2955,11 @@ test "unavailable publication failure retains the exact pending operation" {
     publisher.fail = true;
     try std.testing.expectError(
         error.EffectRejected,
-        domain.markUnavailable(fixture_key, publisher.publisher()),
+        domain.markUnavailable(
+            fixture_key,
+            .declaration_removed,
+            publisher.publisher(),
+        ),
     );
     try std.testing.expectEqual(RuntimeTag.opening, domain.runtimeTag(fixture_key).?);
     try std.testing.expect(domain.hasPendingToken(token));
@@ -2806,7 +2978,11 @@ test "unavailable transition settles renderer ownership atomically" {
     publisher.fail = true;
     try std.testing.expectError(
         error.EffectRejected,
-        opened_domain.markUnavailable(fixture_key, publisher.publisher()),
+        opened_domain.markUnavailable(
+            fixture_key,
+            .declaration_removed,
+            publisher.publisher(),
+        ),
     );
     try std.testing.expectEqual(
         RuntimeTag.opened,
@@ -2814,7 +2990,11 @@ test "unavailable transition settles renderer ownership atomically" {
     );
 
     publisher.fail = false;
-    try opened_domain.markUnavailable(fixture_key, publisher.publisher());
+    try opened_domain.markUnavailable(
+        fixture_key,
+        .declaration_removed,
+        publisher.publisher(),
+    );
     try std.testing.expectEqual(@as(usize, 1), publisher.effect_count);
     try std.testing.expectEqual(
         std.meta.Tag(EffectView).teardown,
@@ -2854,7 +3034,11 @@ test "unavailable transition settles renderer ownership atomically" {
     publisher.fail = true;
     try std.testing.expectError(
         error.EffectRejected,
-        closing_domain.markUnavailable(fixture_key, publisher.publisher()),
+        closing_domain.markUnavailable(
+            fixture_key,
+            .declaration_removed,
+            publisher.publisher(),
+        ),
     );
     try std.testing.expectEqual(
         RuntimeTag.closing,
@@ -2863,7 +3047,11 @@ test "unavailable transition settles renderer ownership atomically" {
     try std.testing.expect(closing_domain.hasPendingToken(close_token));
 
     publisher.fail = false;
-    try closing_domain.markUnavailable(fixture_key, publisher.publisher());
+    try closing_domain.markUnavailable(
+        fixture_key,
+        .declaration_removed,
+        publisher.publisher(),
+    );
     try std.testing.expectEqual(@as(usize, 2), publisher.effect_count);
     try std.testing.expectEqual(
         std.meta.Tag(EffectView).cancel,
@@ -3012,12 +3200,12 @@ test "resume projection is gated by authoritative capability state" {
     defer unknown.deinit(std.testing.allocator);
     try std.testing.expect(std.meta.activeTag(unknown) == .omitted);
 
-    domain.setCapability(.unsupported);
+    try domain.setCapability(.unsupported);
     var unsupported = try domain.resumeProjection(std.testing.allocator);
     defer unsupported.deinit(std.testing.allocator);
     try std.testing.expect(std.meta.activeTag(unsupported) == .omitted);
 
-    domain.setCapability(.supported);
+    try domain.setCapability(.supported);
     var supported = try domain.resumeProjection(std.testing.allocator);
     defer supported.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), supported.canvases.len);
@@ -3125,4 +3313,176 @@ test "shutdown publication failure preserves opened and closing renderers" {
     );
     try std.testing.expect(closing_domain.hasPendingToken(close_token));
     try std.testing.expect(!closing_domain.shutdown_requested);
+}
+
+const ReentrantPublisher = struct {
+    domain: *Domain,
+    reentrant_error: ?anyerror = null,
+
+    fn publisher(self: *ReentrantPublisher) EffectPublisher {
+        return .{
+            .context = self,
+            .publish_atomic_fn = publish,
+        };
+    }
+
+    fn publish(
+        context: *anyopaque,
+        effects: []const EffectView,
+    ) PublishError!void {
+        _ = effects;
+        const self: *ReentrantPublisher = @ptrCast(@alignCast(context));
+        self.domain.record(fixture_key, "reentrant", null) catch |err| {
+            self.reentrant_error = err;
+        };
+    }
+};
+
+test "publication cannot reenter the domain" {
+    var domain = try fixtureDomain(std.testing.allocator);
+    defer domain.deinit();
+    var reentrant: ReentrantPublisher = .{ .domain = &domain };
+    const token = try domain.open(
+        .{ .key = fixture_key },
+        reentrant.publisher(),
+    );
+    try std.testing.expectEqual(
+        @as(anyerror, error.ReentrantDomainCall),
+        reentrant.reentrant_error.?,
+    );
+    try std.testing.expectEqual(
+        RuntimeTag.opening,
+        domain.runtimeTag(fixture_key).?,
+    );
+    try std.testing.expect(domain.hasPendingToken(token));
+    try std.testing.expectEqual(
+        RecordTag.removed,
+        domain.recordTag(fixture_key).?,
+    );
+
+    try domain.record(fixture_key, "after publication", null);
+    try std.testing.expectEqual(
+        RecordTag.recorded,
+        domain.recordTag(fixture_key).?,
+    );
+}
+
+test "registry owned bytes are bounded before cloning or allocating" {
+    const oversized_schema = "{\"pad\":\"" ++ ("x" ** 512) ++ "\"}";
+    const oversized: CanvasDeclarationInput = .{
+        .extension_id = "fixture.extension",
+        .canvas_id = "review",
+        .display_name = "Review",
+        .input_schema_json = oversized_schema,
+    };
+    var no_storage: [0]u8 = .{};
+    var fixed = std.heap.FixedBufferAllocator.init(&no_storage);
+    var empty_domain = Domain.init(
+        fixed.allocator(),
+        .{ .max_registry_bytes = 64 },
+    );
+    defer empty_domain.deinit();
+    try std.testing.expectError(
+        error.RegistryTooLarge,
+        empty_domain.applyRegistry(.{ .replacement = &.{oversized} }),
+    );
+
+    var domain = Domain.init(
+        std.testing.allocator,
+        .{ .max_registry_bytes = 64 },
+    );
+    defer domain.deinit();
+    try domain.applyRegistry(.{ .replacement = &.{fixture_declaration} });
+    const original_allocator = domain.allocator;
+    domain.allocator = fixed.allocator();
+    const result = domain.applyRegistry(.{ .incremental = .{
+        .upserted = &.{oversized},
+    } });
+    domain.allocator = original_allocator;
+    try std.testing.expectError(error.RegistryTooLarge, result);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        domain.registry.entries.items.len,
+    );
+
+    try domain.applyRegistry(.{ .incremental = .{
+        .upserted = &.{fixture_declaration},
+    } });
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        domain.registry.entries.items.len,
+    );
+}
+
+test "open completion validates result text before cloning" {
+    var domain = try fixtureDomain(std.testing.allocator);
+    defer domain.deinit();
+    var publisher: TestPublisher = .{};
+    var open_input = try OpenInputDocument.init(
+        std.testing.allocator,
+        "{\"selection\":\"backend/src/canvas.zig\"}",
+        .{},
+    );
+    defer open_input.deinit(std.testing.allocator);
+    const token = try domain.open(.{
+        .key = fixture_key,
+        .input = &open_input,
+    }, publisher.publisher());
+
+    var no_storage: [0]u8 = .{};
+    var fixed = std.heap.FixedBufferAllocator.init(&no_storage);
+    const original_allocator = domain.allocator;
+    domain.allocator = fixed.allocator();
+    const result = domain.completeOpen(token, .{ .succeeded = .{
+        .title = "Review",
+        .status = "\xff",
+    } });
+    domain.allocator = original_allocator;
+    try std.testing.expectError(error.InvalidTextUtf8, result);
+    try std.testing.expectEqual(
+        RuntimeTag.opening,
+        domain.runtimeTag(fixture_key).?,
+    );
+    try std.testing.expect(domain.hasPendingToken(token));
+}
+
+test "unavailable transition records the supplied reason" {
+    var domain = try fixtureDomain(std.testing.allocator);
+    defer domain.deinit();
+    var publisher: TestPublisher = .{};
+    const token = try domain.open(
+        .{ .key = fixture_key },
+        publisher.publisher(),
+    );
+    _ = try domain.completeOpen(token, .{ .succeeded = .{} });
+    try domain.markUnavailable(
+        fixture_key,
+        .provider_unavailable,
+        publisher.publisher(),
+    );
+
+    const unknown_key: KeyView = .{
+        .extension_id = fixture_key.extension_id,
+        .canvas_id = fixture_key.canvas_id,
+        .instance_id = "review:secondary",
+    };
+    try domain.markUnavailable(
+        unknown_key,
+        .provider_unavailable,
+        publisher.publisher(),
+    );
+
+    var snapshot = try domain.snapshot(std.testing.allocator);
+    defer snapshot.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), snapshot.instances.len);
+    for (snapshot.instances) |instance| {
+        try std.testing.expectEqual(
+            RuntimeTag.unavailable,
+            instance.runtime,
+        );
+        try std.testing.expectEqual(
+            Degradation.provider_unavailable,
+            instance.degradation.?,
+        );
+    }
 }

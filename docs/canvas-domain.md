@@ -43,7 +43,10 @@ keys enforce an aggregate byte limit, and every public operation validates its
 borrowed key before lookup, capacity, or allocation decisions. Replacement
 registry size and incremental registry operation count are bounded
 independently, so repeated upserts or removals cannot bypass the final-size
-limit.
+limit. The registry also has an aggregate owned-byte budget that is projected
+with overflow-safe arithmetic and enforced before any registry clone or
+declaration allocation, so bounded per-document limits cannot be multiplied
+into an unbounded registry.
 
 JSON remains at the extension boundary, but there is no generic JSON envelope:
 
@@ -70,7 +73,10 @@ Callers submit a complete operation such as `open`, `close`, `invokeAction`, or
 5. commit the candidate with allocation-free swaps.
 
 Publication success means every effect was accepted; failure means none was
-accepted. The publisher must not invoke a completion reentrantly.
+accepted. A publisher must not call back into the same domain while an
+operation is in flight; every mutating entry point rejects reentrancy with
+`ReentrantDomainCall` rather than letting a nested mutation be lost or applied
+to a stale index.
 
 This ordering is the transaction boundary. No authoritative state changes
 before all fallible preparation and publication succeeds, and no fallible work
@@ -112,7 +118,9 @@ state:
 
 Provider or declaration loss uses `markUnavailable`, which atomically cancels
 all work and publishes teardown for any live renderer before committing
-`unavailable`. Registry updates do not guess whether a removed declaration
+`unavailable`. The caller supplies the reason, so snapshots distinguish a
+removed declaration from a lost provider for both known and previously unseen
+instance keys. Registry updates do not guess whether a removed declaration
 means an already-open instance was closed by its provider; a future SDK
 adapter must apply the corresponding typed availability signal explicitly.
 
