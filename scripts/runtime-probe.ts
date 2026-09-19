@@ -1,6 +1,5 @@
-import { startAndStopSdkClient } from "../packages/copilot-adapter/src/index.js";
-import { startAndStopRenderer } from "../packages/frontend-opentui/src/index.js";
+import { createSdkCopilotPort } from "../packages/copilot-adapter/src/index.js";
 
-await startAndStopSdkClient();
-await startAndStopRenderer();
+const port = createSdkCopilotPort({ workingDirectory: process.cwd() });
+await port.close();
 console.log("runtime probe passed");

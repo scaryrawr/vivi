@@ -4,6 +4,7 @@
     { "path": "./packages/core" },
     { "path": "./packages/copilot-adapter" },
     { "path": "./packages/frontend-opentui" },
-    { "path": "./packages/testkit" }
+    { "path": "./packages/testkit" },
+    { "path": "./apps/vivi" }
   ]
 }

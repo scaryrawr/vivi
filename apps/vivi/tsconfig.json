@@ -2,7 +2,7 @@
   "compilerOptions": {
     "composite": true,
     "declaration": true,
-    "outDir": "dist",
+    "outDir": "dist-ts",
     "rootDir": "src",
     "strict": true,
     "module": "NodeNext",
@@ -12,6 +12,10 @@
     "types": ["bun"],
     "skipLibCheck": true
   },
-  "references": [{ "path": "../core" }],
+  "references": [
+    { "path": "../../packages/core" },
+    { "path": "../../packages/copilot-adapter" },
+    { "path": "../../packages/frontend-opentui" }
+  ],
   "include": ["src/**/*.ts"]
 }
