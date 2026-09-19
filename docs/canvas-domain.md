@@ -102,10 +102,10 @@ state:
 - a pending action is removed without changing the instance lifecycle.
 
 Provider or declaration loss uses `markUnavailable`, which atomically cancels
-all work for that instance before committing `unavailable`. Registry updates
-do not guess whether a removed declaration means an already-open instance was
-closed by its provider; a future SDK adapter must apply the corresponding
-typed availability signal explicitly.
+all work and publishes teardown for any live renderer before committing
+`unavailable`. Registry updates do not guess whether a removed declaration
+means an already-open instance was closed by its provider; a future SDK
+adapter must apply the corresponding typed availability signal explicitly.
 
 ## Snapshots and resume
 

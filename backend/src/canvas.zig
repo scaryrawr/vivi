@@ -1192,6 +1192,8 @@ pub const Domain = struct {
         try self.requireOperational();
         const index = self.findInstance(request.key) orelse
             return error.CanvasNotOpen;
+        if (self.instances.items[index].runtime.tag() != .opened)
+            return error.CanvasNotOpen;
         const action_count = self.instances.items[index].pending_actions.items.len;
         if (self.pendingCount() - action_count + 1 >
             self.limits.max_pending_operations)
@@ -1237,18 +1239,24 @@ pub const Domain = struct {
         publisher: EffectPublisher,
     ) !OperationToken {
         try self.requireOperational();
-        try self.requirePendingCapacity(1);
+        const name = try ActionName.init(request.action_name, self.limits);
         const declaration_index = self.registry.find(.{
             .extension_id = request.key.extension_id,
             .canvas_id = request.key.canvas_id,
         }) orelse return error.CanvasUnavailable;
         if (!self.registry.entries.items[declaration_index].hasAction(
-            request.action_name,
+            name.bytes(),
         )) return error.ActionUnavailable;
         const index = self.findInstance(request.key) orelse
             return error.CanvasNotOpen;
         if (self.instances.items[index].runtime.tag() != .opened)
             return error.CanvasNotOpen;
+        var input = if (request.input) |value|
+            try value.clone(self.allocator, self.limits)
+        else
+            null;
+        errdefer if (input) |*value| value.deinit(self.allocator);
+        try self.requirePendingCapacity(1);
 
         var candidate = try self.instances.items[index].clone(
             self.allocator,
@@ -1260,12 +1268,6 @@ pub const Domain = struct {
             else => unreachable,
         };
         const token = try self.peekToken(.action, generation);
-        const name = try ActionName.init(request.action_name, self.limits);
-        var input = if (request.input) |value|
-            try value.clone(self.allocator, self.limits)
-        else
-            null;
-        errdefer if (input) |*value| value.deinit(self.allocator);
         try candidate.pending_actions.ensureUnusedCapacity(self.allocator, 1);
         candidate.pending_actions.appendAssumeCapacity(.{
             .token = token,
@@ -1439,7 +1441,7 @@ pub const Domain = struct {
         errdefer candidate.deinit(self.allocator);
         var effects: std.ArrayList(EffectView) = .empty;
         defer effects.deinit(self.allocator);
-        try self.appendCancellationEffects(&candidate, &effects);
+        try self.appendSettlementEffects(&candidate, &effects);
         candidate.clearActions(self.allocator);
         candidate.replaceRuntime(self.allocator, .unavailable);
         candidate.degradation = .declaration_removed;
@@ -1502,14 +1504,7 @@ pub const Domain = struct {
         var effects: std.ArrayList(EffectView) = .empty;
         defer effects.deinit(self.allocator);
         for (self.instances.items) |*instance| {
-            try self.appendCancellationEffects(instance, &effects);
-            switch (instance.runtime) {
-                .opened, .closing => try effects.append(
-                    self.allocator,
-                    .{ .teardown = instance.key.view() },
-                ),
-                .closed, .opening, .unavailable => {},
-            }
+            try self.appendSettlementEffects(instance, &effects);
         }
         if (effects.items.len > 0) try publisher.publishAtomic(effects.items);
         for (self.instances.items) |*instance| {
@@ -1718,6 +1713,21 @@ pub const Domain = struct {
                 self.allocator,
                 .{ .cancel = action.token },
             );
+        }
+    }
+
+    fn appendSettlementEffects(
+        self: Domain,
+        instance: *const Instance,
+        effects: *std.ArrayList(EffectView),
+    ) !void {
+        try self.appendCancellationEffects(instance, effects);
+        switch (instance.runtime) {
+            .opened, .closing => try effects.append(
+                self.allocator,
+                .{ .teardown = instance.key.view() },
+            ),
+            .closed, .opening, .unavailable => {},
         }
     }
 
@@ -2266,6 +2276,81 @@ test "close and action publication failures leave stable prior state" {
     try std.testing.expectEqual(@as(usize, 0), domain.pendingCount());
 }
 
+test "request validation precedes operation backpressure" {
+    var domain = Domain.init(
+        std.testing.allocator,
+        .{ .max_pending_operations = 1 },
+    );
+    defer domain.deinit();
+    domain.setCapability(.supported);
+    try domain.applyRegistry(.{
+        .replacement = &.{fixture_declaration},
+    });
+    var publisher: TestPublisher = .{};
+    const open_token = try domain.open(
+        .{ .key = fixture_key },
+        publisher.publisher(),
+    );
+
+    try std.testing.expectError(
+        error.CanvasNotOpen,
+        domain.close(.{ .key = fixture_key }, publisher.publisher()),
+    );
+    try std.testing.expectError(
+        error.CanvasUnavailable,
+        domain.invokeAction(.{
+            .key = .{
+                .extension_id = "missing.extension",
+                .canvas_id = "review",
+                .instance_id = "primary",
+            },
+            .action_name = "refresh",
+        }, publisher.publisher()),
+    );
+    try std.testing.expectError(
+        error.ActionUnavailable,
+        domain.invokeAction(.{
+            .key = fixture_key,
+            .action_name = "missing",
+        }, publisher.publisher()),
+    );
+    try std.testing.expectError(
+        error.CanvasNotOpen,
+        domain.invokeAction(.{
+            .key = fixture_key,
+            .action_name = "refresh",
+        }, publisher.publisher()),
+    );
+
+    _ = try domain.completeOpen(open_token, .{ .succeeded = .{} });
+    _ = try domain.invokeAction(.{
+        .key = fixture_key,
+        .action_name = "refresh",
+    }, publisher.publisher());
+    try std.testing.expectError(
+        error.IdentifierTooLong,
+        domain.invokeAction(.{
+            .key = fixture_key,
+            .action_name = "x" ** 257,
+        }, publisher.publisher()),
+    );
+    var invalid_input = try ActionInputDocument.init(
+        std.testing.allocator,
+        "{\"value\":1}",
+        .{},
+    );
+    defer invalid_input.deinit(std.testing.allocator);
+    invalid_input.bytes[0] = '[';
+    try std.testing.expectError(
+        error.InvalidInputDocument,
+        domain.invokeAction(.{
+            .key = fixture_key,
+            .action_name = "refresh",
+            .input = &invalid_input,
+        }, publisher.publisher()),
+    );
+}
+
 test "close cancels pending actions before closing the instance" {
     var domain = try fixtureDomain(std.testing.allocator);
     defer domain.deinit();
@@ -2332,6 +2417,82 @@ test "unavailable publication failure retains the exact pending operation" {
     );
     try std.testing.expectEqual(RuntimeTag.opening, domain.runtimeTag(fixture_key).?);
     try std.testing.expect(domain.hasPendingToken(token));
+}
+
+test "unavailable transition settles renderer ownership atomically" {
+    var opened_domain = try fixtureDomain(std.testing.allocator);
+    defer opened_domain.deinit();
+    var publisher: TestPublisher = .{};
+    const opened_token = try opened_domain.open(
+        .{ .key = fixture_key },
+        publisher.publisher(),
+    );
+    _ = try opened_domain.completeOpen(opened_token, .{ .succeeded = .{} });
+
+    publisher.fail = true;
+    try std.testing.expectError(
+        error.EffectRejected,
+        opened_domain.markUnavailable(fixture_key, publisher.publisher()),
+    );
+    try std.testing.expectEqual(
+        RuntimeTag.opened,
+        opened_domain.runtimeTag(fixture_key).?,
+    );
+
+    publisher.fail = false;
+    try opened_domain.markUnavailable(fixture_key, publisher.publisher());
+    try std.testing.expectEqual(@as(usize, 1), publisher.effect_count);
+    try std.testing.expectEqual(
+        std.meta.Tag(EffectView).teardown,
+        publisher.tags[0],
+    );
+    try std.testing.expectEqual(
+        RuntimeTag.unavailable,
+        opened_domain.runtimeTag(fixture_key).?,
+    );
+
+    var closing_domain = try fixtureDomain(std.testing.allocator);
+    defer closing_domain.deinit();
+    publisher = .{};
+    const closing_open_token = try closing_domain.open(
+        .{ .key = fixture_key },
+        publisher.publisher(),
+    );
+    _ = try closing_domain.completeOpen(
+        closing_open_token,
+        .{ .succeeded = .{} },
+    );
+    const close_token = try closing_domain.close(
+        .{ .key = fixture_key },
+        publisher.publisher(),
+    );
+    publisher.fail = true;
+    try std.testing.expectError(
+        error.EffectRejected,
+        closing_domain.markUnavailable(fixture_key, publisher.publisher()),
+    );
+    try std.testing.expectEqual(
+        RuntimeTag.closing,
+        closing_domain.runtimeTag(fixture_key).?,
+    );
+    try std.testing.expect(closing_domain.hasPendingToken(close_token));
+
+    publisher.fail = false;
+    try closing_domain.markUnavailable(fixture_key, publisher.publisher());
+    try std.testing.expectEqual(@as(usize, 2), publisher.effect_count);
+    try std.testing.expectEqual(
+        std.meta.Tag(EffectView).cancel,
+        publisher.tags[0],
+    );
+    try std.testing.expectEqual(
+        std.meta.Tag(EffectView).teardown,
+        publisher.tags[1],
+    );
+    try std.testing.expectEqual(close_token, publisher.tokens[0]);
+    try std.testing.expectEqual(
+        RuntimeTag.unavailable,
+        closing_domain.runtimeTag(fixture_key).?,
+    );
 }
 
 fn openCompletionAllocationLifecycle(
