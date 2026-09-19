@@ -40,6 +40,7 @@ pub const max_attachment_identity_bytes = @import("attachment.zig").max_identity
 pub const max_attachment_display_name_bytes = @import("attachment.zig").max_display_name_bytes;
 pub const ImageFormat = @import("image.zig").Format;
 pub const CommandCatalog = conversation.CommandCatalog;
+pub const CommandInfo = conversation.CommandInfo;
 pub const UserInputRequest = conversation.UserInputRequest;
 pub const UserInputAnswer = conversation.UserInputAnswer;
 pub const UserInputResponse = conversation.UserInputResponse;
@@ -601,6 +602,7 @@ fn forwardImmediatePrompts(
             .refresh_commands,
             .refresh_models,
             .refresh_sessions,
+            .start_new_session,
             .switch_model,
             .resume_session,
             .execute_command,
@@ -630,6 +632,7 @@ fn startNextQueuedPrompt(
         .refresh_commands,
         .refresh_models,
         .refresh_sessions,
+        .start_new_session,
         .switch_model,
         .resume_session,
         .execute_command,
@@ -1382,10 +1385,11 @@ fn buildCommandCatalog(
     defer listed.deinit();
     const sdk_commands = listed.value.commands;
 
-    var count: usize = 2;
+    var count: usize = 3;
     for (sdk_commands) |command| {
         if (!std.ascii.eqlIgnoreCase(command.name, "model") and
-            !std.ascii.eqlIgnoreCase(command.name, "resume"))
+            !std.ascii.eqlIgnoreCase(command.name, "resume") and
+            !std.ascii.eqlIgnoreCase(command.name, "new"))
         {
             count += 1;
         }
@@ -1412,13 +1416,20 @@ fn buildCommandCatalog(
     initialized += 1;
     commands[initialized] = try initCommandInfo(
         allocator,
+        "new",
+        "Start a fresh conversation in the current workspace",
+    );
+    initialized += 1;
+    commands[initialized] = try initCommandInfo(
+        allocator,
         "resume",
         "Resume a previous Vivi session",
     );
     initialized += 1;
     for (sdk_commands) |command| {
         if (std.ascii.eqlIgnoreCase(command.name, "model") or
-            std.ascii.eqlIgnoreCase(command.name, "resume"))
+            std.ascii.eqlIgnoreCase(command.name, "resume") or
+            std.ascii.eqlIgnoreCase(command.name, "new"))
         {
             continue;
         }
@@ -1435,7 +1446,7 @@ fn buildCommandCatalog(
 fn buildFallbackCommandCatalog(
     allocator: std.mem.Allocator,
 ) !conversation.CommandCatalog {
-    const commands = try allocator.alloc(conversation.CommandInfo, 2);
+    const commands = try allocator.alloc(conversation.CommandInfo, 3);
     errdefer allocator.free(commands);
     var initialized: usize = 0;
     errdefer for (commands[0..initialized]) |*command| {
@@ -1450,10 +1461,26 @@ fn buildFallbackCommandCatalog(
     initialized += 1;
     commands[initialized] = try initCommandInfo(
         allocator,
+        "new",
+        "Start a fresh conversation in the current workspace",
+    );
+    initialized += 1;
+    commands[initialized] = try initCommandInfo(
+        allocator,
         "resume",
         "Resume a previous Vivi session",
     );
     return .{ .allocator = allocator, .commands = commands };
+}
+
+test "fallback command catalog includes new session command" {
+    var catalog = try buildFallbackCommandCatalog(std.testing.allocator);
+    defer catalog.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), catalog.commands.len);
+    try std.testing.expectEqualStrings("model", catalog.commands[0].name);
+    try std.testing.expectEqualStrings("new", catalog.commands[1].name);
+    try std.testing.expectEqualStrings("resume", catalog.commands[2].name);
 }
 
 fn initCommandInfo(
@@ -1500,6 +1527,179 @@ const ResumeTargets = struct {
         self.* = undefined;
     }
 };
+
+fn ReplacementPair(comptime Session: type, comptime Service: type) type {
+    return struct {
+        session: Session,
+        service: Service,
+    };
+}
+
+fn commitPreparedReplacement(
+    comptime Session: type,
+    comptime Service: type,
+    allocator: std.mem.Allocator,
+    session: *Session,
+    service: *Service,
+    resume_targets: *?ResumeTargets,
+    resume_generation: *u64,
+    prepared: anyerror!ReplacementPair(Session, Service),
+) !bool {
+    const candidate = try prepared;
+    var previous = ReplacementPair(Session, Service){
+        .session = session.*,
+        .service = service.*,
+    };
+    session.* = candidate.session;
+    service.* = candidate.service;
+    if (resume_targets.*) |*targets| targets.deinit(allocator);
+    resume_targets.* = null;
+    resume_generation.* = 0;
+    const cleanup_failed = if (previous.session.disconnect())
+        false
+    else |_|
+        true;
+    previous.service.deinit();
+    return cleanup_failed;
+}
+
+test "session replacement commits ownership only after preparation succeeds" {
+    const FakeSession = struct {
+        id: u8,
+        disconnected: *bool,
+
+        fn disconnect(self: @This()) !void {
+            self.disconnected.* = true;
+        }
+    };
+    const FakeService = struct {
+        id: u8,
+        deinitialized: *bool,
+
+        fn deinit(self: *@This()) void {
+            self.deinitialized.* = true;
+        }
+    };
+
+    var old_disconnected = false;
+    var old_service_deinitialized = false;
+    var candidate_disconnected = false;
+    var candidate_service_deinitialized = false;
+    var session = FakeSession{
+        .id = 1,
+        .disconnected = &old_disconnected,
+    };
+    var service = FakeService{
+        .id = 2,
+        .deinitialized = &old_service_deinitialized,
+    };
+    var resume_targets: ?ResumeTargets = .{
+        .generation = 9,
+        .targets = try std.testing.allocator.alloc(ResumeTarget, 0),
+    };
+    defer if (resume_targets) |*targets| targets.deinit(std.testing.allocator);
+    var resume_generation: u64 = 9;
+
+    try std.testing.expectError(
+        error.PreparationFailed,
+        commitPreparedReplacement(
+            FakeSession,
+            FakeService,
+            std.testing.allocator,
+            &session,
+            &service,
+            &resume_targets,
+            &resume_generation,
+            error.PreparationFailed,
+        ),
+    );
+    try std.testing.expectEqual(@as(u8, 1), session.id);
+    try std.testing.expectEqual(@as(u8, 2), service.id);
+    try std.testing.expect(resume_targets != null);
+    try std.testing.expectEqual(@as(u64, 9), resume_generation);
+    try std.testing.expect(!old_disconnected);
+    try std.testing.expect(!old_service_deinitialized);
+
+    const cleanup_failed = try commitPreparedReplacement(
+        FakeSession,
+        FakeService,
+        std.testing.allocator,
+        &session,
+        &service,
+        &resume_targets,
+        &resume_generation,
+        .{
+            .session = .{
+                .id = 3,
+                .disconnected = &candidate_disconnected,
+            },
+            .service = .{
+                .id = 4,
+                .deinitialized = &candidate_service_deinitialized,
+            },
+        },
+    );
+    try std.testing.expect(!cleanup_failed);
+    try std.testing.expectEqual(@as(u8, 3), session.id);
+    try std.testing.expectEqual(@as(u8, 4), service.id);
+    try std.testing.expectEqual(null, resume_targets);
+    try std.testing.expectEqual(@as(u64, 0), resume_generation);
+    try std.testing.expect(old_disconnected);
+    try std.testing.expect(old_service_deinitialized);
+    try std.testing.expect(!candidate_disconnected);
+    try std.testing.expect(!candidate_service_deinitialized);
+}
+
+test "session replacement reports previous cleanup failure after committing" {
+    const FakeSession = struct {
+        disconnected: *bool,
+
+        fn disconnect(self: @This()) !void {
+            self.disconnected.* = true;
+            return error.DisconnectFailed;
+        }
+    };
+    const FakeService = struct {
+        deinitialized: *bool,
+
+        fn deinit(self: *@This()) void {
+            self.deinitialized.* = true;
+        }
+    };
+
+    var old_disconnected = false;
+    var old_service_deinitialized = false;
+    var candidate_disconnected = false;
+    var candidate_service_deinitialized = false;
+    var session = FakeSession{ .disconnected = &old_disconnected };
+    var service = FakeService{ .deinitialized = &old_service_deinitialized };
+    var resume_targets: ?ResumeTargets = null;
+    var resume_generation: u64 = 0;
+
+    const cleanup_failed = try commitPreparedReplacement(
+        FakeSession,
+        FakeService,
+        std.testing.allocator,
+        &session,
+        &service,
+        &resume_targets,
+        &resume_generation,
+        .{
+            .session = .{ .disconnected = &candidate_disconnected },
+            .service = .{ .deinitialized = &candidate_service_deinitialized },
+        },
+    );
+    try std.testing.expect(cleanup_failed);
+    try std.testing.expect(old_disconnected);
+    try std.testing.expect(old_service_deinitialized);
+    try std.testing.expectEqual(&candidate_disconnected, session.disconnected);
+    try std.testing.expectEqual(
+        &candidate_service_deinitialized,
+        service.deinitialized,
+    );
+    try std.testing.expect(!candidate_disconnected);
+    try std.testing.expect(!candidate_service_deinitialized);
+}
 
 fn buildSessionCatalog(
     allocator: std.mem.Allocator,
@@ -2603,6 +2803,106 @@ fn runSdkConversation(
                 resume_targets = result.targets;
                 resume_generation = next_generation;
             },
+            .start_new_session => {
+                var candidate_tools = tools.Service.init(
+                    worker.allocator(),
+                    worker.io(),
+                    active_working_directory,
+                ) catch |err| {
+                    worker.completeNewSession(.{
+                        .failed = conversation.OwnedText.init(
+                            worker.allocator(),
+                            @errorName(err),
+                        ) catch {
+                            worker.closeFailure(.stream, @errorName(err));
+                            return;
+                        },
+                    }) catch {
+                        worker.closeFailure(.stream, "Unable to report new session failure.");
+                        return;
+                    };
+                    continue;
+                };
+                const candidate_prompt = std.fmt.allocPrint(
+                    worker.allocator(),
+                    MinimalCodingAgent.system_prompt,
+                    .{active_working_directory},
+                ) catch |err| {
+                    candidate_tools.deinit();
+                    worker.closeFailure(.stream, @errorName(err));
+                    return;
+                };
+                defer worker.allocator().free(candidate_prompt);
+                var candidate = createSdkSession(
+                    worker,
+                    &client,
+                    candidate_prompt,
+                    active_working_directory,
+                    &active_plan,
+                    context.omlx_api_key,
+                ) catch |err| {
+                    candidate_tools.deinit();
+                    worker.completeNewSession(.{
+                        .failed = conversation.OwnedText.init(
+                            worker.allocator(),
+                            @errorName(err),
+                        ) catch {
+                            worker.closeFailure(.stream, @errorName(err));
+                            return;
+                        },
+                    }) catch {
+                        worker.closeFailure(.stream, "Unable to report new session failure.");
+                        return;
+                    };
+                    continue;
+                };
+                const candidate_commands = buildCommandCatalog(
+                    worker.allocator(),
+                    &client,
+                    candidate,
+                ) catch buildFallbackCommandCatalog(
+                    worker.allocator(),
+                ) catch |err| {
+                    candidate.disconnect() catch {};
+                    candidate_tools.deinit();
+                    worker.completeNewSession(.{
+                        .failed = conversation.OwnedText.init(
+                            worker.allocator(),
+                            @errorName(err),
+                        ) catch {
+                            worker.closeFailure(.stream, @errorName(err));
+                            return;
+                        },
+                    }) catch {
+                        worker.closeFailure(.stream, "Unable to report new session failure.");
+                        return;
+                    };
+                    continue;
+                };
+
+                session_connected = false;
+                const cleanup_failed = commitPreparedReplacement(
+                    copilot.Session,
+                    tools.Service,
+                    worker.allocator(),
+                    &session,
+                    &tool_service,
+                    &resume_targets,
+                    &resume_generation,
+                    .{
+                        .session = candidate,
+                        .service = candidate_tools,
+                    },
+                ) catch unreachable;
+                session_connected = true;
+                worker.completeNewSession(.{ .started = .{
+                    .commands = candidate_commands,
+                    .cleanup_failed = cleanup_failed,
+                } }) catch {
+                    worker.closeFailure(.stream, "Unable to report the new session.");
+                    return;
+                };
+            },
             .resume_session => |key| {
                 const targets = if (resume_targets) |*value| value else {
                     worker.completeSessionResume(.{
@@ -2923,6 +3223,7 @@ fn runSdkConversation(
                                 .refresh_commands,
                                 .refresh_models,
                                 .refresh_sessions,
+                                .start_new_session,
                                 .switch_model,
                                 .resume_session,
                                 .execute_command,
