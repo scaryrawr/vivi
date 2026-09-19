@@ -2,6 +2,7 @@ const std = @import("std");
 const session_title = @import("session_title.zig");
 const tool_activity = @import("tool_activity.zig");
 const attachment = @import("attachment.zig");
+const command_domain = @import("command_domain.zig");
 
 pub const Wake = struct {
     context: *anyopaque,
@@ -130,52 +131,14 @@ pub const Failure = struct {
     }
 };
 
-pub const CommandInfo = struct {
-    name: []u8,
-    description: []u8,
-
-    fn deinit(self: *CommandInfo, allocator: std.mem.Allocator) void {
-        allocator.free(self.name);
-        allocator.free(self.description);
-        self.* = undefined;
-    }
-};
-
-pub const CommandCatalog = struct {
-    allocator: std.mem.Allocator,
-    commands: []CommandInfo,
-
-    pub fn deinit(self: *CommandCatalog) void {
-        for (self.commands) |*command| command.deinit(self.allocator);
-        self.allocator.free(self.commands);
-        self.* = undefined;
-    }
-
-    pub fn clone(
-        self: *const CommandCatalog,
-        allocator: std.mem.Allocator,
-    ) !CommandCatalog {
-        const commands = try allocator.alloc(CommandInfo, self.commands.len);
-        errdefer allocator.free(commands);
-        var initialized: usize = 0;
-        errdefer for (commands[0..initialized]) |*command| {
-            command.deinit(allocator);
-        };
-        for (self.commands, 0..) |command, index| {
-            commands[index] = .{
-                .name = try allocator.dupe(u8, command.name),
-                .description = undefined,
-            };
-            errdefer allocator.free(commands[index].name);
-            commands[index].description = try allocator.dupe(
-                u8,
-                command.description,
-            );
-            initialized += 1;
-        }
-        return .{ .allocator = allocator, .commands = commands };
-    }
-};
+pub const CommandKey = command_domain.CommandKey;
+pub const CommandSource = command_domain.Source;
+pub const CommandAction = command_domain.Action;
+pub const CommandArgumentPolicy = command_domain.ArgumentPolicy;
+pub const CommandDefinition = command_domain.Definition;
+pub const CommandInfo = command_domain.Descriptor;
+pub const CommandCatalog = command_domain.Catalog;
+pub const max_command_argument_bytes = command_domain.max_argument_bytes;
 
 pub const ModelInfo = struct {
     allocator: std.mem.Allocator,
@@ -731,6 +694,26 @@ pub const Closed = union(enum) {
     }
 };
 
+pub const CommandExecutionEvent = union(enum) {
+    completed: struct {
+        key: CommandKey,
+        message: ?OwnedText,
+    },
+    failed: struct {
+        key: CommandKey,
+        message: ?OwnedText,
+    },
+
+    pub fn deinit(self: *CommandExecutionEvent) void {
+        switch (self.*) {
+            inline else => |*result| if (result.message) |*message| {
+                message.deinit();
+            },
+        }
+        self.* = undefined;
+    }
+};
+
 pub const Event = union(enum) {
     ready,
     command_catalog: CommandCatalog,
@@ -749,7 +732,7 @@ pub const Event = union(enum) {
     assistant_complete: OwnedText,
     tool_activity: tool_activity.ToolActivityUpdate,
     user_input_requested: UserInputRequest,
-    command_completed: OwnedText,
+    command_completed: CommandExecutionEvent,
     idle,
     closed: Closed,
 
@@ -759,9 +742,9 @@ pub const Event = union(enum) {
             .reasoning_complete,
             .assistant_delta,
             .assistant_complete,
-            .command_completed,
             .session_title,
             => |*text| text.deinit(),
+            .command_completed => |*result| result.deinit(),
             .tool_activity => |*update| update.deinit(),
             .user_input_requested => |*request| request.deinit(),
             .command_catalog => |*catalog| catalog.deinit(),
@@ -789,7 +772,7 @@ pub const Command = union(enum) {
     refresh_sessions,
     switch_model: OwnedModelSelection,
     resume_session: ResumeKey,
-    execute_command: OwnedText,
+    execute_command: command_domain.Execution,
     user_input_response: OwnedUserInputResponse,
     stop,
 
@@ -797,7 +780,7 @@ pub const Command = union(enum) {
         switch (self.*) {
             .prompt => |*prompt| prompt.message.deinit(),
             .switch_model => |*selection| selection.deinit(),
-            .execute_command => |*text| text.deinit(),
+            .execute_command => |*execution| execution.deinit(),
             .user_input_response => |*response| response.deinit(),
             .refresh_commands,
             .refresh_models,
@@ -845,12 +828,20 @@ const Core = struct {
     command_ready: std.Io.Condition = .init,
     state: State = .starting,
     commands: std.ArrayList(Command) = .empty,
-    events: std.ArrayList(Event) = .empty,
+    events: std.ArrayList(SequencedEvent) = .empty,
+    command_terminal: ?SequencedEvent = null,
+    next_event_sequence: u128 = 1,
+    command_registry: command_domain.Registry,
     pending_user_input: ?UserInputRequest = null,
     next_user_input_request_id: u64 = 1,
     wake_pending: bool = false,
     stop_requested: bool = false,
     worker: ?std.Io.Future(void) = null,
+};
+
+const SequencedEvent = struct {
+    sequence: u128,
+    event: Event,
 };
 
 pub const Worker = struct {
@@ -978,8 +969,76 @@ pub const Worker = struct {
         try self.publish(.assistant_started);
     }
 
-    pub fn commandCatalog(self: *Worker, catalog: CommandCatalog) !void {
-        try self.publish(.{ .command_catalog = catalog });
+    pub fn commandCatalog(
+        self: *Worker,
+        definitions: []const CommandDefinition,
+    ) !void {
+        try self.replaceCommandCatalog(definitions, false);
+    }
+
+    pub fn completeCommandRefresh(
+        self: *Worker,
+        definitions: []const CommandDefinition,
+    ) !void {
+        try self.replaceCommandCatalog(definitions, true);
+    }
+
+    fn replaceCommandCatalog(
+        self: *Worker,
+        definitions: []const CommandDefinition,
+        complete: bool,
+    ) !void {
+        try self.core.mutex.lock(self.core.io);
+        const catalog = try self.core.command_registry.replace(definitions);
+        if (complete and !self.core.stop_requested) self.core.state = .idle;
+        const should_wake = self.publishLocked(.{
+            .command_catalog = catalog,
+        }) catch |err| {
+            self.core.mutex.unlock(self.core.io);
+            return err;
+        };
+        self.core.mutex.unlock(self.core.io);
+        if (should_wake) self.core.wake.notify(self.core.wake.context);
+    }
+
+    pub fn commandCatalogFailed(self: *Worker, message: []const u8) !void {
+        try self.replaceCommandCatalogFailed(message, false);
+    }
+
+    pub fn completeCommandRefreshFailure(
+        self: *Worker,
+        message: []const u8,
+    ) !void {
+        try self.replaceCommandCatalogFailed(message, true);
+    }
+
+    fn replaceCommandCatalogFailed(
+        self: *Worker,
+        message: []const u8,
+        complete: bool,
+    ) !void {
+        try self.core.mutex.lock(self.core.io);
+        const catalog = try self.core.command_registry.replaceFailClosed();
+        if (complete and !self.core.stop_requested) self.core.state = .idle;
+        var should_wake = self.publishLocked(.{
+            .command_catalog = catalog,
+        }) catch |err| {
+            self.core.mutex.unlock(self.core.io);
+            return err;
+        };
+        const status_message = OwnedText.init(
+            self.core.allocator,
+            message,
+        ) catch {
+            self.core.mutex.unlock(self.core.io);
+            if (should_wake) self.core.wake.notify(self.core.wake.context);
+            return;
+        };
+        should_wake = (self.publishLocked(.{
+            .status = status_message,
+        }) catch false) or should_wake;
+        self.core.mutex.unlock(self.core.io);
+        if (should_wake) self.core.wake.notify(self.core.wake.context);
     }
 
     pub fn userInputRequested(
@@ -1043,13 +1102,26 @@ pub const Worker = struct {
         };
     }
 
-    pub fn commandCompleted(self: *Worker, message: []const u8) !void {
-        try self.completeControl(.{
-            .command_completed = try OwnedText.init(
-                self.core.allocator,
-                message,
-            ),
-        });
+    pub fn commandCompleted(
+        self: *Worker,
+        key: CommandKey,
+        message: []const u8,
+    ) !void {
+        try self.completeCommand(.{ .completed = .{
+            .key = key,
+            .message = OwnedText.init(self.core.allocator, message) catch null,
+        } });
+    }
+
+    pub fn commandFailed(
+        self: *Worker,
+        key: CommandKey,
+        message: []const u8,
+    ) !void {
+        try self.completeCommand(.{ .failed = .{
+            .key = key,
+            .message = OwnedText.init(self.core.allocator, message) catch null,
+        } });
     }
 
     pub fn modelCatalog(self: *Worker, catalog: ModelCatalog) !void {
@@ -1070,13 +1142,6 @@ pub const Worker = struct {
         catalog: ModelCatalog,
     ) !void {
         try self.completeControl(.{ .model_catalog = catalog });
-    }
-
-    pub fn completeCommandRefresh(
-        self: *Worker,
-        catalog: CommandCatalog,
-    ) !void {
-        try self.completeControl(.{ .command_catalog = catalog });
     }
 
     pub fn completeModelRefreshFailure(
@@ -1103,6 +1168,13 @@ pub const Worker = struct {
         catalog: SessionCatalog,
     ) !void {
         try self.completeControl(.{ .session_catalog = catalog });
+    }
+
+    pub fn sessionCatalog(
+        self: *Worker,
+        catalog: SessionCatalog,
+    ) !void {
+        try self.publish(.{ .session_catalog = catalog });
     }
 
     pub fn completeSessionRefreshFailure(
@@ -1170,6 +1242,35 @@ pub const Worker = struct {
         return self.publish(event);
     }
 
+    fn completeCommand(
+        self: *Worker,
+        result: CommandExecutionEvent,
+    ) !void {
+        var owned_result = result;
+        errdefer owned_result.deinit();
+        const key = switch (owned_result) {
+            inline else => |outcome| outcome.key,
+        };
+        try self.core.mutex.lock(self.core.io);
+        self.core.command_registry.finish(key) catch |err| {
+            self.core.mutex.unlock(self.core.io);
+            return err;
+        };
+        if (self.core.command_terminal != null) {
+            self.core.mutex.unlock(self.core.io);
+            return error.CommandTerminalOccupied;
+        }
+        self.core.command_terminal = .{
+            .sequence = self.takeEventSequenceLocked(),
+            .event = .{ .command_completed = owned_result },
+        };
+        if (!self.core.stop_requested) self.core.state = .idle;
+        const should_wake = !self.core.wake_pending;
+        self.core.wake_pending = true;
+        self.core.mutex.unlock(self.core.io);
+        if (should_wake) self.core.wake.notify(self.core.wake.context);
+    }
+
     pub fn closeRequested(self: *Worker) void {
         self.close(.requested);
     }
@@ -1187,33 +1288,68 @@ pub const Worker = struct {
     }
 
     fn close(self: *Worker, closed: Closed) void {
+        var owned_closed = closed;
         self.core.mutex.lock(self.core.io) catch {
-            var mutable = closed;
-            mutable.deinit();
+            owned_closed.deinit();
             return;
         };
+        const should_wake = !self.core.wake_pending;
+        if (self.core.command_registry.active) |key| {
+            self.core.command_registry.finish(key) catch {};
+            if (self.core.command_terminal == null) {
+                const message_source = switch (owned_closed) {
+                    .requested => "Command stopped.",
+                    .failed => |failure| failure.message.bytes,
+                };
+                self.core.command_terminal = .{
+                    .sequence = self.takeEventSequenceLocked(),
+                    .event = .{ .command_completed = .{ .failed = .{
+                        .key = key,
+                        .message = OwnedText.init(
+                            self.core.allocator,
+                            message_source,
+                        ) catch null,
+                    } } },
+                };
+                self.core.wake_pending = true;
+            }
+        }
         self.core.state = .closed;
         self.core.mutex.unlock(self.core.io);
-        self.publish(.{ .closed = closed }) catch {};
+        self.publish(.{ .closed = owned_closed }) catch {};
+        if (should_wake) self.core.wake.notify(self.core.wake.context);
     }
 
     fn publish(self: *Worker, event: Event) !void {
         var owned_event = event;
-        errdefer owned_event.deinit();
-
-        try self.core.mutex.lock(self.core.io);
-        const should_wake = !self.core.wake_pending;
-        self.core.events.append(
-            self.core.allocator,
-            owned_event,
-        ) catch |err| {
+        self.core.mutex.lock(self.core.io) catch |err| {
+            owned_event.deinit();
+            return err;
+        };
+        const should_wake = self.publishLocked(owned_event) catch |err| {
             self.core.mutex.unlock(self.core.io);
             return err;
         };
-        self.core.wake_pending = true;
         self.core.mutex.unlock(self.core.io);
-
         if (should_wake) self.core.wake.notify(self.core.wake.context);
+    }
+
+    fn publishLocked(self: *Worker, event: Event) !bool {
+        var owned_event = event;
+        errdefer owned_event.deinit();
+        const should_wake = !self.core.wake_pending;
+        try self.core.events.append(self.core.allocator, .{
+            .sequence = self.takeEventSequenceLocked(),
+            .event = owned_event,
+        });
+        self.core.wake_pending = true;
+        return should_wake;
+    }
+
+    fn takeEventSequenceLocked(self: *Worker) u128 {
+        const sequence = self.core.next_event_sequence;
+        self.core.next_event_sequence +%= 1;
+        return sequence;
     }
 };
 
@@ -1279,17 +1415,32 @@ pub const Conversation = struct {
 
     pub fn executeCommand(
         self: *Conversation,
-        command: []const u8,
+        key: CommandKey,
+        arguments: []const u8,
     ) !void {
-        if (std.mem.trim(u8, command, " \t\r\n").len == 0) {
-            return error.EmptyCommand;
+        try self.core.mutex.lock(self.core.io);
+        defer self.core.mutex.unlock(self.core.io);
+        switch (self.core.state) {
+            .idle => {},
+            .starting,
+            .streaming,
+            .controlling,
+            .awaiting_user_input,
+            => return error.Busy,
+            .stopping => return error.Stopping,
+            .closed => return error.Closed,
         }
-        try self.enqueueControl(.{
-            .execute_command = try OwnedText.init(
-                self.core.allocator,
-                command,
-            ),
+        if (self.core.command_terminal != null) return error.Busy;
+        var execution = try self.core.command_registry.admit(key, arguments);
+        errdefer {
+            self.core.command_registry.finish(key) catch {};
+            execution.deinit();
+        }
+        try self.core.commands.append(self.core.allocator, .{
+            .execute_command = execution,
         });
+        self.core.state = .controlling;
+        self.core.command_ready.signal(self.core.io);
     }
 
     pub fn resumeSession(self: *Conversation, key: ResumeKey) !void {
@@ -1370,13 +1521,28 @@ pub const Conversation = struct {
         try self.core.mutex.lock(self.core.io);
         defer self.core.mutex.unlock(self.core.io);
 
-        if (self.core.events.items.len == 0) {
+        if (self.core.events.items.len == 0 and
+            self.core.command_terminal == null)
+        {
             self.core.wake_pending = false;
             return null;
         }
-        const event = self.core.events.orderedRemove(0);
-        if (self.core.events.items.len == 0) self.core.wake_pending = false;
-        return event;
+        const take_terminal = if (self.core.command_terminal) |terminal|
+            self.core.events.items.len == 0 or
+                terminal.sequence < self.core.events.items[0].sequence
+        else
+            false;
+        const sequenced = if (take_terminal) blk: {
+            const terminal = self.core.command_terminal.?;
+            self.core.command_terminal = null;
+            break :blk terminal;
+        } else self.core.events.orderedRemove(0);
+        if (self.core.events.items.len == 0 and
+            self.core.command_terminal == null)
+        {
+            self.core.wake_pending = false;
+        }
+        return sequenced.event;
     }
 
     pub fn requestStop(self: *Conversation) void {
@@ -1397,9 +1563,11 @@ pub const Conversation = struct {
 
         for (self.core.commands.items) |*command| command.deinit();
         self.core.commands.deinit(self.core.allocator);
-        for (self.core.events.items) |*event| event.deinit();
+        for (self.core.events.items) |*event| event.event.deinit();
         self.core.events.deinit(self.core.allocator);
+        if (self.core.command_terminal) |*terminal| terminal.event.deinit();
         if (self.core.pending_user_input) |*request| request.deinit();
+        self.core.command_registry.deinit();
         const allocator = self.core.allocator;
         switch (self.core.runner) {
             .plain => {},
@@ -1426,6 +1594,7 @@ pub fn openWithRunner(
         .io = io,
         .wake = wake,
         .runner = .{ .plain = runner },
+        .command_registry = command_domain.Registry.init(allocator),
     };
     core.worker = try io.concurrent(runWorker, .{core});
     return .{ .core = core };
@@ -1445,6 +1614,7 @@ pub fn openWithContextRunner(
         .allocator = allocator,
         .io = io,
         .wake = wake,
+        .command_registry = command_domain.Registry.init(allocator),
         .runner = .{ .context = .{
             .pointer = context,
             .run = runner,
@@ -1461,6 +1631,241 @@ fn runWorker(core: *Core) void {
         .plain => |runner| runner(&worker),
         .context => |context| context.run(&worker, context.pointer),
     }
+}
+
+test "admitted commands publish one chronological terminal outcome" {
+    const Script = struct {
+        fn run(worker: *Worker) void {
+            if (!(worker.ready() catch return)) return;
+            worker.commandCatalog(&.{.{
+                .name = "review",
+                .display_name = "Review",
+                .description = "Review changes",
+                .source = .extension,
+                .argument_policy = .optional,
+            }}) catch return;
+            for (0..2) |index| {
+                var command = worker.waitCommand();
+                defer command.deinit();
+                switch (command) {
+                    .execute_command => |execution| {
+                        worker.status(if (index == 0)
+                            "before completion"
+                        else
+                            "before failure") catch return;
+                        if (index == 0) {
+                            worker.commandCompleted(execution.key, "done") catch return;
+                            if (worker.commandCompleted(execution.key, "duplicate")) |_| {
+                                worker.closeFailure(.stream, "Duplicate completion succeeded.");
+                                return;
+                            } else |err| if (err != error.NoActiveCommand) {
+                                worker.closeFailure(.stream, @errorName(err));
+                                return;
+                            }
+                        } else {
+                            worker.commandFailed(execution.key, "failed") catch return;
+                        }
+                    },
+                    else => {
+                        worker.closeFailure(.stream, "Unexpected command.");
+                        return;
+                    },
+                }
+            }
+            var stop = worker.waitCommand();
+            stop.deinit();
+            worker.closeRequested();
+        }
+    };
+    const TestWake = struct {
+        fn notify(_: *anyopaque) void {}
+    };
+    var context: u8 = 0;
+    var handle = try openWithRunner(
+        std.testing.allocator,
+        std.testing.io,
+        .{ .context = &context, .notify = TestWake.notify },
+        Script.run,
+    );
+    defer handle.deinit();
+
+    var key: ?CommandKey = null;
+    while (key == null) {
+        if (try handle.tryTakeEvent()) |event_value| {
+            var event = event_value;
+            defer event.deinit();
+            switch (event) {
+                .command_catalog => |catalog| key = catalog.commands[2].key,
+                else => {},
+            }
+        } else try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try handle.executeCommand(key.?, "carefully");
+
+    var status_count: usize = 0;
+    var terminal_count: usize = 0;
+    while (terminal_count < 2) {
+        if (try handle.tryTakeEvent()) |event_value| {
+            var event = event_value;
+            defer event.deinit();
+            switch (event) {
+                .status => |text| {
+                    try std.testing.expectEqualStrings(
+                        if (status_count == 0)
+                            "before completion"
+                        else
+                            "before failure",
+                        text.bytes,
+                    );
+                    status_count += 1;
+                },
+                .command_completed => |result| {
+                    try std.testing.expectEqual(terminal_count + 1, status_count);
+                    terminal_count += 1;
+                    switch (result) {
+                        .completed => |outcome| {
+                            try std.testing.expectEqual(@as(usize, 1), terminal_count);
+                            try std.testing.expect(std.meta.eql(key.?, outcome.key));
+                            try std.testing.expectEqualStrings(
+                                "done",
+                                outcome.message.?.bytes,
+                            );
+                        },
+                        .failed => |outcome| {
+                            try std.testing.expectEqual(@as(usize, 2), terminal_count);
+                            try std.testing.expect(std.meta.eql(key.?, outcome.key));
+                            try std.testing.expectEqualStrings(
+                                "failed",
+                                outcome.message.?.bytes,
+                            );
+                        },
+                    }
+                    if (terminal_count == 1) {
+                        try handle.executeCommand(key.?, "again");
+                    }
+                },
+                else => {},
+            }
+        } else try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectEqual(@as(usize, 2), terminal_count);
+    handle.requestStop();
+}
+
+test "fatal close publishes command failure before closed without duplication" {
+    const Script = struct {
+        fn run(worker: *Worker) void {
+            if (!(worker.ready() catch return)) return;
+            worker.commandCatalog(&.{.{
+                .name = "fatal",
+                .display_name = "Fatal",
+                .description = "Fails fatally",
+                .source = .sdk_builtin,
+                .argument_policy = .none,
+            }}) catch return;
+            var command = worker.waitCommand();
+            defer command.deinit();
+            worker.closeFailure(.stream, "fatal command");
+        }
+    };
+    const TestWake = struct {
+        fn notify(_: *anyopaque) void {}
+    };
+    var context: u8 = 0;
+    var handle = try openWithRunner(
+        std.testing.allocator,
+        std.testing.io,
+        .{ .context = &context, .notify = TestWake.notify },
+        Script.run,
+    );
+    defer handle.deinit();
+
+    const key = try waitForTestCommandKey(&handle);
+    try handle.executeCommand(key, "");
+    try expectCommandTerminalBeforeClosed(&handle, key, "fatal command");
+}
+
+test "requested close publishes command failure before closed without duplication" {
+    const Script = struct {
+        fn run(worker: *Worker) void {
+            if (!(worker.ready() catch return)) return;
+            worker.commandCatalog(&.{.{
+                .name = "stop",
+                .display_name = "Stop",
+                .description = "Stops",
+                .source = .sdk_builtin,
+                .argument_policy = .none,
+            }}) catch return;
+            var command = worker.waitCommand();
+            defer command.deinit();
+            worker.closeRequested();
+        }
+    };
+    const TestWake = struct {
+        fn notify(_: *anyopaque) void {}
+    };
+    var context: u8 = 0;
+    var handle = try openWithRunner(
+        std.testing.allocator,
+        std.testing.io,
+        .{ .context = &context, .notify = TestWake.notify },
+        Script.run,
+    );
+    defer handle.deinit();
+
+    const key = try waitForTestCommandKey(&handle);
+    try handle.executeCommand(key, "");
+    try expectCommandTerminalBeforeClosed(&handle, key, "Command stopped.");
+}
+
+fn waitForTestCommandKey(handle: *Conversation) !CommandKey {
+    while (true) {
+        if (try handle.tryTakeEvent()) |event_value| {
+            var event = event_value;
+            defer event.deinit();
+            switch (event) {
+                .command_catalog => |catalog| return catalog.commands[2].key,
+                else => {},
+            }
+        } else try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+}
+
+fn expectCommandTerminalBeforeClosed(
+    handle: *Conversation,
+    key: CommandKey,
+    expected_message: []const u8,
+) !void {
+    var terminal_count: usize = 0;
+    var closed_seen = false;
+    while (!closed_seen) {
+        if (try handle.tryTakeEvent()) |event_value| {
+            var event = event_value;
+            defer event.deinit();
+            switch (event) {
+                .command_completed => |result| {
+                    try std.testing.expect(!closed_seen);
+                    terminal_count += 1;
+                    switch (result) {
+                        .failed => |outcome| {
+                            try std.testing.expect(std.meta.eql(key, outcome.key));
+                            try std.testing.expectEqualStrings(
+                                expected_message,
+                                outcome.message.?.bytes,
+                            );
+                        },
+                        .completed => return error.ExpectedCommandFailure,
+                    }
+                },
+                .closed => {
+                    try std.testing.expectEqual(@as(usize, 1), terminal_count);
+                    closed_seen = true;
+                },
+                else => {},
+            }
+        } else try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectEqual(@as(usize, 1), terminal_count);
 }
 
 test "conversation transfers streamed events without SDK access" {
@@ -1916,10 +2321,12 @@ test "waiting for user input preserves queued prompts" {
             .notify = Harness.notify,
         },
         .runner = .{ .plain = Harness.run },
+        .command_registry = command_domain.Registry.init(std.testing.allocator),
     };
     defer {
         for (core.commands.items) |*command| command.deinit();
         core.commands.deinit(std.testing.allocator);
+        core.command_registry.deinit();
     }
     try core.commands.append(std.testing.allocator, .{
         .prompt = .{

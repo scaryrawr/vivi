@@ -40,6 +40,13 @@ pub const max_attachment_identity_bytes = @import("attachment.zig").max_identity
 pub const max_attachment_display_name_bytes = @import("attachment.zig").max_display_name_bytes;
 pub const ImageFormat = @import("image.zig").Format;
 pub const CommandCatalog = conversation.CommandCatalog;
+pub const CommandInfo = conversation.CommandInfo;
+pub const CommandKey = conversation.CommandKey;
+pub const CommandSource = conversation.CommandSource;
+pub const CommandAction = conversation.CommandAction;
+pub const CommandArgumentPolicy = conversation.CommandArgumentPolicy;
+pub const CommandExecutionEvent = conversation.CommandExecutionEvent;
+pub const max_command_argument_bytes = conversation.max_command_argument_bytes;
 pub const UserInputRequest = conversation.UserInputRequest;
 pub const UserInputAnswer = conversation.UserInputAnswer;
 pub const UserInputResponse = conversation.UserInputResponse;
@@ -695,24 +702,126 @@ const InvokedCommand = union(enum) {
     }
 };
 
+const CommandCompletionGuard = struct {
+    worker: *conversation.Worker,
+    key: conversation.CommandKey,
+    completed: bool = false,
+
+    fn succeed(self: *CommandCompletionGuard, message: []const u8) !void {
+        if (self.completed) return error.DuplicateCommandCompletion;
+        try self.worker.commandCompleted(self.key, message);
+        self.completed = true;
+    }
+
+    fn fail(self: *CommandCompletionGuard, message: []const u8) !void {
+        if (self.completed) return error.DuplicateCommandCompletion;
+        try self.worker.commandFailed(self.key, message);
+        self.completed = true;
+    }
+
+    fn ensure(self: *CommandCompletionGuard) void {
+        if (self.completed) return;
+        self.worker.commandFailed(
+            self.key,
+            "Command execution did not complete.",
+        ) catch |err| switch (err) {
+            error.NoActiveCommand => {},
+            else => self.worker.closeFailure(
+                .stream,
+                "Unable to report slash command failure.",
+            ),
+        };
+        self.completed = true;
+    }
+};
+
+test "command completion guard preserves terminal-before-close ordering" {
+    const Script = struct {
+        fn run(worker: *conversation.Worker) void {
+            if (!(worker.ready() catch return)) return;
+            worker.commandCatalog(&.{.{
+                .name = "fatal",
+                .display_name = "Fatal",
+                .description = "Fails",
+                .source = .sdk_builtin,
+                .argument_policy = .none,
+            }}) catch return;
+            var command = worker.waitCommand();
+            defer command.deinit();
+            switch (command) {
+                .execute_command => |execution| {
+                    var completion = CommandCompletionGuard{
+                        .worker = worker,
+                        .key = execution.key,
+                    };
+                    defer completion.ensure();
+                    worker.closeFailure(.stream, "fatal adapter failure");
+                },
+                else => worker.closeFailure(.stream, "Unexpected command."),
+            }
+        }
+    };
+    const TestWake = struct {
+        fn notify(_: *anyopaque) void {}
+    };
+    var context: u8 = 0;
+    var handle = try conversation.openWithRunner(
+        std.testing.allocator,
+        std.testing.io,
+        .{ .context = &context, .notify = TestWake.notify },
+        Script.run,
+    );
+    defer handle.deinit();
+
+    var key: ?conversation.CommandKey = null;
+    while (key == null) {
+        if (try handle.tryTakeEvent()) |event_value| {
+            var event = event_value;
+            defer event.deinit();
+            if (event == .command_catalog) {
+                key = event.command_catalog.commands[2].key;
+            }
+        } else try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try handle.executeCommand(key.?, "");
+
+    var terminal_count: usize = 0;
+    var closed_seen = false;
+    while (!closed_seen) {
+        if (try handle.tryTakeEvent()) |event_value| {
+            var event = event_value;
+            defer event.deinit();
+            switch (event) {
+                .command_completed => |result| {
+                    terminal_count += 1;
+                    switch (result) {
+                        .failed => |outcome| try std.testing.expectEqualStrings(
+                            "fatal adapter failure",
+                            outcome.message.?.bytes,
+                        ),
+                        .completed => return error.ExpectedCommandFailure,
+                    }
+                },
+                .closed => {
+                    try std.testing.expectEqual(@as(usize, 1), terminal_count);
+                    closed_seen = true;
+                },
+                else => {},
+            }
+        } else try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectEqual(@as(usize, 1), terminal_count);
+}
+
 fn executeSdkCommand(
     allocator: std.mem.Allocator,
     client: anytype,
     session: anytype,
-    input: []const u8,
+    name: []const u8,
+    arguments: []const u8,
 ) !InvokedCommand {
-    const trimmed = std.mem.trim(u8, input, " \t\r\n");
-    const command = if (trimmed.len > 0 and trimmed[0] == '/')
-        trimmed[1..]
-    else
-        trimmed;
-    const separator = std.mem.indexOfAny(u8, command, " \t\r\n");
-    const name = if (separator) |index| command[0..index] else command;
-    const args = if (separator) |index|
-        std.mem.trim(u8, command[index..], " \t\r\n")
-    else
-        "";
     if (name.len == 0) return error.EmptyCommand;
+    const args = std.mem.trim(u8, arguments, " \t\r\n");
 
     var result = try client.callRpc(
         struct {
@@ -794,11 +903,7 @@ fn selectedSubcommandInput(
 ) ![]u8 {
     for (selection.options) |option| {
         if (std.mem.eql(u8, option, answer)) {
-            return std.fmt.allocPrint(
-                allocator,
-                "{s} {s}",
-                .{ selection.command, option },
-            );
+            return allocator.dupe(u8, option);
         }
     }
     return error.InvalidSubcommandSelection;
@@ -1360,14 +1465,21 @@ fn isDuplicateHostedModel(
     return false;
 }
 
-fn buildCommandCatalog(
-    allocator: std.mem.Allocator,
-    client: *copilot.Client,
-    session: copilot.Session,
-) !conversation.CommandCatalog {
+fn publishCommandCatalog(
+    worker: anytype,
+    client: anytype,
+    session: anytype,
+    complete_refresh: bool,
+) !void {
     const RpcCommand = struct {
         name: []const u8,
+        displayName: ?[]const u8 = null,
         description: []const u8 = "",
+        kind: []const u8,
+        input: ?struct {
+            hint: []const u8 = "",
+            required: ?bool = null,
+        } = null,
     };
     var listed = try client.callRpc(
         struct { commands: []const RpcCommand },
@@ -1382,91 +1494,187 @@ fn buildCommandCatalog(
     defer listed.deinit();
     const sdk_commands = listed.value.commands;
 
-    var count: usize = 2;
+    var count: usize = 0;
     for (sdk_commands) |command| {
-        if (!std.ascii.eqlIgnoreCase(command.name, "model") and
-            !std.ascii.eqlIgnoreCase(command.name, "resume"))
+        if (std.ascii.eqlIgnoreCase(command.name, "model") or
+            std.ascii.eqlIgnoreCase(command.name, "resume"))
         {
-            count += 1;
+            if (!std.mem.eql(u8, command.kind, "builtin")) {
+                return error.ReservedCommandName;
+            }
+            continue;
         }
+        count += 1;
     }
-    const commands = try allocator.alloc(conversation.CommandInfo, count);
-    errdefer allocator.free(commands);
-    var initialized: usize = 0;
-    errdefer for (commands[0..initialized]) |*command| {
-        allocator.free(command.name);
-        allocator.free(command.description);
-    };
-
-    const sdk_model = for (sdk_commands) |command| {
-        if (std.ascii.eqlIgnoreCase(command.name, "model")) break command;
-    } else null;
-    commands[initialized] = try initCommandInfo(
-        allocator,
-        "model",
-        if (sdk_model) |command|
-            command.description
-        else
-            "Switch the model for new turns",
+    const definitions = try worker.allocator().alloc(
+        conversation.CommandDefinition,
+        count,
     );
-    initialized += 1;
-    commands[initialized] = try initCommandInfo(
-        allocator,
-        "resume",
-        "Resume a previous Vivi session",
-    );
-    initialized += 1;
+    defer worker.allocator().free(definitions);
+    var index: usize = 0;
     for (sdk_commands) |command| {
         if (std.ascii.eqlIgnoreCase(command.name, "model") or
             std.ascii.eqlIgnoreCase(command.name, "resume"))
         {
             continue;
         }
-        commands[initialized] = try initCommandInfo(
-            allocator,
-            command.name,
-            command.description,
-        );
-        initialized += 1;
+        const source: conversation.CommandSource =
+            if (std.mem.eql(u8, command.kind, "builtin"))
+                .sdk_builtin
+            else if (std.mem.eql(u8, command.kind, "client") or
+            std.mem.eql(u8, command.kind, "skill"))
+                .extension
+            else
+                return error.UnsupportedCommandKind;
+        definitions[index] = .{
+            .name = command.name,
+            .display_name = command.displayName orelse command.name,
+            .description = command.description,
+            .hint = if (command.input) |input|
+                if (input.hint.len == 0) null else input.hint
+            else
+                null,
+            .source = source,
+            .argument_policy = if (command.input) |input|
+                if (input.required == true) .required else .optional
+            else
+                .none,
+        };
+        index += 1;
     }
-    return .{ .allocator = allocator, .commands = commands };
+    if (complete_refresh) {
+        try worker.completeCommandRefresh(definitions);
+    } else {
+        try worker.commandCatalog(definitions);
+    }
 }
 
-fn buildFallbackCommandCatalog(
-    allocator: std.mem.Allocator,
-) !conversation.CommandCatalog {
-    const commands = try allocator.alloc(conversation.CommandInfo, 2);
-    errdefer allocator.free(commands);
-    var initialized: usize = 0;
-    errdefer for (commands[0..initialized]) |*command| {
-        allocator.free(command.name);
-        allocator.free(command.description);
+test "command discovery uses the existing client and maps typed policy" {
+    const FakeClient = struct {
+        allocator: std.mem.Allocator,
+        calls: usize = 0,
+
+        fn callRpc(
+            self: *@This(),
+            comptime Result: type,
+            method: []const u8,
+            params: anytype,
+        ) !std.json.Parsed(Result) {
+            self.calls += 1;
+            try std.testing.expectEqualStrings("session.commands.list", method);
+            try std.testing.expectEqualStrings("session-1", params.sessionId);
+            try std.testing.expect(params.includeBuiltins);
+            try std.testing.expect(params.includeSkills);
+            try std.testing.expect(params.includeClientCommands);
+            return std.json.parseFromSlice(
+                Result,
+                self.allocator,
+                \\{"commands":[
+                \\{"name":"model","displayName":"Model","description":"SDK model","kind":"builtin"},
+                \\{"name":"resume","displayName":"Resume","description":"SDK resume","kind":"builtin"},
+                \\{"name":"help","displayName":"Help","description":"Show help","kind":"builtin"},
+                \\{"name":"review","displayName":"Review","description":"Review changes","kind":"skill","input":{"hint":"instructions","required":true}}
+                \\]}
+            ,
+                .{ .ignore_unknown_fields = true },
+            );
+        }
     };
-    commands[initialized] = try initCommandInfo(
-        allocator,
-        "model",
-        "Switch the model for new turns",
+    const Sink = struct {
+        registry: @import("command_domain.zig").Registry,
+        complete: bool = false,
+
+        fn allocator(_: *@This()) std.mem.Allocator {
+            return std.testing.allocator;
+        }
+
+        fn commandCatalog(
+            self: *@This(),
+            definitions: []const conversation.CommandDefinition,
+        ) !void {
+            var catalog = try self.registry.replace(definitions);
+            catalog.deinit();
+        }
+
+        fn completeCommandRefresh(
+            self: *@This(),
+            definitions: []const conversation.CommandDefinition,
+        ) !void {
+            self.complete = true;
+            try self.commandCatalog(definitions);
+        }
+    };
+
+    var client = FakeClient{ .allocator = std.testing.allocator };
+    var sink = Sink{
+        .registry = @import("command_domain.zig").Registry.init(
+            std.testing.allocator,
+        ),
+    };
+    defer sink.registry.deinit();
+    try publishCommandCatalog(&sink, &client, .{ .id = "session-1" }, true);
+    try std.testing.expectEqual(@as(usize, 1), client.calls);
+    try std.testing.expect(sink.complete);
+    const catalog = &sink.registry.catalog.?;
+    try std.testing.expectEqual(@as(usize, 4), catalog.commands.len);
+    try std.testing.expectEqualStrings("model", catalog.commands[0].name);
+    try std.testing.expectEqual(
+        conversation.CommandAction.open_model_selection,
+        catalog.commands[0].action,
     );
-    initialized += 1;
-    commands[initialized] = try initCommandInfo(
-        allocator,
-        "resume",
-        "Resume a previous Vivi session",
+    try std.testing.expectEqualStrings("resume", catalog.commands[1].name);
+    try std.testing.expectEqualStrings("help", catalog.commands[2].name);
+    try std.testing.expectEqual(
+        conversation.CommandArgumentPolicy.none,
+        catalog.commands[2].argument_policy,
     );
-    return .{ .allocator = allocator, .commands = commands };
+    try std.testing.expectEqual(
+        conversation.CommandArgumentPolicy.required,
+        catalog.commands[3].argument_policy,
+    );
+    try std.testing.expectEqual(
+        conversation.CommandSource.extension,
+        catalog.commands[3].source,
+    );
+    try std.testing.expectEqualStrings("instructions", catalog.commands[3].hint.?);
 }
 
-fn initCommandInfo(
-    allocator: std.mem.Allocator,
-    name: []const u8,
-    description: []const u8,
-) !conversation.CommandInfo {
-    const owned_name = try allocator.dupe(u8, name);
-    errdefer allocator.free(owned_name);
-    return .{
-        .name = owned_name,
-        .description = try allocator.dupe(u8, description),
+test "command discovery rejects extension collisions with injected commands" {
+    const FakeClient = struct {
+        fn callRpc(
+            _: *@This(),
+            comptime Result: type,
+            _: []const u8,
+            _: anytype,
+        ) !std.json.Parsed(Result) {
+            return std.json.parseFromSlice(
+                Result,
+                std.testing.allocator,
+                \\{"commands":[{"name":"resume","description":"collision","kind":"skill"}]}
+            ,
+                .{ .ignore_unknown_fields = true },
+            );
+        }
     };
+    const Sink = struct {
+        fn allocator(_: *@This()) std.mem.Allocator {
+            return std.testing.allocator;
+        }
+        fn commandCatalog(
+            _: *@This(),
+            _: []const conversation.CommandDefinition,
+        ) !void {}
+        fn completeCommandRefresh(
+            _: *@This(),
+            _: []const conversation.CommandDefinition,
+        ) !void {}
+    };
+    var client = FakeClient{};
+    var sink = Sink{};
+    try std.testing.expectError(
+        error.ReservedCommandName,
+        publishCommandCatalog(&sink, &client, .{ .id = "session-1" }, false),
+    );
 }
 
 const ResumeTarget = struct {
@@ -1990,13 +2198,9 @@ fn refreshCommandCatalog(
     client: *copilot.Client,
     session: copilot.Session,
 ) void {
-    if (buildCommandCatalog(
-        worker.allocator(),
-        client,
-        session,
-    )) |catalog| {
-        worker.commandCatalog(catalog) catch {};
-    } else |_| {}
+    publishCommandCatalog(worker, client, session, false) catch |err| {
+        worker.commandCatalogFailed(@errorName(err)) catch {};
+    };
 }
 
 fn streamSessionResponse(
@@ -2502,12 +2706,7 @@ fn runSdkConversation(
         return;
     }
 
-    const initial_commands = buildCommandCatalog(
-        worker.allocator(),
-        &client,
-        session,
-    ) catch buildFallbackCommandCatalog(worker.allocator()) catch null;
-    if (initial_commands) |catalog| worker.commandCatalog(catalog) catch {};
+    refreshCommandCatalog(worker, &client, session);
     if (buildModelCatalog(
         worker.allocator(),
         &client,
@@ -2534,22 +2733,18 @@ fn runSdkConversation(
                 return;
             },
             .refresh_commands => {
-                const catalog = buildCommandCatalog(
-                    worker.allocator(),
+                publishCommandCatalog(
+                    worker,
                     &client,
                     session,
-                ) catch buildFallbackCommandCatalog(
-                    worker.allocator(),
+                    true,
                 ) catch |err| {
-                    worker.closeFailure(.stream, @errorName(err));
-                    return;
-                };
-                worker.completeCommandRefresh(catalog) catch {
-                    worker.closeFailure(
-                        .stream,
-                        "Unable to deliver slash commands.",
-                    );
-                    return;
+                    worker.completeCommandRefreshFailure(
+                        @errorName(err),
+                    ) catch {
+                        worker.closeFailure(.stream, @errorName(err));
+                    };
+                    continue;
                 };
             },
             .refresh_models => {
@@ -2804,31 +2999,97 @@ fn runSdkConversation(
                     );
                     return;
                 };
-                if (buildCommandCatalog(
-                    worker.allocator(),
-                    &client,
-                    session,
-                )) |catalog| {
-                    worker.commandCatalog(catalog) catch {};
-                } else |_| {}
+                refreshCommandCatalog(worker, &client, session);
             },
             .execute_command => |requested| {
-                var command_input = worker.allocator().dupe(
-                    u8,
-                    requested.bytes,
-                ) catch |err| {
-                    worker.closeFailure(.stream, @errorName(err));
-                    return;
+                var completion = CommandCompletionGuard{
+                    .worker = worker,
+                    .key = requested.key,
                 };
-                defer worker.allocator().free(command_input);
+                defer completion.ensure();
+                switch (requested.action) {
+                    .open_model_selection => {
+                        const catalog = buildModelCatalog(
+                            worker.allocator(),
+                            &client,
+                            worker.io(),
+                            &active_plan,
+                            omlx_options,
+                        ) catch |err| {
+                            completion.fail(@errorName(err)) catch {};
+                            continue;
+                        };
+                        worker.modelCatalog(catalog) catch |err| {
+                            completion.fail(@errorName(err)) catch {};
+                            continue;
+                        };
+                        completion.succeed("Choose a model.") catch {
+                            worker.closeFailure(
+                                .stream,
+                                "Unable to report slash command completion.",
+                            );
+                            return;
+                        };
+                        continue;
+                    },
+                    .open_session_history => {
+                        var next_generation = resume_generation +% 1;
+                        if (next_generation == 0) next_generation = 1;
+                        var result = buildSessionCatalog(
+                            worker.allocator(),
+                            &client,
+                            session.id,
+                            next_generation,
+                        ) catch |err| {
+                            completion.fail(@errorName(err)) catch {};
+                            continue;
+                        };
+                        worker.sessionCatalog(result.catalog) catch |err| {
+                            result.targets.deinit(worker.allocator());
+                            completion.fail(@errorName(err)) catch {};
+                            continue;
+                        };
+                        if (resume_targets) |*targets| {
+                            targets.deinit(worker.allocator());
+                        }
+                        resume_targets = result.targets;
+                        resume_generation = next_generation;
+                        completion.succeed("Choose a session.") catch {
+                            worker.closeFailure(
+                                .stream,
+                                "Unable to report slash command completion.",
+                            );
+                            return;
+                        };
+                        continue;
+                    },
+                    .execute => {},
+                }
+                var command_name = worker.allocator().dupe(
+                    u8,
+                    requested.action.execute.name,
+                ) catch |err| {
+                    completion.fail(@errorName(err)) catch {};
+                    continue;
+                };
+                defer worker.allocator().free(command_name);
+                var command_arguments = worker.allocator().dupe(
+                    u8,
+                    requested.action.execute.arguments,
+                ) catch |err| {
+                    completion.fail(@errorName(err)) catch {};
+                    continue;
+                };
+                defer worker.allocator().free(command_arguments);
                 command_execution: while (true) {
                     var result = executeSdkCommand(
                         worker.allocator(),
                         &client,
                         session,
-                        command_input,
+                        command_name,
+                        command_arguments,
                     ) catch |err| {
-                        worker.commandCompleted(@errorName(err)) catch {
+                        completion.fail(@errorName(err)) catch {
                             worker.closeFailure(.stream, @errorName(err));
                             return;
                         };
@@ -2837,7 +3098,7 @@ fn runSdkConversation(
                     defer result.deinit(worker.allocator());
                     switch (result) {
                         .completed => |message| {
-                            worker.commandCompleted(message) catch {
+                            completion.succeed(message) catch {
                                 worker.closeFailure(
                                     .stream,
                                     "Unable to report slash command completion.",
@@ -2871,6 +3132,13 @@ fn runSdkConversation(
                                 },
                                 .failed => return,
                             }
+                            completion.succeed("Command completed.") catch {
+                                worker.closeFailure(
+                                    .stream,
+                                    "Unable to report slash command completion.",
+                                );
+                                return;
+                            };
                             break :command_execution;
                         },
                         .select_subcommand => |selection| {
@@ -2904,7 +3172,7 @@ fn runSdkConversation(
                                         selection,
                                         typed.answer.text(),
                                     ) catch |err| {
-                                        worker.commandCompleted(
+                                        completion.fail(
                                             @errorName(err),
                                         ) catch {
                                             worker.closeFailure(
@@ -2915,8 +3183,18 @@ fn runSdkConversation(
                                         };
                                         break :command_execution;
                                     };
-                                    worker.allocator().free(command_input);
-                                    command_input = next_input;
+                                    const next_name = worker.allocator().dupe(
+                                        u8,
+                                        selection.command,
+                                    ) catch |err| {
+                                        worker.allocator().free(next_input);
+                                        completion.fail(@errorName(err)) catch {};
+                                        break :command_execution;
+                                    };
+                                    worker.allocator().free(command_name);
+                                    worker.allocator().free(command_arguments);
+                                    command_name = next_name;
+                                    command_arguments = next_input;
                                     continue :command_execution;
                                 },
                                 .prompt,
@@ -3214,13 +3492,7 @@ fn runSdkConversation(
                     );
                     return;
                 };
-                if (buildCommandCatalog(
-                    worker.allocator(),
-                    &client,
-                    session,
-                )) |catalog| {
-                    worker.commandCatalog(catalog) catch {};
-                } else |_| {}
+                refreshCommandCatalog(worker, &client, session);
             },
             .prompt => |prompt| {
                 sendPrompt(
@@ -3867,7 +4139,7 @@ const FakeCommandClient = struct {
     }
 };
 
-test "slash command invocation handles all interactive result kinds" {
+test "command execution uses the existing client and current session" {
     const session = .{ .id = "session-1" };
     var completed_client = FakeCommandClient{
         .allocator = std.testing.allocator,
@@ -3881,7 +4153,8 @@ test "slash command invocation handles all interactive result kinds" {
         std.testing.allocator,
         &completed_client,
         session,
-        "/autopilot thorough",
+        "autopilot",
+        "thorough",
     );
     defer completed.deinit(std.testing.allocator);
     switch (completed) {
@@ -3905,7 +4178,8 @@ test "slash command invocation handles all interactive result kinds" {
         std.testing.allocator,
         &prompt_client,
         session,
-        "/autopilot thorough",
+        "autopilot",
+        "thorough",
     );
     defer prompt.deinit(std.testing.allocator);
     switch (prompt) {
@@ -3929,7 +4203,8 @@ test "slash command invocation handles all interactive result kinds" {
         std.testing.allocator,
         &select_client,
         session,
-        "/chronicle",
+        "chronicle",
+        "",
     );
     defer selected.deinit(std.testing.allocator);
     switch (selected) {
@@ -3948,7 +4223,7 @@ test "slash command invocation handles all interactive result kinds" {
                 "show",
             );
             defer std.testing.allocator.free(next_input);
-            try std.testing.expectEqualStrings("chronicle show", next_input);
+            try std.testing.expectEqualStrings("show", next_input);
         },
     }
 }

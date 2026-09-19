@@ -117,6 +117,21 @@ fn commandArgumentSuffix(input: []const u8) []const u8 {
     return if (separator) |index| input[index..] else "";
 }
 
+fn commandValidationMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.CommandTakesNoArguments => "This command does not accept arguments.",
+        error.CommandRequiresArguments => "This command requires an argument.",
+        error.CommandArgumentsTooLong => "Command arguments are too long.",
+        error.InvalidCommandArgumentsUtf8 => "Command arguments must be valid UTF-8.",
+        error.InvalidCommandKey,
+        error.StaleCommandKey,
+        => "The command catalog changed. Open the command palette and try again.",
+        error.CommandCatalogUnavailable => "Commands are not available yet. Refresh the command palette and try again.",
+        error.CommandAlreadyActive => "Another command is still running.",
+        else => "The command could not be executed.",
+    };
+}
+
 const FileReferenceQuery = struct {
     start: usize,
     end: usize,
@@ -135,18 +150,6 @@ fn fileReferenceQuery(input: []const u8, cursor: usize) ?FileReferenceQuery {
         .end = end,
         .query = input[start + 1 .. cursor],
     };
-}
-
-fn buildCommandInput(
-    allocator: std.mem.Allocator,
-    command_name: []const u8,
-    composer_input: []const u8,
-) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
-        "{s}{s}",
-        .{ command_name, commandArgumentSuffix(composer_input) },
-    );
 }
 
 fn visibleSelectionRange(
@@ -2545,6 +2548,20 @@ const MenuMode = enum {
     sessions,
 };
 
+const CommandActivation = enum {
+    execute,
+    models,
+    sessions,
+};
+
+fn commandActivation(action: backend.CommandAction) CommandActivation {
+    return switch (action) {
+        .execute => .execute,
+        .open_model_selection => .models,
+        .open_session_history => .sessions,
+    };
+}
+
 fn userInputAnswer(
     request: backend.UserInputRequest,
     raw_answer: []const u8,
@@ -3274,7 +3291,7 @@ const ChatUi = struct {
             entries[index] = .{
                 .identity = .{ .text = command.name },
                 .key = command.name,
-                .primary = command.name,
+                .primary = command.display_name,
                 .detail = .{ .text = command.description },
                 .source_index = index,
             };
@@ -3354,48 +3371,53 @@ const ChatUi = struct {
             .commands => {
                 const catalog = self.commands orelse return;
                 const command = catalog.commands[selected.source_index];
-                if (std.ascii.eqlIgnoreCase(command.name, "resume")) {
-                    self.input.clearRetainingCapacity();
-                    self.menu_mode = .loading_sessions;
-                    conversation.refreshSessions() catch |err| switch (err) {
-                        error.Busy => {
-                            self.menu_mode = .closed;
-                            return;
-                        },
-                        else => return err,
-                    };
-                    self.phase = .resuming;
-                    return;
-                }
-                if (!std.ascii.eqlIgnoreCase(command.name, "model")) {
-                    const contents = try self.input.toOwnedContents(
-                        self.allocator,
-                    );
-                    defer self.allocator.free(contents);
-                    const command_input = try buildCommandInput(
-                        self.allocator,
-                        command.name,
-                        contents,
-                    );
-                    defer self.allocator.free(command_input);
-                    conversation.executeCommand(command_input) catch |err| switch (err) {
-                        error.EmptyCommand, error.Busy => return,
-                        else => return err,
-                    };
-                    self.input.clearRetainingCapacity();
-                    self.menu_mode = .closed;
-                    self.phase = .running_command;
-                    return;
-                }
-                self.input.clearRetainingCapacity();
-                self.menu_mode = .loading_models;
-                conversation.refreshModels() catch |err| switch (err) {
-                    error.Busy => {
-                        self.menu_mode = .closed;
+                const contents = try self.input.toOwnedContents(
+                    self.allocator,
+                );
+                defer self.allocator.free(contents);
+                conversation.executeCommand(
+                    command.key,
+                    commandArgumentSuffix(contents),
+                ) catch |err| switch (err) {
+                    error.Busy => return,
+                    error.CommandTakesNoArguments,
+                    error.CommandRequiresArguments,
+                    error.CommandArgumentsTooLong,
+                    error.InvalidCommandArgumentsUtf8,
+                    error.InvalidCommandKey,
+                    error.StaleCommandKey,
+                    error.CommandCatalogUnavailable,
+                    error.CommandAlreadyActive,
+                    => {
+                        if (err == error.StaleCommandKey) {
+                            conversation.refreshCommands() catch {};
+                            self.phase = .loading_commands;
+                        }
+                        try self.transcript.append(
+                            self.allocator,
+                            .status,
+                            commandValidationMessage(err),
+                        );
+                        self.followTail();
                         return;
                     },
                     else => return err,
                 };
+                self.input.clearRetainingCapacity();
+                switch (commandActivation(command.action)) {
+                    .execute => {
+                        self.menu_mode = .closed;
+                        self.phase = .running_command;
+                    },
+                    .models => {
+                        self.menu_mode = .loading_models;
+                        self.phase = .running_command;
+                    },
+                    .sessions => {
+                        self.menu_mode = .loading_sessions;
+                        self.phase = .resuming;
+                    },
+                }
             },
             .files => {
                 const contents = try self.input.toOwnedContents(self.allocator);
@@ -3711,13 +3733,38 @@ const ChatUi = struct {
                 self.phase = .awaiting_input;
                 self.followTail();
             },
-            .command_completed => |message| {
+            .command_completed => |result| {
                 self.phase = .ready;
-                try self.transcript.append(
-                    self.allocator,
-                    .status,
-                    message.bytes,
-                );
+                const message = switch (result) {
+                    .completed => |outcome| if (outcome.message) |text|
+                        text.bytes
+                    else
+                        "Command completed.",
+                    .failed => |outcome| failure: {
+                        if (self.commands) |catalog| {
+                            if (catalog.find(outcome.key)) |command| {
+                                switch (command.action) {
+                                    .open_model_selection => {
+                                        if (self.menu_mode == .loading_models) {
+                                            self.menu_mode = .closed;
+                                        }
+                                    },
+                                    .open_session_history => {
+                                        if (self.menu_mode == .loading_sessions) {
+                                            self.menu_mode = .closed;
+                                        }
+                                    },
+                                    .execute => {},
+                                }
+                            }
+                        }
+                        break :failure if (outcome.message) |text|
+                            text.bytes
+                        else
+                            "Command failed.";
+                    },
+                };
+                try self.transcript.append(self.allocator, .status, message);
             },
             .idle => {
                 self.transcript.endTurn();
@@ -8289,15 +8336,27 @@ test "slash command parsing preserves argument suffixes" {
         " thorough",
         commandArgumentSuffix("/autopilot thorough"),
     );
-    const command_input = try buildCommandInput(
-        std.testing.allocator,
-        "autopilot",
-        "/auto thorough",
-    );
-    defer std.testing.allocator.free(command_input);
-    try std.testing.expectEqualStrings("autopilot thorough", command_input);
     try std.testing.expectEqualStrings("", slashCommandQuery("/").?);
     try std.testing.expect(slashCommandQuery("not-a-command") == null);
+}
+
+test "command actions dispatch without name-based special cases" {
+    try std.testing.expectEqual(
+        CommandActivation.execute,
+        commandActivation(.execute),
+    );
+    try std.testing.expectEqual(
+        CommandActivation.models,
+        commandActivation(.open_model_selection),
+    );
+    try std.testing.expectEqual(
+        CommandActivation.sessions,
+        commandActivation(.open_session_history),
+    );
+    try std.testing.expectEqualStrings(
+        "This command does not accept arguments.",
+        commandValidationMessage(error.CommandTakesNoArguments),
+    );
 }
 
 test "file reference query follows the active composer token" {
@@ -8779,6 +8838,81 @@ test "session catalog failure closes stale cached finder" {
         "Unable to load saved sessions.",
         ui.transcript.messageAt(0).text.items,
     );
+}
+
+test "failed injected commands close their loading menus" {
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    var ui = try ChatUi.init(
+        std.testing.allocator,
+        std.testing.io,
+        &environment,
+    );
+    defer ui.deinit();
+
+    const commands = try std.testing.allocator.alloc(backend.CommandInfo, 2);
+    commands[0] = .{
+        .key = .{
+            .generation = @enumFromInt(1),
+            .slot = @enumFromInt(1),
+        },
+        .name = try std.testing.allocator.dupe(u8, "model"),
+        .display_name = try std.testing.allocator.dupe(u8, "model"),
+        .description = try std.testing.allocator.dupe(u8, "Choose a model"),
+        .hint = null,
+        .source = .vivi,
+        .action = .open_model_selection,
+        .argument_policy = .none,
+    };
+    commands[1] = .{
+        .key = .{
+            .generation = @enumFromInt(1),
+            .slot = @enumFromInt(2),
+        },
+        .name = try std.testing.allocator.dupe(u8, "resume"),
+        .display_name = try std.testing.allocator.dupe(u8, "resume"),
+        .description = try std.testing.allocator.dupe(u8, "Choose a session"),
+        .hint = null,
+        .source = .vivi,
+        .action = .open_session_history,
+        .argument_policy = .none,
+    };
+    ui.commands = .{
+        .allocator = std.testing.allocator,
+        .commands = commands,
+    };
+
+    ui.phase = .running_command;
+    ui.menu_mode = .loading_models;
+    var model_failure: backend.ConversationEvent = .{
+        .command_completed = .{ .failed = .{
+            .key = commands[0].key,
+            .message = try backend.OwnedText.init(
+                std.testing.allocator,
+                "model failure",
+            ),
+        } },
+    };
+    defer model_failure.deinit();
+    _ = try ui.applyConversationEvent(&model_failure);
+    try std.testing.expectEqual(UiPhase.ready, ui.phase);
+    try std.testing.expectEqual(MenuMode.closed, ui.menu_mode);
+
+    ui.phase = .resuming;
+    ui.menu_mode = .loading_sessions;
+    var resume_failure: backend.ConversationEvent = .{
+        .command_completed = .{ .failed = .{
+            .key = commands[1].key,
+            .message = try backend.OwnedText.init(
+                std.testing.allocator,
+                "resume failure",
+            ),
+        } },
+    };
+    defer resume_failure.deinit();
+    _ = try ui.applyConversationEvent(&resume_failure);
+    try std.testing.expectEqual(UiPhase.ready, ui.phase);
+    try std.testing.expectEqual(MenuMode.closed, ui.menu_mode);
 }
 
 test "session catalog completion restores ready after finder dismissal" {

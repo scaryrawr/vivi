@@ -214,9 +214,14 @@ Vivi also passes the detected vision capability through
 Unknown BYOK model names otherwise default to no vision in Copilot, which
 removes image content before it reaches OMLX.
 
-The SDK's generic `Client.callRpc` adapts `session.commands.list` into the
-SDK-free command catalog owned by
-`backend/src/conversation.zig`. It refreshes that catalog after session
+The SDK's generic `Client.callRpc` adapts `session.commands.list` into
+SDK-free definitions consumed by `backend/src/command_domain.zig`. That module
+owns generation-scoped nonzero keys, the closed source/action/argument matrix,
+injected `/model` and `/resume` entries, fail-closed catalog replacement, and
+key-based admission. `backend/src/conversation.zig` serializes admitted
+executions and publishes their terminal outcome through a reserved event slot,
+so queue growth cannot prevent exactly one chronological completion or
+failure. The catalog refreshes after session
 creation, after session replacement, when an unknown SDK event identifies
 `commands.changed`, and whenever the terminal opens `/`. The explicit open-time refresh is
 required because the single SDK-owning worker waits on Vivi's command mailbox
@@ -233,6 +238,11 @@ compatible SDK-contributed commands execute through
 `session.commands.invoke`. Vivi's `ask_user` tool requests cross the backend as
 owned domain events; the terminal shows the question and choices, then returns
 the composer's answer as the tool result.
+
+A future host ABI version should expose this command domain through an explicit
+HostPort mapping of generation, slot, source, action, and argument policy.
+Hosts must not serialize Zig enum representations or gain a generic JSON
+command bridge; ABI v10 intentionally leaves command events unprojected.
 
 Model replacement is a transaction on the SDK worker. It resolves the target
 and creates a candidate session before disconnecting the active session. A
