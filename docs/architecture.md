@@ -12,6 +12,11 @@ events into owned domain values. SDK-free backend modules own conversation
 lifecycle, tools, settings, models, file picking, attachments, presentation,
 and PTY management.
 
+The Bun and TypeScript packages are a transitional migration scaffold. Zig
+remains the production CLI. Install and check the scaffold with
+`bun install --frozen-lockfile` and `bun run check`. Run `bun run probe:runtime`
+only when Copilot credentials and a running Copilot CLI are available.
+
 `cli/src/main.zig` owns command parsing and process setup.
 `cli/src/chat.zig` owns the libvaxis event loop, transcript, composer, menus,
 questions, tool disclosure, scrolling, and responsive terminal layout.
