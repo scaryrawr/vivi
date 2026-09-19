@@ -123,11 +123,13 @@ const NewCommandAction = enum {
 };
 
 fn newCommandAction(input: []const u8) NewCommandAction {
-    return if (std.mem.trim(
-        u8,
-        commandArgumentSuffix(input),
-        " \t\r\n",
-    ).len == 0)
+    const query = slashCommandQuery(input) orelse return .submit_prompt;
+    return if (std.ascii.eqlIgnoreCase(query, "new") and
+        std.mem.trim(
+            u8,
+            commandArgumentSuffix(input),
+            " \t\r\n",
+        ).len == 0)
         .start_session
     else
         .submit_prompt;
@@ -8485,6 +8487,14 @@ test "slash command parsing preserves argument suffixes" {
     try std.testing.expectEqual(
         NewCommandAction.submit_prompt,
         newCommandAction("/new vivi-image-1"),
+    );
+    try std.testing.expectEqual(
+        NewCommandAction.submit_prompt,
+        newCommandAction("/ne"),
+    );
+    try std.testing.expectEqual(
+        NewCommandAction.submit_prompt,
+        newCommandAction("/ew"),
     );
     const command_input = try buildCommandInput(
         std.testing.allocator,
