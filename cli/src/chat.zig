@@ -5139,13 +5139,17 @@ const App = struct {
     }
 
     fn deinit(self: *App) void {
+        self.loop.should_quit = true;
+        if (self.loop.thread) |*thread| {
+            thread.cancel(self.io);
+            self.loop.thread = null;
+        }
         self.file_picker.deinit();
         self.conversation.deinit();
         self.releaseImages();
         self.render_memory.deinit(self.vx.window());
         self.ui.deinit();
         self.terminal_title.deinit();
-        self.loop.stop();
         self.vx.deinit(self.allocator, self.tty.writer());
         self.tty.deinit();
         self.* = undefined;
@@ -5384,7 +5388,16 @@ const App = struct {
     }
 
     fn hardExit(self: *App) noreturn {
-        self.loop.stop();
+        // Cancel the input future the same way deinit() does: cancellation
+        // interrupts the blocked tty read directly, so it can't race with
+        // the Vaxis/tty teardown below (unlike Loop.stop(), which only wakes
+        // the read with a DSR round-trip and hangs when nothing answers it,
+        // for example a piped harness without a terminal emulator).
+        self.loop.should_quit = true;
+        if (self.loop.thread) |*thread| {
+            thread.cancel(self.io);
+            self.loop.thread = null;
+        }
         self.releaseImages();
         self.ui.deinitTranscriptSpool();
         self.render_memory.deinit(self.vx.window());
