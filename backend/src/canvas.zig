@@ -238,7 +238,17 @@ fn validateJson(
             error.OutOfMemory => return err,
             else => return error.InvalidJson,
         };
-        if (first) {
+        const token_is_partial = switch (token) {
+            .partial_number,
+            .partial_string,
+            .partial_string_escaped_1,
+            .partial_string_escaped_2,
+            .partial_string_escaped_3,
+            .partial_string_escaped_4,
+            => true,
+            else => false,
+        };
+        if (first and !token_is_partial) {
             first = false;
             switch (role) {
                 .schema => switch (token) {
@@ -1780,8 +1790,11 @@ pub const Domain = struct {
             canvas.deinit(allocator);
         };
         for (self.instances.items) |instance| {
-            canvases[initialized] =
-                try instance.resumeCanvas(allocator, self.limits) orelse continue;
+            const canvas = try instance.resumeCanvas(
+                allocator,
+                self.limits,
+            ) orelse continue;
+            canvases[initialized] = canvas;
             initialized += 1;
         }
         return .{ .canvases = canvases };
@@ -2277,6 +2290,22 @@ test "bounded identities and role documents validate their own shapes" {
         .{},
     );
     defer escaped.deinit(std.testing.allocator);
+    try std.testing.expectError(
+        error.InvalidSchemaDocument,
+        SchemaDocument.init(
+            std.testing.allocator,
+            "\"line\\nvalue\"",
+            .{},
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidInputDocument,
+        OpenInputDocument.init(
+            std.testing.allocator,
+            "\"line\\nvalue\"",
+            .{},
+        ),
+    );
     try std.testing.expectError(
         error.InvalidInputDocument,
         ActionInputDocument.init(std.testing.allocator, "\"raw\"", .{}),
@@ -3245,6 +3274,21 @@ test "resume projection is gated by authoritative capability state" {
     var supported = try domain.resumeProjection(std.testing.allocator);
     defer supported.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), supported.canvases.len);
+}
+
+test "supported resume projection skips unrecorded instances safely" {
+    var domain = try fixtureDomain(std.testing.allocator);
+    defer domain.deinitUnchecked();
+    var publisher: TestPublisher = .{};
+    try domain.markUnavailable(
+        fixture_key,
+        .provider_unavailable,
+        publisher.publisher(),
+    );
+
+    var projection = try domain.resumeProjection(std.testing.allocator);
+    defer projection.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), projection.canvases.len);
 }
 
 test "shutdown publishes teardown before forgetting an opened renderer" {
