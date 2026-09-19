@@ -1,12 +1,11 @@
+import { builtinModules } from "node:module";
+
 const forbiddenCorePackages = [
   "@github/copilot-sdk",
   "@opentui/core",
   "electrobun",
-  "fs",
-  "path",
-  "os",
-  "tty",
 ];
+const nodeBuiltins = new Set(builtinModules.map((moduleName) => moduleName.replace(/^node:/, "")));
 
 export interface BoundaryViolation {
   readonly message: string;
@@ -15,18 +14,28 @@ export interface BoundaryViolation {
 const matchesPackage = (source: string, packageName: string): boolean =>
   source === packageName || source.startsWith(`${packageName}/`);
 
+const isNodeBuiltin = (source: string): boolean =>
+  nodeBuiltins.has(source.replace(/^node:/, ""));
+
 export function scanText(path: string, text: string): BoundaryViolation[] {
   const normalizedPath = path.replaceAll("\\", "/");
   const violations: BoundaryViolation[] = [];
-  const imports = [
-    ...text.matchAll(/(?:import|export)\s+(?:[^"'`]*?\s+from\s+)?["']([^"']+)["']/g),
-    ...text.matchAll(/\bimport\s*\(\s*["']([^"']+)["']\s*\)/g),
-    ...text.matchAll(/\brequire\s*\(\s*["']([^"']+)["']\s*\)/g),
-  ];
-  for (const match of imports) {
-    const source = match[1];
+  const loader = normalizedPath.endsWith(".tsx") ? "tsx" : "ts";
+  let imports: ReturnType<Bun.Transpiler["scanImports"]>;
+  try {
+    imports = new Bun.Transpiler({ loader }).scanImports(text);
+  } catch (error) {
+    return [{
+      message: `${normalizedPath}: failed to parse imports: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    }];
+  }
+
+  for (const importRecord of imports) {
+    const source = importRecord.path;
     const forbiddenInCore =
-      source.startsWith("node:") ||
+      isNodeBuiltin(source) ||
       source.startsWith("bun:") ||
       forbiddenCorePackages.some((packageName) => matchesPackage(source, packageName));
     if (normalizedPath.startsWith("packages/core/") && forbiddenInCore) {

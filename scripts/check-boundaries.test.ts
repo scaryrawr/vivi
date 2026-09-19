@@ -50,3 +50,20 @@ test("normalizes Windows paths before enforcing package ownership", async () => 
 test("does not confuse package-name prefixes with Node built-ins", () => {
   expect(scanText("packages/core/src/allowed.ts", 'import parser from "path-to-regexp";')).toEqual([]);
 });
+
+test("uses parsed imports instead of matching comments and strings", () => {
+  expect(
+    scanText(
+      "packages/core/src/allowed.ts",
+      '// import fs from "fs"\nconst example = \'require("child_process")\';',
+    ),
+  ).toEqual([]);
+  expect(
+    scanText(
+      "packages/core/src/forbidden.ts",
+      'import { spawn } from "child_process";',
+    ),
+  ).toEqual([
+    'packages/core/src/forbidden.ts: core imports forbidden module "child_process"',
+  ].map((message) => ({ message })));
+});

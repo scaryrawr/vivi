@@ -115,6 +115,7 @@ const displayContent = (state: AppState): string => {
 export function createViviApp(port: CopilotPort): ViviApp {
   let current: AppState = { phase: "ready", messages: [] };
   let nextRequest = 0;
+  let closePromise: Promise<void> | undefined;
   const listeners = new Set<(state: AppState) => void>();
   const makeRequestId = (value: string): RequestId => value as RequestId;
 
@@ -139,6 +140,23 @@ export function createViviApp(port: CopilotPort): ViviApp {
       default:
         return unreachable(intent);
     }
+  };
+
+  const stopPort = (): Promise<void> => {
+    if (closePromise) return closePromise;
+
+    const messages =
+      current.phase === "responding"
+        ? [...current.messages, current.assistantMessage]
+        : current.messages;
+    current = { phase: "shutting-down", messages };
+    for (const listener of listeners) listener(current);
+
+    closePromise = (async () => {
+      await port.close();
+      publish({ type: "shutdown-completed" });
+    })();
+    return closePromise;
   };
 
   const dispatch = async (intent: InputIntent): Promise<void> => {
@@ -166,12 +184,7 @@ export function createViviApp(port: CopilotPort): ViviApp {
           }
           break;
         case "stop-port":
-          if (current.phase !== "stopped") {
-            current = { phase: "shutting-down", messages: current.messages };
-            for (const listener of listeners) listener(current);
-            await port.close();
-            publish({ type: "shutdown-completed" });
-          }
+          await stopPort();
           break;
         default:
           unreachable(effect);
