@@ -704,7 +704,10 @@ pub const EffectPublisher = struct {
     ) PublishError!void,
 
     /// Success means every effect was copied and accepted. Failure means none
-    /// was accepted. The publisher must not complete an operation reentrantly.
+    /// was accepted. The publisher must not call back into the publishing
+    /// domain; every mutating domain entry point, including the infallible
+    /// looking `setCapability`, rejects such a call with
+    /// `error.ReentrantDomainCall`.
     pub fn publishAtomic(
         self: EffectPublisher,
         effects: []const EffectView,
