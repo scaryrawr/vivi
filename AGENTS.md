@@ -70,8 +70,8 @@ the CLI and capitalized `Vivi` for the product name.
 
 Default tests must not require Copilot credentials or a running Copilot CLI.
 Keep `skipLibCheck` out of the core and testkit projects. The SDK and OpenTUI
-adapter projects may use it only while their pinned dependency declarations
-fail TypeScript's library checks.
+adapter projects, and scripts that import them, may use it only while their
+pinned dependency declarations fail TypeScript's library checks.
 When changing `backend/src/attachment.zig` or `backend/src/settings.zig`, also
 run `zig test` directly on the changed module.
 
