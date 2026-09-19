@@ -844,7 +844,7 @@ fn project(event: *const backend.ConversationEvent) ?Projected {
             .failed => |failure| .{
                 .kind = c.VIVI_BACKEND_EVENT_FAILURE,
                 .content_kind = c.VIVI_BACKEND_CONTENT_TEXT,
-                .text = failure.message.bytes,
+                .text = failure.messageText(),
             },
         },
         .user_input_requested => |request| .{
