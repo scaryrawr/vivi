@@ -3,6 +3,25 @@ import XCTest
 
 @MainActor
 final class WebHostHarnessTests: XCTestCase {
+  func testConcurrentStartIsRejectedWithoutReplacingTheActiveStartup() async throws {
+    let harness = WebHostHarness(loadRequest: { _, _ in })
+    let firstStart = Task {
+      try await harness.start()
+    }
+    await Task.yield()
+
+    do {
+      try await harness.start()
+      XCTFail("Expected concurrent start to be rejected")
+    } catch {
+      XCTAssertEqual(error as? WebHostHarness.LifecycleError, .startInProgress)
+    }
+
+    firstStart.cancel()
+    _ = try? await firstStart.value
+    XCTAssertNil(harness.webView)
+  }
+
   func testStaleDeliveryFailureDoesNotDisconnectRestartedBridge() async throws {
     let delivery = SuspendedMessageDelivery()
     let harness = WebHostHarness(deliverMessage: delivery.deliver)

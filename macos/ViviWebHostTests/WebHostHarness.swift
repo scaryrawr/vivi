@@ -47,6 +47,7 @@ final class WebHostHarness: NSObject {
   private var assetSchemeHandler: LocalAssetSchemeHandler?
   private var scriptMessageHandler: WeakScriptMessageHandler?
   private var runGeneration = 0
+  private var isStarting = false
   private(set) var bridgeSessionID: UUID?
   private var loadContinuation: CheckedContinuation<Void, Error>?
   private var isRunning = false
@@ -73,7 +74,11 @@ final class WebHostHarness: NSObject {
   }
 
   func start() async throws {
+    guard !isStarting else { throw LifecycleError.startInProgress }
     guard webView == nil else { return }
+    isStarting = true
+    defer { isStarting = false }
+    let generation = runGeneration
     let assets = try verifiedAssetsDirectory()
     let configuration = WKWebViewConfiguration()
     configuration.websiteDataStore = .nonPersistent()
@@ -81,6 +86,7 @@ final class WebHostHarness: NSObject {
     configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
     let controller = WKUserContentController()
     let rule = try await compileNetworkDenyRule()
+    guard generation == runGeneration else { throw CancellationError() }
     controller.add(rule)
     let scriptMessageHandler = WeakScriptMessageHandler(owner: self)
     controller.add(scriptMessageHandler, name: Self.handlerName)
@@ -109,7 +115,9 @@ final class WebHostHarness: NSObject {
         }
       }
     } catch {
-      stop()
+      if generation == runGeneration {
+        stop()
+      }
       throw error
     }
   }
@@ -312,6 +320,10 @@ final class WebHostHarness: NSObject {
     case invalidEnvelope
     case hostStopped
     case javaScript(String)
+  }
+
+  enum LifecycleError: Error, Equatable {
+    case startInProgress
   }
 
   enum AssetError: Error, Equatable {
