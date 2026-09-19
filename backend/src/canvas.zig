@@ -16,6 +16,15 @@ pub const Limits = struct {
 
 const identity_capacity = 256;
 
+fn validateAggregateLength(lengths: []const usize, maximum: usize) !void {
+    var total: usize = 0;
+    for (lengths) |length| {
+        total = std.math.add(usize, total, length) catch
+            return error.KeyTooLong;
+    }
+    if (total > maximum) return error.KeyTooLong;
+}
+
 fn Identifier(comptime role_name: []const u8) type {
     return struct {
         storage: [identity_capacity]u8 = undefined,
@@ -72,8 +81,10 @@ pub const CanvasKey = struct {
     canvas_id: CanvasId,
 
     pub fn init(input: CanvasKeyView, limits: Limits) !CanvasKey {
-        if (input.extension_id.len + input.canvas_id.len > limits.max_key_bytes)
-            return error.KeyTooLong;
+        try validateAggregateLength(
+            &.{ input.extension_id.len, input.canvas_id.len },
+            limits.max_key_bytes,
+        );
         return .{
             .extension_id = try ExtensionId.init(input.extension_id, limits),
             .canvas_id = try CanvasId.init(input.canvas_id, limits),
@@ -98,13 +109,14 @@ pub const InstanceKey = struct {
     instance_id: InstanceId,
 
     pub fn init(input: KeyView, limits: Limits) !InstanceKey {
-        if (input.extension_id.len +
-            input.canvas_id.len +
-            input.instance_id.len >
-            limits.max_key_bytes)
-        {
-            return error.KeyTooLong;
-        }
+        try validateAggregateLength(
+            &.{
+                input.extension_id.len,
+                input.canvas_id.len,
+                input.instance_id.len,
+            },
+            limits.max_key_bytes,
+        );
         return .{
             .canvas = try CanvasKey.init(.{
                 .extension_id = input.extension_id,
@@ -2048,6 +2060,20 @@ test "bounded identities and role documents validate their own shapes" {
     try std.testing.expectEqualStrings("extension", ExtensionId.role());
     try std.testing.expectEqualStrings("action", ActionName.role());
     try std.testing.expect(ExtensionId != CanvasId);
+    try std.testing.expectError(
+        error.KeyTooLong,
+        validateAggregateLength(
+            &.{ std.math.maxInt(usize), 1 },
+            std.math.maxInt(usize),
+        ),
+    );
+    try std.testing.expectError(
+        error.KeyTooLong,
+        validateAggregateLength(
+            &.{ std.math.maxInt(usize) - 1, 1, 1 },
+            std.math.maxInt(usize),
+        ),
+    );
 
     var schema = try SchemaDocument.init(
         std.testing.allocator,
