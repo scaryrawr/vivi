@@ -253,7 +253,7 @@ final class WebHostHarness: NSObject {
       }
     } catch let error as HostWireV1.ValidationError {
       lastBridgeError = error
-      guard let bridgeSessionID = bridgeSessionID ?? bridgeSessionID(from: body) else { return }
+      guard let bridgeSessionID = bridgeSessionID(from: body) ?? bridgeSessionID else { return }
       do {
         try await send(
           HostWireV1.failure(bridgeSessionID: bridgeSessionID, error: error),

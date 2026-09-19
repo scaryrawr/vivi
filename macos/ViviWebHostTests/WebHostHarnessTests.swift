@@ -3,6 +3,51 @@ import XCTest
 
 @MainActor
 final class WebHostHarnessTests: XCTestCase {
+  func testMalformedRetiredBridgeFailureKeepsItsBodySessionID() async throws {
+    let delivery = SuspendedMessageDelivery()
+    let harness = WebHostHarness(deliverMessage: delivery.deliver)
+    try await harness.start()
+    while harness.bridgeSessionID == nil {
+      await Task.yield()
+    }
+    let retiredBridge = try XCTUnwrap(harness.bridgeSessionID)
+    harness.stop()
+
+    try await harness.start()
+    while harness.bridgeSessionID == nil || harness.bridgeSessionID == retiredBridge {
+      await Task.yield()
+    }
+    let activeBridge = try XCTUnwrap(harness.bridgeSessionID)
+    let deliveredBeforeMalformedRequest = delivery.messages.count
+
+    await harness.receive(
+      context: context(),
+      body: requestBody(
+        bridge: retiredBridge,
+        command: "futureCommand",
+        payload: [:]))
+
+    let failure = try XCTUnwrap(
+      delivery.messages.dropFirst(deliveredBeforeMalformedRequest).last)
+    XCTAssertEqual(failure["kind"] as? String, "failure")
+    XCTAssertEqual(
+      failure["bridgeSessionId"] as? String,
+      retiredBridge.uuidString.lowercased())
+
+    let deliveredBeforeActiveCommand = delivery.messages.count
+    await harness.receive(
+      context: context(),
+      body: requestBody(
+        bridge: activeBridge,
+        command: "selectSession",
+        payload: ["id": "0c8f9cc7-4767-4cec-92a3-9d7759e89a01"]))
+    XCTAssertTrue(
+      delivery.messages.dropFirst(deliveredBeforeActiveCommand).contains {
+        $0["kind"] as? String == "response"
+      })
+    harness.stop()
+  }
+
   func testConcurrentStartIsRejectedWithoutReplacingTheActiveStartup() async throws {
     let harness = WebHostHarness(loadRequest: { _, _ in })
     let firstStart = Task {
