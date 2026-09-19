@@ -53,6 +53,11 @@ func main() throws {
   guard runID.range(of: "^[A-Za-z0-9._-]+$", options: .regularExpression) != nil else {
     fatalError("run-id must contain only letters, digits, dots, underscores, or hyphens")
   }
+  let model =
+    ProcessInfo.processInfo.environment["VIVI_VALIDATION_MODEL"] ?? "copilot/gpt-5.6-luna"
+  guard model.range(of: "^copilot/[A-Za-z0-9._-]+$", options: .regularExpression) != nil else {
+    fatalError("VIVI_VALIDATION_MODEL must be a single copilot/<model-id>")
+  }
   let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
   let directory = root.appendingPathComponent(".verify/vivi/\(runID)")
   try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -98,7 +103,7 @@ func main() throws {
   let gif = directory.appendingPathComponent("chat-streaming.gif")
   let tape = directory.appendingPathComponent("chat-streaming.tape")
   let command =
-    "cd \(quoted(root.path)) && script -q \(quoted(log.path)) ./zig-out/bin/vivi chat --model copilot/gpt-5.4-mini"
+    "cd \(quoted(root.path)) && script -q \(quoted(log.path)) ./zig-out/bin/vivi chat --model \(quoted(model))"
   let readPrompt =
     "Use the read tool to open \(readURL.path). Reply only with the exact text printed in the image. Do not use bash."
   let tapeContents = """
