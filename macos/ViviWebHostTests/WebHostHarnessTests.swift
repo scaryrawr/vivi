@@ -1,0 +1,395 @@
+import WebKit
+import XCTest
+
+@MainActor
+final class WebHostHarnessTests: XCTestCase {
+  func testMalformedRetiredBridgeFailureKeepsItsBodySessionID() async throws {
+    let delivery = SuspendedMessageDelivery()
+    let harness = WebHostHarness(deliverMessage: delivery.deliver)
+    try await harness.start()
+    while harness.bridgeSessionID == nil {
+      await Task.yield()
+    }
+    let retiredBridge = try XCTUnwrap(harness.bridgeSessionID)
+    harness.stop()
+
+    try await harness.start()
+    while harness.bridgeSessionID == nil || harness.bridgeSessionID == retiredBridge {
+      await Task.yield()
+    }
+    let activeBridge = try XCTUnwrap(harness.bridgeSessionID)
+    let deliveredBeforeMalformedRequest = delivery.messages.count
+
+    await harness.receive(
+      context: context(),
+      body: requestBody(
+        bridge: retiredBridge,
+        command: "futureCommand",
+        payload: [:]))
+
+    let failure = try XCTUnwrap(
+      delivery.messages.dropFirst(deliveredBeforeMalformedRequest).last)
+    XCTAssertEqual(failure["kind"] as? String, "failure")
+    XCTAssertEqual(
+      failure["bridgeSessionId"] as? String,
+      retiredBridge.uuidString.lowercased())
+
+    let deliveredBeforeActiveCommand = delivery.messages.count
+    await harness.receive(
+      context: context(),
+      body: requestBody(
+        bridge: activeBridge,
+        command: "selectSession",
+        payload: ["id": "0c8f9cc7-4767-4cec-92a3-9d7759e89a01"]))
+    XCTAssertTrue(
+      delivery.messages.dropFirst(deliveredBeforeActiveCommand).contains {
+        $0["kind"] as? String == "response"
+      })
+    harness.stop()
+  }
+
+  func testConcurrentStartIsRejectedWithoutReplacingTheActiveStartup() async throws {
+    let harness = WebHostHarness(loadRequest: { _, _ in })
+    let firstStart = Task {
+      try await harness.start()
+    }
+    await Task.yield()
+
+    do {
+      try await harness.start()
+      XCTFail("Expected concurrent start to be rejected")
+    } catch {
+      XCTAssertEqual(error as? WebHostHarness.LifecycleError, .startInProgress)
+    }
+
+    firstStart.cancel()
+    _ = try? await firstStart.value
+    XCTAssertNil(harness.webView)
+  }
+
+  func testStaleDeliveryFailureDoesNotDisconnectRestartedBridge() async throws {
+    let delivery = SuspendedMessageDelivery()
+    let harness = WebHostHarness(deliverMessage: delivery.deliver)
+    try await harness.start()
+    while harness.bridgeSessionID == nil {
+      await Task.yield()
+    }
+    let originalBridge = try XCTUnwrap(harness.bridgeSessionID)
+
+    delivery.suspendNext = true
+    let oldReceive = Task {
+      await harness.receive(
+        context: self.context(),
+        body: self.requestBody(
+          bridge: originalBridge,
+          command: "selectSession",
+          payload: ["id": "0c8f9cc7-4767-4cec-92a3-9d7759e89a01"]))
+    }
+    while !delivery.isSuspended {
+      await Task.yield()
+    }
+
+    harness.stop()
+    try await harness.start()
+    while harness.bridgeSessionID == nil || harness.bridgeSessionID == originalBridge {
+      await Task.yield()
+    }
+    let restartedBridge = try XCTUnwrap(harness.bridgeSessionID)
+
+    delivery.resume()
+    await oldReceive.value
+    XCTAssertNil(harness.lastDeliveryError)
+
+    let deliveredBeforeCommand = delivery.messages.count
+    await harness.receive(
+      context: context(),
+      body: requestBody(
+        bridge: restartedBridge,
+        command: "selectSession",
+        payload: ["id": "0c8f9cc7-4767-4cec-92a3-9d7759e89a01"]))
+    XCTAssertTrue(
+      delivery.messages.dropFirst(deliveredBeforeCommand).contains {
+        $0["kind"] as? String == "response"
+      })
+    harness.stop()
+  }
+
+  func testFailedInitialNavigationTearsDownAndAllowsRetry() async throws {
+    let harness = WebHostHarness(loadRequest: { _, _ in })
+    let start = Task {
+      try await harness.start()
+    }
+
+    while harness.webView == nil {
+      await Task.yield()
+    }
+    let webView = try XCTUnwrap(harness.webView)
+    let navigationError = URLError(.cannotOpenFile)
+    harness.webView(
+      webView,
+      didFailProvisionalNavigation: nil,
+      withError: navigationError)
+
+    do {
+      try await start.value
+      XCTFail("Expected initial navigation to fail")
+    } catch {
+      XCTAssertEqual(error as? URLError, navigationError)
+    }
+    XCTAssertNil(harness.webView)
+    XCTAssertFalse(harness.hasInstalledScriptHandlers)
+    XCTAssertNil(webView.navigationDelegate)
+    XCTAssertNil(webView.uiDelegate)
+
+    let retry = Task {
+      try await harness.start()
+    }
+    while harness.webView == nil {
+      await Task.yield()
+    }
+    retry.cancel()
+    _ = try? await retry.value
+    XCTAssertNil(harness.webView)
+  }
+
+  func testScriptMessagesRemainFIFOWhileEarlierDeliveryIsSuspended() async {
+    let queue = OrderedMainActorTaskQueue()
+    var events: [Int] = []
+    var releaseFirst: CheckedContinuation<Void, Never>?
+
+    queue.enqueue {
+      await withCheckedContinuation { continuation in
+        releaseFirst = continuation
+      }
+      events.append(1)
+    }
+    queue.enqueue {
+      events.append(2)
+    }
+
+    while releaseFirst == nil {
+      await Task.yield()
+    }
+    await Task.yield()
+    XCTAssertEqual(events, [])
+
+    releaseFirst?.resume()
+    for _ in 0..<20 where events.count < 2 {
+      await Task.yield()
+    }
+    XCTAssertEqual(events, [1, 2])
+  }
+
+  func testScriptMessagePolicyRejectsWrongHandlerOriginAndFrame() {
+    assertPolicyRejection(context(name: "other"), equals: .wrongHandler)
+    assertPolicyRejection(context(isMainFrame: false), equals: .nonMainFrame)
+    assertPolicyRejection(context(securityHost: "attacker"), equals: .unexpectedOrigin)
+    XCTAssertNoThrow(try ScriptMessagePolicy.validate(context()))
+  }
+
+  func testLoadsPackagedProductionAssetsWithEphemeralStorageAndTearsDown() async throws {
+    let harness = WebHostHarness()
+    try await harness.start()
+    let webView = try XCTUnwrap(harness.webView)
+
+    XCTAssertFalse(webView.configuration.websiteDataStore === WKWebsiteDataStore.default())
+    let protocolName = try await webView.evaluateJavaScript(
+      "window.webkit.messageHandlers.viviHostV1 ? 'vivi.host' : 'missing'")
+    XCTAssertEqual(protocolName as? String, "vivi.host")
+    let rendered = try await waitForBoolean(
+      in: webView,
+      expression: "document.body.textContent.includes('Native bridge proof')")
+    let bodyText = try await webView.evaluateJavaScript("document.body.textContent")
+    XCTAssertGreaterThan(harness.receivedMessageCount, 0)
+    XCTAssertNil(harness.lastBridgeError)
+    XCTAssertTrue(
+      rendered,
+      "\(bodyText ?? "missing body"); messages=\(harness.receivedMessageCount); error=\(String(describing: harness.lastBridgeError))"
+    )
+
+    harness.stop()
+    XCTAssertNil(harness.webView)
+    XCTAssertFalse(harness.hasInstalledScriptHandlers)
+    XCTAssertNil(webView.navigationDelegate)
+    XCTAssertNil(webView.uiDelegate)
+    let receivedBeforeLateMessage = harness.receivedMessageCount
+    await harness.receive(
+      context: context(),
+      body: requestBody(bridge: UUID(), command: "connect", payload: [:]))
+    XCTAssertEqual(harness.receivedMessageCount, receivedBeforeLateMessage)
+    harness.stop()
+
+    try await harness.start()
+    let restartedWebView = try XCTUnwrap(harness.webView)
+    let restarted = try await waitForBoolean(
+      in: restartedWebView,
+      expression: "document.body.textContent.includes('Native bridge proof')")
+    XCTAssertTrue(restarted)
+    harness.stop()
+  }
+
+  func testNavigationPolicyRejectsNetworkAndPopupRequests() async throws {
+    let harness = WebHostHarness()
+    try await harness.start()
+    XCTAssertFalse(
+      harness.allowsNavigation(
+        to: URL(string: "https://example.com"),
+        isMainFrame: true,
+        navigationType: .other))
+    XCTAssertFalse(
+      harness.allowsNavigation(
+        to: URL(string: "vivi-test://app/native.html"),
+        isMainFrame: false,
+        navigationType: .other))
+    XCTAssertFalse(
+      harness.allowsNavigation(
+        to: URL(string: "vivi-test://app/native.html"),
+        isMainFrame: true,
+        navigationType: .linkActivated))
+    XCTAssertFalse(
+      harness.allowsNavigation(
+        to: URL(string: "vivi-test://app/assets/native.js"),
+        isMainFrame: true,
+        navigationType: .other))
+    XCTAssertTrue(
+      harness.allowsNavigation(
+        to: URL(string: "vivi-test://app/native.html#transcript"),
+        isMainFrame: true,
+        navigationType: .other))
+    harness.stop()
+  }
+
+  func testDeliveryFailureIsReportedAndClosesRuntime() async throws {
+    let harness = WebHostHarness()
+    try await harness.start()
+    let webView = try XCTUnwrap(harness.webView)
+    _ = try await waitForBoolean(
+      in: webView,
+      expression: "document.body.textContent.includes('Native bridge proof')")
+    _ = try await webView.evaluateJavaScript("delete window.__viviHostV1Receive")
+    let bridge = try XCTUnwrap(harness.bridgeSessionID)
+
+    await harness.receive(
+      context: context(),
+      body: requestBody(
+        bridge: bridge,
+        command: "selectSession",
+        payload: ["id": "0c8f9cc7-4767-4cec-92a3-9d7759e89a01"]))
+
+    XCTAssertNotNil(harness.lastDeliveryError)
+    harness.stop()
+  }
+
+  func testCreateConversationPublishesATypeScriptValidSessionID() async throws {
+    let harness = WebHostHarness()
+    try await harness.start()
+    let webView = try XCTUnwrap(harness.webView)
+    _ = try await waitForBoolean(
+      in: webView,
+      expression: "document.body.textContent.includes('Native bridge proof')")
+    let bridge = try XCTUnwrap(harness.bridgeSessionID)
+
+    _ = try await webView.callAsyncJavaScript(
+      """
+      window.webkit.messageHandlers.viviHostV1.postMessage({
+        protocol: "vivi.host",
+        version: 1,
+        bridgeSessionId: bridgeSessionId,
+        requestId: crypto.randomUUID(),
+        command: "createConversation",
+        payload: { projectPath: "/test/vivi" }
+      });
+      """,
+      arguments: ["bridgeSessionId": bridge.uuidString.lowercased()],
+      in: nil,
+      contentWorld: .page)
+
+    let createdSessionRendered = try await waitForBoolean(
+      in: webView,
+      expression: "document.querySelectorAll('.session-row').length === 2")
+    XCTAssertTrue(createdSessionRendered)
+    XCTAssertNil(harness.lastBridgeError)
+    XCTAssertNil(harness.lastDeliveryError)
+    harness.stop()
+  }
+
+  private func waitForBoolean(
+    in webView: WKWebView,
+    expression: String
+  ) async throws -> Bool {
+    for _ in 0..<50 {
+      if try await webView.evaluateJavaScript(expression) as? Bool == true {
+        return true
+      }
+      try await Task.sleep(for: .milliseconds(20))
+    }
+    return false
+  }
+
+  private func context(
+    name: String = "viviHostV1",
+    isMainFrame: Bool = true,
+    securityHost: String = "app"
+  ) -> ScriptMessageContext {
+    ScriptMessageContext(
+      name: name,
+      isMainFrame: isMainFrame,
+      securityProtocol: "vivi-test",
+      securityHost: securityHost,
+      securityPort: 0)
+  }
+
+  private func assertPolicyRejection(
+    _ context: ScriptMessageContext,
+    equals expected: ScriptMessagePolicy.Rejection,
+    file: StaticString = #filePath,
+    line: UInt = #line
+  ) {
+    XCTAssertThrowsError(
+      try ScriptMessagePolicy.validate(context),
+      file: file,
+      line: line
+    ) { error in
+      XCTAssertEqual(error as? ScriptMessagePolicy.Rejection, expected, file: file, line: line)
+    }
+  }
+
+  private func requestBody(
+    bridge: UUID,
+    command: String,
+    payload: [String: Any]
+  ) -> [String: Any] {
+    [
+      "protocol": "vivi.host",
+      "version": 1,
+      "bridgeSessionId": bridge.uuidString,
+      "requestId": UUID().uuidString,
+      "command": command,
+      "payload": payload,
+    ]
+  }
+}
+
+@MainActor
+private final class SuspendedMessageDelivery {
+  var suspendNext = false
+  private(set) var isSuspended = false
+  private(set) var messages: [[String: Any]] = []
+  private var continuation: CheckedContinuation<Void, Never>?
+
+  func deliver(_ webView: WKWebView, _ message: [String: Any]) async throws {
+    if suspendNext {
+      suspendNext = false
+      isSuspended = true
+      await withCheckedContinuation { continuation = $0 }
+      isSuspended = false
+      throw WebHostHarness.BridgeDeliveryError.javaScript("stale delivery")
+    }
+    messages.append(message)
+  }
+
+  func resume() {
+    continuation?.resume()
+    continuation = nil
+  }
+}

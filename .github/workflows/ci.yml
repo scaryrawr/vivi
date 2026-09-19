@@ -192,6 +192,19 @@ jobs:
         with:
           version: 0.16.0
 
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+
+      - name: Install pnpm
+        # The proxy used for workspace dependencies does not publish pnpm 12.
+        run: npm install --global pnpm@12.4.2
+
+      - name: Install web dependencies
+        working-directory: web
+        run: pnpm install --frozen-lockfile
+
       - name: Build CLI and macOS app
         run: |
           zig build
