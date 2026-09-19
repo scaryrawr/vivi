@@ -76,6 +76,13 @@ Use the executable helper:
 .github/skills/verify-vivi/bin/verify-vivi frame-check <run-id> chat-markdown
 ```
 
+`chat-default` launches bare `vivi` and proves that it enters chat.
+`chat-implicit` launches a chat flag without the `chat` subcommand and proves
+that the selected model display name reaches the TUI. Both drives retain the
+same PTY transcript, normalized text, assertions, frames, contact sheet, and
+visual-review evidence as `chat-streaming`, and both names are accepted by
+`extract-frames` and `frame-check`.
+
 `<run-id>` must contain only letters, digits, dots, underscores, or hyphens.
 Each command writes to `.verify/vivi/<run-id>/`, so concurrent runs do not
 share PTYs or evidence. Multiple Vivi processes may run side by side because

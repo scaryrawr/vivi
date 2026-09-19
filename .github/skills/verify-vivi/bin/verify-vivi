@@ -320,8 +320,25 @@ streaming_drive() {
     input_fifo="$run_dir/$capture.input"
     rm -f "$input_fifo"
     mkfifo "$input_fifo"
-    cat "$input_fifo" | script -q "$run_dir/$capture.terminal.log" sh -c \
-        'stty cols 100 rows 30; exec "$0" "$@"' "$binary" "$@" &
+    pty_command="stty cols 100 rows 30; exec $(shell_quote "$binary")"
+    for arg in "$@"; do
+        pty_command="$pty_command $(shell_quote "$arg")"
+    done
+    case "$(uname -s)" in
+        Darwin)
+            cat "$input_fifo" |
+                script -q "$run_dir/$capture.terminal.log" sh -c "$pty_command" &
+            ;;
+        Linux)
+            cat "$input_fifo" |
+                script -q -e -c "$pty_command" -- "$run_dir/$capture.terminal.log" &
+            ;;
+        *)
+            printf 'streaming verification requires BSD or util-linux script\n' >&2
+            rm -f "$input_fifo"
+            return 1
+            ;;
+    esac
     pty_pid=$!
     printf '%s\n' "$pty_pid" >"$run_dir/pty.pid"
     trap 'kill "$pty_pid" 2>/dev/null || true; wait "$pty_pid" 2>/dev/null || true; rm -f "$input_fifo"' EXIT INT TERM
