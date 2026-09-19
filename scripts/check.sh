@@ -7,3 +7,4 @@ cd "$repo_root"
 ./scripts/check-zig.sh
 ./scripts/check-c-api-cross.sh
 ./scripts/check-macos.sh
+./scripts/check-web.sh

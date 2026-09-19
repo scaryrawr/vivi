@@ -48,6 +48,12 @@ xcodebuild -project macos/Vivi.xcodeproj -scheme Vivi \
 ./scripts/check.sh                 # full format, Zig, CLI, and Xcode checks
 ```
 
+For `web/`, use the installed `pnpm` binary directly and treat
+`web/pnpm-lock.yaml` as authoritative. Do not use Corepack commands or add
+Corepack-triggering `packageManager` metadata because this environment may
+require the Microsoft package-feed proxy. Do not add npm or Yarn lockfiles.
+Run `./scripts/check-web.sh` for the complete web validation.
+
 Concurrent worktrees build macOS apps with the same bundle identifier. Before
 live Dock or URL-handler verification, confirm the running `Vivi` executable
 comes from the current worktree; otherwise macOS can route activation to

@@ -12,6 +12,7 @@ Copilot.
 - Zig 0.16.0
 - Xcode 26.6
 - `zigdoc`
+- Node.js 24 and pnpm 12 for the standalone web presentation
 - GitHub Copilot CLI in `PATH` for `vivi chat`
 
 The shared core uses
@@ -236,18 +237,36 @@ consume the C ABI; shared product and Copilot behavior stays in Zig.
 `./scripts/check.sh` also cross-builds the Linux shared object and Windows
 x64/ARM64 DLLs without claiming that those GUI applications exist yet.
 
+## Web presentation foundation
+
+`web/` contains the browser-testable React, TypeScript, and Vite presentation
+foundation for a future native webview host. It currently runs only against a
+deterministic in-browser host and does not change the shipping macOS window.
+
+```sh
+cd web
+pnpm install --frozen-lockfile
+pnpm dev
+pnpm storybook
+pnpm check
+```
+
+See [`web/README.md`](web/README.md) for the explicit host contract, strict CSP,
+Playwright evidence, and layer 2 WKWebView responsibilities.
+
 ## Check the repository
 
 ```sh
 ./scripts/check.sh
 ```
 
-The full check composes three independently runnable CI domains:
+The full check composes four independently runnable CI domains:
 
 ```sh
 ./scripts/check-zig.sh
 ./scripts/check-c-api-cross.sh
 ./scripts/check-macos.sh
+./scripts/check-web.sh
 ```
 
 Architecture and ownership decisions are documented in
