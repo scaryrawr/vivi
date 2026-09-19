@@ -30,6 +30,16 @@ Ctrl-C to shut down. VHS is only the frame-capture mechanism; its GIF is
 deleted after extraction by default. VHS and `script` own their child
 processes, so no persistent instance remains after the helper returns.
 
+Credentialed hosted-Copilot validation defaults to
+`copilot/gpt-5.6-luna`. Set `VIVI_VALIDATION_MODEL` to another
+`copilot/<model-id>` only when a validation requirement explicitly calls for
+it. The helper validates and shell-quotes that value before use. Specialized
+attachment and async-Bash overrides still permit an explicit hosted or OMLX
+model because model capability can be part of those tests. Credential-free
+unit, build, and offline checks are unaffected. Recipes that explicitly test
+bare or implicit invocation, model discovery, model switching, or OMLX keep
+the model behavior required by that feature.
+
 If a manual drive is required, run `./zig-out/bin/vivi chat` in a fresh
 terminal. Press Ctrl-C once for cooperative shutdown. Press Ctrl-C a second
 time only when the UI is still showing `Stopping...`.

@@ -11,6 +11,9 @@ then use the matching feature file as the recipe.
   Copilot CLI on `PATH`. VHS 0.12.0 is known to exit without writing output;
   pass a working binary with `VIVI_VHS=/path/to/vhs`.
 - Authenticate GitHub Copilot CLI before driving `vivi chat`.
+- Hosted validation uses `copilot/gpt-5.6-luna` by default. Override it with
+  `VIVI_VALIDATION_MODEL=copilot/<model-id>` only when the validation itself
+  requires another hosted model.
 - Run `.github/skills/verify-vivi/bin/verify-vivi doctor`.
 - Give every verification attempt a unique run ID. Evidence belongs in
   `.verify/vivi/<run-id>/`.

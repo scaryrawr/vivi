@@ -29,7 +29,9 @@ VIVI_KEEP_GIF=1 \
   .github/skills/verify-vivi/bin/verify-vivi chat-async-bash <run-id>
 ```
 
-Set `VIVI_ASYNC_BASH_MODEL` to exercise a specific hosted or OMLX model.
+The recipe defaults to `VIVI_VALIDATION_MODEL`, which is
+`copilot/gpt-5.6-luna` unless overridden. Set `VIVI_ASYNC_BASH_MODEL` to
+exercise a specific hosted or OMLX model.
 
 Inspect the contact sheet and frames, complete the generated visual review,
 then run:

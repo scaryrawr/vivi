@@ -32,17 +32,19 @@ Enter to select a model. Escape dismisses either menu.
 .github/skills/verify-vivi/bin/verify-vivi frame-check <run-id> chat-model-menu
 ```
 
-The recipe filters for `gpt-5.6-sol` twice. Its VHS drive switches to and
-persists that hosted model; its second `script` PTY confirms the new Vivi
+The recipe filters for `gpt-5.6-luna` twice by default. Its VHS drive switches
+to and persists that hosted model; its second `script` PTY confirms the new Vivi
 instance already uses it, then sends a deterministic prompt and captures the
 menu, persisted-default status, streamed answer, and shutdown.
 Both runs share an isolated home under the evidence directory, with only the
 Copilot credential directory linked through, so verification never modifies
-the user's real `~/.vivi/settings.json`.
+the user's real `~/.vivi/settings.json`. `VIVI_VALIDATION_MODEL` can select a
+different hosted model when model-switch coverage explicitly requires it.
 
 ## Gotchas
 
-- The authenticated Copilot account must expose `gpt-5.6-sol`.
+- The authenticated Copilot account must expose `gpt-5.6-luna` or the explicit
+  `VIVI_VALIDATION_MODEL`.
 - OMLX rows appear only when OMLX is running and exposes chat models.
 - The new SDK session does not inherit server-side conversation history.
 - The visible Vivi transcript remains on screen after switching.
