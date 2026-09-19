@@ -3,6 +3,44 @@ import XCTest
 
 @MainActor
 final class WebHostHarnessTests: XCTestCase {
+  func testFailedInitialNavigationTearsDownAndAllowsRetry() async throws {
+    let harness = WebHostHarness(loadRequest: { _, _ in })
+    let start = Task {
+      try await harness.start()
+    }
+
+    while harness.webView == nil {
+      await Task.yield()
+    }
+    let webView = try XCTUnwrap(harness.webView)
+    let navigationError = URLError(.cannotOpenFile)
+    harness.webView(
+      webView,
+      didFailProvisionalNavigation: nil,
+      withError: navigationError)
+
+    do {
+      try await start.value
+      XCTFail("Expected initial navigation to fail")
+    } catch {
+      XCTAssertEqual(error as? URLError, navigationError)
+    }
+    XCTAssertNil(harness.webView)
+    XCTAssertFalse(harness.hasInstalledScriptHandlers)
+    XCTAssertNil(webView.navigationDelegate)
+    XCTAssertNil(webView.uiDelegate)
+
+    let retry = Task {
+      try await harness.start()
+    }
+    while harness.webView == nil {
+      await Task.yield()
+    }
+    retry.cancel()
+    _ = try? await retry.value
+    XCTAssertNil(harness.webView)
+  }
+
   func testScriptMessagesRemainFIFOWhileEarlierDeliveryIsSuspended() async {
     let queue = OrderedMainActorTaskQueue()
     var events: [Int] = []

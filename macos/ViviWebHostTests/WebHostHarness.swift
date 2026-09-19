@@ -42,6 +42,7 @@ final class WebHostHarness: NSObject {
   private static let handlerName = "viviHostV1"
   private let runtime: NativeHostRuntime
   private let resourceBundle: Bundle
+  private let loadRequest: (WKWebView, URLRequest) -> Void
   private var assetSchemeHandler: LocalAssetSchemeHandler?
   private var scriptMessageHandler: WeakScriptMessageHandler?
   private(set) var bridgeSessionID: UUID?
@@ -56,10 +57,14 @@ final class WebHostHarness: NSObject {
 
   init(
     adapter: any WebHostDomainAdapter = DeterministicWebHostAdapter(),
-    resourceBundle: Bundle = Bundle(for: WebHostHarness.self)
+    resourceBundle: Bundle = Bundle(for: WebHostHarness.self),
+    loadRequest: @escaping (WKWebView, URLRequest) -> Void = { webView, request in
+      webView.load(request)
+    }
   ) {
     runtime = NativeHostRuntime(adapter: adapter)
     self.resourceBundle = resourceBundle
+    self.loadRequest = loadRequest
     super.init()
   }
 
@@ -88,15 +93,20 @@ final class WebHostHarness: NSObject {
     webView.uiDelegate = self
     self.webView = webView
     isRunning = true
-    try await withTaskCancellationHandler {
-      try await withCheckedThrowingContinuation { continuation in
-        loadContinuation = continuation
-        webView.load(URLRequest(url: URL(string: "vivi-test://app/native.html")!))
+    do {
+      try await withTaskCancellationHandler {
+        try await withCheckedThrowingContinuation { continuation in
+          loadContinuation = continuation
+          loadRequest(webView, URLRequest(url: URL(string: "vivi-test://app/native.html")!))
+        }
+      } onCancel: {
+        Task { @MainActor [weak self] in
+          self?.stop()
+        }
       }
-    } onCancel: {
-      Task { @MainActor [weak self] in
-        self?.stop()
-      }
+    } catch {
+      stop()
+      throw error
     }
   }
 
