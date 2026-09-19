@@ -42,5 +42,6 @@ sheet.
 - Use a VHS release that actually writes its declared GIF; 0.12.0 is known to
   exit successfully without output.
 - The selected model must support images. Override it with
-  `VIVI_ATTACHMENT_MODEL` when the default hosted model is unavailable.
+  `VIVI_ATTACHMENT_MODEL` when the default `copilot/gpt-5.6-luna` validation
+  model is unavailable or a specific vision model is under test.
 - A terminal may reserve Ctrl-V; Alt-V remains the manual fallback.

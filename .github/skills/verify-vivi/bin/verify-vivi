@@ -5,6 +5,7 @@ repo_root=$(git rev-parse --show-toplevel)
 artifact_root="$repo_root/.verify/vivi"
 binary="$repo_root/zig-out/bin/vivi"
 vhs_command=${VIVI_VHS:-vhs}
+default_validation_model=copilot/gpt-5.6-luna
 
 usage() {
     cat <<'EOF'
@@ -47,6 +48,53 @@ validate_run_id() {
     esac
 }
 
+validate_model_id() {
+    variable=$1
+    model=$2
+    case "$model" in
+        *[!A-Za-z0-9._/-]*|'')
+            printf 'invalid %s: %s\n' "$variable" "$model" >&2
+            exit 2
+            ;;
+    esac
+    provider=${model%%/*}
+    model_id=${model#*/}
+    if test "$provider" = "$model" || test -z "$model_id"; then
+        printf '%s must use <provider>/<model-id>: %s\n' "$variable" "$model" >&2
+        exit 2
+    fi
+    case "$provider" in
+        copilot|omlx) ;;
+        *)
+            printf '%s must use the copilot or omlx provider: %s\n' "$variable" "$model" >&2
+            exit 2
+            ;;
+    esac
+    case "$model_id" in
+        */*)
+            printf '%s must contain one provider separator: %s\n' "$variable" "$model" >&2
+            exit 2
+            ;;
+    esac
+}
+
+hosted_validation_model() {
+    if test "${VIVI_VALIDATION_MODEL+x}" = x; then
+        model=$VIVI_VALIDATION_MODEL
+    else
+        model=$default_validation_model
+    fi
+    validate_model_id VIVI_VALIDATION_MODEL "$model"
+    case "$model" in
+        copilot/*) ;;
+        *)
+            printf 'VIVI_VALIDATION_MODEL must select a hosted copilot model: %s\n' "$model" >&2
+            exit 2
+            ;;
+    esac
+    printf '%s\n' "$model"
+}
+
 prepare_run() {
     run_id=$1
     validate_run_id "$run_id"
@@ -60,6 +108,8 @@ build_vivi() {
 }
 
 doctor() {
+    model=$(hosted_validation_model)
+    copilot_model=${model#copilot/}
     require_command zig
     require_command "$vhs_command"
     require_command script
@@ -109,6 +159,7 @@ EOF
             --no-custom-instructions \
             --disable-builtin-mcps \
             --no-ask-user \
+            --model "$copilot_model" \
             -p 'Reply with exactly VIVI_DOCTOR_OK.'
     )
     test "$auth_output" = "VIVI_DOCTOR_OK"
@@ -457,7 +508,8 @@ streaming_drive() {
 }
 
 chat_streaming() {
-    streaming_drive "$1" chat-streaming vivi_stream_ok chat
+    model=$(hosted_validation_model)
+    streaming_drive "$1" chat-streaming vivi_stream_ok chat --model "$model"
 }
 
 chat_default() {
@@ -521,6 +573,7 @@ write_attachment_tape() {
     run_dir=$1
     fixture=$2
     model=$3
+    quoted_model=$(shell_quote "$model")
     cat >"$run_dir/chat-attachments.tape" <<EOF
 Output "$run_dir/chat-attachments.gif"
 Require copilot
@@ -530,7 +583,7 @@ Set Height 720
 Set FontSize 20
 Set TypingSpeed 12ms
 
-Type "cd '$fixture' && '$binary' chat --model $model"
+Type "cd '$fixture' && '$binary' chat --model $quoted_model"
 Enter
 Sleep 8s
 Ctrl+V
@@ -547,14 +600,13 @@ EOF
 
 chat_attachments() {
     run_dir=$(prepare_run "$1")
+    if test "${VIVI_ATTACHMENT_MODEL+x}" = x; then
+        model=$VIVI_ATTACHMENT_MODEL
+        validate_model_id VIVI_ATTACHMENT_MODEL "$model"
+    else
+        model=$(hosted_validation_model)
+    fi
     build_vivi
-    model=${VIVI_ATTACHMENT_MODEL:-copilot/claude-haiku-4.5}
-    case "$model" in
-        *[!A-Za-z0-9._/-]*|'')
-            printf 'invalid VIVI_ATTACHMENT_MODEL: %s\n' "$model" >&2
-            exit 2
-            ;;
-    esac
     fixture="$run_dir/workspace"
     isolated_home="$run_dir/home"
     temporary_directory="$run_dir/tmp"
@@ -642,6 +694,8 @@ EOF
 
 write_markdown_tape() {
     run_dir=$1
+    model=$2
+    quoted_model=$(shell_quote "$model")
     cat >"$run_dir/chat-markdown.tape" <<EOF
 Output "$run_dir/chat-markdown.gif"
 Require copilot
@@ -651,7 +705,7 @@ Set Height 720
 Set FontSize 22
 Set TypingSpeed 10ms
 
-Type "./zig-out/bin/vivi chat --model copilot/gpt-5.4"
+Type "./zig-out/bin/vivi chat --model $quoted_model"
 Enter
 Sleep 3s
 Type "Convert these lowercase labels to uppercase in the response: render test, feature, status, styling, working, tables, readable, vivi_highlight. Use the converted first label as a Markdown heading, then one sentence with bold text and inline code, then a fenced zig code block containing const followed by the converted final label followed by = 42;, then a two-column table using the other converted labels. Do not use tools or add any other text."
@@ -666,8 +720,9 @@ EOF
 
 chat_markdown() {
     run_dir=$(prepare_run "$1")
+    model=$(hosted_validation_model)
     build_vivi
-    write_markdown_tape "$run_dir"
+    write_markdown_tape "$run_dir" "$model"
 
     (cd "$repo_root" && VIVI_KEEP_GIF=1 "$vhs_command" "$run_dir/chat-markdown.tape")
     VIVI_KEEP_GIF=1 extract_frames "$1" chat-markdown
@@ -681,7 +736,7 @@ chat_markdown() {
         sleep 3
         printf '\003'
     ) | script -q "$run_dir/chat-markdown.terminal.log" sh -c \
-        "stty cols 100 rows 30; '$binary' chat --model copilot/gpt-5.4" &
+        "stty cols 100 rows 30; '$binary' chat --model '$model'" &
     pty_pid=$!
     printf '%s\n' "$pty_pid" >"$run_dir/pty.pid"
     trap 'kill "$pty_pid" 2>/dev/null || true; wait "$pty_pid" 2>/dev/null || true' EXIT INT TERM
@@ -747,6 +802,8 @@ chat_markdown() {
 
 write_markdown_read_tape() {
     run_dir=$1
+    model=$2
+    quoted_model=$(shell_quote "$model")
     cat >"$run_dir/chat-markdown-read.tape" <<EOF
 Output "$run_dir/chat-markdown-read.gif"
 Require copilot
@@ -756,7 +813,7 @@ Set Height 720
 Set FontSize 18
 Set TypingSpeed 5ms
 
-Type "./zig-out/bin/vivi chat --model copilot/gpt-5.4"
+Type "./zig-out/bin/vivi chat --model $quoted_model"
 Enter
 Sleep 3s
 Type "Use the read tool exactly once to read README.md, then return the uppercase spelling of vivi_read_done and nothing else."
@@ -775,8 +832,9 @@ EOF
 
 chat_markdown_read() {
     run_dir=$(prepare_run "$1")
+    model=$(hosted_validation_model)
     build_vivi
-    write_markdown_read_tape "$run_dir"
+    write_markdown_read_tape "$run_dir" "$model"
 
     (cd "$repo_root" && VIVI_KEEP_GIF=1 "$vhs_command" "$run_dir/chat-markdown-read.tape")
     VIVI_KEEP_GIF=1 extract_frames "$1" chat-markdown-read
@@ -794,7 +852,7 @@ chat_markdown_read() {
         sleep 3
         printf '\003'
     ) | script -q "$run_dir/chat-markdown-read.terminal.log" sh -c \
-        "stty cols 100 rows 30; '$binary' chat --model copilot/gpt-5.4" &
+        "stty cols 100 rows 30; '$binary' chat --model '$model'" &
     pty_pid=$!
     printf '%s\n' "$pty_pid" >"$run_dir/pty.pid"
     trap 'kill "$pty_pid" 2>/dev/null || true; wait "$pty_pid" 2>/dev/null || true' EXIT INT TERM
@@ -842,6 +900,8 @@ chat_markdown_read() {
 
 write_streaming_input_tape() {
     run_dir=$1
+    model=$2
+    quoted_model=$(shell_quote "$model")
     cat >"$run_dir/chat-streaming-input.tape" <<EOF
 Output "$run_dir/chat-streaming-input.gif"
 Require copilot
@@ -851,7 +911,7 @@ Set Height 720
 Set FontSize 22
 Set TypingSpeed 10ms
 
-Type "./zig-out/bin/vivi chat"
+Type "./zig-out/bin/vivi chat --model $quoted_model"
 Enter
 Sleep 3s
 Type "Run bash with command sleep 6, then reply with ORIGINAL_STEER_RESPONSE."
@@ -875,8 +935,9 @@ EOF
 
 chat_streaming_input() {
     run_dir=$(prepare_run "$1")
+    model=$(hosted_validation_model)
     build_vivi
-    write_streaming_input_tape "$run_dir"
+    write_streaming_input_tape "$run_dir" "$model"
 
     (cd "$repo_root" && VIVI_KEEP_GIF=1 "$vhs_command" "$run_dir/chat-streaming-input.tape")
     VIVI_KEEP_GIF=1 extract_frames "$1" chat-streaming-input
@@ -895,7 +956,7 @@ chat_streaming_input() {
         sleep 3
         printf '\003'
     ) | script -q "$run_dir/chat-streaming-input.terminal.log" sh -c \
-        "stty cols 100 rows 30; '$binary' chat" &
+        "stty cols 100 rows 30; '$binary' chat --model '$model'" &
     pty_pid=$!
     printf '%s\n' "$pty_pid" >"$run_dir/pty.pid"
     trap 'kill "$pty_pid" 2>/dev/null || true; wait "$pty_pid" 2>/dev/null || true' EXIT INT TERM
@@ -945,6 +1006,8 @@ chat_streaming_input() {
 
 write_ask_user_tape() {
     run_dir=$1
+    model=$2
+    quoted_model=$(shell_quote "$model")
     cat >"$run_dir/chat-ask-user.tape" <<EOF
 Output "$run_dir/chat-ask-user.gif"
 Require copilot
@@ -954,7 +1017,7 @@ Set Height 720
 Set FontSize 22
 Set TypingSpeed 10ms
 
-Type "./zig-out/bin/vivi chat --model copilot/default"
+Type "./zig-out/bin/vivi chat --model $quoted_model"
 Enter
 Sleep 10s
 Type "Use ask_user to ask exactly Pick one with choices Alpha and Beta and no freeform. After I answer, reply exactly ANSWER followed by the answer."
@@ -973,8 +1036,9 @@ EOF
 
 chat_ask_user() {
     run_dir=$(prepare_run "$1")
+    model=$(hosted_validation_model)
     build_vivi
-    write_ask_user_tape "$run_dir"
+    write_ask_user_tape "$run_dir" "$model"
 
     (cd "$repo_root" && VIVI_KEEP_GIF=1 "$vhs_command" "$run_dir/chat-ask-user.tape")
     VIVI_KEEP_GIF=1 extract_frames "$1" chat-ask-user
@@ -991,7 +1055,7 @@ chat_ask_user() {
         sleep 3
         printf '\003'
     ) | script -q "$run_dir/chat-ask-user.terminal.log" sh -c \
-        "stty cols 100 rows 30; '$binary' chat --model copilot/default" &
+        "stty cols 100 rows 30; '$binary' chat --model '$model'" &
     pty_pid=$!
     printf '%s\n' "$pty_pid" >"$run_dir/pty.pid"
     trap 'kill "$pty_pid" 2>/dev/null || true; wait "$pty_pid" 2>/dev/null || true' EXIT INT TERM
@@ -1053,6 +1117,7 @@ chat_ask_user() {
 
 write_model_menu_tape() {
     run_dir=$1
+    model_filter=$2
     startup_wait=${VIVI_MODEL_MENU_STARTUP_WAIT:-60s}
     cat >"$run_dir/chat-model-menu.tape" <<EOF
 Output "$run_dir/chat-model-menu.gif"
@@ -1070,7 +1135,7 @@ Type "/model"
 Sleep 3s
 Enter
 Sleep 5s
-Type "gpt-5.6-sol"
+Type "$model_filter"
 Sleep 2s
 Enter
 Sleep 10s
@@ -1086,8 +1151,10 @@ EOF
 
 chat_model_menu() {
     run_dir=$(prepare_run "$1")
+    model=$(hosted_validation_model)
+    model_filter=${model#copilot/}
     build_vivi
-    write_model_menu_tape "$run_dir"
+    write_model_menu_tape "$run_dir" "$model_filter"
     settings_home="$run_dir/home"
     mkdir -p "$settings_home"
     rm -f "$settings_home/.vivi/settings.json"
@@ -1107,7 +1174,7 @@ chat_model_menu() {
         sleep 3
         printf '\r'
         sleep 5
-        printf 'gpt-5.6-sol'
+        printf '%s' "$model_filter"
         sleep 2
         printf '\r'
         sleep 10
@@ -1156,7 +1223,7 @@ chat_model_menu() {
     test "$status" -eq 0
     grep -q 'Already using the selected model and reasoning level.' "$run_dir/chat-model-menu.normalized.txt"
     grep -q 'VIVI_HOSTED_MODEL_SWITCH_OK' "$run_dir/chat-model-menu.normalized.txt"
-    grep -q '"model_id": "copilot/gpt-5.6-sol"' \
+    grep -F -q "\"model_id\": \"$model\"" \
         "$settings_home/.vivi/settings.json"
     grep -q '"reasoning": "off"' \
         "$settings_home/.vivi/settings.json"
@@ -1166,6 +1233,8 @@ chat_model_menu() {
 write_customization_tape() {
     run_dir=$1
     workspace=$2
+    model=$3
+    quoted_model=$(shell_quote "$model")
     startup_wait=${VIVI_CUSTOMIZATION_STARTUP_WAIT:-60s}
     cat >"$run_dir/chat-customization.tape" <<EOF
 Output "$run_dir/chat-customization.gif"
@@ -1176,7 +1245,7 @@ Set Height 720
 Set FontSize 22
 Set TypingSpeed 20ms
 
-Type "cd '$workspace' && '$binary' chat --model copilot/default"
+Type "cd '$workspace' && '$binary' chat --model $quoted_model"
 Enter
 Sleep $startup_wait
 Type "probe"
@@ -1213,11 +1282,12 @@ EOF
 
 chat_customization() {
     run_dir=$(prepare_run "$1")
+    model=$(hosted_validation_model)
     build_vivi
     workspace="$run_dir/workspace"
     customization_home="$run_dir/home"
     prepare_customization_workspace "$workspace"
-    write_customization_tape "$run_dir" "$workspace"
+    write_customization_tape "$run_dir" "$workspace" "$model"
     mkdir -p "$customization_home"
     rm -rf "$customization_home/.vivi"
     github_token=$(gh auth token)
@@ -1241,7 +1311,7 @@ chat_customization() {
     ) | HOME="$customization_home" GH_TOKEN="$github_token" \
         GITHUB_TOKEN="$github_token" \
         script -q "$run_dir/chat-customization.terminal.log" sh -c \
-        "cd '$workspace' && stty cols 100 rows 30; '$binary' chat --model copilot/default" &
+        "cd '$workspace' && stty cols 100 rows 30; '$binary' chat --model '$model'" &
     pty_pid=$!
     printf '%s\n' "$pty_pid" >"$run_dir/pty.pid"
     trap 'kill "$pty_pid" 2>/dev/null || true; wait "$pty_pid" 2>/dev/null || true' EXIT INT TERM
@@ -1283,6 +1353,8 @@ chat_customization() {
 
 write_session_resume_tape() {
     run_dir=$1
+    model=$2
+    quoted_model=$(shell_quote "$model")
     cat >"$run_dir/chat-session-resume.tape" <<EOF
 Output "$run_dir/chat-session-resume.gif"
 Require copilot
@@ -1292,7 +1364,7 @@ Set Height 720
 Set FontSize 22
 Set TypingSpeed 20ms
 
-Type "./zig-out/bin/vivi chat --model copilot/default"
+Type "./zig-out/bin/vivi chat --model $quoted_model"
 Enter
 Sleep 10s
 Type "/resume"
@@ -1313,8 +1385,9 @@ EOF
 
 chat_session_resume() {
     run_dir=$(prepare_run "$1")
+    model=$(hosted_validation_model)
     build_vivi
-    write_session_resume_tape "$run_dir"
+    write_session_resume_tape "$run_dir" "$model"
     resume_home="$run_dir/home"
     vhs_home="$run_dir/vhs-home"
     mkdir -p "$resume_home"
@@ -1334,7 +1407,7 @@ chat_session_resume() {
     ) | HOME="$resume_home" GH_TOKEN="$github_token" \
         GITHUB_TOKEN="$github_token" \
         script -q "$run_dir/chat-session-resume-first.terminal.log" sh -c \
-        "stty cols 100 rows 30; '$binary' chat --model copilot/default"
+        "stty cols 100 rows 30; '$binary' chat --model '$model'"
 
     (
         sleep 10
@@ -1353,7 +1426,7 @@ chat_session_resume() {
     ) | HOME="$resume_home" GH_TOKEN="$github_token" \
         GITHUB_TOKEN="$github_token" \
         script -q "$run_dir/chat-session-resume-second.terminal.log" sh -c \
-        "stty cols 100 rows 30; '$binary' chat --model copilot/default" &
+        "stty cols 100 rows 30; '$binary' chat --model '$model'" &
     pty_pid=$!
     printf '%s\n' "$pty_pid" >"$run_dir/pty.pid"
     trap 'kill "$pty_pid" 2>/dev/null || true; wait "$pty_pid" 2>/dev/null || true' EXIT INT TERM
@@ -1425,7 +1498,7 @@ chat_session_resume() {
             printf 'no\n'
         fi
         printf 'picker_model_hidden='
-        if grep -Fq 'copilot/default' \
+        if grep -Fq "$model" \
             "$run_dir/chat-session-resume-picker.normalized.txt"
         then
             printf 'no\n'
@@ -1444,7 +1517,7 @@ chat_session_resume() {
         "$run_dir/chat-session-resume-picker.normalized.txt"
     grep -Fq "$repo_root" \
         "$run_dir/chat-session-resume-picker.normalized.txt"
-    ! grep -Fq 'copilot/default' \
+    ! grep -Fq "$model" \
         "$run_dir/chat-session-resume-picker.normalized.txt"
 
     (
@@ -1458,7 +1531,7 @@ chat_session_resume() {
     ) | HOME="$vhs_home" GH_TOKEN="$github_token" \
         GITHUB_TOKEN="$github_token" \
         script -q "$run_dir/chat-session-resume-vhs-seed.terminal.log" sh -c \
-        "stty cols 100 rows 30; '$binary' chat --model copilot/default"
+        "stty cols 100 rows 30; '$binary' chat --model '$model'"
 
     (
         cd "$repo_root" &&
@@ -1548,14 +1621,14 @@ cleanup() {
 
 chat_async_bash() {
     run_dir=$(prepare_run "$1")
+    if test "${VIVI_ASYNC_BASH_MODEL+x}" = x; then
+        model=$VIVI_ASYNC_BASH_MODEL
+        validate_model_id VIVI_ASYNC_BASH_MODEL "$model"
+    else
+        model=$(hosted_validation_model)
+    fi
     build_vivi
-    model=${VIVI_ASYNC_BASH_MODEL:-copilot/gpt-5.4}
-    case "$model" in
-        *[!A-Za-z0-9._/-]*|'')
-            printf 'invalid VIVI_ASYNC_BASH_MODEL: %s\n' "$model" >&2
-            exit 2
-            ;;
-    esac
+    quoted_model=$(shell_quote "$model")
     prompt='Use bash action start to run: read value; echo ASYNC:$value. Then use bash action write to send ready followed by a newline, bash action read until ASYNC:ready appears, bash action list once, and bash action stop twice with the same shell_id. Finally reply with the uppercase form of vivi_async_bash_ok and nothing else.'
 
     cat >"$run_dir/chat-async-bash.tape" <<EOF
@@ -1567,7 +1640,7 @@ Set Height 720
 Set FontSize 18
 Set TypingSpeed 5ms
 
-Type "./zig-out/bin/vivi chat --model $model"
+Type "./zig-out/bin/vivi chat --model $quoted_model"
 Enter
 Sleep 3s
 Type "$prompt"
