@@ -132,10 +132,12 @@ class NativeConnectedViviHost implements ConnectedViviHost {
     window.__viviHostV1Receive = (message) => this.receive(message);
     const result = await this.command("connect", {});
     if (result.kind !== "accepted") {
-      throw new NativeHostBridgeError(
+      const error = new NativeHostBridgeError(
         "invalid-message",
         `The native host rejected the connection: ${result.message}`,
       );
+      this.fail(error);
+      throw error;
     }
     await this.readyPromise;
   }

@@ -43,8 +43,10 @@ final class WebHostHarness: NSObject {
   private let runtime: NativeHostRuntime
   private let resourceBundle: Bundle
   private let loadRequest: (WKWebView, URLRequest) -> Void
+  private let deliverMessage: (@MainActor (WKWebView, [String: Any]) async throws -> Void)?
   private var assetSchemeHandler: LocalAssetSchemeHandler?
   private var scriptMessageHandler: WeakScriptMessageHandler?
+  private var runGeneration = 0
   private(set) var bridgeSessionID: UUID?
   private var loadContinuation: CheckedContinuation<Void, Error>?
   private var isRunning = false
@@ -60,11 +62,13 @@ final class WebHostHarness: NSObject {
     resourceBundle: Bundle = Bundle(for: WebHostHarness.self),
     loadRequest: @escaping (WKWebView, URLRequest) -> Void = { webView, request in
       webView.load(request)
-    }
+    },
+    deliverMessage: (@MainActor (WKWebView, [String: Any]) async throws -> Void)? = nil
   ) {
     runtime = NativeHostRuntime(adapter: adapter)
     self.resourceBundle = resourceBundle
     self.loadRequest = loadRequest
+    self.deliverMessage = deliverMessage
     super.init()
   }
 
@@ -112,6 +116,7 @@ final class WebHostHarness: NSObject {
 
   func stop() {
     isRunning = false
+    runGeneration += 1
     runtime.stop()
     loadContinuation?.resume(throwing: CancellationError())
     loadContinuation = nil
@@ -217,6 +222,7 @@ final class WebHostHarness: NSObject {
 
   func receive(context: ScriptMessageContext, body: Any) async {
     guard isRunning else { return }
+    let generation = runGeneration
     do {
       try ScriptMessagePolicy.validate(context)
     } catch let error as ScriptMessagePolicy.Rejection {
@@ -235,20 +241,22 @@ final class WebHostHarness: NSObject {
         bridgeSessionID = request.bridgeSessionID
       }
       for message in messages {
-        try await send(message)
+        try await send(message, generation: generation)
       }
     } catch let error as HostWireV1.ValidationError {
       lastBridgeError = error
       guard let bridgeSessionID = bridgeSessionID ?? bridgeSessionID(from: body) else { return }
       do {
-        try await send(HostWireV1.failure(bridgeSessionID: bridgeSessionID, error: error))
+        try await send(
+          HostWireV1.failure(bridgeSessionID: bridgeSessionID, error: error),
+          generation: generation)
       } catch let deliveryError as BridgeDeliveryError {
-        reportDeliveryFailure(deliveryError)
+        reportDeliveryFailure(deliveryError, generation: generation)
       } catch {
         preconditionFailure("send only throws BridgeDeliveryError")
       }
     } catch let deliveryError as BridgeDeliveryError {
-      reportDeliveryFailure(deliveryError)
+      reportDeliveryFailure(deliveryError, generation: generation)
     } catch {
       preconditionFailure("WebHostHarness received an unexpected error type")
     }
@@ -261,12 +269,22 @@ final class WebHostHarness: NSObject {
     return UUID(uuidString: value)
   }
 
-  private func send(_ message: [String: Any]) async throws {
+  private func send(_ message: [String: Any], generation: Int) async throws {
     guard JSONSerialization.isValidJSONObject(message) else {
       throw BridgeDeliveryError.invalidEnvelope
     }
-    guard isRunning, let webView else {
+    guard isRunning, generation == runGeneration, let webView else {
       throw BridgeDeliveryError.hostStopped
+    }
+    if let deliverMessage {
+      do {
+        try await deliverMessage(webView, message)
+      } catch let error as BridgeDeliveryError {
+        throw error
+      } catch {
+        throw BridgeDeliveryError.javaScript(String(describing: error))
+      }
+      return
     }
     do {
       _ = try await webView.callAsyncJavaScript(
@@ -284,7 +302,8 @@ final class WebHostHarness: NSObject {
     }
   }
 
-  private func reportDeliveryFailure(_ error: BridgeDeliveryError) {
+  private func reportDeliveryFailure(_ error: BridgeDeliveryError, generation: Int) {
+    guard isRunning, generation == runGeneration else { return }
     lastDeliveryError = error
     runtime.deliveryFailed()
   }

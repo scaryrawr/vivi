@@ -3,6 +3,53 @@ import XCTest
 
 @MainActor
 final class WebHostHarnessTests: XCTestCase {
+  func testStaleDeliveryFailureDoesNotDisconnectRestartedBridge() async throws {
+    let delivery = SuspendedMessageDelivery()
+    let harness = WebHostHarness(deliverMessage: delivery.deliver)
+    try await harness.start()
+    while harness.bridgeSessionID == nil {
+      await Task.yield()
+    }
+    let originalBridge = try XCTUnwrap(harness.bridgeSessionID)
+
+    delivery.suspendNext = true
+    let oldReceive = Task {
+      await harness.receive(
+        context: self.context(),
+        body: self.requestBody(
+          bridge: originalBridge,
+          command: "selectSession",
+          payload: ["id": "0c8f9cc7-4767-4cec-92a3-9d7759e89a01"]))
+    }
+    while !delivery.isSuspended {
+      await Task.yield()
+    }
+
+    harness.stop()
+    try await harness.start()
+    while harness.bridgeSessionID == nil || harness.bridgeSessionID == originalBridge {
+      await Task.yield()
+    }
+    let restartedBridge = try XCTUnwrap(harness.bridgeSessionID)
+
+    delivery.resume()
+    await oldReceive.value
+    XCTAssertNil(harness.lastDeliveryError)
+
+    let deliveredBeforeCommand = delivery.messages.count
+    await harness.receive(
+      context: context(),
+      body: requestBody(
+        bridge: restartedBridge,
+        command: "selectSession",
+        payload: ["id": "0c8f9cc7-4767-4cec-92a3-9d7759e89a01"]))
+    XCTAssertTrue(
+      delivery.messages.dropFirst(deliveredBeforeCommand).contains {
+        $0["kind"] as? String == "response"
+      })
+    harness.stop()
+  }
+
   func testFailedInitialNavigationTearsDownAndAllowsRetry() async throws {
     let harness = WebHostHarness(loadRequest: { _, _ in })
     let start = Task {
@@ -256,5 +303,29 @@ final class WebHostHarnessTests: XCTestCase {
       "command": command,
       "payload": payload,
     ]
+  }
+}
+
+@MainActor
+private final class SuspendedMessageDelivery {
+  var suspendNext = false
+  private(set) var isSuspended = false
+  private(set) var messages: [[String: Any]] = []
+  private var continuation: CheckedContinuation<Void, Never>?
+
+  func deliver(_ webView: WKWebView, _ message: [String: Any]) async throws {
+    if suspendNext {
+      suspendNext = false
+      isSuspended = true
+      await withCheckedContinuation { continuation = $0 }
+      isSuspended = false
+      throw WebHostHarness.BridgeDeliveryError.javaScript("stale delivery")
+    }
+    messages.append(message)
+  }
+
+  func resume() {
+    continuation?.resume()
+    continuation = nil
   }
 }

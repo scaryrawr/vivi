@@ -196,6 +196,37 @@ describe("NativeViviHostPort", () => {
       code: "invalid-message",
     });
   });
+
+  it("disconnects a bridge after a typed connect rejection", async () => {
+    const posted: Record<string, unknown>[] = [];
+    window.webkit = {
+      messageHandlers: {
+        viviHostV1: {
+          postMessage: (message) =>
+            posted.push(message as Record<string, unknown>),
+        },
+      },
+    };
+    const connecting = new NativeViviHostPort().connect();
+    const connect = posted[0];
+    window.__viviHostV1Receive?.({
+      protocol: "vivi.host",
+      version: 1,
+      bridgeSessionId: connect.bridgeSessionId,
+      kind: "response",
+      requestId: connect.requestId,
+      result: { kind: "rejected", message: "not available" },
+    });
+
+    await expect(connecting).rejects.toMatchObject({
+      code: "invalid-message",
+    });
+    expect(window.__viviHostV1Receive).toBeUndefined();
+    expect(posted.at(-1)).toMatchObject({
+      bridgeSessionId: connect.bridgeSessionId,
+      command: "disconnect",
+    });
+  });
 });
 
 describe("native host validation", () => {
