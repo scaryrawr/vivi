@@ -5388,12 +5388,16 @@ const App = struct {
     }
 
     fn hardExit(self: *App) noreturn {
-        // Forced exit must not depend on joining the vaxis input thread:
-        // Loop.stop() wakes its blocked tty read with a DSR round-trip and
-        // hangs forever when nothing answers (for example a piped harness
-        // without a terminal emulator). Ask the loop to quit, restore the
-        // terminal, and exit immediately.
+        // Cancel the input future the same way deinit() does: cancellation
+        // interrupts the blocked tty read directly, so it can't race with
+        // the Vaxis/tty teardown below (unlike Loop.stop(), which only wakes
+        // the read with a DSR round-trip and hangs when nothing answers it,
+        // for example a piped harness without a terminal emulator).
         self.loop.should_quit = true;
+        if (self.loop.thread) |*thread| {
+            thread.cancel(self.io);
+            self.loop.thread = null;
+        }
         self.releaseImages();
         self.ui.deinitTranscriptSpool();
         self.render_memory.deinit(self.vx.window());

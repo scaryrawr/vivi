@@ -271,6 +271,10 @@ frame_check() {
     fi
 }
 
+shell_quote() {
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
 write_streaming_tape() {
     run_dir=$1
     capture=$2
@@ -302,10 +306,10 @@ streaming_drive() {
     capture=$2
     prompt_word=$3
     shift 3
-    launch_display="./zig-out/bin/vivi $*"
-    launch_display=${launch_display% }
-    pty_launch="'$binary' ${*:-}"
-    pty_launch=${pty_launch% }
+    launch_display="./zig-out/bin/vivi"
+    for arg in "$@"; do
+        launch_display="$launch_display $(shell_quote "$arg")"
+    done
     expected_response=$(printf '%s' "$prompt_word" | tr 'a-z' 'A-Z')
     build_vivi
     write_streaming_tape "$run_dir" "$capture" "$launch_display" "$prompt_word"
@@ -317,7 +321,7 @@ streaming_drive() {
     rm -f "$input_fifo"
     mkfifo "$input_fifo"
     cat "$input_fifo" | script -q "$run_dir/$capture.terminal.log" sh -c \
-        "stty cols 100 rows 30; $pty_launch" &
+        'stty cols 100 rows 30; exec "$0" "$@"' "$binary" "$@" &
     pty_pid=$!
     printf '%s\n' "$pty_pid" >"$run_dir/pty.pid"
     trap 'kill "$pty_pid" 2>/dev/null || true; wait "$pty_pid" 2>/dev/null || true; rm -f "$input_fifo"' EXIT INT TERM
