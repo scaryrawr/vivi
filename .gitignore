@@ -5,3 +5,7 @@ zig-out/
 .verify/
 
 *.result
+
+node_modules/
+*.tsbuildinfo
+packages/*/dist/

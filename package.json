@@ -1,0 +1,21 @@
+{
+  "name": "vivi-typescript-rewrite",
+  "private": true,
+  "packageManager": "bun@1.4.2",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "boundary-check": "bun scripts/check-boundaries.ts",
+    "typecheck": "tsc -b",
+    "test": "bun test",
+    "probe:runtime": "bun scripts/runtime-probe.ts",
+    "check": "bun run boundary-check && bun run typecheck && bun run test"
+  },
+  "devDependencies": {
+    "@github/copilot-sdk": "1.0.14",
+    "@opentui/core": "0.5.11",
+    "@types/bun": "1.4.2",
+    "typescript": "7.0.2"
+  }
+}
