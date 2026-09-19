@@ -9,6 +9,7 @@ pub const Limits = struct {
     max_json_nodes: usize = 2048,
     max_actions_per_canvas: usize = 32,
     max_registry_entries: usize = 128,
+    max_registry_operations: usize = 256,
     max_instances: usize = 64,
     max_pending_operations: usize = 128,
 };
@@ -147,13 +148,36 @@ fn JsonDocument(comptime role: JsonRole) type {
             value: []const u8,
             limits: Limits,
         ) !Self {
+            try validateBytes(value, allocator, limits);
+            return .{ .bytes = try allocator.dupe(u8, value) };
+        }
+
+        pub fn validate(
+            self: Self,
+            allocator: std.mem.Allocator,
+            limits: Limits,
+        ) !void {
+            try validateBytes(self.bytes, allocator, limits);
+        }
+
+        fn validateBytes(
+            value: []const u8,
+            allocator: std.mem.Allocator,
+            limits: Limits,
+        ) !void {
             if (value.len == 0) return error.EmptyJsonDocument;
             if (value.len > limits.max_json_bytes)
                 return error.JsonDocumentTooLong;
             if (!std.unicode.utf8ValidateSlice(value))
                 return error.InvalidJsonUtf8;
             try validateJson(allocator, value, role, limits);
-            return .{ .bytes = try allocator.dupe(u8, value) };
+        }
+
+        fn cloneValidated(
+            self: Self,
+            allocator: std.mem.Allocator,
+        ) !Self {
+            return .{ .bytes = try allocator.dupe(u8, self.bytes) };
         }
 
         pub fn clone(
@@ -581,7 +605,10 @@ pub const EffectView = union(enum) {
         input_json: ?[]const u8,
     },
     cancel: OperationToken,
-    teardown: KeyView,
+    teardown: struct {
+        key: KeyView,
+        generation: Generation,
+    },
 };
 
 pub const PublishError = error{
@@ -1251,11 +1278,8 @@ pub const Domain = struct {
             return error.CanvasNotOpen;
         if (self.instances.items[index].runtime.tag() != .opened)
             return error.CanvasNotOpen;
-        var input = if (request.input) |value|
-            try value.clone(self.allocator, self.limits)
-        else
-            null;
-        errdefer if (input) |*value| value.deinit(self.allocator);
+        if (request.input) |value|
+            try value.validate(self.allocator, self.limits);
         try self.requirePendingCapacity(1);
 
         var candidate = try self.instances.items[index].clone(
@@ -1268,6 +1292,11 @@ pub const Domain = struct {
             else => unreachable,
         };
         const token = try self.peekToken(.action, generation);
+        var input = if (request.input) |value|
+            try value.cloneValidated(self.allocator)
+        else
+            null;
+        errdefer if (input) |*value| value.deinit(self.allocator);
         try candidate.pending_actions.ensureUnusedCapacity(self.allocator, 1);
         candidate.pending_actions.appendAssumeCapacity(.{
             .token = token,
@@ -1722,13 +1751,18 @@ pub const Domain = struct {
         effects: *std.ArrayList(EffectView),
     ) !void {
         try self.appendCancellationEffects(instance, effects);
-        switch (instance.runtime) {
-            .opened, .closing => try effects.append(
-                self.allocator,
-                .{ .teardown = instance.key.view() },
-            ),
-            .closed, .opening, .unavailable => {},
-        }
+        const generation = switch (instance.runtime) {
+            .opened => |opened| opened.generation,
+            .closing => |closing| closing.prior.generation,
+            .closed, .opening, .unavailable => return,
+        };
+        try effects.append(
+            self.allocator,
+            .{ .teardown = .{
+                .key = instance.key.view(),
+                .generation = generation,
+            } },
+        );
     }
 
     fn buildRegistry(
@@ -1758,6 +1792,13 @@ pub const Domain = struct {
         self: *Domain,
         delta: RegistryDeltaInput,
     ) !Registry {
+        const operation_count = std.math.add(
+            usize,
+            delta.removed.len,
+            delta.upserted.len,
+        ) catch return error.TooManyRegistryOperations;
+        if (operation_count > self.limits.max_registry_operations)
+            return error.TooManyRegistryOperations;
         var result = try self.registry.clone(self.allocator, self.limits);
         errdefer result.deinit(self.allocator);
         for (delta.removed) |removed| {
@@ -1840,6 +1881,7 @@ const TestPublisher = struct {
     token_count: usize = 0,
     tokens: [8]OperationToken = undefined,
     tags: [8]std.meta.Tag(EffectView) = undefined,
+    teardown_generations: [8]Generation = undefined,
 
     fn publisher(self: *TestPublisher) EffectPublisher {
         return .{
@@ -1876,7 +1918,9 @@ const TestPublisher = struct {
                     self.tokens[self.token_count] = value;
                     self.token_count += 1;
                 },
-                .teardown => {},
+                .teardown => |value| {
+                    self.teardown_generations[index] = value.generation;
+                },
             }
         }
     }
@@ -1990,6 +2034,37 @@ test "registry replacement and incremental update are distinct and atomic" {
     );
 
     try domain.applyRegistry(.{ .replacement = &.{second} });
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        domain.registry.entries.items.len,
+    );
+}
+
+test "incremental registry work is bounded before cloning" {
+    var domain = Domain.init(
+        std.testing.allocator,
+        .{ .max_registry_operations = 1 },
+    );
+    defer domain.deinit();
+    try domain.applyRegistry(.{
+        .replacement = &.{fixture_declaration},
+    });
+    const removals = [_]CanvasKeyView{
+        .{
+            .extension_id = "fixture.extension",
+            .canvas_id = "missing-one",
+        },
+        .{
+            .extension_id = "fixture.extension",
+            .canvas_id = "missing-two",
+        },
+    };
+    try std.testing.expectError(
+        error.TooManyRegistryOperations,
+        domain.applyRegistry(.{ .incremental = .{
+            .removed = &removals,
+        } }),
+    );
     try std.testing.expectEqual(
         @as(usize, 1),
         domain.registry.entries.items.len,
@@ -2447,8 +2522,19 @@ test "unavailable transition settles renderer ownership atomically" {
         publisher.tags[0],
     );
     try std.testing.expectEqual(
+        opened_token.generation,
+        publisher.teardown_generations[0],
+    );
+    try std.testing.expectEqual(
         RuntimeTag.unavailable,
         opened_domain.runtimeTag(fixture_key).?,
+    );
+    const reopened_token = try opened_domain.open(
+        .{ .key = fixture_key },
+        publisher.publisher(),
+    );
+    try std.testing.expect(
+        reopened_token.generation != publisher.teardown_generations[0],
     );
 
     var closing_domain = try fixtureDomain(std.testing.allocator);
@@ -2487,6 +2573,10 @@ test "unavailable transition settles renderer ownership atomically" {
     try std.testing.expectEqual(
         std.meta.Tag(EffectView).teardown,
         publisher.tags[1],
+    );
+    try std.testing.expectEqual(
+        close_token.generation,
+        publisher.teardown_generations[1],
     );
     try std.testing.expectEqual(close_token, publisher.tokens[0]);
     try std.testing.expectEqual(
@@ -2650,6 +2740,10 @@ test "shutdown publishes teardown before forgetting an opened renderer" {
         std.meta.Tag(EffectView).teardown,
         publisher.tags[0],
     );
+    try std.testing.expectEqual(
+        token.generation,
+        publisher.teardown_generations[0],
+    );
     try std.testing.expectEqual(RuntimeTag.closed, domain.runtimeTag(fixture_key).?);
 }
 
@@ -2676,6 +2770,10 @@ test "shutdown cancels an in-flight close and tears down its live renderer" {
     try std.testing.expectEqual(
         std.meta.Tag(EffectView).teardown,
         publisher.tags[1],
+    );
+    try std.testing.expectEqual(
+        close_token.generation,
+        publisher.teardown_generations[1],
     );
     try std.testing.expectEqual(close_token, publisher.tokens[0]);
     try std.testing.expectEqual(@as(usize, 0), domain.pendingCount());

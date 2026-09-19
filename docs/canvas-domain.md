@@ -39,7 +39,9 @@ and HostPort transport are intentionally unchanged.
 
 Identity values are nominal, fixed-capacity UTF-8 values. Construction rejects
 empty, invalid, or over-limit input before it reaches domain state. Composite
-keys enforce an aggregate byte limit.
+keys enforce an aggregate byte limit. Replacement registry size and
+incremental registry operation count are bounded independently, so repeated
+upserts or removals cannot bypass the final-size limit.
 
 JSON remains at the extension boundary, but there is no generic JSON envelope:
 
@@ -123,6 +125,9 @@ Shutdown uses the same transaction rule as other cancellations. A publication
 failure leaves every pending operation live and makes shutdown retryable. A
 successful shutdown publishes explicit teardown effects for opened renderers,
 stabilizes all instances, clears pending actions, and is idempotent.
+Teardown effects carry the renderer generation; adapters must ignore a
+teardown whose generation no longer matches the renderer currently bound to
+that instance key.
 
 ## Later adapters
 
