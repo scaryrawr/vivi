@@ -313,6 +313,47 @@ final class NativeApplicationCoordinatorTests: XCTestCase {
       [record.id])
   }
 
+  func testNewCommandCreatesConversationInResumedWorkspaceWithoutChooser() {
+    let harness = CoordinatorHarness()
+    harness.coordinator.open([
+      URL(string: "vivi://chat?workspace=/tmp/one")!
+    ])
+    let record = harness.coordinator.conversations.records[0]
+    harness.drivers[0].send(.ready)
+    harness.drivers[0].send(.modelCatalog(coordinatorModelCatalog()))
+    let key = ResumeKey(generation: 9, slot: 2)
+    let summary = SessionSummary(
+      key: key,
+      workingDirectory: "/tmp/two",
+      title: "Resumed conversation",
+      isCurrent: false)
+
+    record.store.refreshSessions()
+    harness.drivers[0].send(
+      .sessionCatalog(SessionCatalog(sessions: [summary])))
+    record.store.resumeSession(key)
+    harness.drivers[0].send(
+      .sessionResume(
+        .resumed(
+          ResumedSession(
+            summary: summary,
+            transcript: [.assistant("restored")],
+            cleanupFailed: false))))
+    record.store.draft = "/new"
+    record.store.submit()
+
+    XCTAssertEqual(harness.coordinator.conversations.records.count, 2)
+    XCTAssertEqual(
+      harness.coordinator.conversations.records.map(\.navigation.workspace.canonicalPath),
+      ["/tmp/two", "/tmp/two"])
+    XCTAssertEqual(
+      harness.coordinator.conversations.selectedID,
+      harness.coordinator.conversations.records[1].id)
+    XCTAssertEqual(harness.choosers.count, 0)
+    XCTAssertEqual(record.store.draft, "")
+    XCTAssertEqual(record.store.transcript.map(\.text), ["restored"])
+  }
+
   func testUntitledLaunchPresentsMainWindow() {
     let harness = CoordinatorHarness()
     let delegate = ViviAppDelegate(applicationCoordinator: harness.coordinator)
@@ -385,7 +426,7 @@ private final class CoordinatorHarness {
         return ConversationID(
           rawValue: UUID(uuidString: "00000000-0000-0000-0000-\(String(format: "%012d", nextID))")!)
       },
-      makeConversation: { [weak self] id, workspace, configuration in
+      makeConversation: { [weak self] id, workspace, configuration, requestNewConversation in
         self?.creationRequests.append(
           CreationRequest(workspace: workspace, configuration: configuration))
         let driver = ControllableConversationDriver()
@@ -393,7 +434,10 @@ private final class CoordinatorHarness {
         return ConversationRecord(
           id: id,
           launchWorkspace: workspace,
-          store: NativeChatStore(workspace: workspace.canonicalPath, driver: driver))
+          store: NativeChatStore(
+            workspace: workspace.canonicalPath,
+            driver: driver,
+            requestNewConversation: requestNewConversation))
       },
       makeWorkspaceChooser: { [weak self] in
         let chooser = ControllableWorkspaceChooser()

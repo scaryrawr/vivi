@@ -361,13 +361,15 @@ final class NativeChatStore: ObservableObject {
   private var responseHeaderVisible = false
   private let driver: ViviConversationDriving
   private let attachmentAcquirer: ComposerAttachmentAcquiring
+  private let requestNewConversation: @MainActor (WorkspaceIdentity) -> Bool
   private var attachmentAcquisitionTask: Task<Void, Never>?
   private var closeCompletions: [@MainActor () -> Void] = []
 
   init(
     workspace: String,
     driver: ViviConversationDriving,
-    attachmentAcquirer: ComposerAttachmentAcquiring = AppKitComposerAttachmentAcquirer()
+    attachmentAcquirer: ComposerAttachmentAcquiring = AppKitComposerAttachmentAcquirer(),
+    requestNewConversation: @escaping @MainActor (WorkspaceIdentity) -> Bool = { _ in false }
   ) {
     let presentation = ActiveConversationPresentation(
       workspace: workspace,
@@ -377,6 +379,7 @@ final class NativeChatStore: ObservableObject {
     activePresentation = presentation
     self.driver = driver
     self.attachmentAcquirer = attachmentAcquirer
+    self.requestNewConversation = requestNewConversation
     let started = driver.start { [weak self] event in
       self?.reduce(event)
     }
@@ -442,6 +445,15 @@ final class NativeChatStore: ObservableObject {
   func submit() {
     let prompt = draft.trimmingCharacters(in: .whitespacesAndNewlines)
     guard canSubmit else { return }
+    if attachments.isEmpty,
+      prompt.caseInsensitiveCompare("/new") == .orderedSame,
+      let activeWorkspace = WorkspaceIdentity(absolutePath: workspace)
+    {
+      if requestNewConversation(activeWorkspace) {
+        draft = ""
+      }
+      return
+    }
     let submittedAttachments = attachments
     let result = driver.submit(prompt, attachments: submittedAttachments)
     guard result == .accepted else {

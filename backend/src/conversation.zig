@@ -452,6 +452,22 @@ pub const SessionResumeResult = union(enum) {
     }
 };
 
+pub const NewSessionResult = union(enum) {
+    started: struct {
+        commands: CommandCatalog,
+        cleanup_failed: bool,
+    },
+    failed: OwnedText,
+
+    pub fn deinit(self: *NewSessionResult) void {
+        switch (self.*) {
+            .started => |*result| result.commands.deinit(),
+            .failed => |*message| message.deinit(),
+        }
+        self.* = undefined;
+    }
+};
+
 fn allocatorFreeModels(allocator: std.mem.Allocator, values: []ModelInfo) void {
     for (values) |*value| value.deinit();
     allocator.free(values);
@@ -723,6 +739,7 @@ pub const Event = union(enum) {
     session_catalog: SessionCatalog,
     session_catalog_failed: OwnedText,
     session_resume: SessionResumeResult,
+    new_session: NewSessionResult,
     session_title: OwnedText,
     status: OwnedText,
     assistant_started,
@@ -754,6 +771,7 @@ pub const Event = union(enum) {
             .session_catalog => |*catalog| catalog.deinit(),
             .session_catalog_failed => |*text| text.deinit(),
             .session_resume => |*result| result.deinit(),
+            .new_session => |*result| result.deinit(),
             .status => |*text| text.deinit(),
             .closed => |*closed| closed.deinit(),
             .ready, .assistant_started, .idle => {},
@@ -770,6 +788,7 @@ pub const Command = union(enum) {
     refresh_commands,
     refresh_models,
     refresh_sessions,
+    start_new_session: ?CommandKey,
     switch_model: OwnedModelSelection,
     resume_session: ResumeKey,
     execute_command: command_domain.Execution,
@@ -785,6 +804,7 @@ pub const Command = union(enum) {
             .refresh_commands,
             .refresh_models,
             .refresh_sessions,
+            .start_new_session,
             .resume_session,
             .stop,
             => {},
@@ -931,6 +951,7 @@ pub const Worker = struct {
                 .refresh_commands,
                 .refresh_models,
                 .refresh_sessions,
+                .start_new_session,
                 .switch_model,
                 .resume_session,
                 .execute_command,
@@ -981,6 +1002,15 @@ pub const Worker = struct {
         definitions: []const CommandDefinition,
     ) !void {
         try self.replaceCommandCatalog(definitions, true);
+    }
+
+    pub fn replaceCommandCatalogSnapshot(
+        self: *Worker,
+        definitions: []const CommandDefinition,
+    ) !CommandCatalog {
+        try self.core.mutex.lock(self.core.io);
+        defer self.core.mutex.unlock(self.core.io);
+        return self.core.command_registry.replace(definitions);
     }
 
     fn replaceCommandCatalog(
@@ -1211,6 +1241,13 @@ pub const Worker = struct {
         try self.completeControl(.{ .session_resume = result });
     }
 
+    pub fn completeNewSession(
+        self: *Worker,
+        result: NewSessionResult,
+    ) !void {
+        try self.completeControl(.{ .new_session = result });
+    }
+
     pub fn assistantComplete(self: *Worker, text: []const u8) !void {
         try self.publish(.{
             .assistant_complete = try OwnedText.init(self.core.allocator, text),
@@ -1401,6 +1438,10 @@ pub const Conversation = struct {
         try self.enqueueControl(.refresh_sessions);
     }
 
+    pub fn startNewSession(self: *Conversation) !void {
+        try self.enqueueControl(.{ .start_new_session = null });
+    }
+
     pub fn switchModel(self: *Conversation, selection: ModelSelection) !void {
         if (std.mem.trim(u8, selection.model_id, " \t\r\n").len == 0) {
             return error.EmptyModel;
@@ -1432,13 +1473,23 @@ pub const Conversation = struct {
         }
         if (self.core.command_terminal != null) return error.Busy;
         var execution = try self.core.command_registry.admit(key, arguments);
-        errdefer {
-            self.core.command_registry.finish(key) catch {};
+        if (execution.action == .start_new_session) {
             execution.deinit();
+            self.core.commands.append(self.core.allocator, .{
+                .start_new_session = key,
+            }) catch |err| {
+                self.core.command_registry.finish(key) catch {};
+                return err;
+            };
+        } else {
+            errdefer {
+                self.core.command_registry.finish(key) catch {};
+                execution.deinit();
+            }
+            try self.core.commands.append(self.core.allocator, .{
+                .execute_command = execution,
+            });
         }
-        try self.core.commands.append(self.core.allocator, .{
-            .execute_command = execution,
-        });
         self.core.state = .controlling;
         self.core.command_ready.signal(self.core.io);
     }
@@ -1695,7 +1746,7 @@ test "admitted commands publish one chronological terminal outcome" {
             var event = event_value;
             defer event.deinit();
             switch (event) {
-                .command_catalog => |catalog| key = catalog.commands[2].key,
+                .command_catalog => |catalog| key = catalog.commands[3].key,
                 else => {},
             }
         } else try std.testing.io.sleep(.fromMilliseconds(1), .awake);
@@ -1824,7 +1875,7 @@ fn waitForTestCommandKey(handle: *Conversation) !CommandKey {
             var event = event_value;
             defer event.deinit();
             switch (event) {
-                .command_catalog => |catalog| return catalog.commands[2].key,
+                .command_catalog => |catalog| return catalog.commands[3].key,
                 else => {},
             }
         } else try std.testing.io.sleep(.fromMilliseconds(1), .awake);
@@ -1895,6 +1946,7 @@ test "conversation transfers streamed events without SDK access" {
                 .refresh_commands,
                 .refresh_models,
                 .refresh_sessions,
+                .start_new_session,
                 .switch_model,
                 .resume_session,
                 .execute_command,

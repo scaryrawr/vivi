@@ -50,6 +50,7 @@ pub const Source = enum {
 pub const Action = enum {
     execute,
     open_model_selection,
+    start_new_session,
     open_session_history,
 };
 
@@ -146,6 +147,7 @@ pub const Execution = struct {
             arguments: []u8,
         },
         open_model_selection,
+        start_new_session,
         open_session_history,
     },
 
@@ -155,7 +157,10 @@ pub const Execution = struct {
                 self.allocator.free(value.name);
                 self.allocator.free(value.arguments);
             },
-            .open_model_selection, .open_session_history => {},
+            .open_model_selection,
+            .start_new_session,
+            .open_session_history,
+            => {},
         }
         self.* = undefined;
     }
@@ -235,6 +240,7 @@ pub const Registry = struct {
                 } };
             },
             .open_model_selection => .open_model_selection,
+            .start_new_session => .start_new_session,
             .open_session_history => .open_session_history,
         };
         self.active = key;
@@ -259,10 +265,10 @@ fn buildCatalog(
     generation: Generation,
     definitions: []const Definition,
 ) !Catalog {
-    if (definitions.len > std.math.maxInt(u32) - 2) {
+    if (definitions.len > std.math.maxInt(u32) - 3) {
         return error.TooManyCommands;
     }
-    const commands = try allocator.alloc(Descriptor, definitions.len + 2);
+    const commands = try allocator.alloc(Descriptor, definitions.len + 3);
     errdefer allocator.free(commands);
     var initialized: usize = 0;
     errdefer for (commands[0..initialized]) |*command| {
@@ -285,6 +291,18 @@ fn buildCatalog(
         .generation = generation,
         .slot = try Slot.init(2),
     }, .{
+        .name = "new",
+        .display_name = "new",
+        .description = "Start a fresh conversation in the current workspace",
+        .source = .vivi,
+        .action = .start_new_session,
+        .argument_policy = .none,
+    });
+    initialized += 1;
+    commands[2] = try initDescriptor(allocator, .{
+        .generation = generation,
+        .slot = try Slot.init(3),
+    }, .{
         .name = "resume",
         .display_name = "resume",
         .description = "Resume a previous Vivi session",
@@ -296,9 +314,9 @@ fn buildCatalog(
 
     for (definitions, 0..) |definition, index| {
         try validateDefinition(definition);
-        commands[index + 2] = try initDescriptor(allocator, .{
+        commands[index + 3] = try initDescriptor(allocator, .{
             .generation = generation,
-            .slot = try Slot.init(@intCast(index + 3)),
+            .slot = try Slot.init(@intCast(index + 4)),
         }, definition);
         initialized += 1;
     }
@@ -318,6 +336,7 @@ fn validateDefinition(definition: Definition) !void {
         return error.InvalidCommandDefinition;
     }
     if (std.ascii.eqlIgnoreCase(definition.name, "model") or
+        std.ascii.eqlIgnoreCase(definition.name, "new") or
         std.ascii.eqlIgnoreCase(definition.name, "resume"))
     {
         return error.ReservedCommandName;
@@ -369,13 +388,22 @@ test "catalog generations are nonzero and stale keys fail closed" {
         .argument_policy = .optional,
     }});
     defer first.deinit();
-    const old_key = first.commands[2].key;
+    const old_key = first.commands[3].key;
     try std.testing.expectEqual(@as(u64, 1), old_key.generation.value());
-    try std.testing.expectEqual(@as(u32, 3), old_key.slot.value());
+    try std.testing.expectEqual(@as(u32, 4), old_key.slot.value());
 
     var fallback = try registry.replaceFailClosed();
     defer fallback.deinit();
-    try std.testing.expectEqual(@as(usize, 2), fallback.commands.len);
+    try std.testing.expectEqual(@as(usize, 3), fallback.commands.len);
+    try std.testing.expectEqualStrings("new", fallback.commands[1].name);
+    try std.testing.expectEqual(
+        Action.start_new_session,
+        fallback.commands[1].action,
+    );
+    var new_execution = try registry.admit(fallback.commands[1].key, "");
+    defer new_execution.deinit();
+    try std.testing.expect(new_execution.action == .start_new_session);
+    try registry.finish(new_execution.key);
     try std.testing.expectError(
         error.StaleCommandKey,
         registry.admit(old_key, ""),
@@ -405,13 +433,13 @@ test "admission enforces source action and argument policy" {
     defer catalog.deinit();
     try std.testing.expectError(
         error.CommandRequiresArguments,
-        registry.admit(catalog.commands[2].key, ""),
+        registry.admit(catalog.commands[3].key, ""),
     );
     try std.testing.expectError(
         error.CommandTakesNoArguments,
-        registry.admit(catalog.commands[3].key, "extra"),
+        registry.admit(catalog.commands[4].key, "extra"),
     );
-    var execution = try registry.admit(catalog.commands[2].key, " value ");
+    var execution = try registry.admit(catalog.commands[3].key, " value ");
     defer execution.deinit();
     try std.testing.expectEqualStrings("required", execution.action.execute.name);
     try std.testing.expectEqualStrings(" value ", execution.action.execute.arguments);
@@ -466,7 +494,7 @@ test "admission cleans up the command name when argument allocation fails" {
     registry.allocator = failing.allocator();
     try std.testing.expectError(
         error.OutOfMemory,
-        registry.admit(catalog.commands[2].key, "arguments"),
+        registry.admit(catalog.commands[3].key, "arguments"),
     );
     registry.allocator = std.testing.allocator;
     try std.testing.expect(registry.active == null);

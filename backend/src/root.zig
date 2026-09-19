@@ -608,6 +608,7 @@ fn forwardImmediatePrompts(
             .refresh_commands,
             .refresh_models,
             .refresh_sessions,
+            .start_new_session,
             .switch_model,
             .resume_session,
             .execute_command,
@@ -637,6 +638,7 @@ fn startNextQueuedPrompt(
         .refresh_commands,
         .refresh_models,
         .refresh_sessions,
+        .start_new_session,
         .switch_model,
         .resume_session,
         .execute_command,
@@ -1492,11 +1494,26 @@ fn publishCommandCatalog(
         },
     );
     defer listed.deinit();
-    const sdk_commands = listed.value.commands;
+    const definitions = try commandDefinitions(
+        worker.allocator(),
+        listed.value.commands,
+    );
+    defer worker.allocator().free(definitions);
+    if (complete_refresh) {
+        try worker.completeCommandRefresh(definitions);
+    } else {
+        try worker.commandCatalog(definitions);
+    }
+}
 
+fn commandDefinitions(
+    allocator: std.mem.Allocator,
+    sdk_commands: anytype,
+) ![]conversation.CommandDefinition {
     var count: usize = 0;
     for (sdk_commands) |command| {
         if (std.ascii.eqlIgnoreCase(command.name, "model") or
+            std.ascii.eqlIgnoreCase(command.name, "new") or
             std.ascii.eqlIgnoreCase(command.name, "resume"))
         {
             if (!std.mem.eql(u8, command.kind, "builtin")) {
@@ -1506,15 +1523,16 @@ fn publishCommandCatalog(
         }
         count += 1;
     }
-    const definitions = try worker.allocator().alloc(
+    const definitions = try allocator.alloc(
         conversation.CommandDefinition,
         count,
     );
-    defer worker.allocator().free(definitions);
+    errdefer allocator.free(definitions);
     var index: usize = 0;
     for (sdk_commands) |command| {
         if (std.ascii.eqlIgnoreCase(command.name, "model") or
-            std.ascii.eqlIgnoreCase(command.name, "resume"))
+            std.ascii.eqlIgnoreCase(command.name, "resume") or
+            std.ascii.eqlIgnoreCase(command.name, "new"))
         {
             continue;
         }
@@ -1542,11 +1560,41 @@ fn publishCommandCatalog(
         };
         index += 1;
     }
-    if (complete_refresh) {
-        try worker.completeCommandRefresh(definitions);
-    } else {
-        try worker.commandCatalog(definitions);
-    }
+    return definitions;
+}
+
+fn snapshotCommandCatalog(
+    worker: *conversation.Worker,
+    client: *copilot.Client,
+    session: copilot.Session,
+) !conversation.CommandCatalog {
+    const RpcCommand = struct {
+        name: []const u8,
+        displayName: ?[]const u8 = null,
+        description: []const u8 = "",
+        kind: []const u8,
+        input: ?struct {
+            hint: []const u8 = "",
+            required: ?bool = null,
+        } = null,
+    };
+    var listed = try client.callRpc(
+        struct { commands: []const RpcCommand },
+        "session.commands.list",
+        .{
+            .sessionId = session.id,
+            .includeBuiltins = true,
+            .includeSkills = true,
+            .includeClientCommands = true,
+        },
+    );
+    defer listed.deinit();
+    const definitions = try commandDefinitions(
+        worker.allocator(),
+        listed.value.commands,
+    );
+    defer worker.allocator().free(definitions);
+    return worker.replaceCommandCatalogSnapshot(definitions);
 }
 
 test "command discovery uses the existing client and maps typed policy" {
@@ -1571,6 +1619,7 @@ test "command discovery uses the existing client and maps typed policy" {
                 self.allocator,
                 \\{"commands":[
                 \\{"name":"model","displayName":"Model","description":"SDK model","kind":"builtin"},
+                \\{"name":"new","displayName":"New","description":"SDK new","kind":"builtin"},
                 \\{"name":"resume","displayName":"Resume","description":"SDK resume","kind":"builtin"},
                 \\{"name":"help","displayName":"Help","description":"Show help","kind":"builtin"},
                 \\{"name":"review","displayName":"Review","description":"Review changes","kind":"skill","input":{"hint":"instructions","required":true}}
@@ -1616,27 +1665,32 @@ test "command discovery uses the existing client and maps typed policy" {
     try std.testing.expectEqual(@as(usize, 1), client.calls);
     try std.testing.expect(sink.complete);
     const catalog = &sink.registry.catalog.?;
-    try std.testing.expectEqual(@as(usize, 4), catalog.commands.len);
+    try std.testing.expectEqual(@as(usize, 5), catalog.commands.len);
     try std.testing.expectEqualStrings("model", catalog.commands[0].name);
     try std.testing.expectEqual(
         conversation.CommandAction.open_model_selection,
         catalog.commands[0].action,
     );
-    try std.testing.expectEqualStrings("resume", catalog.commands[1].name);
-    try std.testing.expectEqualStrings("help", catalog.commands[2].name);
+    try std.testing.expectEqualStrings("new", catalog.commands[1].name);
+    try std.testing.expectEqual(
+        conversation.CommandAction.start_new_session,
+        catalog.commands[1].action,
+    );
+    try std.testing.expectEqualStrings("resume", catalog.commands[2].name);
+    try std.testing.expectEqualStrings("help", catalog.commands[3].name);
     try std.testing.expectEqual(
         conversation.CommandArgumentPolicy.none,
-        catalog.commands[2].argument_policy,
-    );
-    try std.testing.expectEqual(
-        conversation.CommandArgumentPolicy.required,
         catalog.commands[3].argument_policy,
     );
     try std.testing.expectEqual(
-        conversation.CommandSource.extension,
-        catalog.commands[3].source,
+        conversation.CommandArgumentPolicy.required,
+        catalog.commands[4].argument_policy,
     );
-    try std.testing.expectEqualStrings("instructions", catalog.commands[3].hint.?);
+    try std.testing.expectEqual(
+        conversation.CommandSource.extension,
+        catalog.commands[4].source,
+    );
+    try std.testing.expectEqualStrings("instructions", catalog.commands[4].hint.?);
 }
 
 test "command discovery rejects extension collisions with injected commands" {
@@ -1650,7 +1704,7 @@ test "command discovery rejects extension collisions with injected commands" {
             return std.json.parseFromSlice(
                 Result,
                 std.testing.allocator,
-                \\{"commands":[{"name":"resume","description":"collision","kind":"skill"}]}
+                \\{"commands":[{"name":"new","description":"collision","kind":"skill"}]}
             ,
                 .{ .ignore_unknown_fields = true },
             );
@@ -1708,6 +1762,179 @@ const ResumeTargets = struct {
         self.* = undefined;
     }
 };
+
+fn ReplacementPair(comptime Session: type, comptime Service: type) type {
+    return struct {
+        session: Session,
+        service: Service,
+    };
+}
+
+fn commitPreparedReplacement(
+    comptime Session: type,
+    comptime Service: type,
+    allocator: std.mem.Allocator,
+    session: *Session,
+    service: *Service,
+    resume_targets: *?ResumeTargets,
+    resume_generation: *u64,
+    prepared: anyerror!ReplacementPair(Session, Service),
+) !bool {
+    const candidate = try prepared;
+    var previous = ReplacementPair(Session, Service){
+        .session = session.*,
+        .service = service.*,
+    };
+    session.* = candidate.session;
+    service.* = candidate.service;
+    if (resume_targets.*) |*targets| targets.deinit(allocator);
+    resume_targets.* = null;
+    resume_generation.* = 0;
+    const cleanup_failed = if (previous.session.disconnect())
+        false
+    else |_|
+        true;
+    previous.service.deinit();
+    return cleanup_failed;
+}
+
+test "session replacement commits ownership only after preparation succeeds" {
+    const FakeSession = struct {
+        id: u8,
+        disconnected: *bool,
+
+        fn disconnect(self: @This()) !void {
+            self.disconnected.* = true;
+        }
+    };
+    const FakeService = struct {
+        id: u8,
+        deinitialized: *bool,
+
+        fn deinit(self: *@This()) void {
+            self.deinitialized.* = true;
+        }
+    };
+
+    var old_disconnected = false;
+    var old_service_deinitialized = false;
+    var candidate_disconnected = false;
+    var candidate_service_deinitialized = false;
+    var session = FakeSession{
+        .id = 1,
+        .disconnected = &old_disconnected,
+    };
+    var service = FakeService{
+        .id = 2,
+        .deinitialized = &old_service_deinitialized,
+    };
+    var resume_targets: ?ResumeTargets = .{
+        .generation = 9,
+        .targets = try std.testing.allocator.alloc(ResumeTarget, 0),
+    };
+    defer if (resume_targets) |*targets| targets.deinit(std.testing.allocator);
+    var resume_generation: u64 = 9;
+
+    try std.testing.expectError(
+        error.PreparationFailed,
+        commitPreparedReplacement(
+            FakeSession,
+            FakeService,
+            std.testing.allocator,
+            &session,
+            &service,
+            &resume_targets,
+            &resume_generation,
+            error.PreparationFailed,
+        ),
+    );
+    try std.testing.expectEqual(@as(u8, 1), session.id);
+    try std.testing.expectEqual(@as(u8, 2), service.id);
+    try std.testing.expect(resume_targets != null);
+    try std.testing.expectEqual(@as(u64, 9), resume_generation);
+    try std.testing.expect(!old_disconnected);
+    try std.testing.expect(!old_service_deinitialized);
+
+    const cleanup_failed = try commitPreparedReplacement(
+        FakeSession,
+        FakeService,
+        std.testing.allocator,
+        &session,
+        &service,
+        &resume_targets,
+        &resume_generation,
+        .{
+            .session = .{
+                .id = 3,
+                .disconnected = &candidate_disconnected,
+            },
+            .service = .{
+                .id = 4,
+                .deinitialized = &candidate_service_deinitialized,
+            },
+        },
+    );
+    try std.testing.expect(!cleanup_failed);
+    try std.testing.expectEqual(@as(u8, 3), session.id);
+    try std.testing.expectEqual(@as(u8, 4), service.id);
+    try std.testing.expectEqual(null, resume_targets);
+    try std.testing.expectEqual(@as(u64, 0), resume_generation);
+    try std.testing.expect(old_disconnected);
+    try std.testing.expect(old_service_deinitialized);
+    try std.testing.expect(!candidate_disconnected);
+    try std.testing.expect(!candidate_service_deinitialized);
+}
+
+test "session replacement reports previous cleanup failure after committing" {
+    const FakeSession = struct {
+        disconnected: *bool,
+
+        fn disconnect(self: @This()) !void {
+            self.disconnected.* = true;
+            return error.DisconnectFailed;
+        }
+    };
+    const FakeService = struct {
+        deinitialized: *bool,
+
+        fn deinit(self: *@This()) void {
+            self.deinitialized.* = true;
+        }
+    };
+
+    var old_disconnected = false;
+    var old_service_deinitialized = false;
+    var candidate_disconnected = false;
+    var candidate_service_deinitialized = false;
+    var session = FakeSession{ .disconnected = &old_disconnected };
+    var service = FakeService{ .deinitialized = &old_service_deinitialized };
+    var resume_targets: ?ResumeTargets = null;
+    var resume_generation: u64 = 0;
+
+    const cleanup_failed = try commitPreparedReplacement(
+        FakeSession,
+        FakeService,
+        std.testing.allocator,
+        &session,
+        &service,
+        &resume_targets,
+        &resume_generation,
+        .{
+            .session = .{ .disconnected = &candidate_disconnected },
+            .service = .{ .deinitialized = &candidate_service_deinitialized },
+        },
+    );
+    try std.testing.expect(cleanup_failed);
+    try std.testing.expect(old_disconnected);
+    try std.testing.expect(old_service_deinitialized);
+    try std.testing.expectEqual(&candidate_disconnected, session.disconnected);
+    try std.testing.expectEqual(
+        &candidate_service_deinitialized,
+        service.deinitialized,
+    );
+    try std.testing.expect(!candidate_disconnected);
+    try std.testing.expect(!candidate_service_deinitialized);
+}
 
 fn buildSessionCatalog(
     allocator: std.mem.Allocator,
@@ -2798,6 +3025,121 @@ fn runSdkConversation(
                 resume_targets = result.targets;
                 resume_generation = next_generation;
             },
+            .start_new_session => |command_key| {
+                var completion: ?CommandCompletionGuard =
+                    if (command_key) |key|
+                        .{ .worker = worker, .key = key }
+                    else
+                        null;
+                defer if (completion) |*guard| guard.ensure();
+                var candidate_tools = tools.Service.init(
+                    worker.allocator(),
+                    worker.io(),
+                    active_working_directory,
+                ) catch |err| {
+                    worker.completeNewSession(.{
+                        .failed = conversation.OwnedText.init(
+                            worker.allocator(),
+                            @errorName(err),
+                        ) catch {
+                            worker.closeFailure(.stream, @errorName(err));
+                            return;
+                        },
+                    }) catch {
+                        worker.closeFailure(.stream, "Unable to report new session failure.");
+                        return;
+                    };
+                    continue;
+                };
+                const candidate_prompt = std.fmt.allocPrint(
+                    worker.allocator(),
+                    MinimalCodingAgent.system_prompt,
+                    .{active_working_directory},
+                ) catch |err| {
+                    candidate_tools.deinit();
+                    worker.closeFailure(.stream, @errorName(err));
+                    return;
+                };
+                defer worker.allocator().free(candidate_prompt);
+                var candidate = createSdkSession(
+                    worker,
+                    &client,
+                    candidate_prompt,
+                    active_working_directory,
+                    &active_plan,
+                    context.omlx_api_key,
+                ) catch |err| {
+                    candidate_tools.deinit();
+                    worker.completeNewSession(.{
+                        .failed = conversation.OwnedText.init(
+                            worker.allocator(),
+                            @errorName(err),
+                        ) catch {
+                            worker.closeFailure(.stream, @errorName(err));
+                            return;
+                        },
+                    }) catch {
+                        worker.closeFailure(.stream, "Unable to report new session failure.");
+                        return;
+                    };
+                    continue;
+                };
+                const candidate_commands = snapshotCommandCatalog(
+                    worker,
+                    &client,
+                    candidate,
+                ) catch worker.replaceCommandCatalogSnapshot(
+                    &.{},
+                ) catch |err| {
+                    candidate.disconnect() catch {};
+                    candidate_tools.deinit();
+                    worker.completeNewSession(.{
+                        .failed = conversation.OwnedText.init(
+                            worker.allocator(),
+                            @errorName(err),
+                        ) catch {
+                            worker.closeFailure(.stream, @errorName(err));
+                            return;
+                        },
+                    }) catch {
+                        worker.closeFailure(.stream, "Unable to report new session failure.");
+                        return;
+                    };
+                    continue;
+                };
+
+                session_connected = false;
+                const cleanup_failed = commitPreparedReplacement(
+                    copilot.Session,
+                    tools.Service,
+                    worker.allocator(),
+                    &session,
+                    &tool_service,
+                    &resume_targets,
+                    &resume_generation,
+                    .{
+                        .session = candidate,
+                        .service = candidate_tools,
+                    },
+                ) catch unreachable;
+                session_connected = true;
+                worker.completeNewSession(.{ .started = .{
+                    .commands = candidate_commands,
+                    .cleanup_failed = cleanup_failed,
+                } }) catch {
+                    worker.closeFailure(.stream, "Unable to report the new session.");
+                    return;
+                };
+                if (completion) |*guard| {
+                    guard.succeed("Started a new session.") catch {
+                        worker.closeFailure(
+                            .stream,
+                            "Unable to report slash command completion.",
+                        );
+                        return;
+                    };
+                }
+            },
             .resume_session => |key| {
                 const targets = if (resume_targets) |*value| value else {
                     worker.completeSessionResume(.{
@@ -3032,6 +3374,7 @@ fn runSdkConversation(
                         };
                         continue;
                     },
+                    .start_new_session => unreachable,
                     .open_session_history => {
                         var next_generation = resume_generation +% 1;
                         if (next_generation == 0) next_generation = 1;
@@ -3201,6 +3544,7 @@ fn runSdkConversation(
                                 .refresh_commands,
                                 .refresh_models,
                                 .refresh_sessions,
+                                .start_new_session,
                                 .switch_model,
                                 .resume_session,
                                 .execute_command,

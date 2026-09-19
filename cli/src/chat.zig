@@ -132,6 +132,24 @@ fn commandValidationMessage(err: anyerror) []const u8 {
     };
 }
 
+const NewCommandAction = enum {
+    start_session,
+    submit_prompt,
+};
+
+fn newCommandAction(input: []const u8) NewCommandAction {
+    const query = slashCommandQuery(input) orelse return .submit_prompt;
+    return if (std.ascii.eqlIgnoreCase(query, "new") and
+        std.mem.trim(
+            u8,
+            commandArgumentSuffix(input),
+            " \t\r\n",
+        ).len == 0)
+        .start_session
+    else
+        .submit_prompt;
+}
+
 const FileReferenceQuery = struct {
     start: usize,
     end: usize,
@@ -1022,6 +1040,7 @@ const UiPhase = enum {
     awaiting_input,
     running_command,
     switching,
+    starting_new_session,
     resuming,
     stopping,
 
@@ -1034,6 +1053,7 @@ const UiPhase = enum {
             .awaiting_input => "Answer required",
             .running_command => "Running command...",
             .switching => "Switching model...",
+            .starting_new_session => "Starting new session...",
             .resuming => "Resuming session...",
             .stopping => "Stopping...",
         };
@@ -2551,6 +2571,7 @@ const MenuMode = enum {
 const CommandActivation = enum {
     execute,
     models,
+    new_session,
     sessions,
 };
 
@@ -2558,6 +2579,7 @@ fn commandActivation(action: backend.CommandAction) CommandActivation {
     return switch (action) {
         .execute => .execute,
         .open_model_selection => .models,
+        .start_new_session => .new_session,
         .open_session_history => .sessions,
     };
 }
@@ -3375,6 +3397,14 @@ const ChatUi = struct {
                     self.allocator,
                 );
                 defer self.allocator.free(contents);
+                const activation = commandActivation(command.action);
+                if (activation == .new_session and
+                    newCommandAction(contents) == .submit_prompt)
+                {
+                    self.menu_mode = .closed;
+                    try self.submitPrompt(conversation, .immediate);
+                    return;
+                }
                 conversation.executeCommand(
                     command.key,
                     commandArgumentSuffix(contents),
@@ -3404,7 +3434,7 @@ const ChatUi = struct {
                     else => return err,
                 };
                 self.input.clearRetainingCapacity();
-                switch (commandActivation(command.action)) {
+                switch (activation) {
                     .execute => {
                         self.menu_mode = .closed;
                         self.phase = .running_command;
@@ -3412,6 +3442,10 @@ const ChatUi = struct {
                     .models => {
                         self.menu_mode = .loading_models;
                         self.phase = .running_command;
+                    },
+                    .new_session => {
+                        self.menu_mode = .closed;
+                        self.phase = .starting_new_session;
                     },
                     .sessions => {
                         self.menu_mode = .loading_sessions;
@@ -3689,6 +3723,46 @@ const ChatUi = struct {
                     },
                 }
             },
+            .new_session => |result| {
+                if (self.phase == .starting_new_session) self.phase = .ready;
+                self.menu_mode = .closed;
+                switch (result) {
+                    .started => |success| {
+                        const replacement_commands = try success.commands.clone(
+                            self.allocator,
+                        );
+                        if (self.commands) |*current| current.deinit();
+                        self.commands = replacement_commands;
+                        if (self.sessions) |*current| current.deinit();
+                        self.sessions = null;
+                        self.clearToolFocus();
+                        self.tool_anchor = null;
+                        try self.closeFilePicker();
+                        var previous = self.transcript;
+                        self.transcript = .{};
+                        previous.deinit(self.allocator);
+                        self.input.clearRetainingCapacity();
+                        self.rows_from_tail = 0;
+                        self.last_total_rows = 0;
+                        self.last_viewport_rows = 0;
+                        if (success.cleanup_failed) {
+                            try self.transcript.append(
+                                self.allocator,
+                                .status,
+                                "Started a new session. The previous session could not be detached cleanly.",
+                            );
+                        }
+                    },
+                    .failed => |failure| {
+                        try self.transcript.append(
+                            self.allocator,
+                            .status,
+                            failure.bytes,
+                        );
+                        try self.syncComposerMenu();
+                    },
+                }
+            },
             .assistant_started => {
                 self.phase = .responding;
                 self.transcript.beginQueuedTurn();
@@ -3754,7 +3828,7 @@ const ChatUi = struct {
                                             self.menu_mode = .closed;
                                         }
                                     },
-                                    .execute => {},
+                                    .start_new_session, .execute => {},
                                 }
                             }
                         }
@@ -4727,7 +4801,7 @@ const ChatUi = struct {
                         "↑/↓ select  ·  Enter accept  ·  Ctrl-C stop"
                 else
                     "Enter answer  ·  Wheel/PgUp/PgDn scroll  ·  Ctrl-C stop",
-                .connecting, .loading_commands, .running_command, .switching, .resuming => "Wheel/PgUp/PgDn scroll  ·  Ctrl-C stop",
+                .connecting, .loading_commands, .running_command, .switching, .starting_new_session, .resuming => "Wheel/PgUp/PgDn scroll  ·  Ctrl-C stop",
                 .stopping => "Ctrl-C again force exit",
             }
         else if (window.width >= 24)
@@ -4738,7 +4812,7 @@ const ChatUi = struct {
                     "↑/↓ select  ·  Enter accept"
                 else
                     "Enter answer  ·  Ctrl-C stop",
-                .connecting, .loading_commands, .running_command, .switching, .resuming => "Ctrl-C stop",
+                .connecting, .loading_commands, .running_command, .switching, .starting_new_session, .resuming => "Ctrl-C stop",
                 .stopping => "Ctrl-C again force exit",
             }
         else switch (self.phase) {
@@ -4748,7 +4822,7 @@ const ChatUi = struct {
                 "Enter choice"
             else
                 "Enter answer",
-            .connecting, .loading_commands, .running_command, .switching, .resuming => "Ctrl-C stop",
+            .connecting, .loading_commands, .running_command, .switching, .starting_new_session, .resuming => "Ctrl-C stop",
             .stopping => "Ctrl-C again",
         };
         const model_name = self.selectedModelDisplayName();
@@ -5005,6 +5079,15 @@ const TerminalTitle = struct {
         self.current = replacement;
         return true;
     }
+
+    fn reset(self: *TerminalTitle, writer: *std.Io.Writer) !bool {
+        const current = self.current orelse return false;
+        try writer.writeAll("\x1b]2;vivi\x1b\\");
+        try writer.flush();
+        self.allocator.free(current);
+        self.current = null;
+        return true;
+    }
 };
 
 const App = struct {
@@ -5100,13 +5183,17 @@ const App = struct {
     }
 
     fn deinit(self: *App) void {
+        self.loop.should_quit = true;
+        if (self.loop.thread) |*thread| {
+            thread.cancel(self.io);
+            self.loop.thread = null;
+        }
         self.file_picker.deinit();
         self.conversation.deinit();
         self.releaseImages();
         self.render_memory.deinit(self.vx.window());
         self.ui.deinit();
         self.terminal_title.deinit();
-        self.loop.stop();
         self.vx.deinit(self.allocator, self.tty.writer());
         self.tty.deinit();
         self.* = undefined;
@@ -5274,6 +5361,8 @@ const App = struct {
                     self.tty.writer(),
                     event.session_title.bytes,
                 );
+            } else if (event == .new_session and event.new_session == .started) {
+                _ = try self.terminal_title.reset(self.tty.writer());
             }
             if (stream_update and
                 self.ui.rows_from_tail == 0 and
@@ -5343,7 +5432,16 @@ const App = struct {
     }
 
     fn hardExit(self: *App) noreturn {
-        self.loop.stop();
+        // Cancel the input future the same way deinit() does: cancellation
+        // interrupts the blocked tty read directly, so it can't race with
+        // the Vaxis/tty teardown below (unlike Loop.stop(), which only wakes
+        // the read with a DSR round-trip and hangs when nothing answers it,
+        // for example a piped harness without a terminal emulator).
+        self.loop.should_quit = true;
+        if (self.loop.thread) |*thread| {
+            thread.cancel(self.io);
+            self.loop.thread = null;
+        }
         self.releaseImages();
         self.ui.deinitTranscriptSpool();
         self.render_memory.deinit(self.vx.window());
@@ -5391,6 +5489,15 @@ test "terminal title emits exact OSC bytes only for canonical changes" {
             "\x1b]2;vivi — A new title\x1b\\",
         output.written(),
     );
+
+    try std.testing.expect(try title.reset(&output.writer));
+    try std.testing.expectEqualStrings(
+        "\x1b]2;vivi — What were the last 10 commits for?\x1b\\" ++
+            "\x1b]2;vivi — A new title\x1b\\" ++
+            "\x1b]2;vivi\x1b\\",
+        output.written(),
+    );
+    try std.testing.expect(!try title.reset(&output.writer));
 }
 
 test "terminal title rejects unsafe or absent updates without output" {
@@ -6478,6 +6585,121 @@ test "resuming replaces the visible transcript with the owned history snapshot" 
         ui.transcript.messageAt(2).text.items,
     );
     try std.testing.expectEqual(@as(usize, 0), ui.rows_from_tail);
+}
+
+test "new session replaces transcript and commands while preserving cwd" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try temporary.dir.realPath(
+        std.testing.io,
+        &path_buffer,
+    );
+    var ui: ChatUi = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .input = TextInput.init(std.testing.allocator),
+        .transcript_spool = try TranscriptSpool.init(
+            std.testing.allocator,
+            std.testing.io,
+            path_buffer[0..path_len],
+        ),
+        .cwd = try std.testing.allocator.dupe(u8, "/current"),
+        .phase = .starting_new_session,
+        .rows_from_tail = 3,
+    };
+    defer ui.deinit();
+    try ui.input.insertSliceAtCursor("/new");
+    try ui.transcript.append(std.testing.allocator, .user, "old prompt");
+
+    const commands = try std.testing.allocator.alloc(backend.CommandInfo, 1);
+    commands[0] = .{
+        .key = .{
+            .generation = @enumFromInt(1),
+            .slot = @enumFromInt(1),
+        },
+        .name = try std.testing.allocator.dupe(u8, "new"),
+        .display_name = try std.testing.allocator.dupe(u8, "new"),
+        .description = try std.testing.allocator.dupe(u8, "Start fresh"),
+        .hint = null,
+        .source = .vivi,
+        .action = .start_new_session,
+        .argument_policy = .none,
+    };
+    var event: backend.ConversationEvent = .{ .new_session = .{
+        .started = .{
+            .commands = .{
+                .allocator = std.testing.allocator,
+                .commands = commands,
+            },
+            .cleanup_failed = false,
+        },
+    } };
+    defer event.deinit();
+
+    _ = try ui.applyConversationEvent(&event);
+    try std.testing.expectEqual(UiPhase.ready, ui.phase);
+    try std.testing.expectEqualStrings("/current", ui.cwd);
+    try std.testing.expectEqual(@as(usize, 0), ui.transcript.entries.items.len);
+    const input = try ui.input.toOwnedContents(std.testing.allocator);
+    defer std.testing.allocator.free(input);
+    try std.testing.expectEqualStrings("", input);
+    try std.testing.expectEqualStrings("new", ui.commands.?.commands[0].name);
+    try std.testing.expectEqual(@as(usize, 0), ui.rows_from_tail);
+    const spool = if (ui.transcript_spool) |*value|
+        value
+    else
+        return error.MissingTranscriptSpool;
+    const page = try spool.write("fresh transcript");
+    const restored = try spool.read(std.testing.allocator, page);
+    defer std.testing.allocator.free(restored);
+    try std.testing.expectEqualStrings("fresh transcript", restored);
+}
+
+test "new session failure keeps command retry available" {
+    const commands = try std.testing.allocator.alloc(backend.CommandInfo, 1);
+    commands[0] = .{
+        .key = .{
+            .generation = @enumFromInt(1),
+            .slot = @enumFromInt(1),
+        },
+        .name = try std.testing.allocator.dupe(u8, "new"),
+        .display_name = try std.testing.allocator.dupe(u8, "new"),
+        .description = try std.testing.allocator.dupe(u8, "Start fresh"),
+        .hint = null,
+        .source = .vivi,
+        .action = .start_new_session,
+        .argument_policy = .none,
+    };
+    var ui: ChatUi = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .input = TextInput.init(std.testing.allocator),
+        .cwd = try std.testing.allocator.dupe(u8, "/current"),
+        .phase = .starting_new_session,
+        .commands = .{
+            .allocator = std.testing.allocator,
+            .commands = commands,
+        },
+    };
+    defer ui.deinit();
+    try ui.input.insertSliceAtCursor("/new");
+
+    var event: backend.ConversationEvent = .{ .new_session = .{
+        .failed = try backend.OwnedText.init(
+            std.testing.allocator,
+            "Unable to start a new session.",
+        ),
+    } };
+    defer event.deinit();
+
+    _ = try ui.applyConversationEvent(&event);
+    try std.testing.expectEqual(UiPhase.ready, ui.phase);
+    try std.testing.expectEqual(MenuMode.commands, ui.menu_mode);
+    try std.testing.expectEqual(@as(usize, 1), ui.menu.matches.items.len);
+    const input = try ui.input.toOwnedContents(std.testing.allocator);
+    defer std.testing.allocator.free(input);
+    try std.testing.expectEqualStrings("/new", input);
 }
 
 test "empty assistant completion does not create or clear a draft" {
@@ -8336,6 +8558,38 @@ test "slash command parsing preserves argument suffixes" {
         " thorough",
         commandArgumentSuffix("/autopilot thorough"),
     );
+    try std.testing.expectEqualStrings(
+        " extra",
+        commandArgumentSuffix("/new extra"),
+    );
+    try std.testing.expectEqualStrings(
+        " pasted-image-token",
+        commandArgumentSuffix("/new pasted-image-token"),
+    );
+    try std.testing.expectEqual(
+        NewCommandAction.start_session,
+        newCommandAction("/new"),
+    );
+    try std.testing.expectEqual(
+        NewCommandAction.start_session,
+        newCommandAction("/new \t"),
+    );
+    try std.testing.expectEqual(
+        NewCommandAction.submit_prompt,
+        newCommandAction("/new extra"),
+    );
+    try std.testing.expectEqual(
+        NewCommandAction.submit_prompt,
+        newCommandAction("/new vivi-image-1"),
+    );
+    try std.testing.expectEqual(
+        NewCommandAction.submit_prompt,
+        newCommandAction("/ne"),
+    );
+    try std.testing.expectEqual(
+        NewCommandAction.submit_prompt,
+        newCommandAction("/ew"),
+    );
     try std.testing.expectEqualStrings("", slashCommandQuery("/").?);
     try std.testing.expect(slashCommandQuery("not-a-command") == null);
 }
@@ -8348,6 +8602,10 @@ test "command actions dispatch without name-based special cases" {
     try std.testing.expectEqual(
         CommandActivation.models,
         commandActivation(.open_model_selection),
+    );
+    try std.testing.expectEqual(
+        CommandActivation.new_session,
+        commandActivation(.start_new_session),
     );
     try std.testing.expectEqual(
         CommandActivation.sessions,
