@@ -104,7 +104,7 @@ pub const CanvasKey = struct {
         };
     }
 
-    pub fn eqlView(self: *const CanvasKey, other: CanvasKeyView) bool {
+    fn eqlView(self: *const CanvasKey, other: CanvasKeyView) bool {
         return std.mem.eql(u8, self.extension_id.bytes(), other.extension_id) and
             std.mem.eql(u8, self.canvas_id.bytes(), other.canvas_id);
     }
@@ -140,7 +140,7 @@ pub const InstanceKey = struct {
         };
     }
 
-    pub fn eqlView(self: *const InstanceKey, other: KeyView) bool {
+    fn eqlView(self: *const InstanceKey, other: KeyView) bool {
         return self.canvas.eqlView(.{
             .extension_id = other.extension_id,
             .canvas_id = other.canvas_id,
