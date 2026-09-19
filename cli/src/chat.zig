@@ -3521,6 +3521,16 @@ const ChatUi = struct {
         }
     }
 
+    fn completeCommandPhase(self: *ChatUi) bool {
+        switch (self.phase) {
+            .running_command, .starting_new_session, .resuming => {
+                self.phase = .ready;
+                return true;
+            },
+            else => return false,
+        }
+    }
+
     fn applyConversationEvent(
         self: *ChatUi,
         event: *const backend.ConversationEvent,
@@ -3817,7 +3827,7 @@ const ChatUi = struct {
                 self.followTail();
             },
             .command_completed => |result| {
-                self.phase = .ready;
+                const owns_ui = self.completeCommandPhase();
                 const message = switch (result) {
                     .completed => |outcome| if (outcome.message) |text|
                         text.bytes
@@ -3828,17 +3838,23 @@ const ChatUi = struct {
                             if (catalog.find(outcome.key)) |command| {
                                 switch (command.action) {
                                     .open_model_selection => {
-                                        if (self.menu_mode == .loading_models) {
+                                        if (owns_ui and
+                                            self.menu_mode == .loading_models)
+                                        {
                                             self.menu_mode = .closed;
                                         }
                                     },
                                     .open_session_history => {
-                                        if (self.menu_mode == .loading_sessions) {
+                                        if (owns_ui and
+                                            self.menu_mode == .loading_sessions)
+                                        {
                                             self.menu_mode = .closed;
                                         }
                                     },
                                     .start_new_session => {
-                                        try self.syncComposerMenu();
+                                        if (owns_ui) {
+                                            try self.syncComposerMenu();
+                                        }
                                     },
                                     .execute => {},
                                 }
@@ -9216,6 +9232,67 @@ test "failed injected commands close their loading menus" {
     defer resume_failure.deinit();
     _ = try ui.applyConversationEvent(&resume_failure);
     try std.testing.expectEqual(UiPhase.ready, ui.phase);
+    try std.testing.expectEqual(MenuMode.closed, ui.menu_mode);
+}
+
+test "command terminals preserve a newer responding prompt phase" {
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    var ui = try ChatUi.init(
+        std.testing.allocator,
+        std.testing.io,
+        &environment,
+    );
+    defer ui.deinit();
+
+    const key: backend.CommandKey = .{
+        .generation = @enumFromInt(1),
+        .slot = @enumFromInt(1),
+    };
+    const commands = try std.testing.allocator.alloc(backend.CommandInfo, 1);
+    commands[0] = .{
+        .key = key,
+        .name = try std.testing.allocator.dupe(u8, "agent"),
+        .display_name = try std.testing.allocator.dupe(u8, "agent"),
+        .description = try std.testing.allocator.dupe(u8, "Run an agent"),
+        .hint = null,
+        .source = .sdk_builtin,
+        .action = .execute,
+        .argument_policy = .none,
+    };
+    ui.commands = .{
+        .allocator = std.testing.allocator,
+        .commands = commands,
+    };
+    ui.phase = .responding;
+    ui.menu_mode = .closed;
+
+    var completed: backend.ConversationEvent = .{
+        .command_completed = .{ .completed = .{
+            .key = key,
+            .message = try backend.OwnedText.init(
+                std.testing.allocator,
+                "old command completed",
+            ),
+        } },
+    };
+    defer completed.deinit();
+    _ = try ui.applyConversationEvent(&completed);
+    try std.testing.expectEqual(UiPhase.responding, ui.phase);
+    try std.testing.expectEqual(MenuMode.closed, ui.menu_mode);
+
+    var failed: backend.ConversationEvent = .{
+        .command_completed = .{ .failed = .{
+            .key = key,
+            .message = try backend.OwnedText.init(
+                std.testing.allocator,
+                "old command failed",
+            ),
+        } },
+    };
+    defer failed.deinit();
+    _ = try ui.applyConversationEvent(&failed);
+    try std.testing.expectEqual(UiPhase.responding, ui.phase);
     try std.testing.expectEqual(MenuMode.closed, ui.menu_mode);
 }
 

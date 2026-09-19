@@ -2540,13 +2540,20 @@ test "typed stream tool projection leaves Vivi tools to external events" {
 }
 
 fn refreshCommandCatalog(
-    worker: *conversation.Worker,
-    client: *copilot.Client,
-    session: copilot.Session,
-) void {
+    worker: anytype,
+    client: anytype,
+    session: anytype,
+) bool {
     publishCommandCatalog(worker, client, session, false) catch |err| {
-        worker.commandCatalogFailed(@errorName(err)) catch {};
+        worker.commandCatalogFailed(@errorName(err)) catch {
+            worker.closeFailure(
+                .stream,
+                "Unable to invalidate the stale command catalog.",
+            );
+            return false;
+        };
     };
+    return true;
 }
 
 fn reportCommandRefreshFailure(
@@ -2558,6 +2565,105 @@ fn reportCommandRefreshFailure(
         return false;
     };
     return true;
+}
+
+test "unreportable implicit command refresh failure closes and terminates the path" {
+    const Registry = @import("command_domain.zig").Registry;
+    const FakeClient = struct {
+        fn callRpc(
+            _: *@This(),
+            comptime Result: type,
+            _: []const u8,
+            _: anytype,
+        ) !std.json.Parsed(Result) {
+            return error.DiscoveryFailed;
+        }
+    };
+    const Sink = struct {
+        registry: Registry,
+        closed: bool = false,
+        wakes: usize = 0,
+
+        fn allocator(_: *@This()) std.mem.Allocator {
+            return std.testing.allocator;
+        }
+
+        fn commandCatalog(
+            _: *@This(),
+            _: []const conversation.CommandDefinition,
+        ) !void {
+            return error.UnexpectedCatalog;
+        }
+
+        fn completeCommandRefresh(
+            _: *@This(),
+            _: []const conversation.CommandDefinition,
+        ) !void {
+            return error.UnexpectedCatalog;
+        }
+
+        fn commandCatalogFailed(
+            self: *@This(),
+            _: []const u8,
+        ) !void {
+            var catalog = try self.registry.replaceFailClosed();
+            catalog.deinit();
+        }
+
+        fn closeFailure(
+            self: *@This(),
+            kind: conversation.FailureKind,
+            message: []const u8,
+        ) void {
+            std.debug.assert(kind == .stream);
+            std.debug.assert(std.mem.eql(
+                u8,
+                message,
+                "Unable to invalidate the stale command catalog.",
+            ));
+            if (self.closed) return;
+            self.closed = true;
+            self.wakes += 1;
+        }
+
+        fn admit(
+            self: *@This(),
+            key: conversation.CommandKey,
+        ) !void {
+            if (self.closed) return error.Closed;
+            var execution = try self.registry.admit(key, "");
+            execution.deinit();
+        }
+    };
+
+    var failing = std.testing.FailingAllocator.init(
+        std.testing.allocator,
+        .{ .fail_index = 0 },
+    );
+    var sink = Sink{
+        .registry = Registry.init(std.testing.allocator),
+    };
+    defer sink.registry.deinit();
+    var initial = try sink.registry.replace(&.{.{
+        .name = "agent",
+        .display_name = "Agent",
+        .description = "Run an agent",
+        .source = .sdk_builtin,
+        .argument_policy = .none,
+    }});
+    defer initial.deinit();
+    const old_key = sink.registry.catalog.?.commands[3].key;
+    sink.registry.allocator = failing.allocator();
+    var client = FakeClient{};
+
+    try std.testing.expect(!refreshCommandCatalog(
+        &sink,
+        &client,
+        .{ .id = "session-1" },
+    ));
+    try std.testing.expect(sink.closed);
+    try std.testing.expectEqual(@as(usize, 1), sink.wakes);
+    try std.testing.expectError(error.Closed, sink.admit(old_key));
 }
 
 test "unreportable command refresh failure closes and terminates the path" {
@@ -2783,11 +2889,11 @@ fn streamSessionResponse(
                     },
                 }
             },
-            .commands_changed => refreshCommandCatalog(
+            .commands_changed => if (!refreshCommandCatalog(
                 worker,
                 client,
                 session,
-            ),
+            )) return .failed,
             .tool_execution_start => |started| emitTypedToolStart(
                 worker,
                 &typed_tool_calls,
@@ -2947,7 +3053,11 @@ fn streamSessionResponse(
                     unknown.event_type,
                     "commands.changed",
                 )) {
-                    refreshCommandCatalog(worker, client, session);
+                    if (!refreshCommandCatalog(
+                        worker,
+                        client,
+                        session,
+                    )) return .failed;
                 }
             },
             else => {},
@@ -3101,7 +3211,7 @@ fn runSdkConversation(
         return;
     }
 
-    refreshCommandCatalog(worker, &client, session);
+    if (!refreshCommandCatalog(worker, &client, session)) return;
     if (buildModelCatalog(
         worker.allocator(),
         &client,
@@ -3496,7 +3606,7 @@ fn runSdkConversation(
                     );
                     return;
                 };
-                refreshCommandCatalog(worker, &client, session);
+                if (!refreshCommandCatalog(worker, &client, session)) return;
             },
             .execute_command => |requested| {
                 var completion = CommandCompletionGuard{
@@ -3991,7 +4101,7 @@ fn runSdkConversation(
                     );
                     return;
                 };
-                refreshCommandCatalog(worker, &client, session);
+                if (!refreshCommandCatalog(worker, &client, session)) return;
             },
             .prompt => |prompt| {
                 sendPrompt(
