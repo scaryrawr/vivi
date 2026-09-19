@@ -453,7 +453,7 @@ pub const CanvasDeclaration = struct {
         };
     }
 
-    pub fn hasAction(self: *const CanvasDeclaration, name: []const u8) bool {
+    fn hasAction(self: *const CanvasDeclaration, name: []const u8) bool {
         for (self.actions) |*action| {
             if (std.mem.eql(u8, action.name.bytes(), name)) return true;
         }
@@ -2085,7 +2085,21 @@ pub const Domain = struct {
                 declaration.deinit(self.allocator);
             }
         }
-        for (delta.upserted) |input| {
+        for (delta.upserted, 0..) |input, input_index| {
+            const key = CanvasKeyView{
+                .extension_id = input.extension_id,
+                .canvas_id = input.canvas_id,
+            };
+            if (upsertsCanvasKey(
+                delta.upserted[input_index + 1 ..],
+                key,
+            )) continue;
+            const existing_index = result.find(key);
+            if (existing_index == null and
+                result.entries.items.len >= self.limits.max_registry_entries)
+            {
+                return error.TooManyRegistryEntries;
+            }
             var declaration = try CanvasDeclaration.init(
                 self.allocator,
                 input,
@@ -2093,20 +2107,11 @@ pub const Domain = struct {
             );
             var declaration_owned = true;
             errdefer if (declaration_owned) declaration.deinit(self.allocator);
-            const key = CanvasKeyView{
-                .extension_id = input.extension_id,
-                .canvas_id = input.canvas_id,
-            };
-            if (result.find(key)) |index| {
+            if (existing_index) |index| {
                 result.entries.items[index].deinit(self.allocator);
                 result.entries.items[index] = declaration;
                 declaration_owned = false;
             } else {
-                if (result.entries.items.len >=
-                    self.limits.max_registry_entries)
-                {
-                    return error.TooManyRegistryEntries;
-                }
                 try result.entries.append(self.allocator, declaration);
                 declaration_owned = false;
             }
@@ -3552,6 +3557,57 @@ test "registry action limits are checked before traversal or allocation" {
         @as(usize, 1),
         domain.registry.entries.items.len,
     );
+}
+
+test "incremental registry skips shadowed upserts before construction" {
+    var domain = try fixtureDomain(std.testing.allocator);
+    defer domain.deinitUnchecked();
+    const duplicate_actions = [_]ActionDeclarationInput{
+        .{ .name = "same", .display_name = "One" },
+        .{ .name = "same", .display_name = "Two" },
+    };
+    var shadowed = fixture_declaration;
+    shadowed.display_name = "Shadowed";
+    shadowed.actions = &duplicate_actions;
+    var final = fixture_declaration;
+    final.display_name = "Final";
+    final.actions = &.{};
+
+    try domain.applyRegistry(.{ .incremental = .{
+        .upserted = &.{ shadowed, final },
+    } });
+    try std.testing.expectEqual(@as(usize, 1), domain.registry.entries.items.len);
+    try std.testing.expectEqualStrings(
+        "Final",
+        domain.registry.entries.items[0].display_name,
+    );
+}
+
+test "incremental registry checks capacity before declaration construction" {
+    var domain = Domain.init(
+        std.testing.allocator,
+        .{ .max_registry_entries = 1 },
+    );
+    defer domain.deinitUnchecked();
+    try domain.applyRegistry(.{ .replacement = &.{fixture_declaration} });
+    const duplicate_actions = [_]ActionDeclarationInput{
+        .{ .name = "same", .display_name = "One" },
+        .{ .name = "same", .display_name = "Two" },
+    };
+    const invalid_new: CanvasDeclarationInput = .{
+        .extension_id = "fixture.extension",
+        .canvas_id = "new",
+        .display_name = "New",
+        .actions = &duplicate_actions,
+    };
+
+    try std.testing.expectError(
+        error.TooManyRegistryEntries,
+        domain.applyRegistry(.{ .incremental = .{
+            .upserted = &.{invalid_new},
+        } }),
+    );
+    try std.testing.expectEqual(@as(usize, 1), domain.registry.entries.items.len);
 }
 
 test "open completion validates result text before cloning" {
