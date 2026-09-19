@@ -1647,12 +1647,12 @@ pub const Domain = struct {
         return .{ .canvases = canvases };
     }
 
-    pub fn runtimeTag(self: Domain, key: KeyView) ?RuntimeTag {
+    fn runtimeTag(self: Domain, key: KeyView) ?RuntimeTag {
         const index = self.findInstance(key) orelse return null;
         return self.instances.items[index].runtime.tag();
     }
 
-    pub fn recordTag(self: Domain, key: KeyView) ?RecordTag {
+    fn recordTag(self: Domain, key: KeyView) ?RecordTag {
         const index = self.findInstance(key) orelse return null;
         return self.instances.items[index].record.tag();
     }
@@ -1847,6 +1847,12 @@ pub const Domain = struct {
     ) !Registry {
         if (inputs.len > self.limits.max_registry_entries)
             return error.TooManyRegistryEntries;
+        for (inputs) |input| {
+            _ = try CanvasKey.init(.{
+                .extension_id = input.extension_id,
+                .canvas_id = input.canvas_id,
+            }, self.limits);
+        }
         var result: Registry = .{};
         errdefer result.deinit(self.allocator);
         try result.entries.ensureUnusedCapacity(self.allocator, inputs.len);
@@ -1877,6 +1883,12 @@ pub const Domain = struct {
             return error.TooManyRegistryOperations;
         for (delta.removed) |removed| {
             _ = try CanvasKey.init(removed, self.limits);
+        }
+        for (delta.upserted) |input| {
+            _ = try CanvasKey.init(.{
+                .extension_id = input.extension_id,
+                .canvas_id = input.canvas_id,
+            }, self.limits);
         }
         var result = try self.registry.clone(self.allocator, self.limits);
         errdefer result.deinit(self.allocator);
@@ -2144,6 +2156,36 @@ test "incremental registry work is bounded before cloning" {
             .removed = &removals,
         } }),
     );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        domain.registry.entries.items.len,
+    );
+}
+
+test "registry keys validate before owned allocation" {
+    const invalid: CanvasDeclarationInput = .{
+        .extension_id = "x" ** 257,
+        .canvas_id = "review",
+        .display_name = "Invalid",
+    };
+    var no_storage: [0]u8 = .{};
+    var fixed = std.heap.FixedBufferAllocator.init(&no_storage);
+    var empty_domain = Domain.init(fixed.allocator(), .{});
+    defer empty_domain.deinit();
+    try std.testing.expectError(
+        error.IdentifierTooLong,
+        empty_domain.applyRegistry(.{ .replacement = &.{invalid} }),
+    );
+
+    var domain = try fixtureDomain(std.testing.allocator);
+    defer domain.deinit();
+    const original_allocator = domain.allocator;
+    domain.allocator = fixed.allocator();
+    const result = domain.applyRegistry(.{ .incremental = .{
+        .upserted = &.{invalid},
+    } });
+    domain.allocator = original_allocator;
+    try std.testing.expectError(error.IdentifierTooLong, result);
     try std.testing.expectEqual(
         @as(usize, 1),
         domain.registry.entries.items.len,
