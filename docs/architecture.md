@@ -23,6 +23,18 @@ C-compatible library. `backend/src/root.zig` is the only production module
 allowed to import `copilot_sdk`. `backend/src/c_api.zig` adapts domain values
 to the versioned C header; it does not own product behavior.
 
+`backend/src/canvas.zig` owns the SDK-free, renderer-neutral canvas domain.
+It validates bounded declaration, action, and instance identities plus
+role-specific JSON documents, then reduces registry and instance operations
+through transactional lifecycle changes. Every `opening` or `closing` state
+contains its exact pending token and owned effect data. Fallible preparation
+and atomic effect publication complete before an allocation-free state commit,
+so cancellation, allocation failure, publication failure, and stale
+completion cannot orphan transitional state. The module currently has no SDK,
+C ABI, CLI, Swift, AppKit, WKWebView, or HostPort integration. See
+[`canvas-domain.md`](canvas-domain.md) for the boundary intended for those
+later adapters.
+
 Native applications are intentionally asymmetric:
 
 | Host | Native UX and build ownership | Core artifact |
