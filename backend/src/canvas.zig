@@ -473,7 +473,12 @@ pub const CanvasDeclaration = struct {
     }
 };
 
-fn declarationInputBytes(input: CanvasDeclarationInput) !usize {
+fn declarationInputBytes(
+    input: CanvasDeclarationInput,
+    limits: Limits,
+) !usize {
+    if (input.actions.len > limits.max_actions_per_canvas)
+        return error.TooManyActions;
     var total = try addRegistryBytes(
         input.display_name.len,
         input.description.len,
@@ -1219,6 +1224,7 @@ pub const Domain = struct {
     ) !void {
         try self.beginOperation();
         defer self.endOperation();
+        try self.requireOperational();
         self.capability = capability;
     }
 
@@ -1996,7 +2002,7 @@ pub const Domain = struct {
         for (inputs) |input| {
             budget = try addRegistryBytes(
                 budget,
-                try declarationInputBytes(input),
+                try declarationInputBytes(input, self.limits),
             );
         }
         if (budget > self.limits.max_registry_bytes)
@@ -2037,7 +2043,7 @@ pub const Domain = struct {
             if (upsertsCanvasKey(delta.upserted[index + 1 ..], key)) continue;
             budget = try addRegistryBytes(
                 budget,
-                try declarationInputBytes(input),
+                try declarationInputBytes(input, self.limits),
             );
         }
         if (budget > self.limits.max_registry_bytes)
@@ -3194,6 +3200,22 @@ test "shutdown publication failure is retryable and success is idempotent" {
     try std.testing.expectEqual(RuntimeTag.closed, domain.runtimeTag(fixture_key).?);
 }
 
+test "capability cannot change after shutdown" {
+    var domain = try fixtureDomain(std.testing.allocator);
+    defer domain.deinit();
+    try domain.record(fixture_key, "Recorded review", null);
+    var publisher: TestPublisher = .{};
+    try domain.shutdown(publisher.publisher());
+
+    try std.testing.expectError(
+        error.Shutdown,
+        domain.setCapability(.unsupported),
+    );
+    var projection = try domain.resumeProjection(std.testing.allocator);
+    defer projection.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), projection.canvases.len);
+}
+
 test "resume projection is gated by authoritative capability state" {
     var domain = Domain.init(std.testing.allocator, .{});
     defer domain.deinit();
@@ -3444,6 +3466,53 @@ test "registry owned bytes are bounded before cloning or allocating" {
     try domain.applyRegistry(.{ .incremental = .{
         .upserted = &.{fixture_declaration},
     } });
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        domain.registry.entries.items.len,
+    );
+}
+
+test "registry action limits are checked before traversal or allocation" {
+    const one_action = [_]ActionDeclarationInput{.{
+        .name = "refresh",
+        .display_name = "Refresh",
+    }};
+    const oversized: CanvasDeclarationInput = .{
+        .extension_id = "fixture.extension",
+        .canvas_id = "review",
+        .display_name = "Review",
+        .actions = &one_action,
+    };
+    var no_storage: [0]u8 = .{};
+    var fixed = std.heap.FixedBufferAllocator.init(&no_storage);
+    var empty_domain = Domain.init(
+        fixed.allocator(),
+        .{ .max_actions_per_canvas = 0 },
+    );
+    defer empty_domain.deinit();
+    try std.testing.expectError(
+        error.TooManyActions,
+        empty_domain.applyRegistry(.{ .replacement = &.{oversized} }),
+    );
+
+    const empty: CanvasDeclarationInput = .{
+        .extension_id = "fixture.extension",
+        .canvas_id = "review",
+        .display_name = "Review",
+    };
+    var domain = Domain.init(
+        std.testing.allocator,
+        .{ .max_actions_per_canvas = 0 },
+    );
+    defer domain.deinit();
+    try domain.applyRegistry(.{ .replacement = &.{empty} });
+    const original_allocator = domain.allocator;
+    domain.allocator = fixed.allocator();
+    const result = domain.applyRegistry(.{ .incremental = .{
+        .upserted = &.{oversized},
+    } });
+    domain.allocator = original_allocator;
+    try std.testing.expectError(error.TooManyActions, result);
     try std.testing.expectEqual(
         @as(usize, 1),
         domain.registry.entries.items.len,
