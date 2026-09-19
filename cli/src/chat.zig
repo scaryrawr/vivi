@@ -5021,6 +5021,15 @@ const TerminalTitle = struct {
         self.current = replacement;
         return true;
     }
+
+    fn reset(self: *TerminalTitle, writer: *std.Io.Writer) !bool {
+        const current = self.current orelse return false;
+        try writer.writeAll("\x1b]2;vivi\x1b\\");
+        try writer.flush();
+        self.allocator.free(current);
+        self.current = null;
+        return true;
+    }
 };
 
 const App = struct {
@@ -5290,6 +5299,8 @@ const App = struct {
                     self.tty.writer(),
                     event.session_title.bytes,
                 );
+            } else if (event == .new_session and event.new_session == .started) {
+                _ = try self.terminal_title.reset(self.tty.writer());
             }
             if (stream_update and
                 self.ui.rows_from_tail == 0 and
@@ -5407,6 +5418,15 @@ test "terminal title emits exact OSC bytes only for canonical changes" {
             "\x1b]2;vivi — A new title\x1b\\",
         output.written(),
     );
+
+    try std.testing.expect(try title.reset(&output.writer));
+    try std.testing.expectEqualStrings(
+        "\x1b]2;vivi — What were the last 10 commits for?\x1b\\" ++
+            "\x1b]2;vivi — A new title\x1b\\" ++
+            "\x1b]2;vivi\x1b\\",
+        output.written(),
+    );
+    try std.testing.expect(!try title.reset(&output.writer));
 }
 
 test "terminal title rejects unsafe or absent updates without output" {
