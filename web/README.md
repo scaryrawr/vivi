@@ -1,9 +1,10 @@
 # Vivi web presentation
 
-Layer 1 of Vivi's presentation migration is a standalone React, TypeScript, and
-Vite workspace. It runs against a deterministic `MockViviHost`; it does not
-embed a `WKWebView`, add a script message handler, or change the shipping macOS
-window.
+Vivi's React, TypeScript, and Vite presentation runs against a deterministic
+`MockViviHost` for browser development. A separate native entry is packaged
+only inside the `SKIP_INSTALL` macOS `ViviWebHostTests.xctest` bundle. It does
+not change the shipping macOS window or place WebKit bridge code or web assets
+in `Vivi.app`.
 
 ## Prerequisites
 
@@ -25,6 +26,7 @@ pnpm lint
 pnpm format
 pnpm test
 pnpm build
+pnpm build:native
 pnpm storybook
 pnpm storybook:build
 pnpm storybook:smoke
@@ -37,19 +39,22 @@ pnpm check
 `src/host/contract.ts` defines the versioned presentation contract. It exposes
 one atomic application snapshot and three named commands: select a session,
 create a conversation in an existing project, and send a message. Transport is
-deliberately absent. The browser mock implements the same port as a future
-native adapter.
+implemented privately by `src/host/native.ts` for the test-only macOS host.
+The bridge uses one named `viviHostV1` handler, validates the closed V1 grammar
+at both ends, and preserves snapshot and connection object identity until a
+strictly newer complete snapshot arrives.
+HostPort V1 has no semantic-span fields; unexpected fields, including attempted
+span additions, are rejected instead of being treated as a compatible widening.
 
 Host state is authoritative for project and session order, selection,
 lifecycle, transcript content, and errors. React owns only drafts, project and
 transcript disclosure, and focus.
 
-Layer 2 must implement `ViviHostPort` in Swift, adapt the existing Zig/C ABI
-events into complete `HostSnapshot` values, validate protocol version 1,
-deduplicate `ClientSubmissionId`, preserve stable session and transcript IDs,
-publish monotonically newer snapshots, and bridge the three named commands.
-The transport framing and `WKScriptMessageHandler` payloads remain private to
-that adapter.
+The native proof uses a deterministic typed test adapter behind a narrow
+domain-facing Swift protocol. It deliberately does not duplicate or adapt
+production SDK/session state. A future production cutover can implement that
+protocol after the native domain exposes an appropriately narrow command and
+snapshot seam.
 
 ## Content security policy
 
