@@ -132,6 +132,11 @@ function closeSdk(lifecycle: Lifecycle): Promise<void> {
     lifecycle.closePromise = (async () => {
       lifecycle.closing = true;
       let firstError: Error | undefined;
+      if (lifecycle.startPromise) {
+        try {
+          await lifecycle.startPromise;
+        } catch {}
+      }
       if (lifecycle.sessionPromise) {
         try {
           await lifecycle.sessionPromise;

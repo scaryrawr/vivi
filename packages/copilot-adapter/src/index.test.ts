@@ -45,8 +45,10 @@ class FakeClient {
   readonly session = new FakeSession();
   readonly calls: string[] = [];
   stopErrors: Error[] = [];
+  startGate: Promise<void> | undefined;
   async start(): Promise<void> {
     this.calls.push("start");
+    if (this.startGate) await this.startGate;
   }
   async createSession(): Promise<FakeSession> {
     this.calls.push("createSession");
@@ -154,4 +156,23 @@ test("closes safely when startup and session creation are still pending", async 
   expect(events).toEqual([{ type: "response-failed", error: "Copilot port is closed" }]);
   expect(fakeClient.session.calls).toContain("disconnect");
   fakeClient.session.createGate = undefined;
+});
+
+test("waits for client startup before stopping during an early close", async () => {
+  let release!: () => void;
+  fakeClient.startGate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  fakeClient.calls.length = 0;
+  const port = createSdkCopilotPort({ workingDirectory: process.cwd() });
+  const response = port.respond("hello");
+  await Promise.resolve();
+  const close = port.close();
+  release();
+  await close;
+  const events = [];
+  for await (const event of response) events.push(event);
+  expect(fakeClient.calls).toEqual(["start", "stop"]);
+  expect(events).toEqual([{ type: "response-failed", error: "Copilot port is closed" }]);
+  fakeClient.startGate = undefined;
 });
