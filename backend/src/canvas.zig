@@ -1154,6 +1154,8 @@ pub const Domain = struct {
             .closing => return error.CanvasClosing,
             .closed, .opening, .unavailable => {},
         };
+        if (request.input) |value|
+            try value.validate(self.allocator, self.limits);
         const replaced_pending = if (existing_index) |index|
             instancePendingCount(&self.instances.items[index])
         else
@@ -1170,10 +1172,19 @@ pub const Domain = struct {
         else
             try Instance.init(request.key, self.limits);
         errdefer candidate.deinit(self.allocator);
+        const reclaimed_index = if (existing_index == null and
+            self.instances.items.len >= self.limits.max_instances)
+            self.findReclaimableInstance()
+        else
+            null;
         if (existing_index == null) {
-            if (self.instances.items.len >= self.limits.max_instances)
+            if (self.instances.items.len >= self.limits.max_instances and
+                reclaimed_index == null)
+            {
                 return error.TooManyInstances;
-            try self.instances.ensureUnusedCapacity(self.allocator, 1);
+            }
+            if (reclaimed_index == null)
+                try self.instances.ensureUnusedCapacity(self.allocator, 1);
         }
 
         var effects: std.ArrayList(EffectView) = .empty;
@@ -1181,7 +1192,7 @@ pub const Domain = struct {
         try self.appendCancellationEffects(&candidate, &effects);
         candidate.clearActions(self.allocator);
         var input = if (request.input) |value|
-            try value.clone(self.allocator, self.limits)
+            try value.cloneValidated(self.allocator)
         else
             null;
         errdefer if (input) |*value| value.deinit(self.allocator);
@@ -1202,7 +1213,7 @@ pub const Domain = struct {
 
         try publisher.publishAtomic(effects.items);
         self.commitOpenToken();
-        if (existing_index) |index| {
+        if (existing_index orelse reclaimed_index) |index| {
             self.instances.items[index].deinit(self.allocator);
             self.instances.items[index] = candidate;
         } else {
@@ -1426,15 +1437,18 @@ pub const Domain = struct {
     ) !CompletionDisposition {
         const location = self.findToken(token) orelse return .ignored_stale;
         if (location.kind != .action) return .ignored_stale;
+        switch (outcome) {
+            .succeeded => |result| try result.validate(
+                self.allocator,
+                self.limits,
+            ),
+            .failed => {},
+        }
         var candidate = try self.instances.items[location.instance_index]
             .clone(self.allocator, self.limits);
         errdefer candidate.deinit(self.allocator);
         switch (outcome) {
-            .succeeded => |result| {
-                var checked = try result.clone(self.allocator, self.limits);
-                checked.deinit(self.allocator);
-                candidate.degradation = null;
-            },
+            .succeeded => candidate.degradation = null,
             .failed => candidate.degradation = .host_failure,
         }
         var removed = candidate.pending_actions.orderedRemove(
@@ -1453,14 +1467,27 @@ pub const Domain = struct {
     ) !void {
         try self.requireOperational();
         const index = self.findInstance(key) orelse {
-            if (self.instances.items.len >= self.limits.max_instances)
+            const reclaimed_index = if (self.instances.items.len >=
+                self.limits.max_instances)
+                self.findReclaimableInstance()
+            else
+                null;
+            if (self.instances.items.len >= self.limits.max_instances and
+                reclaimed_index == null)
+            {
                 return error.TooManyInstances;
+            }
             var instance = try Instance.init(key, self.limits);
             errdefer instance.deinit(self.allocator);
-            try self.instances.ensureUnusedCapacity(self.allocator, 1);
             instance.runtime = .unavailable;
             instance.degradation = .declaration_removed;
-            self.instances.appendAssumeCapacity(instance);
+            if (reclaimed_index) |reclaimed| {
+                self.instances.items[reclaimed].deinit(self.allocator);
+                self.instances.items[reclaimed] = instance;
+            } else {
+                try self.instances.ensureUnusedCapacity(self.allocator, 1);
+                self.instances.appendAssumeCapacity(instance);
+            }
             return;
         };
         var candidate = try self.instances.items[index].clone(
@@ -1487,18 +1514,31 @@ pub const Domain = struct {
     ) !void {
         try self.requireOperational();
         const index = self.findInstance(key) orelse {
-            if (self.instances.items.len >= self.limits.max_instances)
+            const reclaimed_index = if (self.instances.items.len >=
+                self.limits.max_instances)
+                self.findReclaimableInstance()
+            else
+                null;
+            if (self.instances.items.len >= self.limits.max_instances and
+                reclaimed_index == null)
+            {
                 return error.TooManyInstances;
+            }
             var instance = try Instance.init(key, self.limits);
             errdefer instance.deinit(self.allocator);
-            try self.instances.ensureUnusedCapacity(self.allocator, 1);
             instance.record = .{ .recorded = try RecordedState.init(
                 self.allocator,
                 title,
                 input,
                 self.limits,
             ) };
-            self.instances.appendAssumeCapacity(instance);
+            if (reclaimed_index) |reclaimed| {
+                self.instances.items[reclaimed].deinit(self.allocator);
+                self.instances.items[reclaimed] = instance;
+            } else {
+                try self.instances.ensureUnusedCapacity(self.allocator, 1);
+                self.instances.appendAssumeCapacity(instance);
+            }
             return;
         };
         var candidate = try self.instances.items[index].clone(
@@ -1684,6 +1724,21 @@ pub const Domain = struct {
     fn findInstance(self: Domain, key: KeyView) ?usize {
         for (self.instances.items, 0..) |*instance, index| {
             if (instance.key.eqlView(key)) return index;
+        }
+        return null;
+    }
+
+    fn findReclaimableInstance(self: Domain) ?usize {
+        for (self.instances.items, 0..) |instance, index| {
+            if (instance.record.tag() != .removed or
+                instance.pending_actions.items.len != 0)
+            {
+                continue;
+            }
+            switch (instance.runtime) {
+                .closed, .unavailable => return index,
+                .opening, .opened, .closing => {},
+            }
         }
         return null;
     }
@@ -2157,6 +2212,69 @@ test "open rejects live instances instead of discarding renderer state" {
     );
     try std.testing.expectEqual(RuntimeTag.closing, domain.runtimeTag(fixture_key).?);
     try std.testing.expect(domain.hasPendingToken(close));
+}
+
+test "instance capacity reclaims stable unrecorded entries" {
+    var domain = Domain.init(
+        std.testing.allocator,
+        .{ .max_instances = 1 },
+    );
+    defer domain.deinit();
+    domain.setCapability(.supported);
+    try domain.applyRegistry(.{
+        .replacement = &.{fixture_declaration},
+    });
+    var publisher: TestPublisher = .{};
+    const first_key = fixture_key;
+    const second_key = KeyView{
+        .extension_id = "fixture.extension",
+        .canvas_id = "review",
+        .instance_id = "second",
+    };
+    const third_key = KeyView{
+        .extension_id = "fixture.extension",
+        .canvas_id = "review",
+        .instance_id = "third",
+    };
+    const fourth_key = KeyView{
+        .extension_id = "fixture.extension",
+        .canvas_id = "review",
+        .instance_id = "fourth",
+    };
+
+    const first = try domain.open(
+        .{ .key = first_key },
+        publisher.publisher(),
+    );
+    _ = try domain.cancel(first, publisher.publisher());
+    const second = try domain.open(
+        .{ .key = second_key },
+        publisher.publisher(),
+    );
+    try std.testing.expect(domain.runtimeTag(first_key) == null);
+    _ = try domain.cancel(second, publisher.publisher());
+
+    try domain.record(third_key, "Recorded", null);
+    try std.testing.expect(domain.runtimeTag(second_key) == null);
+    try domain.removeRecord(third_key);
+    try domain.markUnavailable(fourth_key, publisher.publisher());
+    try std.testing.expect(domain.runtimeTag(third_key) == null);
+    try std.testing.expectEqual(
+        RuntimeTag.unavailable,
+        domain.runtimeTag(fourth_key).?,
+    );
+
+    _ = try domain.open(
+        .{
+            .key = .{
+                .extension_id = "fixture.extension",
+                .canvas_id = "review",
+                .instance_id = "fifth",
+            },
+        },
+        publisher.publisher(),
+    );
+    try std.testing.expect(domain.runtimeTag(fourth_key) == null);
 }
 
 test "operation boundaries revalidate mutable document storage" {

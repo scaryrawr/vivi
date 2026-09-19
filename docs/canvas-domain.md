@@ -96,6 +96,11 @@ no separate pending-token store that can drift away from lifecycle state.
 Completions match the full token: operation ID, instance generation, and
 operation kind. Missing or mismatched tokens are stale no-ops.
 
+The instance bound applies to active or recorded state, not every key ever
+observed. When capacity is full, a new key may transactionally replace the
+oldest stable unrecorded `closed` or `unavailable` entry; live and recorded
+instances are never evicted.
+
 Cancellation publishes the cancellation effect before committing a stable
 state:
 
