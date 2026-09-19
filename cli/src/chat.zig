@@ -3716,7 +3716,6 @@ const ChatUi = struct {
                         self.commands = replacement_commands;
                         if (self.sessions) |*current| current.deinit();
                         self.sessions = null;
-                        self.deinitTranscriptSpool();
                         self.clearToolFocus();
                         self.tool_anchor = null;
                         try self.closeFilePicker();
@@ -6532,10 +6531,22 @@ test "resuming replaces the visible transcript with the owned history snapshot" 
 }
 
 test "new session replaces transcript and commands while preserving cwd" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try temporary.dir.realPath(
+        std.testing.io,
+        &path_buffer,
+    );
     var ui: ChatUi = .{
         .allocator = std.testing.allocator,
         .io = std.testing.io,
         .input = TextInput.init(std.testing.allocator),
+        .transcript_spool = try TranscriptSpool.init(
+            std.testing.allocator,
+            std.testing.io,
+            path_buffer[0..path_len],
+        ),
         .cwd = try std.testing.allocator.dupe(u8, "/current"),
         .phase = .starting_new_session,
         .rows_from_tail = 3,
@@ -6569,6 +6580,14 @@ test "new session replaces transcript and commands while preserving cwd" {
     try std.testing.expectEqualStrings("", input);
     try std.testing.expectEqualStrings("new", ui.commands.?.commands[0].name);
     try std.testing.expectEqual(@as(usize, 0), ui.rows_from_tail);
+    const spool = if (ui.transcript_spool) |*value|
+        value
+    else
+        return error.MissingTranscriptSpool;
+    const page = try spool.write("fresh transcript");
+    const restored = try spool.read(std.testing.allocator, page);
+    defer std.testing.allocator.free(restored);
+    try std.testing.expectEqualStrings("fresh transcript", restored);
 }
 
 test "new session failure keeps command retry available" {

@@ -1528,6 +1528,179 @@ const ResumeTargets = struct {
     }
 };
 
+fn ReplacementPair(comptime Session: type, comptime Service: type) type {
+    return struct {
+        session: Session,
+        service: Service,
+    };
+}
+
+fn commitPreparedReplacement(
+    comptime Session: type,
+    comptime Service: type,
+    allocator: std.mem.Allocator,
+    session: *Session,
+    service: *Service,
+    resume_targets: *?ResumeTargets,
+    resume_generation: *u64,
+    prepared: anyerror!ReplacementPair(Session, Service),
+) !bool {
+    const candidate = try prepared;
+    var previous = ReplacementPair(Session, Service){
+        .session = session.*,
+        .service = service.*,
+    };
+    session.* = candidate.session;
+    service.* = candidate.service;
+    if (resume_targets.*) |*targets| targets.deinit(allocator);
+    resume_targets.* = null;
+    resume_generation.* = 0;
+    const cleanup_failed = if (previous.session.disconnect())
+        false
+    else |_|
+        true;
+    previous.service.deinit();
+    return cleanup_failed;
+}
+
+test "session replacement commits ownership only after preparation succeeds" {
+    const FakeSession = struct {
+        id: u8,
+        disconnected: *bool,
+
+        fn disconnect(self: @This()) !void {
+            self.disconnected.* = true;
+        }
+    };
+    const FakeService = struct {
+        id: u8,
+        deinitialized: *bool,
+
+        fn deinit(self: *@This()) void {
+            self.deinitialized.* = true;
+        }
+    };
+
+    var old_disconnected = false;
+    var old_service_deinitialized = false;
+    var candidate_disconnected = false;
+    var candidate_service_deinitialized = false;
+    var session = FakeSession{
+        .id = 1,
+        .disconnected = &old_disconnected,
+    };
+    var service = FakeService{
+        .id = 2,
+        .deinitialized = &old_service_deinitialized,
+    };
+    var resume_targets: ?ResumeTargets = .{
+        .generation = 9,
+        .targets = try std.testing.allocator.alloc(ResumeTarget, 0),
+    };
+    defer if (resume_targets) |*targets| targets.deinit(std.testing.allocator);
+    var resume_generation: u64 = 9;
+
+    try std.testing.expectError(
+        error.PreparationFailed,
+        commitPreparedReplacement(
+            FakeSession,
+            FakeService,
+            std.testing.allocator,
+            &session,
+            &service,
+            &resume_targets,
+            &resume_generation,
+            error.PreparationFailed,
+        ),
+    );
+    try std.testing.expectEqual(@as(u8, 1), session.id);
+    try std.testing.expectEqual(@as(u8, 2), service.id);
+    try std.testing.expect(resume_targets != null);
+    try std.testing.expectEqual(@as(u64, 9), resume_generation);
+    try std.testing.expect(!old_disconnected);
+    try std.testing.expect(!old_service_deinitialized);
+
+    const cleanup_failed = try commitPreparedReplacement(
+        FakeSession,
+        FakeService,
+        std.testing.allocator,
+        &session,
+        &service,
+        &resume_targets,
+        &resume_generation,
+        .{
+            .session = .{
+                .id = 3,
+                .disconnected = &candidate_disconnected,
+            },
+            .service = .{
+                .id = 4,
+                .deinitialized = &candidate_service_deinitialized,
+            },
+        },
+    );
+    try std.testing.expect(!cleanup_failed);
+    try std.testing.expectEqual(@as(u8, 3), session.id);
+    try std.testing.expectEqual(@as(u8, 4), service.id);
+    try std.testing.expectEqual(null, resume_targets);
+    try std.testing.expectEqual(@as(u64, 0), resume_generation);
+    try std.testing.expect(old_disconnected);
+    try std.testing.expect(old_service_deinitialized);
+    try std.testing.expect(!candidate_disconnected);
+    try std.testing.expect(!candidate_service_deinitialized);
+}
+
+test "session replacement reports previous cleanup failure after committing" {
+    const FakeSession = struct {
+        disconnected: *bool,
+
+        fn disconnect(self: @This()) !void {
+            self.disconnected.* = true;
+            return error.DisconnectFailed;
+        }
+    };
+    const FakeService = struct {
+        deinitialized: *bool,
+
+        fn deinit(self: *@This()) void {
+            self.deinitialized.* = true;
+        }
+    };
+
+    var old_disconnected = false;
+    var old_service_deinitialized = false;
+    var candidate_disconnected = false;
+    var candidate_service_deinitialized = false;
+    var session = FakeSession{ .disconnected = &old_disconnected };
+    var service = FakeService{ .deinitialized = &old_service_deinitialized };
+    var resume_targets: ?ResumeTargets = null;
+    var resume_generation: u64 = 0;
+
+    const cleanup_failed = try commitPreparedReplacement(
+        FakeSession,
+        FakeService,
+        std.testing.allocator,
+        &session,
+        &service,
+        &resume_targets,
+        &resume_generation,
+        .{
+            .session = .{ .disconnected = &candidate_disconnected },
+            .service = .{ .deinitialized = &candidate_service_deinitialized },
+        },
+    );
+    try std.testing.expect(cleanup_failed);
+    try std.testing.expect(old_disconnected);
+    try std.testing.expect(old_service_deinitialized);
+    try std.testing.expectEqual(&candidate_disconnected, session.disconnected);
+    try std.testing.expectEqual(
+        &candidate_service_deinitialized,
+        service.deinitialized,
+    );
+    try std.testing.expect(!candidate_disconnected);
+    try std.testing.expect(!candidate_service_deinitialized);
+}
+
 fn buildSessionCatalog(
     allocator: std.mem.Allocator,
     client: *copilot.Client,
@@ -2707,20 +2880,21 @@ fn runSdkConversation(
                     continue;
                 };
 
-                const previous_session = session;
-                var previous_tools = tool_service;
                 session_connected = false;
-                session = candidate;
-                tool_service = candidate_tools;
+                const cleanup_failed = commitPreparedReplacement(
+                    copilot.Session,
+                    tools.Service,
+                    worker.allocator(),
+                    &session,
+                    &tool_service,
+                    &resume_targets,
+                    &resume_generation,
+                    .{
+                        .session = candidate,
+                        .service = candidate_tools,
+                    },
+                ) catch unreachable;
                 session_connected = true;
-                if (resume_targets) |*targets| targets.deinit(worker.allocator());
-                resume_targets = null;
-                resume_generation = 0;
-                const cleanup_failed = if (previous_session.disconnect())
-                    false
-                else |_|
-                    true;
-                previous_tools.deinit();
                 worker.completeNewSession(.{ .started = .{
                     .commands = candidate_commands,
                     .cleanup_failed = cleanup_failed,
