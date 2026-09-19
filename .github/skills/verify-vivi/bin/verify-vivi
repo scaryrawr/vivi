@@ -79,7 +79,11 @@ validate_model_id() {
 }
 
 hosted_validation_model() {
-    model=${VIVI_VALIDATION_MODEL:-$default_validation_model}
+    if test "${VIVI_VALIDATION_MODEL+x}" = x; then
+        model=$VIVI_VALIDATION_MODEL
+    else
+        model=$default_validation_model
+    fi
     validate_model_id VIVI_VALIDATION_MODEL "$model"
     case "$model" in
         copilot/*) ;;
