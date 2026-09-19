@@ -227,6 +227,7 @@ fn validateJson(
             .partial_string_escaped_2,
             .partial_string_escaped_3,
             .partial_string_escaped_4,
+            => {},
             .allocated_number,
             .allocated_string,
             => return error.InvalidJson,
@@ -1905,6 +1906,12 @@ test "bounded identities and role documents validate their own shapes" {
         .{},
     );
     defer input.deinit(std.testing.allocator);
+    var escaped = try OpenInputDocument.init(
+        std.testing.allocator,
+        "{\"label\":\"line\\nvalue\"}",
+        .{},
+    );
+    defer escaped.deinit(std.testing.allocator);
     try std.testing.expectError(
         error.InvalidInputDocument,
         ActionInputDocument.init(std.testing.allocator, "\"raw\"", .{}),
