@@ -115,13 +115,14 @@ Hosts cannot retain mutable pointers into the domain.
 Recording state is independent of runtime state. `resumeProjection` includes
 only recorded identity, title, and open input. It excludes runtime tokens,
 generations, location, status, pending actions, and other process-local facts.
-Unknown capability produces an omitted projection; known support with no
-recorded canvases produces an explicit empty list.
+The domain's own capability state is the single authority: unknown or
+unsupported capability produces an omitted projection, while supported
+capability with no recorded canvases produces an explicit empty list.
 
 Shutdown uses the same transaction rule as other cancellations. A publication
 failure leaves every pending operation live and makes shutdown retryable. A
-successful shutdown stabilizes all instances, clears pending actions, and is
-idempotent.
+successful shutdown publishes explicit teardown effects for opened renderers,
+stabilizes all instances, clears pending actions, and is idempotent.
 
 ## Later adapters
 

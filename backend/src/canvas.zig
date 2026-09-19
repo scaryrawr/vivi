@@ -581,6 +581,7 @@ pub const EffectView = union(enum) {
         input_json: ?[]const u8,
     },
     cancel: OperationToken,
+    teardown: KeyView,
 };
 
 pub const PublishError = error{
@@ -1502,21 +1503,18 @@ pub const Domain = struct {
         defer effects.deinit(self.allocator);
         for (self.instances.items) |*instance| {
             try self.appendCancellationEffects(instance, &effects);
+            switch (instance.runtime) {
+                .opened, .closing => try effects.append(
+                    self.allocator,
+                    .{ .teardown = instance.key.view() },
+                ),
+                .closed, .opening, .unavailable => {},
+            }
         }
         if (effects.items.len > 0) try publisher.publishAtomic(effects.items);
         for (self.instances.items) |*instance| {
             instance.clearActions(self.allocator);
-            switch (instance.runtime) {
-                .closing => {
-                    const closing = instance.runtime.closing;
-                    instance.runtime = .closed;
-                    instance.replaceRuntime(
-                        self.allocator,
-                        .{ .opened = closing.prior },
-                    );
-                },
-                else => instance.replaceRuntime(self.allocator, .closed),
-            }
+            instance.replaceRuntime(self.allocator, .closed);
         }
         self.shutdown_requested = true;
     }
@@ -1562,9 +1560,8 @@ pub const Domain = struct {
     pub fn resumeProjection(
         self: *const Domain,
         allocator: std.mem.Allocator,
-        capability_known: bool,
     ) !ResumeProjection {
-        if (!capability_known) return .omitted;
+        if (self.capability != .supported) return .omitted;
         var count: usize = 0;
         for (self.instances.items) |instance| {
             if (instance.record.tag() == .recorded) count += 1;
@@ -1830,7 +1827,9 @@ const TestPublisher = struct {
     fail: bool = false,
     calls: usize = 0,
     effect_count: usize = 0,
+    token_count: usize = 0,
     tokens: [8]OperationToken = undefined,
+    tags: [8]std.meta.Tag(EffectView) = undefined,
 
     fn publisher(self: *TestPublisher) EffectPublisher {
         return .{
@@ -1847,13 +1846,28 @@ const TestPublisher = struct {
         self.calls += 1;
         if (self.fail) return error.EffectRejected;
         self.effect_count = effects.len;
+        self.token_count = 0;
         for (effects, 0..) |effect, index| {
-            self.tokens[index] = switch (effect) {
-                .start_open => |value| value.token,
-                .start_close => |value| value.token,
-                .invoke_action => |value| value.token,
-                .cancel => |value| value,
-            };
+            self.tags[index] = std.meta.activeTag(effect);
+            switch (effect) {
+                .start_open => |value| {
+                    self.tokens[self.token_count] = value.token;
+                    self.token_count += 1;
+                },
+                .start_close => |value| {
+                    self.tokens[self.token_count] = value.token;
+                    self.token_count += 1;
+                },
+                .invoke_action => |value| {
+                    self.tokens[self.token_count] = value.token;
+                    self.token_count += 1;
+                },
+                .cancel => |value| {
+                    self.tokens[self.token_count] = value;
+                    self.token_count += 1;
+                },
+                .teardown => {},
+            }
         }
     }
 };
@@ -2362,10 +2376,7 @@ test "recording and resume projection exclude transient runtime metadata" {
     );
     defer input.deinit(std.testing.allocator);
     try domain.record(fixture_key, "Recorded review", &input);
-    var projection = try domain.resumeProjection(
-        std.testing.allocator,
-        true,
-    );
+    var projection = try domain.resumeProjection(std.testing.allocator);
     defer projection.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), projection.canvases.len);
     try std.testing.expectEqualStrings(
@@ -2404,7 +2415,7 @@ fn projectionAllocationLifecycle(allocator: std.mem.Allocator) !void {
 
     var snapshot = try domain.snapshot(allocator);
     defer snapshot.deinit(allocator);
-    var projection = try domain.resumeProjection(allocator, true);
+    var projection = try domain.resumeProjection(allocator);
     defer projection.deinit(allocator);
 }
 
@@ -2434,8 +2445,126 @@ test "shutdown publication failure is retryable and success is idempotent" {
 
     publisher.fail = false;
     try domain.shutdown(publisher.publisher());
+    const calls_after_success = publisher.calls;
     try domain.shutdown(publisher.publisher());
     try std.testing.expect(domain.shutdown_requested);
+    try std.testing.expectEqual(calls_after_success, publisher.calls);
     try std.testing.expectEqual(@as(usize, 0), domain.pendingCount());
     try std.testing.expectEqual(RuntimeTag.closed, domain.runtimeTag(fixture_key).?);
+}
+
+test "resume projection is gated by authoritative capability state" {
+    var domain = Domain.init(std.testing.allocator, .{});
+    defer domain.deinit();
+    try domain.record(fixture_key, "Recorded review", null);
+
+    var unknown = try domain.resumeProjection(std.testing.allocator);
+    defer unknown.deinit(std.testing.allocator);
+    try std.testing.expect(std.meta.activeTag(unknown) == .omitted);
+
+    domain.setCapability(.unsupported);
+    var unsupported = try domain.resumeProjection(std.testing.allocator);
+    defer unsupported.deinit(std.testing.allocator);
+    try std.testing.expect(std.meta.activeTag(unsupported) == .omitted);
+
+    domain.setCapability(.supported);
+    var supported = try domain.resumeProjection(std.testing.allocator);
+    defer supported.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), supported.canvases.len);
+}
+
+test "shutdown publishes teardown before forgetting an opened renderer" {
+    var domain = try fixtureDomain(std.testing.allocator);
+    defer domain.deinit();
+    var publisher: TestPublisher = .{};
+    const token = try domain.open(
+        .{ .key = fixture_key },
+        publisher.publisher(),
+    );
+    _ = try domain.completeOpen(token, .{ .succeeded = .{} });
+
+    try domain.shutdown(publisher.publisher());
+    try std.testing.expectEqual(@as(usize, 1), publisher.effect_count);
+    try std.testing.expectEqual(
+        std.meta.Tag(EffectView).teardown,
+        publisher.tags[0],
+    );
+    try std.testing.expectEqual(RuntimeTag.closed, domain.runtimeTag(fixture_key).?);
+}
+
+test "shutdown cancels an in-flight close and tears down its live renderer" {
+    var domain = try fixtureDomain(std.testing.allocator);
+    defer domain.deinit();
+    var publisher: TestPublisher = .{};
+    const open_token = try domain.open(
+        .{ .key = fixture_key },
+        publisher.publisher(),
+    );
+    _ = try domain.completeOpen(open_token, .{ .succeeded = .{} });
+    const close_token = try domain.close(
+        .{ .key = fixture_key },
+        publisher.publisher(),
+    );
+
+    try domain.shutdown(publisher.publisher());
+    try std.testing.expectEqual(@as(usize, 2), publisher.effect_count);
+    try std.testing.expectEqual(
+        std.meta.Tag(EffectView).cancel,
+        publisher.tags[0],
+    );
+    try std.testing.expectEqual(
+        std.meta.Tag(EffectView).teardown,
+        publisher.tags[1],
+    );
+    try std.testing.expectEqual(close_token, publisher.tokens[0]);
+    try std.testing.expectEqual(@as(usize, 0), domain.pendingCount());
+    try std.testing.expectEqual(RuntimeTag.closed, domain.runtimeTag(fixture_key).?);
+}
+
+test "shutdown publication failure preserves opened and closing renderers" {
+    var opened_domain = try fixtureDomain(std.testing.allocator);
+    defer opened_domain.deinit();
+    var publisher: TestPublisher = .{};
+    const opened_token = try opened_domain.open(
+        .{ .key = fixture_key },
+        publisher.publisher(),
+    );
+    _ = try opened_domain.completeOpen(opened_token, .{ .succeeded = .{} });
+    publisher.fail = true;
+    try std.testing.expectError(
+        error.EffectRejected,
+        opened_domain.shutdown(publisher.publisher()),
+    );
+    try std.testing.expectEqual(
+        RuntimeTag.opened,
+        opened_domain.runtimeTag(fixture_key).?,
+    );
+    try std.testing.expect(!opened_domain.shutdown_requested);
+
+    var closing_domain = try fixtureDomain(std.testing.allocator);
+    defer closing_domain.deinit();
+    publisher = .{};
+    const closing_open_token = try closing_domain.open(
+        .{ .key = fixture_key },
+        publisher.publisher(),
+    );
+    _ = try closing_domain.completeOpen(
+        closing_open_token,
+        .{ .succeeded = .{} },
+    );
+    const close_token = try closing_domain.close(
+        .{ .key = fixture_key },
+        publisher.publisher(),
+    );
+    publisher.fail = true;
+    try std.testing.expectError(
+        error.EffectRejected,
+        closing_domain.shutdown(publisher.publisher()),
+    );
+    try std.testing.expectEqual(
+        RuntimeTag.closing,
+        closing_domain.runtimeTag(fixture_key).?,
+    );
+    try std.testing.expect(closing_domain.hasPendingToken(close_token));
+    try std.testing.expect(!closing_domain.shutdown_requested);
 }
