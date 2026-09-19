@@ -1304,7 +1304,9 @@ pub const Worker = struct {
             .sequence = self.takeEventSequenceLocked(),
             .event = .{ .command_completed = owned_result },
         };
-        if (!self.core.stop_requested) self.core.state = .idle;
+        if (!self.core.stop_requested and self.core.commands.items.len == 0) {
+            self.core.state = .idle;
+        }
         const should_wake = !self.core.wake_pending;
         self.core.wake_pending = true;
         self.core.mutex.unlock(self.core.io);
@@ -1830,6 +1832,60 @@ test "admitted commands publish one chronological terminal outcome" {
     }
     try std.testing.expectEqual(@as(usize, 2), terminal_count);
     handle.requestStop();
+}
+
+test "command terminal preserves newer queued operation state" {
+    const Harness = struct {
+        fn run(_: *Worker) void {}
+
+        fn notify(_: *anyopaque) void {}
+    };
+
+    var wake_context: u8 = 0;
+    var core: Core = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .wake = .{
+            .context = &wake_context,
+            .notify = Harness.notify,
+        },
+        .runner = .{ .plain = Harness.run },
+        .state = .idle,
+        .command_registry = command_domain.Registry.init(std.testing.allocator),
+    };
+    defer {
+        for (core.commands.items) |*command| command.deinit();
+        core.commands.deinit(std.testing.allocator);
+        for (core.events.items) |*event| event.event.deinit();
+        core.events.deinit(std.testing.allocator);
+        if (core.command_terminal) |*terminal| terminal.event.deinit();
+        if (core.close_event) |*close_event| close_event.event.deinit();
+        core.command_registry.deinit();
+    }
+    var worker: Worker = .{ .core = &core };
+    var handle: Conversation = .{ .core = &core };
+
+    try worker.commandCatalog(&.{.{
+        .name = "agent",
+        .display_name = "Agent",
+        .description = "Runs an agent prompt",
+        .source = .sdk_builtin,
+        .argument_policy = .none,
+    }});
+    const key = core.command_registry.catalog.?.commands[3].key;
+    try handle.executeCommand(key, "");
+    var admitted = worker.tryTakeCommand().?;
+    defer admitted.deinit();
+    try std.testing.expect(admitted == .execute_command);
+
+    try worker.idle();
+    try handle.submit(.{ .text = "newer prompt" }, .enqueue);
+    try std.testing.expectEqual(State.streaming, core.state);
+
+    try worker.commandCompleted(key, "old command completed");
+    try std.testing.expectEqual(State.streaming, core.state);
+    try std.testing.expectEqual(@as(usize, 1), core.commands.items.len);
+    try std.testing.expect(core.commands.items[0] == .prompt);
 }
 
 test "command catalog replacement failure releases mutex for failure completion" {
