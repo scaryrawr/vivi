@@ -737,6 +737,23 @@ const CommandCompletionGuard = struct {
     }
 };
 
+fn reportNewSessionSetupFailure(
+    worker: *conversation.Worker,
+    completion: *?CommandCompletionGuard,
+    message: []const u8,
+) !void {
+    if (completion.*) |*guard| {
+        try guard.fail(message);
+        return;
+    }
+    try worker.completeNewSession(.{
+        .failed = try conversation.OwnedText.init(
+            worker.allocator(),
+            message,
+        ),
+    });
+}
+
 test "command completion guard preserves terminal-before-close ordering" {
     const Script = struct {
         fn run(worker: *conversation.Worker) void {
@@ -813,6 +830,108 @@ test "command completion guard preserves terminal-before-close ordering" {
         } else try std.testing.io.sleep(.fromMilliseconds(1), .awake);
     }
     try std.testing.expectEqual(@as(usize, 1), terminal_count);
+}
+
+test "typed new session setup failure publishes one failure outcome" {
+    const Script = struct {
+        fn run(worker: *conversation.Worker) void {
+            if (!(worker.ready() catch return)) return;
+            worker.commandCatalog(&.{}) catch return;
+            var command = worker.waitCommand();
+            defer command.deinit();
+            switch (command) {
+                .start_new_session => |key| {
+                    var completion: ?CommandCompletionGuard =
+                        if (key) |command_key|
+                            .{ .worker = worker, .key = command_key }
+                        else
+                            null;
+                    defer if (completion) |*guard| guard.ensure();
+                    reportNewSessionSetupFailure(
+                        worker,
+                        &completion,
+                        "representative setup failure",
+                    ) catch {
+                        worker.closeFailure(
+                            .stream,
+                            "Unable to report new session failure.",
+                        );
+                        return;
+                    };
+                },
+                else => {
+                    worker.closeFailure(.stream, "Unexpected command.");
+                    return;
+                },
+            }
+            var stop = worker.waitCommand();
+            stop.deinit();
+            worker.closeRequested();
+        }
+    };
+    const TestWake = struct {
+        fn notify(_: *anyopaque) void {}
+    };
+    var context: u8 = 0;
+    var handle = try conversation.openWithRunner(
+        std.testing.allocator,
+        std.testing.io,
+        .{ .context = &context, .notify = TestWake.notify },
+        Script.run,
+    );
+    defer handle.deinit();
+
+    var key: ?conversation.CommandKey = null;
+    while (key == null) {
+        if (try handle.tryTakeEvent()) |event_value| {
+            var event = event_value;
+            defer event.deinit();
+            if (event == .command_catalog) {
+                for (event.command_catalog.commands) |catalog_command| {
+                    if (catalog_command.action == .start_new_session) {
+                        key = catalog_command.key;
+                        break;
+                    }
+                }
+            }
+        } else try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try handle.executeCommand(key.?, "");
+
+    var new_session_failure_count: usize = 0;
+    var command_failure_count: usize = 0;
+    var stop_requested = false;
+    var closed_seen = false;
+    while (!closed_seen) {
+        if (try handle.tryTakeEvent()) |event_value| {
+            var event = event_value;
+            defer event.deinit();
+            switch (event) {
+                .new_session => |result| switch (result) {
+                    .failed => new_session_failure_count += 1,
+                    .started => return error.ExpectedNewSessionFailure,
+                },
+                .command_completed => |result| switch (result) {
+                    .failed => |outcome| {
+                        command_failure_count += 1;
+                        try std.testing.expectEqualStrings(
+                            "representative setup failure",
+                            outcome.message.?.bytes,
+                        );
+                        if (!stop_requested) {
+                            handle.requestStop();
+                            stop_requested = true;
+                        }
+                    },
+                    .completed => return error.ExpectedCommandFailure,
+                },
+                .closed => closed_seen = true,
+                else => {},
+            }
+        } else try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectEqual(@as(usize, 0), new_session_failure_count);
+    try std.testing.expectEqual(@as(usize, 1), command_failure_count);
 }
 
 fn executeSdkCommand(
@@ -3037,15 +3156,11 @@ fn runSdkConversation(
                     worker.io(),
                     active_working_directory,
                 ) catch |err| {
-                    worker.completeNewSession(.{
-                        .failed = conversation.OwnedText.init(
-                            worker.allocator(),
-                            @errorName(err),
-                        ) catch {
-                            worker.closeFailure(.stream, @errorName(err));
-                            return;
-                        },
-                    }) catch {
+                    reportNewSessionSetupFailure(
+                        worker,
+                        &completion,
+                        @errorName(err),
+                    ) catch {
                         worker.closeFailure(.stream, "Unable to report new session failure.");
                         return;
                     };
@@ -3070,15 +3185,11 @@ fn runSdkConversation(
                     context.omlx_api_key,
                 ) catch |err| {
                     candidate_tools.deinit();
-                    worker.completeNewSession(.{
-                        .failed = conversation.OwnedText.init(
-                            worker.allocator(),
-                            @errorName(err),
-                        ) catch {
-                            worker.closeFailure(.stream, @errorName(err));
-                            return;
-                        },
-                    }) catch {
+                    reportNewSessionSetupFailure(
+                        worker,
+                        &completion,
+                        @errorName(err),
+                    ) catch {
                         worker.closeFailure(.stream, "Unable to report new session failure.");
                         return;
                     };
@@ -3093,15 +3204,11 @@ fn runSdkConversation(
                 ) catch |err| {
                     candidate.disconnect() catch {};
                     candidate_tools.deinit();
-                    worker.completeNewSession(.{
-                        .failed = conversation.OwnedText.init(
-                            worker.allocator(),
-                            @errorName(err),
-                        ) catch {
-                            worker.closeFailure(.stream, @errorName(err));
-                            return;
-                        },
-                    }) catch {
+                    reportNewSessionSetupFailure(
+                        worker,
+                        &completion,
+                        @errorName(err),
+                    ) catch {
                         worker.closeFailure(.stream, "Unable to report new session failure.");
                         return;
                     };

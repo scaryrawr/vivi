@@ -220,11 +220,11 @@ removes image content before it reaches OMLX.
 The SDK's generic `Client.callRpc` adapts `session.commands.list` into
 SDK-free definitions consumed by `backend/src/command_domain.zig`. That module
 owns generation-scoped nonzero keys, the closed source/action/argument matrix,
-injected `/model` and `/resume` entries, fail-closed catalog replacement, and
-key-based admission. `backend/src/conversation.zig` serializes admitted
-executions and publishes their terminal outcome through a reserved event slot,
-so queue growth cannot prevent exactly one chronological completion or
-failure. The catalog refreshes after session
+injected `/model`, `/new`, and `/resume` entries, fail-closed catalog
+replacement, and key-based admission. `backend/src/conversation.zig`
+serializes admitted executions and publishes their terminal outcome through a
+reserved event slot, so queue growth cannot prevent exactly one chronological
+completion or failure. The catalog refreshes after session
 creation, after session replacement, when an unknown SDK event identifies
 `commands.changed`, and whenever the terminal opens `/`. The explicit open-time refresh is
 required because the single SDK-owning worker waits on Vivi's command mailbox
