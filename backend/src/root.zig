@@ -2549,6 +2549,55 @@ fn refreshCommandCatalog(
     };
 }
 
+fn reportCommandRefreshFailure(
+    worker: anytype,
+    message: []const u8,
+) bool {
+    worker.completeCommandRefreshFailure(message) catch {
+        worker.closeFailure(.stream, message);
+        return false;
+    };
+    return true;
+}
+
+test "unreportable command refresh failure closes and terminates the path" {
+    const Sink = struct {
+        complete_calls: usize = 0,
+        close_calls: usize = 0,
+        closed_message: ?[]const u8 = null,
+
+        fn completeCommandRefreshFailure(
+            self: *@This(),
+            _: []const u8,
+        ) !void {
+            self.complete_calls += 1;
+            return error.PublishFailed;
+        }
+
+        fn closeFailure(
+            self: *@This(),
+            kind: conversation.FailureKind,
+            message: []const u8,
+        ) void {
+            std.debug.assert(kind == .stream);
+            self.close_calls += 1;
+            self.closed_message = message;
+        }
+    };
+    var sink = Sink{};
+
+    try std.testing.expect(!reportCommandRefreshFailure(
+        &sink,
+        "command discovery failed",
+    ));
+    try std.testing.expectEqual(@as(usize, 1), sink.complete_calls);
+    try std.testing.expectEqual(@as(usize, 1), sink.close_calls);
+    try std.testing.expectEqualStrings(
+        "command discovery failed",
+        sink.closed_message.?,
+    );
+}
+
 fn streamSessionResponse(
     worker: *conversation.Worker,
     client: *copilot.Client,
@@ -3085,11 +3134,10 @@ fn runSdkConversation(
                     session,
                     true,
                 ) catch |err| {
-                    worker.completeCommandRefreshFailure(
+                    if (!reportCommandRefreshFailure(
+                        worker,
                         @errorName(err),
-                    ) catch {
-                        worker.closeFailure(.stream, @errorName(err));
-                    };
+                    )) return;
                     continue;
                 };
             },
