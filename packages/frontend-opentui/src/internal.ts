@@ -1,7 +1,9 @@
 import type { AppState, AppViewModel, ViviApp } from "@vivi/core";
+import { createCliRenderer } from "@opentui/core";
 
 export interface RendererInput {
   value: string;
+  focus(): void;
   on(event: string, handler: (value: string) => void): void;
   off(event: string, handler: (value: string) => void): void;
 }
@@ -63,6 +65,7 @@ export async function runChatLifecycle({
   const onKeypress = (key: { readonly name: string; readonly ctrl: boolean }): void => {
     if (!isCtrlC(key)) return;
     if (ctrlC.requested) {
+      renderer.destroy();
       forceExit(130);
     }
     ctrlC.requested = true;
@@ -73,6 +76,7 @@ export async function runChatLifecycle({
   };
   renderer.input.on("enter", onEnter);
   renderer.keyInput.on("keypress", onKeypress);
+  renderer.input.focus();
   try {
     render(app, renderer.transcript);
     renderer.start();
@@ -89,4 +93,16 @@ export async function runChatLifecycle({
     renderer.destroy();
   }
   if (firstError) throw firstError;
+}
+
+export async function probeRenderer(): Promise<void> {
+  const renderer = await createCliRenderer({
+    clearOnShutdown: false,
+    exitOnCtrlC: false,
+    exitSignals: [],
+    useKittyKeyboard: null,
+    useMouse: false,
+  });
+  renderer.start();
+  renderer.destroy();
 }

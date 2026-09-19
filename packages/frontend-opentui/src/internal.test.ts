@@ -11,6 +11,7 @@ type Key = { readonly name: string; readonly ctrl: boolean };
 
 class FakeInput implements RendererInput {
   value = "";
+  focused = false;
   private handler?: (value: string) => void;
   on(_event: string, handler: (value: string) => void): void {
     this.handler = handler;
@@ -21,6 +22,9 @@ class FakeInput implements RendererInput {
   emit(value: string): void {
     this.value = value;
     this.handler?.(value);
+  }
+  focus(): void {
+    this.focused = true;
   }
 }
 
@@ -115,7 +119,9 @@ function makeRenderer(): {
       keyInput: keys,
       requestRender: () => counts.renders++,
       start: () => counts.starts++,
-      destroy: () => counts.destroys++,
+      destroy: () => {
+        if (counts.destroys === 0) counts.destroys++;
+      },
     },
   };
 }
@@ -135,6 +141,7 @@ test("dispatches trimmed Enter input, clears the input, and renders state update
   expect(app.dispatches).toEqual(["hello"]);
   expect(input.value).toBe("");
   expect(counts.starts).toBe(1);
+  expect(input.focused).toBe(true);
   expect(counts.renders).toBeGreaterThan(0);
   expect(renderer.transcript.content).toBe("User: hello");
   keys.emit({ name: "c", ctrl: true });
@@ -160,6 +167,7 @@ test("first Ctrl-C starts cooperative close and second Ctrl-C forces exit immedi
   expect(forced).toBe(0);
   expect(() => keys.emit({ name: "c", ctrl: true })).toThrow("forced");
   expect(forced).toBe(130);
+  expect(counts.destroys).toBe(1);
   app.release();
   await run;
   expect(counts.destroys).toBe(1);

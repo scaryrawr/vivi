@@ -38,8 +38,10 @@ type Lifecycle = {
   readonly client: CopilotClient;
   readonly workingDirectory: string;
   session?: CopilotSession;
+  sessionPromise?: Promise<CopilotSession>;
   startPromise?: Promise<void>;
   closePromise?: Promise<void>;
+  closing: boolean;
 };
 
 const errorMessage = (error: unknown): string =>
@@ -56,14 +58,21 @@ function ensureStarted(lifecycle: Lifecycle): Promise<void> {
 }
 
 async function ensureSession(lifecycle: Lifecycle): Promise<CopilotSession> {
+  if (lifecycle.closing) throw new Error("Copilot port is closed");
   await ensureStarted(lifecycle);
-  if (!lifecycle.session) {
-    lifecycle.session = await lifecycle.client.createSession({
-      workingDirectory: lifecycle.workingDirectory,
-      streaming: true,
-    });
+  if (!lifecycle.sessionPromise) {
+    lifecycle.sessionPromise = (async () => {
+      if (lifecycle.closing) throw new Error("Copilot port is closed");
+      const session = await lifecycle.client.createSession({
+        workingDirectory: lifecycle.workingDirectory,
+        streaming: true,
+      });
+      lifecycle.session = session;
+      if (lifecycle.closing) throw new Error("Copilot port is closed");
+      return session;
+    })();
   }
-  return lifecycle.session;
+  return lifecycle.sessionPromise;
 }
 
 function respondWithSdk(lifecycle: Lifecycle, prompt: string): AsyncIterable<CopilotPortEvent> {
@@ -121,7 +130,13 @@ function respondWithSdk(lifecycle: Lifecycle, prompt: string): AsyncIterable<Cop
 function closeSdk(lifecycle: Lifecycle): Promise<void> {
   if (!lifecycle.closePromise) {
     lifecycle.closePromise = (async () => {
+      lifecycle.closing = true;
       let firstError: Error | undefined;
+      if (lifecycle.sessionPromise) {
+        try {
+          await lifecycle.sessionPromise;
+        } catch {}
+      }
       if (lifecycle.session) {
         try {
           await lifecycle.session.abort();
@@ -150,6 +165,7 @@ export function createSdkCopilotPort(options: SdkCopilotPortOptions): CopilotPor
   const lifecycle: Lifecycle = {
     client: new CopilotClient({ workingDirectory: options.workingDirectory }),
     workingDirectory: options.workingDirectory,
+    closing: false,
   };
   return {
     respond: (prompt) => respondWithSdk(lifecycle, prompt),

@@ -12,7 +12,7 @@
     "test": "bun test",
     "probe:runtime": "bun scripts/runtime-probe.ts",
     "build:vivi": "bun build apps/vivi/src/main.ts --compile --outfile apps/vivi/dist/vivi",
-    "check": "bun run boundary-check && bun run typecheck && bun run test"
+    "check": "bun run boundary-check && bun run typecheck && bun run test && bun run build:vivi"
   },
   "devDependencies": {
     "@github/copilot-sdk": "1.0.14",

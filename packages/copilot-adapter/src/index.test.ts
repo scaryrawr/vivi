@@ -9,6 +9,7 @@ class FakeSession {
   emitError: string | undefined;
   abortError: Error | undefined;
   disconnectError: Error | undefined;
+  createGate: Promise<void> | undefined;
   response: Promise<{ data: { content: string } } | undefined> = Promise.resolve({
     data: { content: "fallback" },
   });
@@ -49,6 +50,7 @@ class FakeClient {
   }
   async createSession(): Promise<FakeSession> {
     this.calls.push("createSession");
+    if (this.session.createGate) await this.session.createGate;
     return this.session;
   }
   async stop(): Promise<Error[]> {
@@ -134,4 +136,22 @@ test("attempts every cleanup step, preserves the first error, and memoizes close
   fakeClient.session.abortError = undefined;
   fakeClient.session.disconnectError = undefined;
   fakeClient.stopErrors = [];
+});
+
+test("closes safely when startup and session creation are still pending", async () => {
+  let release!: () => void;
+  fakeClient.session.createGate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const port = createSdkCopilotPort({ workingDirectory: process.cwd() });
+  const response = port.respond("hello");
+  await Promise.resolve();
+  const close = port.close();
+  release();
+  await close;
+  const events = [];
+  for await (const event of response) events.push(event);
+  expect(events).toEqual([{ type: "response-failed", error: "Copilot port is closed" }]);
+  expect(fakeClient.session.calls).toContain("disconnect");
+  fakeClient.session.createGate = undefined;
 });
