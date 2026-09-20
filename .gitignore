@@ -9,3 +9,5 @@ zig-out/
 node_modules/
 *.tsbuildinfo
 packages/*/dist/
+apps/*/dist/
+apps/*/dist-ts/
