@@ -50,6 +50,15 @@ fn promptSubmissionFailureReason(err: anyerror) ?[]const u8 {
     };
 }
 
+/// Screen span of an OSC 8 link captured while drawing the transcript.
+/// Rows and columns are relative to the transcript region origin.
+const LinkHit = struct {
+    row: usize,
+    col_start: u16,
+    col_end: u16,
+    uri: []u8,
+};
+
 const AppEvent = union(enum) {
     key_press: vaxis.Key,
     mouse: vaxis.Mouse,
@@ -2643,6 +2652,8 @@ const ChatUi = struct {
     last_transcript_region: Region = .{},
     last_composer_height: u16 = 0,
     tool_hits: std.ArrayList(?usize) = .empty,
+    link_hits: std.ArrayList(LinkHit) = .empty,
+    open_uri_hook: ?*const fn (*ChatUi, []const u8) void = null,
     tool_anchor: ?struct { entry_index: usize, row: usize } = null,
     // Borrowed from the transcript; call IDs survive entry insertion and growth.
     focused_tool: ?[]const u8 = null,
@@ -2678,6 +2689,8 @@ const ChatUi = struct {
         for (&self.composer_display) |*display| display.deinit(self.allocator);
         if (self.pasted_images) |*store| store.deinit();
         self.tool_hits.deinit(self.allocator);
+        self.clearLinkHits();
+        self.link_hits.deinit(self.allocator);
         self.menu.deinit(self.allocator);
         self.clearFilePaths();
         self.file_paths.deinit(self.allocator);
@@ -2994,6 +3007,82 @@ const ChatUi = struct {
         return true;
     }
 
+    fn clearLinkHits(self: *ChatUi) void {
+        for (self.link_hits.items) |*hit| self.allocator.free(hit.uri);
+        self.link_hits.clearRetainingCapacity();
+    }
+
+    fn recordLinkHit(
+        self: *ChatUi,
+        row: usize,
+        col_start: u16,
+        col_end: u16,
+        uri: []const u8,
+    ) void {
+        if (col_end <= col_start) return;
+        const owned = self.allocator.dupe(u8, uri) catch return;
+        errdefer self.allocator.free(owned);
+        self.link_hits.append(self.allocator, .{
+            .row = row,
+            .col_start = col_start,
+            .col_end = col_end,
+            .uri = owned,
+        }) catch {
+            self.allocator.free(owned);
+        };
+    }
+
+    fn linkUriAt(self: *ChatUi, row: usize, col: usize) ?[]const u8 {
+        for (self.link_hits.items) |hit| {
+            if (hit.row == row and col >= hit.col_start and col < hit.col_end)
+                return hit.uri;
+        }
+        return null;
+    }
+
+    fn openUri(self: *ChatUi, uri: []const u8) void {
+        if (self.open_uri_hook) |hook| {
+            hook(self, uri);
+            return;
+        }
+        // Launch and reap on a detached thread: desktop openers such as
+        // xdg-open can stay attached to the browser, and waiting here would
+        // freeze input handling and drawing until the opener exits.
+        const owned = self.allocator.dupe(u8, uri) catch return;
+        const launcher: Opener = .{
+            .allocator = self.allocator,
+            .io = self.io,
+            .uri = owned,
+        };
+        const thread = std.Thread.spawn(.{}, Opener.run, .{launcher}) catch {
+            self.allocator.free(owned);
+            return;
+        };
+        thread.detach();
+    }
+
+    const Opener = struct {
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        uri: []u8,
+
+        fn run(self: Opener) void {
+            defer self.allocator.free(self.uri);
+            const argv: []const []const u8 = switch (@import("builtin").os.tag) {
+                .macos => &.{ "open", self.uri },
+                .windows => &.{ "rundll32", "url.dll,FileProtocolHandler", self.uri },
+                else => &.{ "xdg-open", self.uri },
+            };
+            var child = std.process.spawn(self.io, .{
+                .argv = argv,
+                .stdin = .ignore,
+                .stdout = .ignore,
+                .stderr = .ignore,
+            }) catch return;
+            _ = child.wait(self.io) catch {};
+        }
+    };
+
     fn handleMouse(self: *ChatUi, mouse: vaxis.Mouse) bool {
         if (!self.last_transcript_region.contains(mouse.col, mouse.row))
             return false;
@@ -3003,7 +3092,12 @@ const ChatUi = struct {
             .wheel_up => self.scrollUp(mouse_wheel_rows),
             .wheel_down => self.scrollDown(mouse_wheel_rows),
             .left => blk: {
+                const rel_col: usize = @as(usize, @intCast(mouse.col)) - self.last_transcript_region.x;
                 var row: usize = @as(usize, @intCast(mouse.row)) - self.last_transcript_region.y;
+                if (self.linkUriAt(row, rel_col)) |uri| {
+                    self.openUri(uri);
+                    break :blk false;
+                }
                 if (row >= self.tool_hits.items.len) break :blk false;
                 const entry_index = self.tool_hits.items[row] orelse break :blk false;
                 if (entry_index >= self.transcript.entries.items.len) break :blk false;
@@ -3971,6 +4065,7 @@ const ChatUi = struct {
         self.last_composer_height = layout.composer.height;
         self.last_transcript_region = layout.transcript;
         self.tool_hits.clearRetainingCapacity();
+        self.clearLinkHits();
         if (layout.transcript.height > 0) {
             const transcript_window = layout.transcript.child(root);
             if (self.transcript.entries.items.len == 0) {
@@ -4552,6 +4647,10 @@ const ChatUi = struct {
                         .col_offset = column,
                         .wrap = .none,
                     });
+                    if (segment.uri) |uri| {
+                        const end = column +| window.gwidth(segment.text);
+                        self.recordLinkHit(row, column, end, uri);
+                    }
                     column +|= window.gwidth(segment.text);
                 }
             },
@@ -4582,6 +4681,10 @@ const ChatUi = struct {
                         .col_offset = column,
                         .wrap = .none,
                     });
+                    if (segment.uri) |uri| {
+                        const end = column +| window.gwidth(segment.text);
+                        self.recordLinkHit(row, column, end, uri);
+                    }
                     column +|= window.gwidth(segment.text);
                 }
             },
@@ -8209,6 +8312,78 @@ test "Markdown draw storage remains valid while screen cells are consumed" {
         "Tables",
     ) != null);
 }
+
+test "left clicking a transcript link opens it in the default browser" {
+    var ui: ChatUi = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .input = TextInput.init(std.testing.allocator),
+        .cwd = try std.testing.allocator.dupe(u8, "."),
+    };
+    defer ui.deinit();
+    try ui.transcript.append(
+        std.testing.allocator,
+        .assistant,
+        "visit [example](https://example.com/page) now",
+    );
+
+    var screen = try vaxis.Screen.init(std.testing.allocator, .{
+        .rows = 16,
+        .cols = 60,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(std.testing.allocator);
+    const window: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = screen.width,
+        .height = screen.height,
+        .screen = &screen,
+    };
+    var projection = try ui.draw(window);
+    defer if (projection) |*value| value.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), ui.link_hits.items.len);
+    const hit = ui.link_hits.items[0];
+    try std.testing.expectEqualStrings("https://example.com/page", hit.uri);
+
+    // The linked text starts after the "visit " prefix at the body indent.
+    const link_col = ui.last_transcript_region.x + hit.col_start;
+    const link_row: u16 = @intCast(ui.last_transcript_region.y + hit.row);
+    const before = screen.readCell(link_col - 1, link_row).?;
+    try std.testing.expectEqualStrings(" ", before.char.grapheme);
+
+    ui.open_uri_hook = struct {
+        fn capture(_: *ChatUi, uri: []const u8) void {
+            captured_uri = uri;
+        }
+    }.capture;
+    // Clicking just outside the link span does not open anything.
+    _ = ui.handleMouse(.{
+        .col = @intCast(link_col - 1),
+        .row = @intCast(link_row),
+        .button = .left,
+        .mods = .{},
+        .type = .press,
+    });
+    try std.testing.expectEqual(@as(?[]const u8, null), captured_uri);
+
+    // Clicking inside the link span opens it in the browser.
+    _ = ui.handleMouse(.{
+        .col = @intCast(link_col + 2),
+        .row = @intCast(link_row),
+        .button = .left,
+        .mods = .{},
+        .type = .press,
+    });
+    try std.testing.expect(captured_uri != null);
+    try std.testing.expectEqualStrings("https://example.com/page", captured_uri.?);
+}
+
+var captured_uri: ?[]const u8 = null;
 
 test "renderer arenas preserve screen borrows and stabilize after warmup" {
     var ui: ChatUi = .{
