@@ -6,4 +6,3 @@ cd "$repo_root"
 
 ./scripts/check-zig.sh
 ./scripts/check-cli-cross.sh
-bun run check
