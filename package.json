@@ -12,6 +12,7 @@
     "test": "bun test",
     "probe:runtime": "bun scripts/runtime-probe.ts",
     "build:vivi": "bun build apps/vivi/src/main.ts --compile --outfile apps/vivi/dist/vivi",
+    "verify:compiled-parity": "bun scripts/verify-compiled-parity.ts",
     "check": "bun run boundary-check && bun run typecheck && bun run test && bun run build:vivi"
   },
   "devDependencies": {

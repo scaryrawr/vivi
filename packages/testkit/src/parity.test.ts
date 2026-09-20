@@ -16,6 +16,8 @@ test("reports the first literal parity mismatch", () => {
       path: "$[1]",
       expected: " world",
       actual: "world",
+      expectedLiteral: '" world"',
+      actualLiteral: '"world"',
     },
   });
 });

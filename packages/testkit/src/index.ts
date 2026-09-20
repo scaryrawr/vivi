@@ -18,6 +18,8 @@ export interface FirstMismatch {
   readonly path: string;
   readonly expected: unknown;
   readonly actual: unknown;
+  readonly expectedLiteral: string;
+  readonly actualLiteral: string;
 }
 
 export interface ParityResult {
@@ -42,11 +44,19 @@ export function compareFixture(
   };
 }
 
-function firstMismatch(path: string, expected: unknown, actual: unknown): FirstMismatch | undefined {
+function firstMismatch(
+  path: string,
+  expected: unknown,
+  actual: unknown,
+): FirstMismatch | undefined {
   if (Object.is(expected, actual)) return undefined;
   if (Array.isArray(expected) && Array.isArray(actual)) {
     if (expected.length !== actual.length) {
-      return { path: `${path}.length`, expected: expected.length, actual: actual.length };
+      return mismatch(
+        `${path}.length`,
+        expected.length,
+        actual.length,
+      );
     }
     for (let index = 0; index < expected.length; index++) {
       const mismatch = firstMismatch(`${path}[${index}]`, expected[index], actual[index]);
@@ -62,9 +72,21 @@ function firstMismatch(path: string, expected: unknown, actual: unknown): FirstM
     }
     return undefined;
   }
-  return { path, expected, actual };
+  return mismatch(path, expected, actual);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
+
+function mismatch(path: string, expected: unknown, actual: unknown): FirstMismatch {
+  return {
+    path,
+    expected,
+    actual,
+    expectedLiteral: JSON.stringify(expected),
+    actualLiteral: JSON.stringify(actual),
+  };
+}
+
+export * from "./compiled-parity.js";

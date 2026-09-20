@@ -130,6 +130,7 @@ fn writeHelp(writer: *std.Io.Writer) !void {
         \\  models     List available Copilot and OMLX models.
         \\  chat       Start an interactive streaming Vivi chat.
         \\
+        \\
     );
 }
 
