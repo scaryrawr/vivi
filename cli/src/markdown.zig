@@ -579,11 +579,11 @@ pub fn analyzeSource(
         // Include UTF-8 continuation bytes so spans never split a code point.
         while (i < source.len and
             (flags[i] == flags[start] or (source[i] & 0xc0) == 0x80)) i += 1;
-        spans.append(allocator, .{
+        try spans.append(allocator, .{
             .start = start,
             .end = i,
             .style = styleFromFlags(flags[start]),
-        }) catch break;
+        });
     }
     return spans.toOwnedSlice(allocator);
 }

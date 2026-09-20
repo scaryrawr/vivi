@@ -8423,6 +8423,97 @@ test "left clicking a transcript link opens it in the default browser" {
 
 var captured_uri: ?[]const u8 = null;
 
+test "user, queued, and question messages render Markdown with registered links" {
+    var ui: ChatUi = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .input = TextInput.init(std.testing.allocator),
+        .cwd = try std.testing.allocator.dupe(u8, "."),
+    };
+    defer ui.deinit();
+    try ui.transcript.append(
+        std.testing.allocator,
+        .user,
+        "visit [bing](https://bing.com) **boldly**",
+    );
+    try ui.transcript.append(
+        std.testing.allocator,
+        .queued,
+        "queued *emphasis* here",
+    );
+    try ui.transcript.append(
+        std.testing.allocator,
+        .question,
+        "question `code` here",
+    );
+
+    var screen = try vaxis.Screen.init(std.testing.allocator, .{
+        .rows = 16,
+        .cols = 60,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(std.testing.allocator);
+    const window: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = screen.width,
+        .height = screen.height,
+        .screen = &screen,
+    };
+    var maybe_projection = try ui.draw(window);
+    defer if (maybe_projection) |*value| value.deinit(std.testing.allocator);
+    const projection = &maybe_projection.?;
+
+    // All three roles must project through the Markdown path, never plain body.
+    var markdown_lines: usize = 0;
+    for (projection.lines.items) |line| {
+        try std.testing.expect(line.kind != .body);
+        if (line.kind == .markdown) markdown_lines += 1;
+    }
+    try std.testing.expect(markdown_lines >= 3);
+
+    // Styling must actually be parsed: literal markup markers are consumed.
+    var rendered_text: std.ArrayList(u8) = .empty;
+    defer rendered_text.deinit(std.testing.allocator);
+    for (0..screen.height) |row| {
+        for (0..screen.width) |column| {
+            const cell = screen.readCell(@intCast(column), @intCast(row)).?;
+            try rendered_text.appendSlice(std.testing.allocator, cell.char.grapheme);
+        }
+    }
+    const flat = rendered_text.items;
+    try std.testing.expect(std.mem.indexOf(u8, flat, "[bing]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, flat, "**boldly**") == null);
+    try std.testing.expect(std.mem.indexOf(u8, flat, "bing") != null);
+
+    // The user-role link must register a clickable hit that opens the URI.
+    captured_uri = null;
+    ui.open_uri_hook = struct {
+        fn capture(_: *ChatUi, uri: []const u8) void {
+            captured_uri = uri;
+        }
+    }.capture;
+    var opened = false;
+    for (ui.link_hits.items) |hit| {
+        if (std.mem.eql(u8, hit.uri, "https://bing.com")) {
+            opened = true;
+            _ = ui.handleMouse(.{
+                .col = @intCast(ui.last_transcript_region.x + hit.col_start + 1),
+                .row = @intCast(ui.last_transcript_region.y + hit.row),
+                .button = .left,
+                .mods = .{},
+                .type = .press,
+            });
+        }
+    }
+    try std.testing.expect(opened);
+    try std.testing.expect(captured_uri != null);
+    try std.testing.expectEqualStrings("https://bing.com", captured_uri.?);
+}
+
 test "renderer arenas preserve screen borrows and stabilize after warmup" {
     var ui: ChatUi = .{
         .allocator = std.testing.allocator,
