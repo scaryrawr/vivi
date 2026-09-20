@@ -90,17 +90,3 @@ Explicit macOS targets require both `--sysroot` and `-Dmacos-sdk` from
 
 Architecture and ownership decisions are documented in
 [`docs/architecture.md`](docs/architecture.md).
-
-## TypeScript migration scaffold
-
-Zig remains the production CLI. The Bun and TypeScript packages are a migration
-scaffold, not a replacement command and not a feature-parity claim.
-The scaffold pins Bun 1.4.2 and TypeScript 7.0.2.
-
-```sh
-bun install --frozen-lockfile
-bun run check
-bun run probe:runtime
-```
-
-`bun run probe:runtime` requires Copilot credentials and a running Copilot CLI.
