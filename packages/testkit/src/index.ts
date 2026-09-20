@@ -67,8 +67,17 @@ function firstMismatch(
   if (isRecord(expected) && isRecord(actual)) {
     const keys = [...new Set([...Object.keys(expected), ...Object.keys(actual)])].sort();
     for (const key of keys) {
-      const mismatch = firstMismatch(`${path}.${key}`, expected[key], actual[key]);
-      if (mismatch) return mismatch;
+      const expectedHasKey = Object.hasOwn(expected, key);
+      const actualHasKey = Object.hasOwn(actual, key);
+      if (!expectedHasKey || !actualHasKey) {
+        return mismatch(
+          `${path}.${key}`,
+          expectedHasKey ? expected[key] : undefined,
+          actualHasKey ? actual[key] : undefined,
+        );
+      }
+      const nestedMismatch = firstMismatch(`${path}.${key}`, expected[key], actual[key]);
+      if (nestedMismatch) return nestedMismatch;
     }
     return undefined;
   }
@@ -84,9 +93,13 @@ function mismatch(path: string, expected: unknown, actual: unknown): FirstMismat
     path,
     expected,
     actual,
-    expectedLiteral: JSON.stringify(expected),
-    actualLiteral: JSON.stringify(actual),
+    expectedLiteral: literal(expected),
+    actualLiteral: literal(actual),
   };
+}
+
+function literal(value: unknown): string {
+  return JSON.stringify(value) ?? String(value);
 }
 
 export * from "./compiled-parity.js";

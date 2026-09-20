@@ -21,3 +21,17 @@ test("reports the first literal parity mismatch", () => {
     },
   });
 });
+
+test("renders missing values in mismatch evidence", () => {
+  expect(compareFixture("missing-value", { value: "present" }, {})).toEqual({
+    status: "FAIL",
+    fixture: "missing-value",
+    firstMismatch: {
+      path: "$.value",
+      expected: "present",
+      actual: undefined,
+      expectedLiteral: '"present"',
+      actualLiteral: "undefined",
+    },
+  });
+});

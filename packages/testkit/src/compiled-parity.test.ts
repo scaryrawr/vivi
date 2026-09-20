@@ -101,6 +101,27 @@ test("reports the first mismatched help line with literal values", async () => {
   });
 });
 
+test("reports a crashed compiled CLI as FAIL", async () => {
+  const result = await runCompiledHelpParity(
+    fixture,
+    artifacts,
+    dependencies({
+      execute: async (artifact) => ({
+        exitStatus: artifact.label === "zig" ? 1 : 0,
+        stdout: artifact.label === "zig" ? "" : fixture.expected.stdout,
+        stderr: "",
+      }),
+    }),
+  );
+  expect(result.firstMismatch).toEqual({
+    path: "$.exitStatus",
+    expected: 0,
+    actual: 1,
+    expectedLiteral: "0",
+    actualLiteral: "1",
+  });
+});
+
 test("returns INCONCLUSIVE when a build is unavailable", async () => {
   const result = await runCompiledHelpParity(
     fixture,

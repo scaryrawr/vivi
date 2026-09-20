@@ -111,12 +111,10 @@ export async function runCompiledHelpParity(
     if (output.exitStatus === null) {
       return inconclusive(fixture.name, `${identity.label} process did not exit`);
     }
-    let commandNames: readonly string[];
+    let commandNames: readonly string[] = [];
     try {
       commandNames = extractCommandNames(normalizeLineEndings(output.stdout));
-    } catch (error) {
-      return inconclusive(fixture.name, errorMessage(error));
-    }
+    } catch {}
     runs.push({
       identity,
       argv: fixture.argv,
@@ -135,29 +133,21 @@ export async function runCompiledHelpParity(
     stderr: { lines: normalizeLineEndings(fixture.expected.stderr).split("\n") },
     commandNames: fixture.expected.commandNames,
   };
-  const zigComparison = compareFixture(
-    fixture.name,
-    expected,
-    comparableRun(runs[0]),
-  );
-  if (zigComparison.status === "FAIL") {
-    return { ...zigComparison, zig: runs[0], bun: runs[1] };
+  const zigMismatch = firstObservationMismatch(fixture.name, expected, comparableRun(runs[0]));
+  if (zigMismatch) {
+    return { status: "FAIL", fixture: fixture.name, firstMismatch: zigMismatch, zig: runs[0], bun: runs[1] };
   }
-  const bunComparison = compareFixture(
-    fixture.name,
-    expected,
-    comparableRun(runs[1]),
-  );
-  if (bunComparison.status === "FAIL") {
-    return { ...bunComparison, zig: runs[0], bun: runs[1] };
+  const bunMismatch = firstObservationMismatch(fixture.name, expected, comparableRun(runs[1]));
+  if (bunMismatch) {
+    return { status: "FAIL", fixture: fixture.name, firstMismatch: bunMismatch, zig: runs[0], bun: runs[1] };
   }
-  const pairComparison = compareFixture(
+  const pairMismatch = firstObservationMismatch(
     fixture.name,
     comparableRun(runs[0]),
     comparableRun(runs[1]),
   );
-  if (pairComparison.status === "FAIL") {
-    return { ...pairComparison, zig: runs[0], bun: runs[1] };
+  if (pairMismatch) {
+    return { status: "FAIL", fixture: fixture.name, firstMismatch: pairMismatch, zig: runs[0], bun: runs[1] };
   }
   return { status: "PASS", fixture: fixture.name, zig: runs[0], bun: runs[1] };
 }
@@ -181,13 +171,37 @@ export function extractCommandNames(helpText: string): readonly string[] {
   return names;
 }
 
-function comparableRun(run: ArtifactRun): unknown {
+interface ComparableObservation {
+  readonly exitStatus: number | null;
+  readonly stdout: { readonly lines: readonly string[] };
+  readonly stderr: { readonly lines: readonly string[] };
+  readonly commandNames: readonly string[];
+}
+
+function comparableRun(run: ArtifactRun): ComparableObservation {
   return {
     exitStatus: run.output.exitStatus,
     stdout: { lines: run.output.stdout.split("\n") },
     stderr: { lines: run.output.stderr.split("\n") },
     commandNames: run.commandNames,
   };
+}
+
+function firstObservationMismatch(
+  fixture: string,
+  expected: ComparableObservation,
+  actual: ComparableObservation,
+): FirstMismatch | undefined {
+  for (const field of ["exitStatus", "stdout", "stderr", "commandNames"] as const) {
+    const comparison = compareFixture(fixture, expected[field], actual[field]);
+    if (comparison.status === "FAIL" && comparison.firstMismatch) {
+      return {
+        ...comparison.firstMismatch,
+        path: `$.${field}${comparison.firstMismatch.path.slice(1)}`,
+      };
+    }
+  }
+  return undefined;
 }
 
 function inconclusive(fixture: string, reason: string): CompiledParityReport {
