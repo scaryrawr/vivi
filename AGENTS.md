@@ -44,10 +44,14 @@ zig build test
 zigdoc copilot_sdk.Client
 bun install --frozen-lockfile
 bun run check
+bun run verify:compiled-parity
 ```
 
 Run `bun run probe:runtime` separately when Copilot credentials and the
 Copilot CLI are available. Default checks must not require either.
+`bun run verify:compiled-parity` builds and executes the Zig and compiled Bun
+artifacts for deterministic behavior-parity fixtures; it must not be replaced
+with source entrypoints or `bun run` wrappers.
 
 For platform-specific clipboard or terminal-input changes, cross-build the
 executables:
