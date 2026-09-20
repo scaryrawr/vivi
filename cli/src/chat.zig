@@ -3045,19 +3045,43 @@ const ChatUi = struct {
             hook(self, uri);
             return;
         }
-        const argv: []const []const u8 = switch (@import("builtin").os.tag) {
-            .macos => &.{ "open", uri },
-            .windows => &.{ "rundll32", "url.dll,FileProtocolHandler", uri },
-            else => &.{ "xdg-open", uri },
+        // Launch and reap on a detached thread: desktop openers such as
+        // xdg-open can stay attached to the browser, and waiting here would
+        // freeze input handling and drawing until the opener exits.
+        const owned = self.allocator.dupe(u8, uri) catch return;
+        const launcher: Opener = .{
+            .allocator = self.allocator,
+            .io = self.io,
+            .uri = owned,
         };
-        var child = std.process.spawn(self.io, .{
-            .argv = argv,
-            .stdin = .ignore,
-            .stdout = .ignore,
-            .stderr = .ignore,
-        }) catch return;
-        _ = child.wait(self.io) catch {};
+        const thread = std.Thread.spawn(.{}, Opener.run, .{launcher}) catch {
+            self.allocator.free(owned);
+            return;
+        };
+        thread.detach();
     }
+
+    const Opener = struct {
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        uri: []u8,
+
+        fn run(self: Opener) void {
+            defer self.allocator.free(self.uri);
+            const argv: []const []const u8 = switch (@import("builtin").os.tag) {
+                .macos => &.{ "open", self.uri },
+                .windows => &.{ "rundll32", "url.dll,FileProtocolHandler", self.uri },
+                else => &.{ "xdg-open", self.uri },
+            };
+            var child = std.process.spawn(self.io, .{
+                .argv = argv,
+                .stdin = .ignore,
+                .stdout = .ignore,
+                .stderr = .ignore,
+            }) catch return;
+            _ = child.wait(self.io) catch {};
+        }
+    };
 
     fn handleMouse(self: *ChatUi, mouse: vaxis.Mouse) bool {
         if (!self.last_transcript_region.contains(mouse.col, mouse.row))
