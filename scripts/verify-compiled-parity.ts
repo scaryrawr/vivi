@@ -8,8 +8,11 @@ import {
   type CompiledArtifactSpec,
   type CompiledHelpFixture,
 } from "../packages/testkit/src/index.js";
+import { runBunProcess } from "./compiled-process.js";
 
 const root = process.cwd();
+const BUILD_TIMEOUT_MS = 120_000;
+const HELP_TIMEOUT_MS = 2_000;
 const fixture: CompiledHelpFixture = {
   name: "help",
   argv: ["--help"],
@@ -41,23 +44,24 @@ const artifacts: readonly [CompiledArtifactSpec, CompiledArtifactSpec] = [
 
 const report = await runCompiledHelpParity(fixture, artifacts, {
   build: async (artifact) => {
-    const process = Bun.spawn([...artifact.buildCommand], {
-      cwd: root,
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    const [exitCode, stdout, stderr] = await Promise.all([
-      process.exited,
-      new Response(process.stdout).text(),
-      new Response(process.stderr).text(),
-    ]);
-    return {
-      ok: exitCode === 0,
-      details:
-        exitCode === 0
-          ? undefined
-          : `${artifact.label} build exited ${exitCode}: ${stdout}${stderr}`,
-    };
+    try {
+      const result = await runBunProcess(artifact.buildCommand, {
+        cwd: root,
+        timeoutMs: BUILD_TIMEOUT_MS,
+      });
+      return {
+        ok: result.exitStatus === 0,
+        details:
+          result.exitStatus === 0
+            ? undefined
+            : `${artifact.label} build did not complete successfully: ${result.stdout}${result.stderr}`,
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        details: `${artifact.label} build failed: ${errorMessage(error)}`,
+      };
+    }
   },
   identify: identifyArtifact,
   execute: executeArtifact,
@@ -88,15 +92,12 @@ async function executeArtifact(
   identity: ArtifactIdentity,
   argv: readonly string[],
 ): Promise<ArtifactOutput> {
-  const process = Bun.spawn([identity.resolvedPath, ...argv], {
+  return runBunProcess([identity.resolvedPath, ...argv], {
     cwd: root,
-    stdout: "pipe",
-    stderr: "pipe",
+    timeoutMs: HELP_TIMEOUT_MS,
   });
-  const [exitStatus, stdout, stderr] = await Promise.all([
-    process.exited,
-    new Response(process.stdout).text(),
-    new Response(process.stderr).text(),
-  ]);
-  return { exitStatus, stdout, stderr };
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

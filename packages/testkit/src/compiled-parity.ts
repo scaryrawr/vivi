@@ -42,8 +42,6 @@ export interface ArtifactRun {
 }
 
 export interface CompiledParityReport extends ParityResult {
-  readonly status: "PASS" | "FAIL" | "INCONCLUSIVE";
-  readonly fixture: string;
   readonly zig?: ArtifactRun;
   readonly bun?: ArtifactRun;
   readonly reason?: string;
@@ -133,8 +131,8 @@ export async function runCompiledHelpParity(
 
   const expected = {
     exitStatus: fixture.expected.exitStatus,
-    stdout: normalizeLineEndings(fixture.expected.stdout),
-    stderr: normalizeLineEndings(fixture.expected.stderr),
+    stdout: { lines: normalizeLineEndings(fixture.expected.stdout).split("\n") },
+    stderr: { lines: normalizeLineEndings(fixture.expected.stderr).split("\n") },
     commandNames: fixture.expected.commandNames,
   };
   const zigComparison = compareFixture(
@@ -186,8 +184,8 @@ export function extractCommandNames(helpText: string): readonly string[] {
 function comparableRun(run: ArtifactRun): unknown {
   return {
     exitStatus: run.output.exitStatus,
-    stdout: run.output.stdout,
-    stderr: run.output.stderr,
+    stdout: { lines: run.output.stdout.split("\n") },
+    stderr: { lines: run.output.stderr.split("\n") },
     commandNames: run.commandNames,
   };
 }

@@ -77,6 +77,30 @@ test("returns FAIL with the first literal mismatch", async () => {
   });
 });
 
+test("reports the first mismatched help line with literal values", async () => {
+  const result = await runCompiledHelpParity(
+    fixture,
+    artifacts,
+    dependencies({
+      execute: async (artifact) => ({
+        exitStatus: 0,
+        stdout:
+          artifact.label === "bun"
+            ? fixture.expected.stdout.replace("List models.", "List other models.")
+            : fixture.expected.stdout,
+        stderr: "",
+      }),
+    }),
+  );
+  expect(result.firstMismatch).toEqual({
+    path: "$.stdout.lines[3]",
+    expected: "  models     List models.",
+    actual: "  models     List other models.",
+    expectedLiteral: '"  models     List models."',
+    actualLiteral: '"  models     List other models."',
+  });
+});
+
 test("returns INCONCLUSIVE when a build is unavailable", async () => {
   const result = await runCompiledHelpParity(
     fixture,
