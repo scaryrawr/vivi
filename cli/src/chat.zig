@@ -4898,9 +4898,10 @@ const ChatUi = struct {
         });
         const text_style = vaxis.Style{ .bg = composer_background };
         if (self.phase.acceptsComposerInput()) {
+            const contents = self.composer_display[self.composer_display_index].items;
             const measure = measureWrappedComposer(
                 content,
-                self.composer_display[self.composer_display_index].items,
+                contents,
                 self.input.byteOffsetToCursor(),
             );
             const scroll_rows = if (measure.cursor_row >= content.height)
@@ -4911,11 +4912,60 @@ const ChatUi = struct {
                 .y_off = -@as(i17, @intCast(scroll_rows)),
                 .height = measure.rows,
             });
-            var segments = [_]vaxis.Segment{.{
-                .text = self.composer_display[self.composer_display_index].items,
-                .style = text_style,
-            }};
-            _ = drawing.print(&segments, .{ .wrap = .word });
+            // Render inline Markdown styling over the exact composer bytes so
+            // cursor and wrap positions are unchanged; fall back to plain text
+            // on any analysis failure.
+            var printed = false;
+            if (contents.len > 0) {
+                const analysis = markdown.analyzeSource(self.allocator, contents);
+                if (analysis) |source_spans| {
+                    defer self.allocator.free(source_spans);
+                    if (source_spans.len > 0) {
+                        var styled: std.ArrayList(vaxis.Segment) = .empty;
+                        defer styled.deinit(self.allocator);
+                        var ok = true;
+                        var prev: usize = 0;
+                        for (source_spans) |span| {
+                            if (span.start > prev) {
+                                styled.append(self.allocator, .{
+                                    .text = contents[prev..span.start],
+                                    .style = text_style,
+                                }) catch {
+                                    ok = false;
+                                    break;
+                                };
+                            }
+                            styled.append(self.allocator, .{
+                                .text = contents[span.start..span.end],
+                                .style = markdown.combineStyle(text_style, span.style),
+                            }) catch {
+                                ok = false;
+                                break;
+                            };
+                            prev = span.end;
+                        }
+                        if (ok and prev < contents.len) {
+                            styled.append(self.allocator, .{
+                                .text = contents[prev..],
+                                .style = text_style,
+                            }) catch {
+                                ok = false;
+                            };
+                        }
+                        if (ok and styled.items.len > 0) {
+                            _ = drawing.print(styled.items, .{ .wrap = .word });
+                            printed = true;
+                        }
+                    }
+                } else |_| {}
+            }
+            if (!printed) {
+                var segments = [_]vaxis.Segment{.{
+                    .text = contents,
+                    .style = text_style,
+                }};
+                _ = drawing.print(&segments, .{ .wrap = .word });
+            }
             drawing.showCursor(measure.cursor_col, measure.cursor_row);
             if (self.focused_tool != null) drawing.hideCursor();
         } else {

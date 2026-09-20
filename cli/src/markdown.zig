@@ -308,6 +308,286 @@ pub fn combineStyle(base: vaxis.Style, markdown: Style) vaxis.Style {
     return result;
 }
 
+/// A style range expressed over the original Markdown source. The bytes in
+/// [start, end) keep their literal content (syntax markers included) so an
+/// editor can style its buffer in place without moving the cursor: identical
+/// bytes mean identical wrap positions and cursor offsets.
+pub const SourceSpan = struct {
+    start: usize,
+    end: usize,
+    style: Style,
+};
+
+const flag_bold: u8 = 1 << 0;
+const flag_italic: u8 = 1 << 1;
+const flag_strikethrough: u8 = 1 << 2;
+const flag_code: u8 = 1 << 3;
+const flag_heading: u8 = 1 << 4;
+const flag_link: u8 = 1 << 5;
+
+const emphasis_stack_limit = 8;
+
+const EmphasisOpener = struct {
+    marker: u8 = 0,
+    start: usize = 0,
+    run: usize = 0,
+};
+
+fn markRange(flags: []u8, start: usize, end: usize, bits: u8) void {
+    if (start >= end or start >= flags.len) return;
+    const stop = @min(end, flags.len);
+    for (flags[start..stop]) |*slot| slot.* |= bits;
+}
+
+fn styleFromFlags(bits: u8) Style {
+    return .{
+        .bold = bits & flag_bold != 0,
+        .italic = bits & flag_italic != 0,
+        .strikethrough = bits & flag_strikethrough != 0,
+        .code = bits & flag_code != 0,
+        .heading = bits & flag_heading != 0,
+        .link = bits & flag_link != 0,
+    };
+}
+
+fn countRun(text: []const u8, from: usize, limit: usize, byte: u8) usize {
+    var n: usize = 0;
+    while (from + n < limit and text[from + n] == byte) n += 1;
+    return n;
+}
+
+fn isSpaceByte(byte: u8) bool {
+    return byte == ' ' or byte == '\t' or byte == '\r' or byte == '\n';
+}
+
+fn isWordChar(byte: u8) bool {
+    return std.ascii.isAlphanumeric(byte) or byte >= 0x80;
+}
+
+/// Scans inline Markdown for one line, OR-ing style bits into the absolute
+/// positions of `flags`. Unmatched markers are left unstyled (literal).
+fn scanInline(flags: []u8, text: []const u8, lo: usize, hi: usize, depth: u8) void {
+    var i = lo;
+    var emphasis_openers: [emphasis_stack_limit]EmphasisOpener =
+        @splat(.{ .marker = 0, .start = 0, .run = 0 });
+    var emphasis_depth: usize = 0;
+
+    while (i < hi) {
+        switch (text[i]) {
+            '\\' => {
+                i += if (i + 1 < hi) 2 else 1;
+            },
+            '`' => {
+                const run = countRun(text, i, hi, '`');
+                var j = i + run;
+                var closed: ?usize = null;
+                while (j + run <= hi) {
+                    if (text[j] != '`') {
+                        j += 1;
+                        continue;
+                    }
+                    const crun = countRun(text, j, hi, '`');
+                    if (crun == run and j > i + run) {
+                        closed = j;
+                        break;
+                    }
+                    j += @max(crun, 1);
+                }
+                if (closed) |at| markRange(flags, i, at + run, flag_code);
+                i = if (closed) |at| at + run else i + run;
+            },
+            '[', '!' => {
+                const image = text[i] == '!' and i + 1 < hi and text[i + 1] == '[';
+                if (!image and text[i] != '[') {
+                    i += 1;
+                    continue;
+                }
+                const label_open = if (image) i + 1 else i;
+                if (matchLink(text, hi, label_open)) |link| {
+                    markRange(flags, i, link.dest_end + 1, flag_link);
+                    if (depth < 4) scanInline(flags, text, label_open + 1, link.label_close, depth + 2);
+                    i = link.dest_end + 1;
+                } else {
+                    i += if (image) 1 else 1;
+                }
+            },
+            '~' => {
+                if (i + 1 < hi and text[i + 1] == '~' and (i + 2 >= hi or text[i + 2] != '~')) {
+                    const closed = findDouble(text, i + 2, hi, '~');
+                    if (closed) |at| {
+                        markRange(flags, i, at + 2, flag_strikethrough);
+                        if (depth < 4) scanInline(flags, text, i + 2, at, depth + 2);
+                        i = at + 2;
+                    } else {
+                        i += 2;
+                    }
+                } else {
+                    i += 1;
+                }
+            },
+            '*', '_' => {
+                const marker = text[i];
+                const run = countRun(text, i, hi, marker);
+                // An underscore glued to a word character (snake_case) or one
+                // with only whitespace after it cannot open emphasis.
+                const after = if (i + run < hi) text[i + run] else '\n';
+                const can_open = !isSpaceByte(after) and
+                    (marker == '*' or i == lo or !isWordChar(text[i - 1]));
+                const can_close = emphasis_depth > 0 and
+                    emphasis_openers[emphasis_depth - 1].marker == marker and
+                    i > emphasis_openers[emphasis_depth - 1].start + emphasis_openers[emphasis_depth - 1].run and
+                    !isSpaceByte(text[i - 1]);
+
+                if (can_close) {
+                    const opener = emphasis_openers[emphasis_depth - 1];
+                    const closer_run = @min(run, opener.run);
+                    if (closer_run >= 2) markRange(flags, opener.start, i + closer_run, flag_bold);
+                    if (closer_run == 1 or opener.run >= 3) {
+                        markRange(flags, opener.start, i + closer_run, flag_italic);
+                    }
+                    emphasis_depth -= 1;
+                    i += closer_run;
+                } else if (can_open and emphasis_depth < emphasis_stack_limit) {
+                    emphasis_openers[emphasis_depth] = .{ .marker = marker, .start = i, .run = run };
+                    emphasis_depth += 1;
+                    i += run;
+                } else {
+                    i += run;
+                }
+            },
+            else => i += 1,
+        }
+    }
+}
+
+const LinkMatch = struct { label_close: usize, dest_end: usize };
+
+fn matchLink(text: []const u8, hi: usize, label_open: usize) ?LinkMatch {
+    var depth: usize = 1;
+    var j = label_open + 1;
+    var label_close: ?usize = null;
+    while (j < hi) {
+        switch (text[j]) {
+            '\\' => j += 2,
+            '[' => {
+                depth += 1;
+                j += 1;
+            },
+            ']' => {
+                depth -= 1;
+                if (depth == 0) {
+                    label_close = j;
+                    break;
+                }
+                j += 1;
+            },
+            else => j += 1,
+        }
+    } else return null;
+    const closed = label_close.?;
+    if (closed + 1 >= hi or text[closed + 1] != '(') return null;
+    var paren_depth: usize = 1;
+    var k = closed + 2;
+    while (k < hi) {
+        switch (text[k]) {
+            '\\' => k += 2,
+            '(' => {
+                paren_depth += 1;
+                k += 1;
+            },
+            ')' => {
+                paren_depth -= 1;
+                if (paren_depth == 0) return .{ .label_close = closed, .dest_end = k };
+                k += 1;
+            },
+            else => k += 1,
+        }
+    } else return null;
+}
+
+fn findDouble(text: []const u8, from: usize, hi: usize, byte: u8) ?usize {
+    var j = from;
+    while (j + 1 < hi) {
+        if (text[j] == byte and text[j + 1] == byte) return j;
+        j += 1;
+    }
+    return null;
+}
+
+fn lineSpan(text: []const u8, from: usize) struct { end: usize, next: usize } {
+    const newline = std.mem.indexOfScalarPos(u8, text, from, '\n') orelse text.len;
+    var end = newline;
+    if (end > from and text[end - 1] == '\r') end -= 1;
+    return .{ .end = end, .next = newline +| 1 };
+}
+
+/// Analyzes Markdown source without rewriting any bytes: returned spans
+/// cover the original text (syntax markers included) so a live editor can
+/// style its buffer in place while cursor and wrap offsets stay exact.
+pub fn analyzeSource(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+) ![]SourceSpan {
+    if (source.len == 0) return &.{};
+    const flags = try allocator.alloc(u8, source.len);
+    defer allocator.free(flags);
+    @memset(flags, 0);
+
+    var fence: u8 = 0;
+    var pos: usize = 0;
+    while (pos < source.len) {
+        const line = lineSpan(source, pos);
+        var body = pos;
+        while (body < line.end and source[body] == ' ' and body - pos < 3) body += 1;
+
+        if (fence != 0) {
+            markRange(flags, pos, line.end, flag_code);
+            if (body < line.end and source[body] == fence and
+                countRun(source, body, line.end, fence) >= 3)
+                fence = 0;
+        } else if (body < line.end and
+            (source[body] == '`' or source[body] == '~') and
+            countRun(source, body, line.end, source[body]) >= 3)
+        {
+            fence = source[body];
+            markRange(flags, pos, line.end, flag_code);
+        } else if (body < line.end and source[body] == '#') {
+            const hashes = countRun(source, body, line.end, '#');
+            const at_end = body + hashes >= line.end;
+            const next = if (at_end) '\n' else source[body + hashes];
+            if (hashes >= 1 and hashes <= 6 and (at_end or next == ' ' or next == '\t')) {
+                markRange(flags, pos, line.end, flag_heading);
+            } else {
+                scanInline(flags, source, pos, line.end, 0);
+            }
+        } else {
+            scanInline(flags, source, pos, line.end, 0);
+        }
+        pos = line.next;
+    }
+
+    var spans: std.ArrayList(SourceSpan) = .empty;
+    errdefer spans.deinit(allocator);
+    var i: usize = 0;
+    while (i < source.len) {
+        if (flags[i] == 0) {
+            i += 1;
+            continue;
+        }
+        const start = i;
+        i += 1;
+        // Include UTF-8 continuation bytes so spans never split a code point.
+        while (i < source.len and
+            (flags[i] == flags[start] or (source[i] & 0xc0) == 0x80)) i += 1;
+        spans.append(allocator, .{
+            .start = start,
+            .end = i,
+            .style = styleFromFlags(flags[start]),
+        }) catch break;
+    }
+    return spans.toOwnedSlice(allocator);
+}
+
 fn syntaxColor(token: highlight.Token) vaxis.Color {
     return switch (token) {
         .comment => .{ .rgb = .{ 148, 163, 184 } },
@@ -2337,4 +2617,77 @@ test "narrow tables render as stacked header values" {
         std.mem.indexOf(u8, rendered.items, "Role:\nEngineer") != null,
     );
     try std.testing.expect(std.mem.indexOf(u8, rendered.items, "┌") == null);
+}
+
+test "analyzeSource styles emphasis code and links in place" {
+    const source = "**bold** and *em* and `code` and [link](https://example.com) end";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var saw_bold = false;
+    var saw_italic = false;
+    var saw_code = false;
+    var saw_link = false;
+    var prev_end: usize = 0;
+    for (spans) |span| {
+        try std.testing.expect(span.start >= prev_end);
+        try std.testing.expect(span.end <= source.len);
+        prev_end = span.end;
+        const text = source[span.start..span.end];
+        if (span.style.bold and std.mem.eql(u8, text, "**bold**")) saw_bold = true;
+        if (span.style.italic and std.mem.eql(u8, text, "*em*")) saw_italic = true;
+        if (span.style.code and std.mem.eql(u8, text, "`code`")) saw_code = true;
+        if (span.style.link and std.mem.eql(u8, text, "[link](https://example.com)")) saw_link = true;
+    }
+    try std.testing.expect(saw_bold and saw_italic and saw_code and saw_link);
+}
+
+test "analyzeSource keeps emphasis nesting intact" {
+    const source = "**a *b* c**";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var saw_bold = false;
+    var saw_italic = false;
+    for (spans) |span| {
+        const text = source[span.start..span.end];
+        if (span.style.bold) saw_bold = true;
+        if (span.style.italic and std.mem.indexOf(u8, text, "b") != null) saw_italic = true;
+    }
+    try std.testing.expect(saw_bold and saw_italic);
+}
+
+test "analyzeSource marks headings and fenced code" {
+    const source = "# Title\n\n```zig\nconst x = 1;\n```\nplain text";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var saw_heading = false;
+    var saw_fence_open = false;
+    var saw_fence_body = false;
+    for (spans) |span| {
+        const text = source[span.start..span.end];
+        if (span.style.heading and std.mem.eql(u8, text, "# Title")) saw_heading = true;
+        if (span.style.code and std.mem.eql(u8, text, "```zig")) saw_fence_open = true;
+        if (span.style.code and std.mem.eql(u8, text, "const x = 1;")) saw_fence_body = true;
+    }
+    try std.testing.expect(saw_heading and saw_fence_open and saw_fence_body);
+}
+
+test "analyzeSource leaves unmatched markers and snake_case unstyled" {
+    const spans = try analyzeSource(std.testing.allocator, "snake_case_name and **unclosed and a * b *\n");
+    defer std.testing.allocator.free(spans);
+    try std.testing.expectEqual(@as(usize, 0), spans.len);
+}
+
+test "analyzeSource spans never split code points" {
+    const source = "héllo **wörld** ok";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+    for (spans) |span| {
+        try std.testing.expect((source[span.start] & 0xc0) != 0x80);
+        if (span.end < source.len) {
+            try std.testing.expect((source[span.end] & 0xc0) != 0x80);
+        }
+    }
 }
