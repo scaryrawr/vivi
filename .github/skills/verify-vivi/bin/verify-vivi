@@ -330,8 +330,9 @@ recorded_pty_command() {
     cast=$1
     title=$2
     inner=$3
-    printf 'asciinema rec -q --overwrite --window-size 100x30 --title %s %s --command %s' \
-        "$(shell_quote "$title")" "$(shell_quote "$cast")" "$(shell_quote "$inner")"
+    printf '%s rec -q --overwrite --window-size 100x30 --title %s %s --command %s' \
+        "$(shell_quote "$asciinema_command")" "$(shell_quote "$title")" \
+        "$(shell_quote "$cast")" "$(shell_quote "$inner")"
 }
 
 render_cast() {
@@ -1057,8 +1058,12 @@ chat_customization() {
 
     cast="$run_dir/chat-customization.cast"
     rm -f "$cast"
-    pty_command="cd '$workspace' && stty cols 100 rows 30; '$binary' chat --model '$model'"
-    rec_command=$(recorded_pty_command "$cast" chat-customization "$pty_command")
+    pty_command="cd '$workspace' && stty cols 100 rows 30; exec '$binary' chat --model '$model'"
+    if test "${VIVI_SKIP_RECORDING:-0}" = 1; then
+        run_command="$pty_command"
+    else
+        run_command=$(recorded_pty_command "$cast" chat-customization "$pty_command")
+    fi
 
     (
         sleep 60
@@ -1073,7 +1078,7 @@ chat_customization() {
         printf '\003'
     ) | HOME="$customization_home" GH_TOKEN="$github_token" \
         GITHUB_TOKEN="$github_token" \
-        script -q "$run_dir/chat-customization.terminal.log" sh -c "$rec_command" &
+        script -q "$run_dir/chat-customization.terminal.log" sh -c "$run_command" &
     pty_pid=$!
     printf '%s\n' "$pty_pid" >"$run_dir/pty.pid"
     trap 'kill "$pty_pid" 2>/dev/null || true; wait "$pty_pid" 2>/dev/null || true' EXIT INT TERM
@@ -1086,7 +1091,41 @@ chat_customization() {
     rm -f "$run_dir/pty.pid"
     trap - EXIT INT TERM
 
-    VIVI_KEEP_GIF=1 render_cast "$1" chat-customization
+    if test "${VIVI_SKIP_RECORDING:-0}" = 1; then
+        printf '%s\n' \
+            'Recording was skipped; terminal PTY evidence is available.' \
+            >"$run_dir/chat-customization.visual-blocker.txt"
+    else
+        VIVI_KEEP_GIF=1 render_cast "$1" chat-customization
+    fi
+
+    perl -0pe \
+        's/\e\[[0-?]*[ -\/]*[@-~]//g; s/\e\][^\a]*(?:\a|\e\\)//g' \
+        "$run_dir/chat-customization.terminal.log" |
+        tr -d '\r\b' >"$run_dir/chat-customization.normalized.txt"
+
+    {
+        printf 'exit=%s\n' "$status"
+        printf 'instruction_seen='
+        grep -q 'VIVI_INSTRUCTION_OK' "$run_dir/chat-customization.normalized.txt" &&
+            printf 'yes\n' || printf 'no\n'
+        printf 'skill_menu_seen='
+        grep -q 'Fixture skill discovered by Vivi.' \
+            "$run_dir/chat-customization.normalized.txt" &&
+            printf 'yes\n' || printf 'no\n'
+        printf 'skill_response_seen='
+        grep -q 'VIVI_SKILL_OK' "$run_dir/chat-customization.normalized.txt" &&
+            printf 'yes\n' || printf 'no\n'
+    } >"$run_dir/chat-customization.assertions.txt"
+
+    test "$status" -eq 0
+    grep -q 'VIVI_INSTRUCTION_OK' "$run_dir/chat-customization.normalized.txt"
+    grep -q 'Fixture skill discovered by Vivi.' \
+        "$run_dir/chat-customization.normalized.txt"
+    grep -q 'VIVI_SKILL_OK' "$run_dir/chat-customization.normalized.txt"
+    if test "${VIVI_SKIP_RECORDING:-0}" != 1; then
+        test -s "$run_dir/chat-customization.contact-sheet.png"
+    fi
 }
 
 prepare_customization_workspace() {
@@ -1304,10 +1343,17 @@ chat_async_bash() {
         VIVI_EXPECT_MODEL=$model \
         VIVI_EXPECT_PROMPT=$prompt \
         VIVI_EXPECT_CAST="$cast" \
+        VIVI_EXPECT_ASCINEMA=$asciinema_command \
+        VIVI_SKIP_RECORDING=${VIVI_SKIP_RECORDING:-0} \
         expect <<'EOF' &
 set timeout 90
-spawn -noecho script -q $env(VIVI_EXPECT_LOG) sh -c \
-    "asciinema rec -q --overwrite --window-size 100x30 --title chat-async-bash $env(VIVI_EXPECT_CAST) --command \"stty cols 100 rows 30; exec '$env(VIVI_EXPECT_BINARY)' chat --model '$env(VIVI_EXPECT_MODEL)'\""
+set inner "stty cols 100 rows 30; exec '$env(VIVI_EXPECT_BINARY)' chat --model '$env(VIVI_EXPECT_MODEL)'"
+if { $env(VIVI_SKIP_RECORDING) == "1" } {
+    spawn -noecho script -q $env(VIVI_EXPECT_LOG) sh -c $inner
+} else {
+    spawn -noecho script -q $env(VIVI_EXPECT_LOG) sh -c \
+        "$env(VIVI_EXPECT_ASCINEMA) rec -q --overwrite --window-size 100x30 --title chat-async-bash $env(VIVI_EXPECT_CAST) --command \"$inner\""
+}
 expect {
     -re {Ready} {}
     timeout { exit 124 }
@@ -1406,10 +1452,17 @@ chat_file_picker() {
         VIVI_EXPECT_FIXTURE=$fixture \
         VIVI_EXPECT_LOG="$run_dir/chat-file-picker.terminal.log" \
         VIVI_EXPECT_CAST="$cast" \
+        VIVI_EXPECT_ASCINEMA=$asciinema_command \
+        VIVI_SKIP_RECORDING=${VIVI_SKIP_RECORDING:-0} \
         expect <<'EOF' &
 set timeout 30
-spawn -noecho script -q $env(VIVI_EXPECT_LOG) sh -c \
-    "asciinema rec -q --overwrite --window-size 100x30 --title chat-file-picker $env(VIVI_EXPECT_CAST) --command \"cd '$env(VIVI_EXPECT_FIXTURE)' && stty cols 100 rows 30; exec '$env(VIVI_EXPECT_BINARY)' chat\""
+set inner "cd '$env(VIVI_EXPECT_FIXTURE)' && stty cols 100 rows 30; exec '$env(VIVI_EXPECT_BINARY)' chat"
+if { $env(VIVI_SKIP_RECORDING) == "1" } {
+    spawn -noecho script -q $env(VIVI_EXPECT_LOG) sh -c $inner
+} else {
+    spawn -noecho script -q $env(VIVI_EXPECT_LOG) sh -c \
+        "$env(VIVI_EXPECT_ASCINEMA) rec -q --overwrite --window-size 100x30 --title chat-file-picker $env(VIVI_EXPECT_CAST) --command \"$inner\""
+}
 expect {
     -re {Ready} {}
     timeout { exit 124 }
@@ -1444,7 +1497,13 @@ EOF
     rm -f "$run_dir/pty.pid"
     trap - EXIT INT TERM
 
-    VIVI_KEEP_GIF=1 render_cast "$1" chat-file-picker
+    if test "${VIVI_SKIP_RECORDING:-0}" = 1; then
+        printf '%s\n' \
+            'Recording was skipped; terminal PTY evidence is available.' \
+            >"$run_dir/chat-file-picker.visual-blocker.txt"
+    else
+        VIVI_KEEP_GIF=1 render_cast "$1" chat-file-picker
+    fi
 
     perl -0pe \
         's/\e\[[0-?]*[ -\/]*[@-~]//g; s/\e\][^\a]*(?:\a|\e\\)//g' \
@@ -1468,7 +1527,9 @@ EOF
     grep -F -q '.visible-hidden' "$run_dir/chat-file-picker.normalized.txt"
     ! grep -F -q '.ignored-hidden' "$run_dir/chat-file-picker.normalized.txt"
     ! grep -F -q '.svn/entries' "$run_dir/chat-file-picker.normalized.txt"
-    test -s "$run_dir/chat-file-picker.contact-sheet.png"
+    if test "${VIVI_SKIP_RECORDING:-0}" != 1; then
+        test -s "$run_dir/chat-file-picker.contact-sheet.png"
+    fi
 }
 
 case "${1:-}" in
