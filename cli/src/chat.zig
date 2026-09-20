@@ -1722,14 +1722,15 @@ const Projection = struct {
                             0,
                             0,
                         ),
-                    .user, .queued, .question => 1 +
-                        try counter.appendWrappedRange(
-                            allocators.result,
+                    .user, .queued, .question => @intFromBool(show_role) +
+                        try counter.appendMarkdownRangeAllocating(
+                            allocators,
                             entry_index,
                             message.text.items,
                             window,
-                            .body,
-                            2,
+                            @max(window.width -| 2, 1),
+                            null,
+                            .markdown,
                             0,
                             0,
                         ),
@@ -1814,17 +1815,20 @@ const Projection = struct {
                     );
                 },
                 .user, .queued, .question => {
-                    try self.lines.append(allocator, .{
-                        .kind = .role,
-                        .entry_index = entry_index,
-                    });
-                    try self.appendWrapped(
+                    if (show_role) {
+                        try self.lines.append(allocator, .{
+                            .kind = .role,
+                            .entry_index = entry_index,
+                        });
+                    }
+                    try self.appendMarkdown(
                         allocator,
                         entry_index,
                         message.text.items,
                         window,
-                        .body,
-                        2,
+                        @max(window.width -| 2, 1),
+                        null,
+                        .markdown,
                     );
                 },
                 .status => try self.appendWrapped(
@@ -2051,22 +2055,24 @@ const Projection = struct {
                 }
             },
             .user, .queued, .question => {
-                if (first == 0 and last > 0) {
+                const body_offset: usize = @intFromBool(show_role);
+                if (show_role and first == 0 and last > 0) {
                     try self.lines.append(allocators.result, .{
                         .kind = .role,
                         .entry_index = entry_index,
                     });
                 }
-                if (last > 1) {
-                    _ = try self.appendWrappedRange(
-                        allocators.result,
+                if (last > body_offset) {
+                    _ = try self.appendMarkdownRangeAllocating(
+                        allocators,
                         entry_index,
                         message.text.items,
                         window,
-                        .body,
-                        2,
-                        first -| 1,
-                        last - 1,
+                        @max(window.width -| 2, 1),
+                        null,
+                        .markdown,
+                        first -| body_offset,
+                        last -| body_offset,
                     );
                 }
             },
@@ -4598,25 +4604,7 @@ const ChatUi = struct {
                     .wrap = .none,
                 });
             },
-            .body => {
-                const message = entry.constMessage().?;
-                var segments = [_]vaxis.Segment{.{
-                    .text = message.text.items[line.start..line.end],
-                    .style = if (message.role == .reasoning)
-                        .{
-                            .fg = reasoning_color,
-                            .dim = true,
-                            .italic = true,
-                        }
-                    else
-                        .{},
-                }};
-                _ = window.print(&segments, .{
-                    .row_offset = row,
-                    .col_offset = if (window.width >= 4) 2 else 0,
-                    .wrap = .none,
-                });
-            },
+            .body => unreachable,
             .markdown => {
                 const message = entry.constMessage().?;
                 const base_style: vaxis.Style =
