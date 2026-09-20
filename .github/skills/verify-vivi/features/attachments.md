@@ -23,13 +23,13 @@ Enter.
 On macOS, run:
 
 ```sh
-VIVI_VHS=/path/to/working/vhs \
-  .github/skills/verify-vivi/bin/verify-vivi \
+.github/skills/verify-vivi/bin/verify-vivi \
   chat-attachments <run-id>
 ```
 
 The recipe creates a blue PNG, writes it to the AppKit pasteboard, starts Vivi
-from a fixture workspace, and drives both VHS and `script` PTYs with a run-local
+from a fixture workspace, and drives one asciinema-recorded `script` PTY with a
+run-local
 `HOME` and `TMPDIR`. It injects the authenticated GitHub token rather than
 copying or symlinking `.copilot`. The assertions require the attachment token,
 the hosted response, workspace instruction marker, private
@@ -39,8 +39,6 @@ sheet.
 ## Gotchas
 
 - The recipe is macOS-only because it prepares the real AppKit pasteboard.
-- Use a VHS release that actually writes its declared GIF; 0.12.0 is known to
-  exit successfully without output.
 - The selected model must support images. Override it with
   `VIVI_ATTACHMENT_MODEL` when the default `copilot/gpt-5.6-luna` validation
   model is unavailable or a specific vision model is under test.

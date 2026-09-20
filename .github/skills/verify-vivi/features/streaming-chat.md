@@ -89,9 +89,9 @@ Preconditions:
 ## Gotchas
 
 - This recipe calls the live Copilot service and may take longer than the
-  capture waits on a slow connection. The VHS drive waits 45 seconds; the PTY
-  drive polls its transcript for the expected response for up to 90 seconds.
-  Increase both limits together when diagnosing latency.
+  capture waits on a slow connection. The drive polls its transcript for the
+  expected response for up to 90 seconds before sending Ctrl-C.
+  Increase that limit when diagnosing latency.
 - Raw vaxis transcripts contain cursor-control sequences and may visually
   collapse spaces. Assert the no-space marker, not screen-line formatting.
 - The single Ctrl-C may arrive after the response completes, which is valid
