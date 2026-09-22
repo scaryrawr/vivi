@@ -327,6 +327,7 @@ const flag_heading: u8 = 1 << 4;
 const flag_link: u8 = 1 << 5;
 
 const emphasis_stack_limit = 8;
+const max_code_span_delimiter = 32;
 
 const EmphasisOpener = struct {
     marker: u8 = 0,
@@ -585,6 +586,7 @@ const LinkMatch = struct { label_close: usize, dest_end: usize };
 
 fn findCodeSpanEnd(text: []const u8, start: usize, hi: usize) ?usize {
     const run = countRun(text, start, hi, '`');
+    if (run > max_code_span_delimiter) return null;
     var cursor = start + run;
     while (cursor + run <= hi) {
         if (text[cursor] != '`') {
@@ -1017,6 +1019,22 @@ pub fn analyzeSource(
                     );
                     inline_start = null;
                 }
+                var heading_contents = body + hashes;
+                while (heading_contents < line.end and
+                    (source[heading_contents] == ' ' or source[heading_contents] == '\t'))
+                {
+                    heading_contents += 1;
+                }
+                analyzeInlineRange(
+                    flags,
+                    delimiter_pairs,
+                    delimiter_stack,
+                    link_states,
+                    link_dest_ends,
+                    source,
+                    heading_contents,
+                    line.end,
+                );
                 markRange(flags, pos, line.end, flag_heading);
             } else {
                 if (inline_start == null) inline_start = pos;
@@ -3161,6 +3179,30 @@ test "analyzeSource marks headings and fenced code" {
     try std.testing.expect(saw_heading and saw_fence_open and saw_fence_body);
 }
 
+test "analyzeSource preserves inline styles inside ATX headings" {
+    const source = "# *Title* and [link](https://example.com)";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var saw_heading_italic = false;
+    var saw_heading_link = false;
+    for (spans) |span| {
+        const text = source[span.start..span.end];
+        if (span.style.heading and span.style.italic and
+            std.mem.indexOf(u8, text, "Title") != null)
+        {
+            saw_heading_italic = true;
+        }
+        if (span.style.heading and span.style.link and
+            std.mem.indexOf(u8, text, "link") != null)
+        {
+            saw_heading_link = true;
+        }
+    }
+    try std.testing.expect(saw_heading_italic);
+    try std.testing.expect(saw_heading_link);
+}
+
 test "analyzeSource leaves unmatched markers and snake_case unstyled" {
     const spans = try analyzeSource(std.testing.allocator, "snake_case_name and **unclosed and a * b *\n");
     defer std.testing.allocator.free(spans);
@@ -3461,6 +3503,15 @@ test "analyzeSource scans unmatched link openers once" {
         "[inner](https://example.com)",
         nested[nested_spans[0].start..nested_spans[0].end],
     );
+}
+
+test "analyzeSource rejects inline code delimiters longer than md4c limit" {
+    const delimiter = "`" ** 33;
+    const source = delimiter ++ "code" ++ delimiter;
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    for (spans) |span| try std.testing.expect(!span.style.code);
 }
 
 test "analyzeSource fences close only on an equally long unannotated fence" {
