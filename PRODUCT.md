@@ -2,37 +2,31 @@
 
 ## Platform
 
-Cross-platform command-line interface.
+Cross-platform launcher and extension distribution for GitHub Copilot CLI.
 
 ## Users
 
-Vivi serves developers who want focused, project-aware Copilot conversations
-in the terminal without managing a separate desktop application.
+Vivi serves developers who want local model discovery and an opinionated
+Copilot environment without maintaining a separate agent client.
 
 ## Product Purpose
 
-Vivi provides a responsive streaming chat, model selection, session resume,
-workspace-aware tools, image attachments, and visible reasoning/tool activity
-through one portable CLI.
+Vivi discovers local providers before session startup, installs coordinated
+extensions, and launches Copilot with a persistent isolated profile.
 
 ## Capabilities and Constraints
 
-- Zig is the authoritative implementation and the only production owner of the
-  Copilot SDK.
-- The libvaxis CLI owns terminal rendering, accessibility-oriented keyboard
-  interaction, composer state, and transcript navigation.
-- Backend modules own conversations, models, settings, tools, attachments,
-  presentation semantics, and process lifecycle.
-- Vivi does not ship native desktop or web application hosts.
-- Workspace MCP tools remain fail-closed until an explicit approval boundary
-  exists.
+- Bun is the authoritative launcher implementation.
+- Copilot CLI owns terminal rendering, sessions, authentication, permissions,
+  tools, MCP, skills, agents, and conversation lifecycle.
+- Vivi owns local provider discovery, generated startup configuration, and its
+  named extension directories.
+- Vivi does not ship a second chat client, daemon, native host, or web host.
 
 ## Product Principles
 
-- Keep the terminal experience compact, keyboard-first, and explicit about
-  streaming, tools, failures, and recovery.
-- Preserve project and session context without introducing another service or
-  daemon.
-- Prefer typed domain values and direct module boundaries over generic
-  protocols.
-- Prove behavior through the built CLI and real PTY interaction.
+- Add value before Copilot starts or through supported extension boundaries.
+- Keep the launcher transparent: preserve arguments, stdio, signals, and exit
+  status.
+- Never overwrite Copilot-managed state.
+- Prove behavior through the compiled launcher and the real Copilot CLI.

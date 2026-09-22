@@ -1,92 +1,89 @@
 # Vivi
 
-Vivi is a cross-platform command-line interface for project-aware Copilot
-conversations. Its interactive chat is built with Zig and libvaxis and runs on
-Windows, Linux, and macOS.
+Vivi is a small cross-platform launcher for an opinionated GitHub Copilot CLI
+environment. It discovers local models before Copilot starts, installs bundled
+extensions into an isolated profile, and then delegates the full interactive
+experience to the upstream `copilot` executable.
 
 ## Requirements
 
-- Zig 0.16.0
-- `zigdoc`
-- GitHub Copilot CLI in `PATH` for `vivi chat`
+- GitHub Copilot CLI available as `copilot`
+- Bun 1.4.x for development only
 
-Vivi uses
-[`scaryrawr/copilot-sdk-zig`](https://github.com/scaryrawr/copilot-sdk-zig),
-pinned in `build.zig.zon`. Copilot credentials are not required for builds or
-tests.
+Release binaries include the Bun runtime.
 
-## Build and test
-
-```sh
-zig build
-zig build run -- --help
-zig build run -- models
-zig build run -- chat
-zig build test
-./scripts/check.sh
-```
-
-The CLI and its tests use LLVM because Zig 0.16.0's default x86_64 backend
-crashes compiling the image decoder. Backend-only targets retain Zig's default
-selection. Pass `-Dllvm=true` or `-Dllvm=false` to compare compiler backends.
-
-`./scripts/check.sh` runs formatting, tests, CLI smoke checks, and Linux and
-Windows cross-builds.
-
-## Chat
-
-Running `vivi` with no command starts the full-screen chat. The interface
-includes a scrolling transcript, workspace context, streaming responses,
-reasoning and tool activity, slash commands, model selection, session resume,
-and a compact bottom composer.
+## Usage
 
 ```sh
 vivi
 vivi chat
-vivi chat --model copilot/<model-id> --reasoning high
-vivi chat --model omlx/<model-id> --reasoning xhigh
+vivi --model copilot/gpt-5.6-luna --reasoning high
+vivi --model omlx/Qwen3.5-9B
+vivi models
 ```
 
-Hosted Copilot and OMLX sessions retain the `ask_user`, `skill`, and
-`web_fetch` built-ins alongside configured MCP tools and four Vivi tools:
-`read`, `bash`, `edit`, and `write`. Ambient workspace MCP permission requests
-remain denied until Vivi has an explicit approval flow.
+Running `vivi` with no command launches Copilot. `chat` is a compatibility
+alias. All unrecognized arguments pass directly to Copilot CLI. Vivi also
+translates its former `copilot/<model>` identifiers and `--reasoning` flag to
+Copilot's native syntax.
 
-Vivi keeps its Copilot runtime state under `~/.vivi/copilot/`, separate from
-the standalone Copilot CLI's `~/.copilot/` directory. The selected model and
-reasoning level are stored in `~/.vivi/settings.json`.
+Vivi loads the last model and reasoning selection from
+`~/.vivi/settings.json`. Explicit `--model` or `--reasoning` arguments win.
+Changing the model or reasoning effort through Copilot's `/model` flow updates
+the Vivi setting for the next new session. Resumed sessions retain their own
+saved model configuration.
 
-Use `/model` to switch models, `/new` to replace the active conversation, and
-`/resume` to continue a session from Vivi's private Copilot store. Press
-Ctrl-C once for cooperative shutdown and again only if Copilot remains blocked.
+Copilot's BYOK model registry does not currently expose supported reasoning
+levels to the built-in model picker. For local models, use `/reasoning` to show
+the current effort or `/reasoning high` to change it. The launcher flags
+`--reasoning` and `--reasoning-effort` remain available for startup selection.
 
-## Images
+Vivi stores its persistent Copilot profile under `~/.vivi/copilot`. This keeps
+Vivi sessions, permissions, plugins, and authentication separate from a normal
+`~/.copilot` installation. Set `VIVI_HOME` to move the entire Vivi profile or
+`VIVI_COPILOT_PATH` to select a specific Copilot executable.
 
-Press **Ctrl-V** or **Alt-V** to paste an image from the system clipboard.
-Vivi snapshots the image to a private temporary file and submits it as a typed
-attachment when its quoted path remains in the composer. macOS uses AppKit,
-Linux uses `wl-paste` or `xclip`, and Windows uses PowerShell clipboard support.
+## Local models
 
-The `read` tool accepts PNG, JPEG, GIF, and WebP images. Supported terminals
-can expand PNG, JPEG, and GIF results with Kitty graphics; other terminals
-retain the text summary.
+Before every launch, Vivi concurrently probes:
 
-## Models
+| Provider  | Default endpoint         |
+| --------- | ------------------------ |
+| Ollama    | `http://localhost:11434` |
+| LM Studio | `http://localhost:1234`  |
+| OMLX      | `http://localhost:8000`  |
+| OSaurus   | `http://localhost:1337`  |
+| GenieX    | `http://127.0.0.1:18181` |
 
-`vivi models` lists authenticated Copilot models and OMLX models discovered
-from `http://localhost:8000/v1/models/status`. Set `OMLX_BASE_URL` and
-`OMLX_API_KEY` to override the local endpoint and credential.
+Use `<PROVIDER>_BASE_URL`, `<PROVIDER>_API_KEY`, and the supported
+`<PROVIDER>_CONTEXT_LENGTH` variables to override discovery. Unavailable
+servers are ignored. The generated provider registry is private,
+process-scoped, and removed after Copilot exits.
+
+## Bundled extensions
+
+Vivi enables Copilot's experimental extension runtime automatically because
+current Copilot CLI releases gate extension discovery behind `--experimental`.
+
+- `vivi-system-prompt` applies Vivi's compact coding-agent policy while
+  preserving safety, environment, repository, and runtime instructions.
+- `vivi-basic-tools` replaces overlapping Copilot built-ins with Vivi's
+  `read`, `bash`, `edit`, and `write` implementations.
+- `vivi-local-model-policy` blocks subagent and factory orchestration while a
+  discovered local model is selected by declaring built-in exclusions when the
+  extension joins the session.
+- `vivi-reasoning` provides the `/reasoning` session command for local models.
+- `vivi-selection-persistence` records model and reasoning changes for the next
+  Vivi session.
 
 ## Development
 
 ```sh
-zig fmt build.zig backend cli
-zigdoc copilot_sdk.Client
+bun install
+bun run check
+bun run build
+./dist/vivi --help
 ```
-
-Release CLIs target glibc 2.17 on Linux and macOS 14.0 on Apple silicon.
-Explicit macOS targets require both `--sysroot` and `-Dmacos-sdk` from
-`xcrun --sdk macosx --show-sdk-path`.
 
 Architecture and ownership decisions are documented in
 [`docs/architecture.md`](docs/architecture.md).

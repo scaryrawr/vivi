@@ -2,70 +2,57 @@
 
 ## Project Structure
 
-Vivi is a cross-platform Zig CLI:
+Vivi is a Bun monorepo that prepares an opinionated GitHub Copilot CLI profile
+and launches the upstream `copilot` executable.
 
-- `backend/src/root.zig` owns Copilot SDK adaptation and is the only production
-  module allowed to import `copilot_sdk`.
-- `backend/src/` contains SDK-free domain services for conversations, tools,
-  models, settings, presentation, file picking, attachments, and PTYs.
-- `cli/src/` owns command parsing and the libvaxis terminal interface.
-- `build.zig.zon` is the sole SDK dependency pin.
-- `third_party/` contains vendored source with its upstream license and exact
-  revision documented.
+- `apps/vivi/` owns command parsing and process launching.
+- `packages/provider-discovery/` discovers supported local model servers and
+  emits Copilot's named provider/model registry.
+- `packages/copilot-profile/` materializes Vivi-owned extensions and secure
+  per-process configuration.
+- `packages/settings/` parses, migrates, and writes Vivi's versioned default
+  model and reasoning selection.
+- `extensions/` contains independent Copilot CLI extensions.
+- `scripts/build.ts` compiles the standalone cross-platform executable.
 
-Do not add native or web application hosts, a C ABI, generic JSON bridges,
-daemons, or speculative executable targets. Keep UI policy in the CLI and
-Copilot SDK types inside `backend/src/root.zig`.
-
-Treat ambient MCP server and tool names as repository-controlled input. A
-workspace can shadow built-in names, so permission decisions must not trust a
-server/tool-name pair as proof of provenance. Keep ambient MCP permissions
-fail-closed until an explicit user approval boundary exists.
+Copilot CLI owns the terminal UI, authentication, permissions, sessions,
+tools, MCP integration, and conversation lifecycle. Do not reimplement those
+surfaces in Vivi.
 
 ## Build and Test
 
-Use Zig 0.16.x.
+Use Bun 1.4.x.
 
 ```sh
-zig build
-zig build run -- --help
-zig build test
+bun install
+bun run build
+bun run check
 ./scripts/check.sh
-zigdoc copilot_sdk.Client
 ```
 
-For platform-specific clipboard or terminal-input changes, cross-build the
-executables:
-
-```sh
-zig build -Dtarget=x86_64-linux-gnu --prefix zig-out/cli-linux
-zig build -Dtarget=x86_64-windows-gnu --prefix zig-out/cli-windows
-```
-
-Use the Windows GNU target when cross-building without MSVC headers. Release
-CLIs target glibc 2.17 on Linux and macOS 14.0 on Apple silicon. An explicit
-macOS target must pass both `--sysroot` and `-Dmacos-sdk` from
-`xcrun --sdk macosx --show-sdk-path`.
+Default tests must not require Copilot credentials or a running Copilot CLI.
+End-to-end verification uses the installed `copilot` executable and an
+isolated `VIVI_HOME`.
 
 ## Style
 
-Run `zig fmt build.zig backend cli`. Preserve lowercase `vivi` for the CLI and
-capitalized `Vivi` for the product name.
+Run `bun run format`. Preserve lowercase `vivi` for the executable and
+capitalized `Vivi` for the product name. Keep provider discovery side-effect
+free except for bounded HTTP requests. Extension stdout is reserved for the
+Copilot JSON-RPC connection; use `session.log()` for user-visible messages.
 
-Default tests must not require Copilot credentials or a running Copilot CLI.
-When changing `backend/src/attachment.zig` or `backend/src/settings.zig`, also
-run `zig test` directly on the changed module.
+## Profile Ownership
 
-With Zig 0.16 on POSIX, open a directory with `.iterate = true` before calling
-`Dir.setPermissions`; the default `openDirAbsolute` handle may be `O_PATH` on
-Linux, causing `setPermissions` to abort with `BADF`.
-
-Version every persisted settings schema change. Parse each supported older
-version explicitly, migrate it in memory, and test the next write.
+Within `COPILOT_HOME`, Vivi may overwrite only its named extension directories
+and ephemeral runtime files. Never overwrite Copilot-managed authentication,
+permission, plugin, session, history, or log state. Provider registries
+containing API keys must be private, process-scoped, and removed after Copilot
+exits. Version every `~/.vivi/settings.json` schema change, parse older
+versions explicitly, migrate them in memory, and test the next write.
 
 ## Pull Requests
 
 Keep changes narrowly scoped and include relevant command output in PR
-descriptions. User-visible CLI or TUI changes require a reviewer-facing demo
-captured through the built application. Never commit generated archives,
-caches, credentials, or a Copilot CLI binary.
+descriptions. User-visible launcher or extension changes require evidence
+captured through the compiled `dist/vivi` executable. Never commit generated
+executables, caches, credentials, or runtime provider registries.

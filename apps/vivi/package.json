@@ -1,0 +1,11 @@
+{
+  "name": "@vivi/cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@vivi/copilot-profile": "workspace:*",
+    "@vivi/provider-discovery": "workspace:*",
+    "@vivi/settings": "workspace:*"
+  }
+}
