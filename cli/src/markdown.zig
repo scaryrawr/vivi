@@ -1538,16 +1538,24 @@ fn quoteLineHasContent(source: []const u8, pos: usize, line_end: usize) bool {
 const FenceContext = struct {
     quote_depth: usize,
     body_column: usize,
+    list_marker: bool,
 
-    fn eql(self: FenceContext, other: FenceContext) bool {
-        return self.quote_depth == other.quote_depth and
-            self.body_column == other.body_column;
+    fn matches(self: FenceContext, line: FenceLine) bool {
+        if (self.quote_depth != line.context.quote_depth or
+            line.context.list_marker)
+        {
+            return false;
+        }
+        if (!self.list_marker) return !line.code_indented;
+        return line.context.body_column >= self.body_column and
+            line.context.body_column <= self.body_column + 3;
     }
 };
 
 const FenceLine = struct {
     body: usize,
     context: FenceContext,
+    code_indented: bool,
 };
 
 fn fenceLine(source: []const u8, pos: usize, line_end: usize) FenceLine {
@@ -1555,7 +1563,12 @@ fn fenceLine(source: []const u8, pos: usize, line_end: usize) FenceLine {
     if (indent.columns >= 4) {
         return .{
             .body = pos + indent.bytes,
-            .context = .{ .quote_depth = 0, .body_column = indent.columns },
+            .context = .{
+                .quote_depth = 0,
+                .body_column = indent.columns,
+                .list_marker = false,
+            },
+            .code_indented = true,
         };
     }
     var cursor = pos + indent.bytes;
@@ -1577,18 +1590,22 @@ fn fenceLine(source: []const u8, pos: usize, line_end: usize) FenceLine {
                 .context = .{
                     .quote_depth = quote_depth,
                     .body_column = body_column + nested_indent.columns,
+                    .list_marker = false,
                 },
+                .code_indented = true,
             };
         }
         body_column += nested_indent.columns;
         cursor += nested_indent.bytes;
     }
 
+    var list_marker = false;
     if (cursor < line_end and
         (source[cursor] == '-' or source[cursor] == '+' or source[cursor] == '*') and
         cursor + 1 < line_end and
         (source[cursor + 1] == ' ' or source[cursor + 1] == '\t'))
     {
+        list_marker = true;
         body_column += 2;
         cursor += 2;
     } else {
@@ -1602,6 +1619,7 @@ fn fenceLine(source: []const u8, pos: usize, line_end: usize) FenceLine {
             (source[cursor] == '.' or source[cursor] == ')') and
             (source[cursor + 1] == ' ' or source[cursor + 1] == '\t'))
         {
+            list_marker = true;
             body_column += cursor + 2 - digits_start;
             cursor += 2;
         } else {
@@ -1616,7 +1634,12 @@ fn fenceLine(source: []const u8, pos: usize, line_end: usize) FenceLine {
     }
     return .{
         .body = cursor,
-        .context = .{ .quote_depth = quote_depth, .body_column = body_column },
+        .context = .{
+            .quote_depth = quote_depth,
+            .body_column = body_column,
+            .list_marker = list_marker,
+        },
+        .code_indented = false,
     };
 }
 
@@ -1747,9 +1770,14 @@ pub fn analyzeSource(
 
     var fence: u8 = 0;
     var fence_len: usize = 0;
-    var fence_context: FenceContext = .{ .quote_depth = 0, .body_column = 0 };
+    var fence_context: FenceContext = .{
+        .quote_depth = 0,
+        .body_column = 0,
+        .list_marker = false,
+    };
     var inline_start: ?usize = null;
     var inline_container: InlineContainer = .plain;
+    var inline_container_column: usize = 0;
     var table_mode = false;
     var previous_line_start: usize = 0;
     var pos: usize = 0;
@@ -1758,6 +1786,10 @@ pub fn analyzeSource(
         const indent = leadingIndent(source, pos, line.end);
         const body = pos + indent.bytes;
         const fence_line = fenceLine(source, pos, line.end);
+        const list_fence_opener = fence_line.code_indented and
+            inline_start != null and inline_container == .list and
+            fence_line.context.body_column >= inline_container_column and
+            fence_line.context.body_column <= inline_container_column + 3;
         if (table_mode and
             (body == line.end or findTableSeparator(source, pos, line.end) == null))
         {
@@ -1766,7 +1798,7 @@ pub fn analyzeSource(
 
         if (fence != 0) {
             markRange(flags, pos, line.end, flag_code);
-            if (fence_line.context.eql(fence_context) and
+            if (fence_context.matches(fence_line) and
                 fence_line.body < line.end and source[fence_line.body] == fence)
             {
                 const run = countRun(source, fence_line.body, line.end, fence);
@@ -1800,7 +1832,8 @@ pub fn analyzeSource(
                 );
                 inline_start = null;
             }
-        } else if (fence_line.body < line.end and
+        } else if ((!fence_line.code_indented or list_fence_opener) and
+            fence_line.body < line.end and
             (source[fence_line.body] == '`' or source[fence_line.body] == '~') and
             validFenceOpener(source, fence_line.body, line.end, source[fence_line.body]))
         {
@@ -1821,7 +1854,14 @@ pub fn analyzeSource(
             }
             fence = source[fence_line.body];
             fence_len = countRun(source, fence_line.body, line.end, source[fence_line.body]);
-            fence_context = fence_line.context;
+            fence_context = if (list_fence_opener)
+                .{
+                    .quote_depth = fence_line.context.quote_depth,
+                    .body_column = inline_container_column,
+                    .list_marker = true,
+                }
+            else
+                fence_line.context;
             markRange(flags, pos, line.end, flag_code);
         } else if (inline_start != null and
             inline_container == .plain and
@@ -1924,6 +1964,10 @@ pub fn analyzeSource(
                 if ((quote_line and quote_has_content) or startsListItem(source, pos, line.end)) {
                     inline_start = pos;
                     inline_container = if (quote_line) .quote else .list;
+                    inline_container_column = if (inline_container == .list)
+                        fence_line.context.body_column
+                    else
+                        0;
                 } else if (!quote_line) {
                     analyzeInlineRange(
                         flags,
@@ -1982,12 +2026,14 @@ pub fn analyzeSource(
                 if (inline_start == null) {
                     inline_start = pos;
                     inline_container = .plain;
+                    inline_container_column = 0;
                 }
             }
         } else {
             if (inline_start == null) {
                 inline_start = pos;
                 inline_container = .plain;
+                inline_container_column = 0;
             }
         }
         previous_line_start = pos;
@@ -4225,6 +4271,41 @@ test "analyzeSource requires matching fence container context" {
         }
     }
     try std.testing.expect(saw_list_code and saw_list_after);
+
+    const indented_source = "  ```\ncode\n```\n*after*";
+    const indented_spans = try analyzeSource(std.testing.allocator, indented_source);
+    defer std.testing.allocator.free(indented_spans);
+
+    var saw_indented_after = false;
+    for (indented_spans) |span| {
+        if (span.style.italic and
+            std.mem.eql(u8, indented_source[span.start..span.end], "*after*"))
+        {
+            saw_indented_after = true;
+        }
+    }
+    try std.testing.expect(saw_indented_after);
+
+    const over_indented_source =
+        "```\ncode\n    ```\n*still code*\n```\n*after*";
+    const over_indented_spans = try analyzeSource(
+        std.testing.allocator,
+        over_indented_source,
+    );
+    defer std.testing.allocator.free(over_indented_spans);
+
+    var saw_over_indented_code = false;
+    var saw_over_indented_after = false;
+    for (over_indented_spans) |span| {
+        const text = over_indented_source[span.start..span.end];
+        if (span.style.code and std.mem.eql(u8, text, "*still code*")) {
+            saw_over_indented_code = true;
+        }
+        if (span.style.italic and std.mem.eql(u8, text, "*after*")) {
+            saw_over_indented_after = true;
+        }
+    }
+    try std.testing.expect(saw_over_indented_code and saw_over_indented_after);
 }
 
 test "analyzeSource preserves inline styles inside ATX headings" {
@@ -4969,6 +5050,43 @@ test "analyzeSource rejects backtick fences with backticks in the info string" {
             try std.testing.expect(!span.style.code);
         }
     }
+}
+
+test "analyzeSource treats four-space fence markers as indented code" {
+    const source = "    ```\n*plain*";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var saw_indented_code = false;
+    var saw_plain_emphasis = false;
+    for (spans) |span| {
+        const text = source[span.start..span.end];
+        if (span.style.code and std.mem.eql(u8, text, "    ```")) {
+            saw_indented_code = true;
+        }
+        if (span.style.italic and std.mem.eql(u8, text, "*plain*")) {
+            saw_plain_emphasis = true;
+        }
+    }
+    try std.testing.expect(saw_indented_code and saw_plain_emphasis);
+
+    const list_source =
+        "- item\n    ```\n    code\n    ```\n*after*";
+    const list_spans = try analyzeSource(std.testing.allocator, list_source);
+    defer std.testing.allocator.free(list_spans);
+
+    var saw_list_code = false;
+    var saw_list_after = false;
+    for (list_spans) |span| {
+        const text = list_source[span.start..span.end];
+        if (span.style.code and std.mem.eql(u8, text, "    code")) {
+            saw_list_code = true;
+        }
+        if (span.style.italic and std.mem.eql(u8, text, "*after*")) {
+            saw_list_after = true;
+        }
+    }
+    try std.testing.expect(saw_list_code and saw_list_after);
 }
 
 test "analyzeSource scans unmatched link openers once" {
