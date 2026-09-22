@@ -336,6 +336,7 @@ const EmphasisOpener = struct {
     run: usize = 0,
     original_mod3: u2 = 0,
     can_close: bool = false,
+    previous_same: usize = std.math.maxInt(usize),
 };
 
 const PendingDelimiter = struct {
@@ -438,6 +439,15 @@ fn delimiterFlanking(before: CharacterClass, after: CharacterClass) DelimiterFla
     };
 }
 
+fn delimiterMarkerSlot(marker: u8) usize {
+    return switch (marker) {
+        '*' => 0,
+        '_' => 1,
+        '~' => 2,
+        else => unreachable,
+    };
+}
+
 /// Scans inline Markdown for one line, OR-ing style bits into the absolute
 /// positions of `flags`. Unmatched markers are left unstyled (literal).
 fn scanInline(
@@ -454,6 +464,8 @@ fn scanInline(
 ) void {
     var i = lo;
     const opener_stack = emphasis_openers[lo..hi];
+    const no_opener = std.math.maxInt(usize);
+    var opener_tops: [3]usize = @splat(no_opener);
     var emphasis_depth: usize = 0;
     var pending_delimiter: ?PendingDelimiter = null;
 
@@ -536,13 +548,11 @@ fn scanInline(
 
                 var opener_index: ?usize = null;
                 if (delimiter_can_close) {
-                    var candidate_index = emphasis_depth;
-                    while (candidate_index > 0) {
-                        candidate_index -= 1;
+                    var candidate_index = opener_tops[delimiterMarkerSlot(marker)];
+                    while (candidate_index != no_opener) {
                         const candidate = opener_stack[candidate_index];
-                        if (candidate.marker != marker or
-                            (marker == '~' and candidate.run != run))
-                        {
+                        if (marker == '~' and candidate.run != run) {
+                            candidate_index = candidate.previous_same;
                             continue;
                         }
                         const rule_of_three_allows_close = marker == '~' or
@@ -553,6 +563,7 @@ fn scanInline(
                             opener_index = candidate_index;
                             break;
                         }
+                        candidate_index = candidate.previous_same;
                     }
                 }
 
@@ -578,6 +589,11 @@ fn scanInline(
                             );
                         }
                         emphasis_depth = candidate_index;
+                        for (&opener_tops) |*top| {
+                            while (top.* != no_opener and top.* >= emphasis_depth) {
+                                top.* = opener_stack[top.*].previous_same;
+                            }
+                        }
                         i += run;
                         continue;
                     }
@@ -594,6 +610,11 @@ fn scanInline(
                     markRange(delimiter_roles, i, i + consumed, delimiter_closer);
                     opener.run -= consumed;
                     if (opener.run == 0) emphasis_depth = candidate_index;
+                    for (&opener_tops) |*top| {
+                        while (top.* != no_opener and top.* >= emphasis_depth) {
+                            top.* = opener_stack[top.*].previous_same;
+                        }
+                    }
                     if (consumed < run) {
                         pending_delimiter = .{
                             .start = i + consumed,
@@ -606,13 +627,16 @@ fn scanInline(
                     }
                     i += consumed;
                 } else if (can_open) {
+                    const marker_slot = delimiterMarkerSlot(marker);
                     opener_stack[emphasis_depth] = .{
                         .marker = marker,
                         .start = i,
                         .run = run,
                         .original_mod3 = original_mod3,
                         .can_close = delimiter_can_close,
+                        .previous_same = opener_tops[marker_slot],
                     };
+                    opener_tops[marker_slot] = emphasis_depth;
                     emphasis_depth += 1;
                     i += run;
                 } else {
@@ -1443,6 +1467,12 @@ fn startsQuoteLine(source: []const u8, pos: usize, line_end: usize) bool {
     return body < line_end and indent.columns < 4 and source[body] == '>';
 }
 
+const InlineContainer = enum {
+    plain,
+    list,
+    quote,
+};
+
 /// Analyzes Markdown source without rewriting any bytes: returned spans
 /// cover the original text (syntax markers included) so a live editor can
 /// style its buffer in place while cursor and wrap offsets stay exact.
@@ -1474,7 +1504,7 @@ pub fn analyzeSource(
     var fence: u8 = 0;
     var fence_len: usize = 0;
     var inline_start: ?usize = null;
-    var inline_quote = false;
+    var inline_container: InlineContainer = .plain;
     var pos: usize = 0;
     while (pos < source.len) {
         const line = lineSpan(source, pos);
@@ -1537,7 +1567,9 @@ pub fn analyzeSource(
             fence = source[body];
             fence_len = countRun(source, body, line.end, source[body]);
             markRange(flags, pos, line.end, flag_code);
-        } else if (inline_start != null and isSetextUnderline(source, pos, line.end)) {
+        } else if (inline_start != null and inline_container == .plain and
+            isSetextUnderline(source, pos, line.end))
+        {
             const start = inline_start.?;
             analyzeInlineRange(
                 flags,
@@ -1557,7 +1589,7 @@ pub fn analyzeSource(
             markRange(flags, pos, line.end, flag_code);
         } else if (startsParagraphInterrupt(source, pos, line.end)) {
             const quote_line = startsQuoteLine(source, pos, line.end);
-            if (!(quote_line and inline_start != null and inline_quote)) {
+            if (!(quote_line and inline_start != null and inline_container == .quote)) {
                 if (inline_start) |start| {
                     analyzeInlineRange(
                         flags,
@@ -1575,7 +1607,7 @@ pub fn analyzeSource(
                 }
                 if (quote_line or startsListItem(source, pos, line.end)) {
                     inline_start = pos;
-                    inline_quote = quote_line;
+                    inline_container = if (quote_line) .quote else .list;
                 } else {
                     analyzeInlineRange(
                         flags,
@@ -1633,7 +1665,7 @@ pub fn analyzeSource(
             } else {
                 if (inline_start == null) {
                     inline_start = pos;
-                    inline_quote = false;
+                    inline_container = .plain;
                 }
             }
         } else {
@@ -4151,6 +4183,17 @@ test "analyzeSource bounds malformed angle destination scans" {
     try std.testing.expectEqual(@as(usize, 0), spans.len);
 }
 
+test "analyzeSource bounds mixed-marker delimiter scans" {
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(std.testing.allocator);
+    for (0..2_000) |_| try source.appendSlice(std.testing.allocator, "*a ");
+    for (0..2_000) |_| try source.appendSlice(std.testing.allocator, "a_ ");
+
+    const spans = try analyzeSource(std.testing.allocator, source.items);
+    defer std.testing.allocator.free(spans);
+    try std.testing.expectEqual(@as(usize, 0), spans.len);
+}
+
 test "analyzeSource permits parentheses inside angle link destinations" {
     const source = "[x](<https://e.test/a(b>)";
     const spans = try analyzeSource(std.testing.allocator, source);
@@ -4293,6 +4336,13 @@ test "analyzeSource preserves inline spans across quote continuations" {
         }
     }
     try std.testing.expect(saw_continuation);
+}
+
+test "analyzeSource does not promote setext headings across containers" {
+    const source = "- item\n---\n\n> quote\n---";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+    for (spans) |span| try std.testing.expect(!span.style.heading);
 }
 
 test "analyzeSource distinguishes indented code from paragraph continuation" {
