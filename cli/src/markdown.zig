@@ -380,7 +380,14 @@ fn delimiterFlanking(before: u8, after: u8) DelimiterFlanking {
 
 /// Scans inline Markdown for one line, OR-ing style bits into the absolute
 /// positions of `flags`. Unmatched markers are left unstyled (literal).
-fn scanInline(flags: []u8, text: []const u8, lo: usize, hi: usize, depth: u8) void {
+fn scanInline(
+    flags: []u8,
+    delimiter_pairs: []const usize,
+    text: []const u8,
+    lo: usize,
+    hi: usize,
+    depth: u8,
+) void {
     var i = lo;
     var emphasis_openers: [emphasis_stack_limit]EmphasisOpener =
         @splat(.{ .marker = 0, .start = 0, .run = 0 });
@@ -417,9 +424,18 @@ fn scanInline(flags: []u8, text: []const u8, lo: usize, hi: usize, depth: u8) vo
                     continue;
                 }
                 const label_open = if (image) i + 1 else i;
-                if (matchLink(text, hi, label_open)) |link| {
+                if (linkAt(delimiter_pairs, text, hi, label_open)) |link| {
                     markRange(flags, i, link.dest_end + 1, flag_link);
-                    if (depth < 4) scanInline(flags, text, label_open + 1, link.label_close, depth + 2);
+                    if (depth < 4) {
+                        scanInline(
+                            flags,
+                            delimiter_pairs,
+                            text,
+                            label_open + 1,
+                            link.label_close,
+                            depth + 2,
+                        );
+                    }
                     i = link.dest_end + 1;
                 } else {
                     i += if (image) 1 else 1;
@@ -430,7 +446,9 @@ fn scanInline(flags: []u8, text: []const u8, lo: usize, hi: usize, depth: u8) vo
                     const closed = findDouble(text, i + 2, hi, '~');
                     if (closed) |at| {
                         markRange(flags, i, at + 2, flag_strikethrough);
-                        if (depth < 4) scanInline(flags, text, i + 2, at, depth + 2);
+                        if (depth < 4) {
+                            scanInline(flags, delimiter_pairs, text, i + 2, at, depth + 2);
+                        }
                         i = at + 2;
                     } else {
                         i += 2;
@@ -478,47 +496,60 @@ fn scanInline(flags: []u8, text: []const u8, lo: usize, hi: usize, depth: u8) vo
 
 const LinkMatch = struct { label_close: usize, dest_end: usize };
 
-fn matchLink(text: []const u8, hi: usize, label_open: usize) ?LinkMatch {
-    var depth: usize = 1;
-    var j = label_open + 1;
-    var label_close: ?usize = null;
-    while (j < hi) {
-        switch (text[j]) {
-            '\\' => j += 2,
-            '[' => {
-                depth += 1;
-                j += 1;
-            },
-            ']' => {
-                depth -= 1;
-                if (depth == 0) {
-                    label_close = j;
-                    break;
-                }
-                j += 1;
-            },
-            else => j += 1,
+fn pairDelimiters(
+    pairs: []usize,
+    stack: []usize,
+    text: []const u8,
+    lo: usize,
+    hi: usize,
+    open: u8,
+    close: u8,
+) void {
+    var depth: usize = 0;
+    var i = lo;
+    while (i < hi) {
+        if (text[i] == '\\') {
+            i += if (i + 1 < hi) 2 else 1;
+            continue;
         }
-    } else return null;
-    const closed = label_close.?;
-    if (closed + 1 >= hi or text[closed + 1] != '(') return null;
-    var paren_depth: usize = 1;
-    var k = closed + 2;
-    while (k < hi) {
-        switch (text[k]) {
-            '\\' => k += 2,
-            '(' => {
-                paren_depth += 1;
-                k += 1;
-            },
-            ')' => {
-                paren_depth -= 1;
-                if (paren_depth == 0) return .{ .label_close = closed, .dest_end = k };
-                k += 1;
-            },
-            else => k += 1,
+        if (text[i] == open) {
+            stack[depth] = i;
+            depth += 1;
+        } else if (text[i] == close and depth > 0) {
+            depth -= 1;
+            pairs[stack[depth]] = i;
         }
-    } else return null;
+        i += 1;
+    }
+}
+
+fn prepareInlinePairs(
+    pairs: []usize,
+    stack: []usize,
+    text: []const u8,
+    lo: usize,
+    hi: usize,
+) void {
+    pairDelimiters(pairs, stack, text, lo, hi, '[', ']');
+    pairDelimiters(pairs, stack, text, lo, hi, '(', ')');
+}
+
+fn linkAt(
+    delimiter_pairs: []const usize,
+    text: []const u8,
+    hi: usize,
+    label_open: usize,
+) ?LinkMatch {
+    const label_close = delimiter_pairs[label_open];
+    if (label_close == std.math.maxInt(usize) or
+        label_close + 1 >= hi or
+        text[label_close + 1] != '(')
+    {
+        return null;
+    }
+    const dest_end = delimiter_pairs[label_close + 1];
+    if (dest_end == std.math.maxInt(usize)) return null;
+    return .{ .label_close = label_close, .dest_end = dest_end };
 }
 
 fn findDouble(text: []const u8, from: usize, hi: usize, byte: u8) ?usize {
@@ -548,6 +579,11 @@ pub fn analyzeSource(
     const flags = try allocator.alloc(u8, source.len);
     defer allocator.free(flags);
     @memset(flags, 0);
+    const delimiter_pairs = try allocator.alloc(usize, source.len);
+    defer allocator.free(delimiter_pairs);
+    @memset(delimiter_pairs, std.math.maxInt(usize));
+    const delimiter_stack = try allocator.alloc(usize, source.len);
+    defer allocator.free(delimiter_stack);
 
     var fence: u8 = 0;
     var fence_len: usize = 0;
@@ -589,10 +625,12 @@ pub fn analyzeSource(
             if (hashes >= 1 and hashes <= 6 and (at_end or next == ' ' or next == '\t')) {
                 markRange(flags, pos, line.end, flag_heading);
             } else {
-                scanInline(flags, source, pos, line.end, 0);
+                prepareInlinePairs(delimiter_pairs, delimiter_stack, source, pos, line.end);
+                scanInline(flags, delimiter_pairs, source, pos, line.end, 0);
             }
         } else {
-            scanInline(flags, source, pos, line.end, 0);
+            prepareInlinePairs(delimiter_pairs, delimiter_stack, source, pos, line.end);
+            scanInline(flags, delimiter_pairs, source, pos, line.end, 0);
         }
         pos = line.next;
     }
@@ -2729,6 +2767,26 @@ test "analyzeSource applies the underscore flanking rule like md4c" {
         if (span.style.italic and std.mem.indexOf(u8, text, "emphasis") != null) saw_close = true;
     }
     try std.testing.expect(saw_close);
+}
+
+test "analyzeSource scans unmatched link openers once" {
+    const source = try std.testing.allocator.alloc(u8, 8_000);
+    defer std.testing.allocator.free(source);
+    @memset(source, '[');
+
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+    try std.testing.expectEqual(@as(usize, 0), spans.len);
+
+    const nested = "[[inner](https://example.com)";
+    const nested_spans = try analyzeSource(std.testing.allocator, nested);
+    defer std.testing.allocator.free(nested_spans);
+    try std.testing.expectEqual(@as(usize, 1), nested_spans.len);
+    try std.testing.expect(nested_spans[0].style.link);
+    try std.testing.expectEqualStrings(
+        "[inner](https://example.com)",
+        nested[nested_spans[0].start..nested_spans[0].end],
+    );
 }
 
 test "analyzeSource fences close only on an equally long unannotated fence" {
