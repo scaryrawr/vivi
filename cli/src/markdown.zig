@@ -326,7 +326,6 @@ const flag_code: u8 = 1 << 3;
 const flag_heading: u8 = 1 << 4;
 const flag_link: u8 = 1 << 5;
 
-const emphasis_stack_limit = 8;
 const max_code_span_delimiter = 32;
 
 const EmphasisOpener = struct {
@@ -444,20 +443,14 @@ fn scanInline(
     delimiter_pairs: []const usize,
     link_states: []const u8,
     link_dest_ends: []const usize,
+    emphasis_openers: []EmphasisOpener,
     text: []const u8,
     lo: usize,
     hi: usize,
     depth: u8,
 ) void {
     var i = lo;
-    var emphasis_openers: [emphasis_stack_limit]EmphasisOpener =
-        @splat(.{
-            .marker = 0,
-            .start = 0,
-            .run = 0,
-            .original_mod3 = 0,
-            .can_close = false,
-        });
+    const opener_stack = emphasis_openers[lo..hi];
     var emphasis_depth: usize = 0;
     var pending_delimiter: ?PendingDelimiter = null;
 
@@ -484,13 +477,14 @@ fn scanInline(
                     link_dest_ends,
                     label_open,
                 )) |link| {
-                    markRange(flags, i, link.dest_end + 1, flag_link);
+                    if (!image) markRange(flags, i, link.dest_end + 1, flag_link);
                     if (depth < 4) {
                         scanInline(
                             flags,
                             delimiter_pairs,
                             link_states,
                             link_dest_ends,
+                            emphasis_openers,
                             text,
                             label_open + 1,
                             link.label_close,
@@ -541,7 +535,7 @@ fn scanInline(
                     var candidate_index = emphasis_depth;
                     while (candidate_index > 0) {
                         candidate_index -= 1;
-                        const candidate = emphasis_openers[candidate_index];
+                        const candidate = opener_stack[candidate_index];
                         if (candidate.marker != marker or
                             (marker == '~' and candidate.run != run))
                         {
@@ -559,7 +553,7 @@ fn scanInline(
                 }
 
                 if (opener_index) |candidate_index| {
-                    var opener = &emphasis_openers[candidate_index];
+                    var opener = &opener_stack[candidate_index];
                     emphasis_depth = candidate_index + 1;
                     if (marker == '~') {
                         markRange(flags, opener.start, i + run, flag_strikethrough);
@@ -569,6 +563,7 @@ fn scanInline(
                                 delimiter_pairs,
                                 link_states,
                                 link_dest_ends,
+                                emphasis_openers,
                                 text,
                                 opener.start + run,
                                 i,
@@ -597,8 +592,7 @@ fn scanInline(
                     }
                     i += consumed;
                 } else if (can_open) {
-                    if (emphasis_depth >= emphasis_stack_limit) return;
-                    emphasis_openers[emphasis_depth] = .{
+                    opener_stack[emphasis_depth] = .{
                         .marker = marker,
                         .start = i,
                         .run = run,
@@ -767,6 +761,7 @@ fn scanAutolinkPart(
     start: usize,
     hi: usize,
     allowed: []const u8,
+    allow_parentheses: bool,
 ) ?usize {
     var cursor = start;
     var count: usize = 0;
@@ -776,11 +771,16 @@ fn scanAutolinkPart(
         if (std.ascii.isAlphanumeric(byte) or std.mem.indexOfScalar(u8, allowed, byte) != null) {
             count += 1;
             cursor += 1;
-        } else if (byte == '(') {
+        } else if (allow_parentheses and byte == '(' and cursor + 1 < hi and
+            (std.ascii.isAlphanumeric(text[cursor + 1]) or text[cursor + 1] == '('))
+        {
             paren_depth += 1;
             count += 1;
             cursor += 1;
-        } else if (byte == ')' and paren_depth > 0) {
+        } else if (allow_parentheses and byte == ')' and paren_depth > 0 and
+            cursor > start and
+            (std.ascii.isAlphanumeric(text[cursor - 1]) or text[cursor - 1] == ')'))
+        {
             paren_depth -= 1;
             count += 1;
             cursor += 1;
@@ -795,15 +795,15 @@ fn scanAutolinkPart(
 fn scanUrlAutolink(text: []const u8, start: usize, prefix_len: usize, hi: usize) ?usize {
     var cursor = scanAutolinkHost(text, start + prefix_len, hi) orelse return null;
     if (cursor < hi and text[cursor] == '/') {
-        cursor = scanAutolinkPart(text, cursor, hi, "/._+-") orelse return null;
+        cursor = scanAutolinkPart(text, cursor, hi, "/._+-", false) orelse return null;
     }
     if (cursor < hi and text[cursor] == '?') {
-        if (scanAutolinkPart(text, cursor + 1, hi, "&.-+_=")) |query_end| {
+        if (scanAutolinkPart(text, cursor + 1, hi, "&.-+_=", true)) |query_end| {
             cursor = query_end;
         }
     }
     if (cursor < hi and text[cursor] == '#') {
-        cursor = scanAutolinkPart(text, cursor + 1, hi, ".-+_") orelse return null;
+        cursor = scanAutolinkPart(text, cursor + 1, hi, ".-+_", false) orelse return null;
     }
     return cursor;
 }
@@ -879,6 +879,7 @@ fn analyzeInlineRange(
     flags: []u8,
     delimiter_pairs: []usize,
     delimiter_stack: []usize,
+    emphasis_openers: []EmphasisOpener,
     link_states: []u8,
     link_dest_ends: []usize,
     source: []const u8,
@@ -901,6 +902,7 @@ fn analyzeInlineRange(
         delimiter_pairs,
         link_states,
         link_dest_ends,
+        emphasis_openers,
         source,
         start,
         end,
@@ -1161,19 +1163,31 @@ fn validFenceOpener(source: []const u8, body: usize, line_end: usize, marker: u8
         std.mem.indexOfScalar(u8, source[body + run .. line_end], '`') == null;
 }
 
-fn leadingSpaceCount(source: []const u8, pos: usize, line_end: usize) usize {
-    var body = pos;
-    while (body < line_end and source[body] == ' ') body += 1;
-    return body - pos;
+const LeadingIndent = struct {
+    bytes: usize,
+    columns: usize,
+};
+
+fn leadingIndent(source: []const u8, pos: usize, line_end: usize) LeadingIndent {
+    var cursor = pos;
+    var columns: usize = 0;
+    while (cursor < line_end) : (cursor += 1) {
+        switch (source[cursor]) {
+            ' ' => columns += 1,
+            '\t' => columns = (columns + 4) & ~@as(usize, 3),
+            else => break,
+        }
+    }
+    return .{ .bytes = cursor - pos, .columns = columns };
 }
 
 fn isSetextUnderline(source: []const u8, pos: usize, line_end: usize) bool {
-    const indent = leadingSpaceCount(source, pos, line_end);
-    if (indent > 3 or pos + indent >= line_end) return false;
-    const marker = source[pos + indent];
+    const indent = leadingIndent(source, pos, line_end);
+    if (indent.columns > 3 or pos + indent.bytes >= line_end) return false;
+    const marker = source[pos + indent.bytes];
     if (marker != '=' and marker != '-') return false;
     var count: usize = 0;
-    for (source[pos + indent .. line_end]) |byte| {
+    for (source[pos + indent.bytes .. line_end]) |byte| {
         if (byte == marker) {
             count += 1;
         } else if (byte != ' ' and byte != '\t') {
@@ -1200,9 +1214,9 @@ fn isThematicLine(source: []const u8, body: usize, line_end: usize) bool {
 }
 
 fn startsParagraphInterrupt(source: []const u8, pos: usize, line_end: usize) bool {
-    var body = pos;
-    while (body < line_end and source[body] == ' ') body += 1;
-    if (body >= line_end or body - pos >= 4) return false;
+    const indent = leadingIndent(source, pos, line_end);
+    const body = pos + indent.bytes;
+    if (body >= line_end or indent.columns >= 4) return false;
 
     if (source[body] == '>') return true;
 
@@ -1251,6 +1265,8 @@ pub fn analyzeSource(
     @memset(delimiter_pairs, std.math.maxInt(usize));
     const delimiter_stack = try allocator.alloc(usize, source.len);
     defer allocator.free(delimiter_stack);
+    const emphasis_openers = try allocator.alloc(EmphasisOpener, source.len);
+    defer allocator.free(emphasis_openers);
     const link_states = try allocator.alloc(u8, source.len);
     defer allocator.free(link_states);
     @memset(link_states, 0);
@@ -1264,12 +1280,12 @@ pub fn analyzeSource(
     var pos: usize = 0;
     while (pos < source.len) {
         const line = lineSpan(source, pos);
-        var body = pos;
-        while (body < line.end and source[body] == ' ' and body - pos < 3) body += 1;
+        const indent = leadingIndent(source, pos, line.end);
+        const body = pos + indent.bytes;
 
         if (fence != 0) {
             markRange(flags, pos, line.end, flag_code);
-            if (body < line.end and source[body] == fence) {
+            if (indent.columns <= 3 and body < line.end and source[body] == fence) {
                 const run = countRun(source, body, line.end, fence);
                 if (run >= fence_len) {
                     // A closing fence may only be followed by whitespace; text
@@ -1285,7 +1301,22 @@ pub fn analyzeSource(
                     if (trailing_ok) fence = 0;
                 }
             }
-        } else if (body < line.end and
+        } else if (body == line.end) {
+            if (inline_start) |start| {
+                analyzeInlineRange(
+                    flags,
+                    delimiter_pairs,
+                    delimiter_stack,
+                    emphasis_openers,
+                    link_states,
+                    link_dest_ends,
+                    source,
+                    start,
+                    pos,
+                );
+                inline_start = null;
+            }
+        } else if (indent.columns <= 3 and
             (source[body] == '`' or source[body] == '~') and
             validFenceOpener(source, body, line.end, source[body]))
         {
@@ -1294,6 +1325,7 @@ pub fn analyzeSource(
                     flags,
                     delimiter_pairs,
                     delimiter_stack,
+                    emphasis_openers,
                     link_states,
                     link_dest_ends,
                     source,
@@ -1311,6 +1343,7 @@ pub fn analyzeSource(
                 flags,
                 delimiter_pairs,
                 delimiter_stack,
+                emphasis_openers,
                 link_states,
                 link_dest_ends,
                 source,
@@ -1319,9 +1352,7 @@ pub fn analyzeSource(
             );
             markRange(flags, start, line.end, flag_heading);
             inline_start = null;
-        } else if (inline_start == null and
-            leadingSpaceCount(source, pos, line.end) >= 4)
-        {
+        } else if (inline_start == null and indent.columns >= 4) {
             markRange(flags, pos, line.end, flag_code);
         } else if (startsParagraphInterrupt(source, pos, line.end)) {
             if (inline_start) |start| {
@@ -1329,6 +1360,7 @@ pub fn analyzeSource(
                     flags,
                     delimiter_pairs,
                     delimiter_stack,
+                    emphasis_openers,
                     link_states,
                     link_dest_ends,
                     source,
@@ -1341,13 +1373,14 @@ pub fn analyzeSource(
                 flags,
                 delimiter_pairs,
                 delimiter_stack,
+                emphasis_openers,
                 link_states,
                 link_dest_ends,
                 source,
                 pos,
                 line.end,
             );
-        } else if (body < line.end and source[body] == '#') {
+        } else if (indent.columns <= 3 and source[body] == '#') {
             const hashes = countRun(source, body, line.end, '#');
             const at_end = body + hashes >= line.end;
             const next = if (at_end) '\n' else source[body + hashes];
@@ -1357,6 +1390,7 @@ pub fn analyzeSource(
                         flags,
                         delimiter_pairs,
                         delimiter_stack,
+                        emphasis_openers,
                         link_states,
                         link_dest_ends,
                         source,
@@ -1375,6 +1409,7 @@ pub fn analyzeSource(
                     flags,
                     delimiter_pairs,
                     delimiter_stack,
+                    emphasis_openers,
                     link_states,
                     link_dest_ends,
                     source,
@@ -1384,20 +1419,6 @@ pub fn analyzeSource(
                 markRange(flags, pos, line.end, flag_heading);
             } else {
                 if (inline_start == null) inline_start = pos;
-            }
-        } else if (body == line.end) {
-            if (inline_start) |start| {
-                analyzeInlineRange(
-                    flags,
-                    delimiter_pairs,
-                    delimiter_stack,
-                    link_states,
-                    link_dest_ends,
-                    source,
-                    start,
-                    pos,
-                );
-                inline_start = null;
             }
         } else {
             if (inline_start == null) inline_start = pos;
@@ -1409,6 +1430,7 @@ pub fn analyzeSource(
             flags,
             delimiter_pairs,
             delimiter_stack,
+            emphasis_openers,
             link_states,
             link_dest_ends,
             source,
@@ -3508,11 +3530,36 @@ test "analyzeSource keeps emphasis nesting intact" {
     try std.testing.expect(saw_bold and saw_italic);
 }
 
-test "analyzeSource leaves overflowed emphasis nesting unstyled" {
+test "analyzeSource styles deeply nested emphasis" {
     const source = "*a _b *c _d *e _f *g _h *i* h_ g* f_ e* d_ c* b_ a*";
     const spans = try analyzeSource(std.testing.allocator, source);
     defer std.testing.allocator.free(spans);
-    try std.testing.expectEqual(@as(usize, 0), spans.len);
+    var saw_innermost = false;
+    for (spans) |span| {
+        if (span.style.italic and
+            std.mem.indexOf(u8, source[span.start..span.end], "i") != null)
+        {
+            saw_innermost = true;
+        }
+    }
+    try std.testing.expect(saw_innermost);
+}
+
+test "analyzeSource does not style image syntax as a link" {
+    const source = "![*alt*](https://example.com)";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var saw_alt_emphasis = false;
+    for (spans) |span| {
+        try std.testing.expect(!span.style.link);
+        if (span.style.italic and
+            std.mem.indexOf(u8, source[span.start..span.end], "alt") != null)
+        {
+            saw_alt_emphasis = true;
+        }
+    }
+    try std.testing.expect(saw_alt_emphasis);
 }
 
 test "analyzeSource marks headings and fenced code" {
@@ -3808,6 +3855,13 @@ test "analyzeSource matches permissive autolink boundaries and host grammar" {
         if (span.style.italic and span.style.link) saw_emphasized_link = true;
     }
     try std.testing.expect(saw_emphasized_link);
+
+    const parenthesized_path = try analyzeSource(
+        std.testing.allocator,
+        "https://example.com/()",
+    );
+    defer std.testing.allocator.free(parenthesized_path);
+    for (parenthesized_path) |span| try std.testing.expect(!span.style.link);
 }
 
 test "analyzeSource bounds malformed angle destination scans" {
@@ -3956,6 +4010,20 @@ test "analyzeSource distinguishes indented code from paragraph continuation" {
         }
     }
     try std.testing.expect(saw_continuation);
+}
+
+test "analyzeSource expands tabs for indentation and ends paragraphs at blank lines" {
+    const tab_source = "\t*code*";
+    const tab_spans = try analyzeSource(std.testing.allocator, tab_source);
+    defer std.testing.allocator.free(tab_spans);
+    try std.testing.expectEqual(@as(usize, 1), tab_spans.len);
+    try std.testing.expect(tab_spans[0].style.code);
+    try std.testing.expect(!tab_spans[0].style.italic);
+
+    const blank_source = "*foo\n    \nbar*";
+    const blank_spans = try analyzeSource(std.testing.allocator, blank_source);
+    defer std.testing.allocator.free(blank_spans);
+    for (blank_spans) |span| try std.testing.expect(!span.style.italic);
 }
 
 test "analyzeSource marks setext heading contents" {
