@@ -17,7 +17,7 @@ zig build
 ```
 
 Vivi is a short-lived CLI/TUI, not a server. Start every interactive drive in
-its own VHS or `script` PTY:
+its own `script` PTY:
 
 ```sh
 .github/skills/verify-vivi/bin/verify-vivi chat-streaming <run-id>
@@ -26,9 +26,10 @@ its own VHS or `script` PTY:
 The TUI is ready when the captured frames show the `vivi` welcome, `Ready`
 context, and the bottom composer with its colored left accent. The helper
 submits a deterministic prompt, waits for the streamed answer, and sends
-Ctrl-C to shut down. VHS is only the frame-capture mechanism; its GIF is
-deleted after extraction by default. VHS and `script` own their child
-processes, so no persistent instance remains after the helper returns.
+Ctrl-C to shut down. asciinema is only the recording mechanism and `agg`
+renders its GIF; the GIF is deleted after frame extraction by default. `script`
+and asciinema own their child processes, so no persistent instance remains
+after the helper returns.
 
 Credentialed hosted-Copilot validation defaults to
 `copilot/gpt-5.6-luna`. Set `VIVI_VALIDATION_MODEL` to another
@@ -53,13 +54,13 @@ looks questionable:
 .github/skills/verify-vivi/bin/verify-vivi doctor
 ```
 
-It requires Zig, VHS, `script`, Expect, FFmpeg/FFprobe, GitHub CLI with an
-available `gh auth token`, and GitHub Copilot CLI; builds Vivi; checks the
-installed Vivi and Copilot versions; records a temporary VHS smoke GIF; and
+It requires Zig, asciinema 3.x, `agg`, `script`, Expect, FFmpeg/FFprobe, GitHub
+CLI with an available `gh auth token`, and GitHub Copilot CLI; builds Vivi;
+checks the installed Vivi, asciinema, `agg`, and Copilot versions; records a
+temporary asciinema session and renders it with `agg` as a smoke GIF; and
 sends a no-tools Copilot prompt that must return `VIVI_DOCTOR_OK`. A failure
-means the instance is not worth driving. VHS 0.12.0 can exit successfully
-without writing its recording; use a working release such as 0.11.0 with
-`VIVI_VHS=/path/to/vhs` when the smoke check reports that failure. Copilot CLI
+means the instance is not worth driving. Set `VIVI_ASCIINEMA` or `VIVI_AGG`
+to point at non-default binary locations. Copilot CLI
 does not expose a standalone authenticated status command, so the minimal
 prompt is the authentication check.
 
@@ -135,7 +136,8 @@ For TUI proof, capture:
 - `*.normalized.txt`: the same PTY output with terminal control sequences
   removed for stable text assertions.
 - `*.assertions.txt`: the exact expected marker and command exit status.
-- `*.tape`: the generated VHS input used for the run.
+- `*.cast`: the asciicast recording captured during the run (kept only with
+  `VIVI_KEEP_GIF=1`).
 
 The GIF is not proof. It is an optional presentation artifact for demos or PR
 descriptions. Set `VIVI_KEEP_GIF=1` when running a TUI recipe to retain it:
@@ -144,6 +146,12 @@ descriptions. Set `VIVI_KEEP_GIF=1` when running a TUI recipe to retain it:
 VIVI_KEEP_GIF=1 \
   .github/skills/verify-vivi/bin/verify-vivi chat-streaming <run-id>
 ```
+
+Set `VIVI_SKIP_RECORDING=1` only when asciinema or `agg` is unavailable and
+terminal-only diagnosis is still useful. Every TUI recipe then launches Vivi
+directly inside `script`, skips rendering, and writes a `*.visual-blocker.txt`
+note alongside the terminal transcript, normalized text, and assertions.
+This mode does not produce valid visual proof.
 
 For noninteractive CLI proof, capture stdout, stderr, and exit status in
 separate files.
@@ -184,10 +192,10 @@ Run cleanup explicitly after an interrupted attempt:
 .github/skills/verify-vivi/bin/verify-vivi cleanup <run-id>
 ```
 
-Cleanup removes only transient PID files and empty generated tapes from an
-unfinished run. It preserves extracted frames, contact sheets, visual reviews,
-terminal transcripts, normalized text, assertions, stdout, stderr, and any
-GIF explicitly retained with `VIVI_KEEP_GIF=1`.
+Cleanup removes only transient PID files and empty generated files from an
+unfinished run. It preserves casts, extracted frames, contact sheets, visual
+reviews, terminal transcripts, normalized text, assertions, stdout, stderr, and
+any GIF explicitly retained with `VIVI_KEEP_GIF=1`.
 After cleanup, confirm the evidence directory still exists:
 
 ```sh
