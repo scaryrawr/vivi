@@ -147,6 +147,12 @@ VIVI_KEEP_GIF=1 \
   .github/skills/verify-vivi/bin/verify-vivi chat-streaming <run-id>
 ```
 
+Set `VIVI_SKIP_RECORDING=1` only when asciinema or `agg` is unavailable and
+terminal-only diagnosis is still useful. Every TUI recipe then launches Vivi
+directly inside `script`, skips rendering, and writes a `*.visual-blocker.txt`
+note alongside the terminal transcript, normalized text, and assertions.
+This mode does not produce valid visual proof.
+
 For noninteractive CLI proof, capture stdout, stderr, and exit status in
 separate files.
 

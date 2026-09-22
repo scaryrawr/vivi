@@ -332,6 +332,7 @@ shell_quote() {
 script_launch_command() {
     log=$1
     command=$2
+    command="cd $(shell_quote "$repo_root") && $command"
     case "$(uname -s)" in
         Darwin)
             launch_command="script -q $(shell_quote "$log") sh -c $(shell_quote "$command")"
@@ -360,6 +361,17 @@ recorded_pty_command() {
         "$(shell_quote "$cast")" "$(shell_quote "$inner")"
 }
 
+prepare_pty_command() {
+    cast=$1
+    title=$2
+    inner=$3
+    if test "${VIVI_SKIP_RECORDING:-0}" = 1; then
+        run_command=$inner
+    else
+        run_command=$(recorded_pty_command "$cast" "$title" "$inner")
+    fi
+}
+
 render_cast() {
     run_id=$1
     capture=$2
@@ -375,6 +387,37 @@ render_cast() {
         rm -f "$cast"
     fi
     extract_frames "$run_id" "$capture"
+}
+
+finish_recording() {
+    run_id=$1
+    capture=$2
+    run_dir="$artifact_root/$run_id"
+    if test "${VIVI_SKIP_RECORDING:-0}" = 1; then
+        printf '%s\n' \
+            'Recording was skipped; terminal PTY evidence is available.' \
+            >"$run_dir/$capture.visual-blocker.txt"
+    else
+        render_cast "$run_id" "$capture"
+    fi
+}
+
+require_visual_artifacts() {
+    run_dir=$1
+    capture=$2
+    if test "${VIVI_SKIP_RECORDING:-0}" != 1; then
+        test -s "$run_dir/$capture.frames.txt"
+        test -s "$run_dir/$capture.contact-sheet.png"
+    fi
+}
+
+normalize_transcript() {
+    input=$1
+    output=$2
+    perl -0pe \
+        's/\e\[[0-?]*[ -\/]*[@-~]//g; s/\e\][^\a]*(?:\a|\e\\)//g' \
+        "$input" |
+        tr -d '\r\b' >"$output"
 }
 
 streaming_drive() {
@@ -399,9 +442,9 @@ streaming_drive() {
     for arg in "$@"; do
         pty_command="$pty_command $(shell_quote "$arg")"
     done
-    rec_command=$(recorded_pty_command "$cast" "$capture" "$pty_command")
+    prepare_pty_command "$cast" "$capture" "$pty_command"
     cat "$input_fifo" |
-        script_pty "$run_dir/$capture.terminal.log" "$rec_command" &
+        script_pty "$run_dir/$capture.terminal.log" "$run_command" &
     pty_pid=$!
     printf '%s\n' "$pty_pid" >"$run_dir/pty.pid"
     trap 'kill "$pty_pid" 2>/dev/null || true; wait "$pty_pid" 2>/dev/null || true; rm -f "$input_fifo"' EXIT INT TERM
@@ -448,12 +491,10 @@ streaming_drive() {
     rm -f "$input_fifo"
     trap - EXIT INT TERM
 
-    render_cast "$run_id" "$capture"
-
-    perl -0pe \
-        's/\e\[[0-?]*[ -\/]*[@-~]//g; s/\e\][^\a]*(?:\a|\e\\)//g' \
-        "$run_dir/$capture.terminal.log" |
-        tr -d '\r\b' >"$run_dir/$capture.normalized.txt"
+    finish_recording "$run_id" "$capture"
+    normalize_transcript \
+        "$run_dir/$capture.terminal.log" \
+        "$run_dir/$capture.normalized.txt"
 
     session_title=$(
         perl -0ne \
@@ -517,8 +558,7 @@ streaming_drive() {
         "$run_dir/$capture.normalized.txt"
     grep -a -F -q "$expected_title_osc" \
         "$run_dir/$capture.terminal.log"
-    test -s "$run_dir/$capture.frames.txt"
-    test -s "$run_dir/$capture.contact-sheet.png"
+    require_visual_artifacts "$run_dir" "$capture"
 }
 
 chat_streaming() {
@@ -606,7 +646,7 @@ EOF
     prepare_attachment_clipboard "$run_dir"
 
     pty_command="cd '$fixture' && stty cols 100 rows 30; exec '$binary' chat --model '$model'"
-    rec_command=$(recorded_pty_command "$cast" chat-attachments "$pty_command")
+    prepare_pty_command "$cast" chat-attachments "$pty_command"
     (
         sleep 8
         printf '\026'
@@ -618,7 +658,7 @@ EOF
         printf '\003'
     ) | HOME="$isolated_home" TMPDIR="$temporary_directory" \
         GH_TOKEN="$github_token" GITHUB_TOKEN="$github_token" \
-        script_pty "$run_dir/chat-attachments.terminal.log" "$rec_command" &
+        script_pty "$run_dir/chat-attachments.terminal.log" "$run_command" &
     pty_pid=$!
     printf '%s\n' "$pty_pid" >"$run_dir/pty.pid"
     trap 'kill "$pty_pid" 2>/dev/null || true; wait "$pty_pid" 2>/dev/null || true' EXIT INT TERM
@@ -630,12 +670,10 @@ EOF
     rm -f "$run_dir/pty.pid"
     trap - EXIT INT TERM
 
-    render_cast "$1" chat-attachments
-
-    perl -0pe \
-        's/\e\[[0-?]*[ -\/]*[@-~]//g; s/\e\][^\a]*(?:\a|\e\\)//g' \
-        "$run_dir/chat-attachments.terminal.log" |
-        tr -d '\r\b' >"$run_dir/chat-attachments.normalized.txt"
+    finish_recording "$1" chat-attachments
+    normalize_transcript \
+        "$run_dir/chat-attachments.terminal.log" \
+        "$run_dir/chat-attachments.normalized.txt"
 
     {
         printf 'exit=%s\n' "$status"
@@ -666,7 +704,7 @@ EOF
         "$run_dir/chat-attachments.normalized.txt"
     test -d "$isolated_home/.vivi/copilot"
     test ! -e "$isolated_home/.copilot"
-    test -s "$run_dir/chat-attachments.contact-sheet.png"
+    require_visual_artifacts "$run_dir" chat-attachments
 }
 
 chat_markdown() {
@@ -677,7 +715,7 @@ chat_markdown() {
     cast="$run_dir/chat-markdown.cast"
     rm -f "$cast"
     pty_command="stty cols 100 rows 30; '$binary' chat --model '$model'"
-    rec_command=$(recorded_pty_command "$cast" chat-markdown "$pty_command")
+    prepare_pty_command "$cast" chat-markdown "$pty_command"
 
     (
         sleep 8
@@ -687,7 +725,7 @@ chat_markdown() {
         printf '\003'
         sleep 3
         printf '\003'
-    ) | script_pty "$run_dir/chat-markdown.terminal.log" "$rec_command" &
+    ) | script_pty "$run_dir/chat-markdown.terminal.log" "$run_command" &
     pty_pid=$!
     printf '%s\n' "$pty_pid" >"$run_dir/pty.pid"
     trap 'kill "$pty_pid" 2>/dev/null || true; wait "$pty_pid" 2>/dev/null || true' EXIT INT TERM
@@ -700,12 +738,10 @@ chat_markdown() {
     rm -f "$run_dir/pty.pid"
     trap - EXIT INT TERM
 
-    render_cast "$1" chat-markdown
-
-    perl -0pe \
-        's/\e\[[0-?]*[ -\/]*[@-~]//g; s/\e\][^\a]*(?:\a|\e\\)//g' \
-        "$run_dir/chat-markdown.terminal.log" |
-        tr -d '\r\b' >"$run_dir/chat-markdown.normalized.txt"
+    finish_recording "$1" chat-markdown
+    normalize_transcript \
+        "$run_dir/chat-markdown.terminal.log" \
+        "$run_dir/chat-markdown.normalized.txt"
 
     table_cells_seen=yes
     for marker in FEATURE STATUS STYLING WORKING TABLES READABLE; do
@@ -749,8 +785,7 @@ chat_markdown() {
     grep -q 'RENDER TEST' "$run_dir/chat-markdown.normalized.txt"
     grep -q 'VIVI_HIGHLIGHT = 42' "$run_dir/chat-markdown.normalized.txt"
     test "$table_cells_seen" = yes
-    test -s "$run_dir/chat-markdown.frames.txt"
-    test -s "$run_dir/chat-markdown.contact-sheet.png"
+    require_visual_artifacts "$run_dir" chat-markdown
 }
 
 chat_markdown_read() {
@@ -761,7 +796,7 @@ chat_markdown_read() {
     cast="$run_dir/chat-markdown-read.cast"
     rm -f "$cast"
     pty_command="stty cols 100 rows 30; '$binary' chat --model '$model'"
-    rec_command=$(recorded_pty_command "$cast" chat-markdown-read "$pty_command")
+    prepare_pty_command "$cast" chat-markdown-read "$pty_command"
 
     (
         sleep 8
@@ -775,7 +810,7 @@ chat_markdown_read() {
         printf '\003'
         sleep 3
         printf '\003'
-    ) | script_pty "$run_dir/chat-markdown-read.terminal.log" "$rec_command" &
+    ) | script_pty "$run_dir/chat-markdown-read.terminal.log" "$run_command" &
     pty_pid=$!
     printf '%s\n' "$pty_pid" >"$run_dir/pty.pid"
     trap 'kill "$pty_pid" 2>/dev/null || true; wait "$pty_pid" 2>/dev/null || true' EXIT INT TERM
@@ -788,12 +823,10 @@ chat_markdown_read() {
     rm -f "$run_dir/pty.pid"
     trap - EXIT INT TERM
 
-    render_cast "$1" chat-markdown-read
-
-    perl -0pe \
-        's/\e\[[0-?]*[ -\/]*[@-~]//g; s/\e\][^\a]*(?:\a|\e\\)//g' \
-        "$run_dir/chat-markdown-read.terminal.log" |
-        tr -d '\r\b' >"$run_dir/chat-markdown-read.normalized.txt"
+    finish_recording "$1" chat-markdown-read
+    normalize_transcript \
+        "$run_dir/chat-markdown-read.terminal.log" \
+        "$run_dir/chat-markdown-read.normalized.txt"
 
     {
         printf 'exit=%s\n' "$status"
@@ -819,8 +852,7 @@ chat_markdown_read() {
     grep -a -q 'Requirements' "$run_dir/chat-markdown-read.terminal.log"
     grep -a -q 'zig build' "$run_dir/chat-markdown-read.terminal.log"
     grep -q 'VIVI_READ_DONE' "$run_dir/chat-markdown-read.normalized.txt"
-    test -s "$run_dir/chat-markdown-read.frames.txt"
-    test -s "$run_dir/chat-markdown-read.contact-sheet.png"
+    require_visual_artifacts "$run_dir" chat-markdown-read
 }
 
 chat_streaming_input() {
@@ -831,7 +863,7 @@ chat_streaming_input() {
     cast="$run_dir/chat-streaming-input.cast"
     rm -f "$cast"
     pty_command="stty cols 100 rows 30; '$binary' chat --model '$model'"
-    rec_command=$(recorded_pty_command "$cast" chat-streaming-input "$pty_command")
+    prepare_pty_command "$cast" chat-streaming-input "$pty_command"
 
     (
         sleep 8
@@ -846,7 +878,7 @@ chat_streaming_input() {
         printf '\003'
         sleep 3
         printf '\003'
-    ) | script_pty "$run_dir/chat-streaming-input.terminal.log" "$rec_command" &
+    ) | script_pty "$run_dir/chat-streaming-input.terminal.log" "$run_command" &
     pty_pid=$!
     printf '%s\n' "$pty_pid" >"$run_dir/pty.pid"
     trap 'kill "$pty_pid" 2>/dev/null || true; wait "$pty_pid" 2>/dev/null || true' EXIT INT TERM
@@ -859,12 +891,10 @@ chat_streaming_input() {
     rm -f "$run_dir/pty.pid"
     trap - EXIT INT TERM
 
-    render_cast "$1" chat-streaming-input
-
-    perl -0pe \
-        's/\e\[[0-?]*[ -\/]*[@-~]//g; s/\e\][^\a]*(?:\a|\e\\)//g' \
-        "$run_dir/chat-streaming-input.terminal.log" |
-        tr -d '\r\b' >"$run_dir/chat-streaming-input.normalized.txt"
+    finish_recording "$1" chat-streaming-input
+    normalize_transcript \
+        "$run_dir/chat-streaming-input.terminal.log" \
+        "$run_dir/chat-streaming-input.normalized.txt"
 
     {
         printf 'exit=%s\n' "$status"
@@ -893,7 +923,7 @@ chat_streaming_input() {
     grep -q 'VIVI_STEER_OK' "$run_dir/chat-streaming-input.normalized.txt"
     grep -q 'IVI_QUEUE_FIRST' "$run_dir/chat-streaming-input.normalized.txt"
     grep -q 'VIVI_QUEUE_OK' "$run_dir/chat-streaming-input.normalized.txt"
-    test -s "$run_dir/chat-streaming-input.contact-sheet.png"
+    require_visual_artifacts "$run_dir" chat-streaming-input
 }
 
 chat_ask_user() {
@@ -904,7 +934,7 @@ chat_ask_user() {
     cast="$run_dir/chat-ask-user.cast"
     rm -f "$cast"
     pty_command="stty cols 100 rows 30; '$binary' chat --model '$model'"
-    rec_command=$(recorded_pty_command "$cast" chat-ask-user "$pty_command")
+    prepare_pty_command "$cast" chat-ask-user "$pty_command"
 
     (
         sleep 10
@@ -917,7 +947,7 @@ chat_ask_user() {
         printf '\003'
         sleep 3
         printf '\003'
-    ) | script_pty "$run_dir/chat-ask-user.terminal.log" "$rec_command" &
+    ) | script_pty "$run_dir/chat-ask-user.terminal.log" "$run_command" &
     pty_pid=$!
     printf '%s\n' "$pty_pid" >"$run_dir/pty.pid"
     trap 'kill "$pty_pid" 2>/dev/null || true; wait "$pty_pid" 2>/dev/null || true' EXIT INT TERM
@@ -928,14 +958,13 @@ chat_ask_user() {
         status=$?
     fi
     rm -f "$run_dir/pty.pid"
-    render_cast "$1" chat-ask-user
+    finish_recording "$1" chat-ask-user
 
     trap - EXIT INT TERM
 
-    perl -0pe \
-        's/\e\[[0-?]*[ -\/]*[@-~]//g; s/\e\][^\a]*(?:\a|\e\\)//g' \
-        "$run_dir/chat-ask-user.terminal.log" |
-        tr -d '\r\b' >"$run_dir/chat-ask-user.normalized.txt"
+    normalize_transcript \
+        "$run_dir/chat-ask-user.terminal.log" \
+        "$run_dir/chat-ask-user.normalized.txt"
 
     {
         printf 'exit=%s\n' "$status"
@@ -976,7 +1005,7 @@ chat_ask_user() {
     grep -q 'Answer required' "$run_dir/chat-ask-user.normalized.txt"
     grep -Eq 'Vivi[[:space:]]*ANSWER[[:space:]]*Beta' \
         "$run_dir/chat-ask-user.normalized.txt"
-    test -s "$run_dir/chat-ask-user.contact-sheet.png"
+    require_visual_artifacts "$run_dir" chat-ask-user
 }
 
 chat_model_menu() {
@@ -991,10 +1020,20 @@ chat_model_menu() {
 
     cast="$run_dir/chat-model-menu.cast"
     rm -f "$cast"
-    pty_command="stty cols 100 rows 30; '$binary' chat"
-    rec_command=$(recorded_pty_command "$cast" chat-model-menu "$pty_command")
+    pty_command="stty cols 100 rows 30; '$binary' chat; '$binary' chat"
+    prepare_pty_command "$cast" chat-model-menu "$pty_command"
 
     (
+        sleep 8
+        printf '/model'
+        sleep 3
+        printf '\r'
+        sleep 5
+        printf '%s' "$model_filter"
+        sleep 2
+        printf '\r'
+        sleep 10
+        printf '\003'
         sleep 8
         printf '/model'
         sleep 3
@@ -1011,7 +1050,7 @@ chat_model_menu() {
         printf '\003'
     ) | HOME="$settings_home" GH_TOKEN="$github_token" \
         GITHUB_TOKEN="$github_token" \
-        script_pty "$run_dir/chat-model-menu.terminal.log" "$rec_command" &
+        script_pty "$run_dir/chat-model-menu.terminal.log" "$run_command" &
     pty_pid=$!
     printf '%s\n' "$pty_pid" >"$run_dir/pty.pid"
     trap 'kill "$pty_pid" 2>/dev/null || true; wait "$pty_pid" 2>/dev/null || true' EXIT INT TERM
@@ -1024,17 +1063,21 @@ chat_model_menu() {
     rm -f "$run_dir/pty.pid"
     trap - EXIT INT TERM
 
-    render_cast "$1" chat-model-menu
-
-    perl -0pe \
-        's/\e\[[0-?]*[ -\/]*[@-~]//g; s/\e\][^\a]*(?:\a|\e\\)//g' \
-        "$run_dir/chat-model-menu.terminal.log" |
-        tr -d '\r\b' >"$run_dir/chat-model-menu.normalized.txt"
+    finish_recording "$1" chat-model-menu
+    normalize_transcript \
+        "$run_dir/chat-model-menu.terminal.log" \
+        "$run_dir/chat-model-menu.normalized.txt"
 
     {
         printf 'exit=%s\n' "$status"
+        printf 'persisted_default_saved='
+        if grep -a -q 'and saved it as the default.' "$run_dir/chat-model-menu.terminal.log"; then
+            printf 'yes\n'
+        else
+            printf 'no\n'
+        fi
         printf 'persisted_default_seen='
-        if grep -q 'Already using the selected model and reasoning level.' "$run_dir/chat-model-menu.normalized.txt"; then
+        if grep -a -q 'Already using the selected model and reasoning level.' "$run_dir/chat-model-menu.terminal.log"; then
             printf 'yes\n'
         else
             printf 'no\n'
@@ -1048,13 +1091,15 @@ chat_model_menu() {
     } >"$run_dir/chat-model-menu.assertions.txt"
 
     test "$status" -eq 0
-    grep -q 'Already using the selected model and reasoning level.' "$run_dir/chat-model-menu.normalized.txt"
+    grep -a -q 'and saved it as the default.' "$run_dir/chat-model-menu.terminal.log"
+    grep -a -q 'Already using the selected model and reasoning level.' \
+        "$run_dir/chat-model-menu.terminal.log"
     grep -q 'VIVI_HOSTED_MODEL_SWITCH_OK' "$run_dir/chat-model-menu.normalized.txt"
     grep -F -q "\"model_id\": \"$model\"" \
         "$settings_home/.vivi/settings.json"
     grep -q '"reasoning": "off"' \
         "$settings_home/.vivi/settings.json"
-    test -s "$run_dir/chat-model-menu.contact-sheet.png"
+    require_visual_artifacts "$run_dir" chat-model-menu
 }
 
 chat_customization() {
@@ -1071,11 +1116,7 @@ chat_customization() {
     cast="$run_dir/chat-customization.cast"
     rm -f "$cast"
     pty_command="cd '$workspace' && stty cols 100 rows 30; exec '$binary' chat --model '$model'"
-    if test "${VIVI_SKIP_RECORDING:-0}" = 1; then
-        run_command="$pty_command"
-    else
-        run_command=$(recorded_pty_command "$cast" chat-customization "$pty_command")
-    fi
+    prepare_pty_command "$cast" chat-customization "$pty_command"
 
     (
         sleep 60
@@ -1103,18 +1144,10 @@ chat_customization() {
     rm -f "$run_dir/pty.pid"
     trap - EXIT INT TERM
 
-    if test "${VIVI_SKIP_RECORDING:-0}" = 1; then
-        printf '%s\n' \
-            'Recording was skipped; terminal PTY evidence is available.' \
-            >"$run_dir/chat-customization.visual-blocker.txt"
-    else
-        render_cast "$1" chat-customization
-    fi
-
-    perl -0pe \
-        's/\e\[[0-?]*[ -\/]*[@-~]//g; s/\e\][^\a]*(?:\a|\e\\)//g' \
-        "$run_dir/chat-customization.terminal.log" |
-        tr -d '\r\b' >"$run_dir/chat-customization.normalized.txt"
+    finish_recording "$1" chat-customization
+    normalize_transcript \
+        "$run_dir/chat-customization.terminal.log" \
+        "$run_dir/chat-customization.normalized.txt"
 
     {
         printf 'exit=%s\n' "$status"
@@ -1135,9 +1168,7 @@ chat_customization() {
     grep -q 'Fixture skill discovered by Vivi.' \
         "$run_dir/chat-customization.normalized.txt"
     grep -q 'VIVI_SKILL_OK' "$run_dir/chat-customization.normalized.txt"
-    if test "${VIVI_SKIP_RECORDING:-0}" != 1; then
-        test -s "$run_dir/chat-customization.contact-sheet.png"
-    fi
+    require_visual_artifacts "$run_dir" chat-customization
 }
 
 prepare_customization_workspace() {
@@ -1171,7 +1202,7 @@ chat_session_resume() {
     cast="$run_dir/chat-session-resume.cast"
     rm -f "$cast"
     pty_command="stty cols 100 rows 30; '$binary' chat --model '$model'"
-    rec_command=$(recorded_pty_command "$cast" chat-session-resume "$pty_command")
+    prepare_pty_command "$cast" chat-session-resume "$pty_command"
 
     (
         sleep 10
@@ -1202,7 +1233,7 @@ chat_session_resume() {
         sleep 2
     ) | HOME="$resume_home" GH_TOKEN="$github_token" \
         GITHUB_TOKEN="$github_token" \
-        script_pty "$run_dir/chat-session-resume-second.terminal.log" "$rec_command" &
+        script_pty "$run_dir/chat-session-resume-second.terminal.log" "$run_command" &
     pty_pid=$!
     printf '%s\n' "$pty_pid" >"$run_dir/pty.pid"
     trap 'kill "$pty_pid" 2>/dev/null || true; wait "$pty_pid" 2>/dev/null || true' EXIT INT TERM
@@ -1218,14 +1249,12 @@ chat_session_resume() {
         "$run_dir/chat-session-resume-second.terminal.log" \
         >"$run_dir/chat-session-resume.terminal.log"
 
-    perl -0pe \
-        's/\e\[[0-?]*[ -\/]*[@-~]//g; s/\e\][^\a]*(?:\a|\e\\)//g' \
-        "$run_dir/chat-session-resume.terminal.log" |
-        tr -d '\r\b' >"$run_dir/chat-session-resume.normalized.txt"
-    perl -0pe \
-        's/\e\[[0-?]*[ -\/]*[@-~]//g; s/\e\][^\a]*(?:\a|\e\\)//g' \
-        "$run_dir/chat-session-resume-second.terminal.log" |
-        tr -d '\r\b' >"$run_dir/chat-session-resume-second.normalized.txt"
+    normalize_transcript \
+        "$run_dir/chat-session-resume.terminal.log" \
+        "$run_dir/chat-session-resume.normalized.txt"
+    normalize_transcript \
+        "$run_dir/chat-session-resume-second.terminal.log" \
+        "$run_dir/chat-session-resume-second.normalized.txt"
     perl -0ne \
         'if (/Showing saved Vivi sessions\.(.*?)(?:Resuming session\.\.\.)/s) { print $1 }' \
         "$run_dir/chat-session-resume-second.normalized.txt" \
@@ -1296,8 +1325,8 @@ chat_session_resume() {
     ! grep -Fq "$model" \
         "$run_dir/chat-session-resume-picker.normalized.txt"
 
-    render_cast "$1" chat-session-resume
-    test -s "$run_dir/chat-session-resume.contact-sheet.png"
+    finish_recording "$1" chat-session-resume
+    require_visual_artifacts "$run_dir" chat-session-resume
 }
 
 chat_shutdown() {
@@ -1307,16 +1336,24 @@ chat_shutdown() {
     cast="$run_dir/chat-shutdown.cast"
     rm -f "$cast"
     pty_command="stty cols 100 rows 30; exec '$binary' chat"
-    rec_command=$(recorded_pty_command "$cast" chat-shutdown "$pty_command")
+    prepare_pty_command "$cast" chat-shutdown "$pty_command"
     (
         sleep 8
         printf '\003'
-    ) | script_pty "$run_dir/chat-shutdown.pty.log" "$rec_command"
-    render_cast "$1" chat-shutdown
-    test -s "$run_dir/chat-shutdown.frames.txt"
-    test -s "$run_dir/chat-shutdown.contact-sheet.png"
-    printf 'frames_extracted=yes\ncontact_sheet_nonempty=yes\nshutdown=ctrl-c\n' \
-        >"$run_dir/chat-shutdown.assertions.txt"
+    ) | script_pty "$run_dir/chat-shutdown.terminal.log" "$run_command"
+    finish_recording "$1" chat-shutdown
+    normalize_transcript \
+        "$run_dir/chat-shutdown.terminal.log" \
+        "$run_dir/chat-shutdown.normalized.txt"
+    require_visual_artifacts "$run_dir" chat-shutdown
+    {
+        if test "${VIVI_SKIP_RECORDING:-0}" = 1; then
+            printf 'frames_extracted=no\ncontact_sheet_nonempty=no\n'
+        else
+            printf 'frames_extracted=yes\ncontact_sheet_nonempty=yes\n'
+        fi
+        printf 'shutdown=ctrl-c\n'
+    } >"$run_dir/chat-shutdown.assertions.txt"
 }
 
 cleanup() {
@@ -1351,12 +1388,8 @@ chat_async_bash() {
     rm -f "$cast"
 
     pty_command="stty cols 100 rows 30; exec $(shell_quote "$binary") chat --model $(shell_quote "$model")"
-    if test "${VIVI_SKIP_RECORDING:-0}" = 1; then
-        launched_command="$pty_command"
-    else
-        launched_command=$(recorded_pty_command "$cast" chat-async-bash "$pty_command")
-    fi
-    script_launch_command "$run_dir/chat-async-bash.terminal.log" "$launched_command"
+    prepare_pty_command "$cast" chat-async-bash "$pty_command"
+    script_launch_command "$run_dir/chat-async-bash.terminal.log" "$run_command"
 
     VIVI_EXPECT_PROMPT=$prompt \
         VIVI_EXPECT_LAUNCH="$launch_command" \
@@ -1405,10 +1438,9 @@ EOF
     rm -f "$run_dir/pty.pid"
     trap - EXIT INT TERM
 
-    perl -0pe \
-        's/\e\[[0-?]*[ -\/]*[@-~]//g; s/\e\][^\a]*(?:\a|\e\\)//g' \
-        "$run_dir/chat-async-bash.terminal.log" |
-        tr -d '\r\b' >"$run_dir/chat-async-bash.normalized.txt"
+    normalize_transcript \
+        "$run_dir/chat-async-bash.terminal.log" \
+        "$run_dir/chat-async-bash.normalized.txt"
 
     {
         printf 'exit=%s\n' "$status"
@@ -1426,14 +1458,8 @@ EOF
         done
     } >"$run_dir/chat-async-bash.assertions.txt"
 
-    if test "${VIVI_SKIP_RECORDING:-0}" = 1; then
-        printf '%s\n' \
-            'Recording was skipped; terminal PTY evidence is available.' \
-            >"$run_dir/chat-async-bash.visual-blocker.txt"
-    else
-        render_cast "$1" chat-async-bash
-        test -s "$run_dir/chat-async-bash.contact-sheet.png"
-    fi
+    finish_recording "$1" chat-async-bash
+    require_visual_artifacts "$run_dir" chat-async-bash
     test "$status" -eq 0 || test "$status" -eq 124
     grep -a -q 'Start Bash' "$run_dir/chat-async-bash.terminal.log"
     grep -a -q 'List Bash sessions' "$run_dir/chat-async-bash.terminal.log"
@@ -1463,12 +1489,8 @@ chat_file_picker() {
     cast="$run_dir/chat-file-picker.cast"
     rm -f "$cast"
     pty_command="cd $(shell_quote "$fixture") && stty cols 100 rows 30; exec $(shell_quote "$binary") chat"
-    if test "${VIVI_SKIP_RECORDING:-0}" = 1; then
-        launched_command="$pty_command"
-    else
-        launched_command=$(recorded_pty_command "$cast" chat-file-picker "$pty_command")
-    fi
-    script_launch_command "$run_dir/chat-file-picker.terminal.log" "$launched_command"
+    prepare_pty_command "$cast" chat-file-picker "$pty_command"
+    script_launch_command "$run_dir/chat-file-picker.terminal.log" "$run_command"
 
     VIVI_EXPECT_LAUNCH="$launch_command" \
         expect <<'EOF' &
@@ -1508,18 +1530,10 @@ EOF
     rm -f "$run_dir/pty.pid"
     trap - EXIT INT TERM
 
-    if test "${VIVI_SKIP_RECORDING:-0}" = 1; then
-        printf '%s\n' \
-            'Recording was skipped; terminal PTY evidence is available.' \
-            >"$run_dir/chat-file-picker.visual-blocker.txt"
-    else
-        render_cast "$1" chat-file-picker
-    fi
-
-    perl -0pe \
-        's/\e\[[0-?]*[ -\/]*[@-~]//g; s/\e\][^\a]*(?:\a|\e\\)//g' \
-        "$run_dir/chat-file-picker.terminal.log" |
-        tr -d '\r\b' >"$run_dir/chat-file-picker.normalized.txt"
+    finish_recording "$1" chat-file-picker
+    normalize_transcript \
+        "$run_dir/chat-file-picker.terminal.log" \
+        "$run_dir/chat-file-picker.normalized.txt"
 
     {
         printf 'exit=%s\n' "$status"
@@ -1538,9 +1552,7 @@ EOF
     grep -F -q '.visible-hidden' "$run_dir/chat-file-picker.normalized.txt"
     ! grep -F -q '.ignored-hidden' "$run_dir/chat-file-picker.normalized.txt"
     ! grep -F -q '.svn/entries' "$run_dir/chat-file-picker.normalized.txt"
-    if test "${VIVI_SKIP_RECORDING:-0}" != 1; then
-        test -s "$run_dir/chat-file-picker.contact-sheet.png"
-    fi
+    require_visual_artifacts "$run_dir" chat-file-picker
 }
 
 case "${1:-}" in
