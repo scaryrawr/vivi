@@ -1253,25 +1253,18 @@ fn printStyledComposer(
                 col = 0;
             }
 
-            var chunk_start = word_start;
-            while (chunk_start < pos) {
+            const word = text[word_start..pos];
+            var grapheme_iterator = vaxis.unicode.graphemeIterator(word);
+            while (grapheme_iterator.next()) |grapheme| {
+                const grapheme_start = word_start + grapheme.start;
                 const style = composerStyleAt(
                     spans,
                     &span_index,
-                    chunk_start,
+                    grapheme_start,
                     base_style,
                 );
-                var chunk_end = pos;
-                if (span_index < spans.len) {
-                    const span = spans[span_index];
-                    if (span.start > chunk_start) {
-                        chunk_end = @min(chunk_end, span.start);
-                    } else if (span.end > chunk_start) {
-                        chunk_end = @min(chunk_end, span.end);
-                    }
-                }
                 const result = window.printSegment(
-                    .{ .text = text[chunk_start..chunk_end], .style = style },
+                    .{ .text = grapheme.bytes(word), .style = style },
                     .{
                         .row_offset = row,
                         .col_offset = col,
@@ -1281,7 +1274,6 @@ fn printStyledComposer(
                 row = result.row;
                 col = result.col;
                 if (result.overflow) return result;
-                chunk_start = chunk_end;
             }
             soft_wrapped = word_width > 0 and col == 0;
         }
@@ -8812,6 +8804,50 @@ test "styled composer wraps words across style boundaries" {
         composer_background,
         screen.readCell(2, 1).?.style.bg,
     ));
+}
+
+test "styled composer preserves graphemes across style boundaries" {
+    const source = "`a`\u{0301}b";
+    const spans = try markdown.analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var screen = try vaxis.Screen.init(std.testing.allocator, .{
+        .rows = 2,
+        .cols = 10,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(std.testing.allocator);
+    const window: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = screen.width,
+        .height = screen.height,
+        .screen = &screen,
+    };
+
+    var plain_segment = [_]vaxis.Segment{.{ .text = source }};
+    const plain = window.print(
+        &plain_segment,
+        .{ .wrap = .word, .commit = false },
+    );
+    const styled = printStyledComposer(window, source, spans, .{});
+    try std.testing.expectEqual(plain.row, styled.row);
+    try std.testing.expectEqual(plain.col, styled.col);
+    try std.testing.expectEqualStrings(
+        "`\u{0301}",
+        screen.readCell(2, 0).?.char.grapheme,
+    );
+    try std.testing.expectEqual(
+        composer_background,
+        screen.readCell(2, 0).?.style.bg,
+    );
+    try std.testing.expectEqualStrings(
+        "b",
+        screen.readCell(3, 0).?.char.grapheme,
+    );
 }
 
 test "composer word wraps and grows instead of scrolling horizontally" {
