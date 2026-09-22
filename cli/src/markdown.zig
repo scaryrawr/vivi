@@ -360,8 +360,22 @@ fn isSpaceByte(byte: u8) bool {
     return byte == ' ' or byte == '\t' or byte == '\r' or byte == '\n';
 }
 
-fn isWordChar(byte: u8) bool {
-    return std.ascii.isAlphanumeric(byte) or byte >= 0x80;
+fn isPunctByte(byte: u8) bool {
+    return byte < 0x80 and std.ascii.isPunctuation(byte);
+}
+
+const DelimiterFlanking = struct {
+    left: bool,
+    right: bool,
+};
+
+fn delimiterFlanking(before: u8, after: u8) DelimiterFlanking {
+    return .{
+        .left = !isSpaceByte(after) and
+            (isSpaceByte(before) or isPunctByte(before) or !isPunctByte(after)),
+        .right = !isSpaceByte(before) and
+            (isSpaceByte(after) or isPunctByte(after) or !isPunctByte(before)),
+    };
 }
 
 /// Scans inline Markdown for one line, OR-ing style bits into the absolute
@@ -428,15 +442,17 @@ fn scanInline(flags: []u8, text: []const u8, lo: usize, hi: usize, depth: u8) vo
             '*', '_' => {
                 const marker = text[i];
                 const run = countRun(text, i, hi, marker);
-                // An underscore glued to a word character (snake_case) or one
-                // with only whitespace after it cannot open emphasis.
+                const before = if (i > lo) text[i - 1] else '\n';
                 const after = if (i + run < hi) text[i + run] else '\n';
-                const can_open = !isSpaceByte(after) and
-                    (marker == '*' or i == lo or !isWordChar(text[i - 1]));
+                const flanking = delimiterFlanking(before, after);
+                const can_open = flanking.left and
+                    (marker == '*' or !flanking.right or isPunctByte(before));
+                const delimiter_can_close = flanking.right and
+                    (marker == '*' or !flanking.left or isPunctByte(after));
                 const can_close = emphasis_depth > 0 and
                     emphasis_openers[emphasis_depth - 1].marker == marker and
                     i > emphasis_openers[emphasis_depth - 1].start + emphasis_openers[emphasis_depth - 1].run and
-                    !isSpaceByte(text[i - 1]);
+                    delimiter_can_close;
 
                 if (can_close) {
                     const opener = emphasis_openers[emphasis_depth - 1];
@@ -534,6 +550,7 @@ pub fn analyzeSource(
     @memset(flags, 0);
 
     var fence: u8 = 0;
+    var fence_len: usize = 0;
     var pos: usize = 0;
     while (pos < source.len) {
         const line = lineSpan(source, pos);
@@ -542,14 +559,28 @@ pub fn analyzeSource(
 
         if (fence != 0) {
             markRange(flags, pos, line.end, flag_code);
-            if (body < line.end and source[body] == fence and
-                countRun(source, body, line.end, fence) >= 3)
-                fence = 0;
+            if (body < line.end and source[body] == fence) {
+                const run = countRun(source, body, line.end, fence);
+                if (run >= fence_len) {
+                    // A closing fence may only be followed by whitespace; text
+                    // like ```not-a-close keeps the block open, as md4c does.
+                    var trailing_ok = true;
+                    var closer = body + run;
+                    while (closer < line.end) : (closer += 1) {
+                        if (source[closer] != ' ' and source[closer] != '\t') {
+                            trailing_ok = false;
+                            break;
+                        }
+                    }
+                    if (trailing_ok) fence = 0;
+                }
+            }
         } else if (body < line.end and
             (source[body] == '`' or source[body] == '~') and
             countRun(source, body, line.end, source[body]) >= 3)
         {
             fence = source[body];
+            fence_len = countRun(source, body, line.end, source[body]);
             markRange(flags, pos, line.end, flag_code);
         } else if (body < line.end and source[body] == '#') {
             const hashes = countRun(source, body, line.end, '#');
@@ -2678,6 +2709,55 @@ test "analyzeSource leaves unmatched markers and snake_case unstyled" {
     const spans = try analyzeSource(std.testing.allocator, "snake_case_name and **unclosed and a * b *\n");
     defer std.testing.allocator.free(spans);
     try std.testing.expectEqual(@as(usize, 0), spans.len);
+}
+
+test "analyzeSource applies the underscore flanking rule like md4c" {
+    const source = "_foo_bar_ and snake_case_name";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    try std.testing.expectEqual(@as(usize, 1), spans.len);
+    try std.testing.expect(spans[0].style.italic);
+    try std.testing.expect(std.mem.eql(u8, source[spans[0].start..spans[0].end], "_foo_bar_"));
+
+    const punct = "start _emphasis,_ end";
+    const punct_spans = try analyzeSource(std.testing.allocator, punct);
+    defer std.testing.allocator.free(punct_spans);
+    var saw_close = false;
+    for (punct_spans) |span| {
+        const text = punct[span.start..span.end];
+        if (span.style.italic and std.mem.indexOf(u8, text, "emphasis") != null) saw_close = true;
+    }
+    try std.testing.expect(saw_close);
+}
+
+test "analyzeSource fences close only on an equally long unannotated fence" {
+    const source = "````example\n```zig\ninside\n```\nstill inside\n````\nafter";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var saw_inside = false;
+    var saw_still = false;
+    for (spans) |span| {
+        const text = source[span.start..span.end];
+        if (span.style.code and std.mem.eql(u8, text, "inside")) saw_inside = true;
+        if (span.style.code and std.mem.eql(u8, text, "still inside")) saw_still = true;
+    }
+    try std.testing.expect(saw_inside and saw_still);
+
+    // Trailing text after a fence marker does not close the block.
+    const annotated_text = "```\ncode\n```not-a-close\nmore code\n```\ndone";
+    const annotated = try analyzeSource(std.testing.allocator, annotated_text);
+    defer std.testing.allocator.free(annotated);
+    var saw_more = false;
+    var saw_done_code = false;
+    for (annotated) |span| {
+        const text = annotated_text[span.start..span.end];
+        if (span.style.code and std.mem.eql(u8, text, "more code")) saw_more = true;
+        if (span.style.code and std.mem.eql(u8, text, "done")) saw_done_code = true;
+    }
+    try std.testing.expect(saw_more);
+    try std.testing.expect(!saw_done_code);
 }
 
 test "analyzeSource spans never split code points" {
