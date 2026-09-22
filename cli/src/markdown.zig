@@ -325,6 +325,8 @@ const flag_strikethrough: u8 = 1 << 2;
 const flag_code: u8 = 1 << 3;
 const flag_heading: u8 = 1 << 4;
 const flag_link: u8 = 1 << 5;
+const delimiter_opener: u8 = 1 << 0;
+const delimiter_closer: u8 = 1 << 1;
 
 const max_code_span_delimiter = 32;
 
@@ -440,6 +442,7 @@ fn delimiterFlanking(before: CharacterClass, after: CharacterClass) DelimiterFla
 /// positions of `flags`. Unmatched markers are left unstyled (literal).
 fn scanInline(
     flags: []u8,
+    delimiter_roles: []u8,
     delimiter_pairs: []const usize,
     link_states: []const u8,
     link_dest_ends: []const usize,
@@ -481,6 +484,7 @@ fn scanInline(
                     if (depth < 4) {
                         scanInline(
                             flags,
+                            delimiter_roles,
                             delimiter_pairs,
                             link_states,
                             link_dest_ends,
@@ -557,9 +561,12 @@ fn scanInline(
                     emphasis_depth = candidate_index + 1;
                     if (marker == '~') {
                         markRange(flags, opener.start, i + run, flag_strikethrough);
+                        markRange(delimiter_roles, opener.start, opener.start + run, delimiter_opener);
+                        markRange(delimiter_roles, i, i + run, delimiter_closer);
                         if (depth < 4) {
                             scanInline(
                                 flags,
+                                delimiter_roles,
                                 delimiter_pairs,
                                 link_states,
                                 link_dest_ends,
@@ -578,6 +585,13 @@ fn scanInline(
                     const opener_start = opener.start + opener.run - consumed;
                     if (consumed >= 2) markRange(flags, opener_start, i + consumed, flag_bold);
                     if (consumed % 2 == 1) markRange(flags, opener_start, i + consumed, flag_italic);
+                    markRange(
+                        delimiter_roles,
+                        opener_start,
+                        opener_start + consumed,
+                        delimiter_opener,
+                    );
+                    markRange(delimiter_roles, i, i + consumed, delimiter_closer);
                     opener.run -= consumed;
                     if (opener.run == 0) emphasis_depth = candidate_index;
                     if (consumed < run) {
@@ -611,6 +625,10 @@ fn scanInline(
 }
 
 const LinkMatch = struct { label_close: usize, dest_end: usize };
+const LinkCandidate = struct {
+    match: LinkMatch,
+    destination: []const u8,
+};
 
 fn findCodeSpanEnd(text: []const u8, start: usize, hi: usize) ?usize {
     const run = countRun(text, start, hi, '`');
@@ -707,22 +725,32 @@ fn startsWithIgnoreCase(text: []const u8, index: usize, prefix: []const u8) bool
         std.ascii.eqlIgnoreCase(text[index .. index + prefix.len], prefix);
 }
 
-fn autolinkBoundaryBefore(flags: []const u8, text: []const u8, index: usize, lo: usize) bool {
+fn autolinkBoundaryBefore(
+    delimiter_roles: []const u8,
+    text: []const u8,
+    index: usize,
+    lo: usize,
+) bool {
     if (index == lo) return true;
     if (isUnicodeWhitespace(codepointBefore(text, index) orelse return false)) return true;
     return switch (text[index - 1]) {
         '(', '[', '{' => true,
-        '*', '_', '~' => flags[index - 1] & (flag_italic | flag_bold | flag_strikethrough) != 0,
+        '*', '_', '~' => delimiter_roles[index - 1] & delimiter_opener != 0,
         else => false,
     };
 }
 
-fn autolinkBoundaryAfter(flags: []const u8, text: []const u8, index: usize, hi: usize) bool {
+fn autolinkBoundaryAfter(
+    delimiter_roles: []const u8,
+    text: []const u8,
+    index: usize,
+    hi: usize,
+) bool {
     if (index == hi) return true;
     if (isUnicodeWhitespace(codepointAt(text, index) orelse return false)) return true;
     return switch (text[index]) {
         ')', '}', ']', '.', '!', '?', ',', ';' => true,
-        '*', '_', '~' => flags[index] & (flag_italic | flag_bold | flag_strikethrough) != 0,
+        '*', '_', '~' => delimiter_roles[index] & delimiter_closer != 0,
         else => false,
     };
 }
@@ -892,22 +920,48 @@ fn scanAngleAutolink(text: []const u8, start: usize, hi: usize) ?usize {
 
     const contents_start = start + 1;
     const contents_end = close;
-    var parsed_end: ?usize = null;
-    if (startsWithIgnoreCase(text, contents_start, "https://")) {
-        parsed_end = scanUrlAutolink(text, contents_start, 8, contents_end);
-    } else if (startsWithIgnoreCase(text, contents_start, "http://")) {
-        parsed_end = scanUrlAutolink(text, contents_start, 7, contents_end);
-    } else if (startsWithIgnoreCase(text, contents_start, "mailto:")) {
-        parsed_end = scanEmailAutolink(text, contents_start + 7, contents_end);
-    } else {
-        parsed_end = scanEmailAutolink(text, contents_start, contents_end);
+    if (safeSourceUri(text[contents_start..contents_end])) {
+        var scheme_end = contents_start + 1;
+        while (scheme_end < contents_end and scheme_end - contents_start <= 31) {
+            const byte = text[scheme_end];
+            if (byte == ':' and scheme_end - contents_start >= 2) return close + 1;
+            if (!std.ascii.isAlphanumeric(byte) and byte != '+' and byte != '-' and byte != '.') {
+                break;
+            }
+            scheme_end += 1;
+        }
     }
-    if (parsed_end != contents_end) return null;
+
+    var cursor = contents_start;
+    while (cursor < contents_end and
+        (std.ascii.isAlphanumeric(text[cursor]) or
+            std.mem.indexOfScalar(u8, ".!#$%&'*+/=?^_`{|}~-", text[cursor]) != null))
+    {
+        cursor += 1;
+    }
+    if (cursor == contents_start or cursor >= contents_end or text[cursor] != '@') return null;
+    cursor += 1;
+    var label_length: usize = 0;
+    while (cursor < contents_end) : (cursor += 1) {
+        const byte = text[cursor];
+        if (std.ascii.isAlphanumeric(byte)) {
+            label_length += 1;
+        } else if (byte == '-' and label_length > 0) {
+            label_length += 1;
+        } else if (byte == '.' and label_length > 0 and text[cursor - 1] != '-') {
+            label_length = 0;
+        } else {
+            return null;
+        }
+        if (label_length > 63) return null;
+    }
+    if (label_length == 0 or text[contents_end - 1] == '-') return null;
     return close + 1;
 }
 
 fn markPermissiveAutolinks(
     flags: []u8,
+    delimiter_roles: []const u8,
     delimiter_pairs: []const usize,
     link_states: []const u8,
     link_dest_ends: []const usize,
@@ -917,14 +971,15 @@ fn markPermissiveAutolinks(
 ) void {
     var cursor = lo;
     while (cursor < hi) {
-        if (text[cursor] == '!' and cursor + 1 < hi and text[cursor + 1] == '[') {
-            if (linkAt(
-                delimiter_pairs,
-                link_states,
-                link_dest_ends,
-                cursor + 1,
-            )) |image| {
-                cursor = image.dest_end + 1;
+        const label_open = if (text[cursor] == '[')
+            cursor
+        else if (text[cursor] == '!' and cursor + 1 < hi and text[cursor + 1] == '[')
+            cursor + 1
+        else
+            null;
+        if (label_open) |open_index| {
+            if (link_states[open_index] != 0) {
+                cursor = link_dest_ends[open_index] + 1;
                 continue;
             }
         }
@@ -950,7 +1005,7 @@ fn markPermissiveAutolinks(
                 continue;
             }
         }
-        if (autolinkBoundaryBefore(flags, text, cursor, lo)) {
+        if (autolinkBoundaryBefore(delimiter_roles, text, cursor, lo)) {
             var end: ?usize = null;
             if (startsWithIgnoreCase(text, cursor, "https://") or
                 startsWithIgnoreCase(text, cursor, "http://"))
@@ -963,7 +1018,7 @@ fn markPermissiveAutolinks(
                 end = scanEmailAutolink(text, cursor, hi);
             }
             if (end) |link_end| {
-                if (autolinkBoundaryAfter(flags, text, link_end, hi)) {
+                if (autolinkBoundaryAfter(delimiter_roles, text, link_end, hi)) {
                     markRange(flags, cursor, link_end, flag_link);
                     cursor = link_end;
                     continue;
@@ -976,6 +1031,7 @@ fn markPermissiveAutolinks(
 
 fn analyzeInlineRange(
     flags: []u8,
+    delimiter_roles: []u8,
     delimiter_pairs: []usize,
     delimiter_stack: []usize,
     emphasis_openers: []EmphasisOpener,
@@ -998,6 +1054,7 @@ fn analyzeInlineRange(
     );
     scanInline(
         flags,
+        delimiter_roles,
         delimiter_pairs,
         link_states,
         link_dest_ends,
@@ -1009,6 +1066,7 @@ fn analyzeInlineRange(
     );
     markPermissiveAutolinks(
         flags,
+        delimiter_roles,
         delimiter_pairs,
         link_states,
         link_dest_ends,
@@ -1023,7 +1081,7 @@ fn linkCandidateAt(
     text: []const u8,
     hi: usize,
     label_open: usize,
-) ?LinkMatch {
+) ?LinkCandidate {
     const label_close = delimiter_pairs[label_open];
     if (label_close == std.math.maxInt(usize) or
         label_close + 1 >= hi or
@@ -1036,12 +1094,11 @@ fn linkCandidateAt(
         parseInlineLinkContents(text, label_close + 2, dest_end)
     else
         null;
-    if (contents == null or
-        !safeSourceUri(contents.?.destination))
-    {
-        return null;
-    }
-    return .{ .label_close = label_close, .dest_end = dest_end };
+    if (contents == null) return null;
+    return .{
+        .match = .{ .label_close = label_close, .dest_end = dest_end },
+        .destination = contents.?.destination,
+    };
 }
 
 fn prepareInlineLinks(
@@ -1062,9 +1119,9 @@ fn prepareInlineLinks(
         if (text[cursor] != '[') continue;
         const candidate = linkCandidateAt(delimiter_pairs, text, hi, cursor) orelse continue;
         const image = isImageLabelOpen(text, cursor, lo);
-        if (!image and nearest_anchor < candidate.label_close) continue;
-        link_states[cursor] = 1;
-        link_dest_ends[cursor] = candidate.dest_end;
+        if (!image and nearest_anchor < candidate.match.label_close) continue;
+        link_states[cursor] = if (safeSourceUri(candidate.destination)) 2 else 1;
+        link_dest_ends[cursor] = candidate.match.dest_end;
         if (!image) nearest_anchor = cursor;
     }
 }
@@ -1075,7 +1132,7 @@ fn linkAt(
     link_dest_ends: []const usize,
     label_open: usize,
 ) ?LinkMatch {
-    if (link_states[label_open] == 0) return null;
+    if (link_states[label_open] != 2) return null;
     return .{
         .label_close = delimiter_pairs[label_open],
         .dest_end = link_dest_ends[label_open],
@@ -1236,7 +1293,9 @@ fn parseInlineLinkContents(text: []const u8, start: usize, end: usize) ?InlineLi
     }
 
     if (cursor == end) return .{ .destination = destination };
+    const whitespace_start = cursor;
     skipLinkWhitespace(text, &cursor, end);
+    if (cursor == whitespace_start) return null;
     if (cursor == end) return .{ .destination = destination };
 
     const title_close: u8 = switch (text[cursor]) {
@@ -1356,6 +1415,28 @@ fn startsParagraphInterrupt(source: []const u8, pos: usize, line_end: usize) boo
     return isThematicLine(source, body, line_end);
 }
 
+fn startsListItem(source: []const u8, pos: usize, line_end: usize) bool {
+    const indent = leadingIndent(source, pos, line_end);
+    const body = pos + indent.bytes;
+    if (body >= line_end or indent.columns >= 4 or isThematicLine(source, body, line_end)) {
+        return false;
+    }
+    if (source[body] == '-' or source[body] == '+' or source[body] == '*') {
+        return body + 1 < line_end and
+            (source[body + 1] == ' ' or source[body + 1] == '\t');
+    }
+    var digits_end = body;
+    while (digits_end < line_end and digits_end - body < 9 and
+        std.ascii.isDigit(source[digits_end]))
+    {
+        digits_end += 1;
+    }
+    return digits_end > body and digits_end < line_end and
+        (source[digits_end] == '.' or source[digits_end] == ')') and
+        digits_end + 1 < line_end and
+        (source[digits_end + 1] == ' ' or source[digits_end + 1] == '\t');
+}
+
 /// Analyzes Markdown source without rewriting any bytes: returned spans
 /// cover the original text (syntax markers included) so a live editor can
 /// style its buffer in place while cursor and wrap offsets stay exact.
@@ -1367,6 +1448,9 @@ pub fn analyzeSource(
     const flags = try allocator.alloc(u8, source.len);
     defer allocator.free(flags);
     @memset(flags, 0);
+    const delimiter_roles = try allocator.alloc(u8, source.len);
+    defer allocator.free(delimiter_roles);
+    @memset(delimiter_roles, 0);
     const delimiter_pairs = try allocator.alloc(usize, source.len);
     defer allocator.free(delimiter_pairs);
     @memset(delimiter_pairs, std.math.maxInt(usize));
@@ -1412,6 +1496,7 @@ pub fn analyzeSource(
             if (inline_start) |start| {
                 analyzeInlineRange(
                     flags,
+                    delimiter_roles,
                     delimiter_pairs,
                     delimiter_stack,
                     emphasis_openers,
@@ -1430,6 +1515,7 @@ pub fn analyzeSource(
             if (inline_start) |start| {
                 analyzeInlineRange(
                     flags,
+                    delimiter_roles,
                     delimiter_pairs,
                     delimiter_stack,
                     emphasis_openers,
@@ -1448,6 +1534,7 @@ pub fn analyzeSource(
             const start = inline_start.?;
             analyzeInlineRange(
                 flags,
+                delimiter_roles,
                 delimiter_pairs,
                 delimiter_stack,
                 emphasis_openers,
@@ -1465,6 +1552,7 @@ pub fn analyzeSource(
             if (inline_start) |start| {
                 analyzeInlineRange(
                     flags,
+                    delimiter_roles,
                     delimiter_pairs,
                     delimiter_stack,
                     emphasis_openers,
@@ -1476,17 +1564,22 @@ pub fn analyzeSource(
                 );
                 inline_start = null;
             }
-            analyzeInlineRange(
-                flags,
-                delimiter_pairs,
-                delimiter_stack,
-                emphasis_openers,
-                link_states,
-                link_dest_ends,
-                source,
-                pos,
-                line.end,
-            );
+            if (startsListItem(source, pos, line.end)) {
+                inline_start = pos;
+            } else {
+                analyzeInlineRange(
+                    flags,
+                    delimiter_roles,
+                    delimiter_pairs,
+                    delimiter_stack,
+                    emphasis_openers,
+                    link_states,
+                    link_dest_ends,
+                    source,
+                    pos,
+                    line.end,
+                );
+            }
         } else if (indent.columns <= 3 and source[body] == '#') {
             const hashes = countRun(source, body, line.end, '#');
             const at_end = body + hashes >= line.end;
@@ -1495,6 +1588,7 @@ pub fn analyzeSource(
                 if (inline_start) |start| {
                     analyzeInlineRange(
                         flags,
+                        delimiter_roles,
                         delimiter_pairs,
                         delimiter_stack,
                         emphasis_openers,
@@ -1514,6 +1608,7 @@ pub fn analyzeSource(
                 }
                 analyzeInlineRange(
                     flags,
+                    delimiter_roles,
                     delimiter_pairs,
                     delimiter_stack,
                     emphasis_openers,
@@ -1535,6 +1630,7 @@ pub fn analyzeSource(
     if (inline_start) |start| {
         analyzeInlineRange(
             flags,
+            delimiter_roles,
             delimiter_pairs,
             delimiter_stack,
             emphasis_openers,
@@ -3832,6 +3928,13 @@ test "analyzeSource ignores parentheses inside quoted link titles" {
     try std.testing.expectEqualStrings(source, source[spans[0].start..spans[0].end]);
 }
 
+test "analyzeSource requires whitespace before angle destination titles" {
+    const source = "[x](<https://e.test>\"title\")";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+    for (spans) |span| try std.testing.expect(!span.style.link);
+}
+
 test "analyzeSource rejects outer links overlapping nested links" {
     const source = "[outer [inner](https://i)](https://o)";
     const spans = try analyzeSource(std.testing.allocator, source);
@@ -3851,6 +3954,13 @@ test "analyzeSource rejects outer links overlapping nested links" {
     try std.testing.expect(image_spans[0].style.link);
     try std.testing.expectEqual(@as(usize, 0), image_spans[0].start);
     try std.testing.expectEqual(image_source.len, image_spans[image_spans.len - 1].end);
+}
+
+test "analyzeSource suppresses autolinks inside unsafe explicit links" {
+    const source = "[https://example.com](/relative)";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+    for (spans) |span| try std.testing.expect(!span.style.link);
 }
 
 test "analyzeSource resolves deeply nested link candidates once" {
@@ -3995,7 +4105,9 @@ test "analyzeSource matches permissive autolink boundaries and host grammar" {
 }
 
 test "analyzeSource styles safe angle autolinks" {
-    const source = "<https://example.com> <mailto:user@example.com>";
+    const source =
+        "<https://example.com> <mailto:user@example.com> " ++
+        "<https://localhost> <http://x:8080>";
     const spans = try analyzeSource(std.testing.allocator, source);
     defer std.testing.allocator.free(spans);
 
@@ -4003,7 +4115,14 @@ test "analyzeSource styles safe angle autolinks" {
     for (spans) |span| {
         if (span.style.link) linked_segments += 1;
     }
-    try std.testing.expectEqual(@as(usize, 2), linked_segments);
+    try std.testing.expectEqual(@as(usize, 4), linked_segments);
+}
+
+test "analyzeSource requires resolved delimiter directions at autolink boundaries" {
+    const source = "*foo*https://example.com https://example.com*foo*";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+    for (spans) |span| try std.testing.expect(!span.style.link);
 }
 
 test "analyzeSource bounds malformed angle destination scans" {
@@ -4130,6 +4249,21 @@ test "analyzeSource matches quote and ordered-list paragraph interruption" {
         }
     }
     try std.testing.expect(saw_ordered_continuation);
+}
+
+test "analyzeSource preserves inline spans across list continuations" {
+    const source = "- *foo\n  bar*";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+    var saw_continuation = false;
+    for (spans) |span| {
+        if (span.style.italic and
+            std.mem.indexOf(u8, source[span.start..span.end], "bar") != null)
+        {
+            saw_continuation = true;
+        }
+    }
+    try std.testing.expect(saw_continuation);
 }
 
 test "analyzeSource distinguishes indented code from paragraph continuation" {
