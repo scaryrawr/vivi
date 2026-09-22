@@ -713,63 +713,118 @@ fn startsWithIgnoreCase(text: []const u8, index: usize, prefix: []const u8) bool
         std.ascii.eqlIgnoreCase(text[index .. index + prefix.len], prefix);
 }
 
-fn autolinkBoundaryBefore(text: []const u8, index: usize, lo: usize) bool {
+fn autolinkBoundaryBefore(flags: []const u8, text: []const u8, index: usize, lo: usize) bool {
     if (index == lo) return true;
-    return characterClass(codepointBefore(text, index)) != .other;
+    if (isUnicodeWhitespace(codepointBefore(text, index) orelse return false)) return true;
+    return switch (text[index - 1]) {
+        '(', '[', '{' => true,
+        '*', '_', '~' => flags[index - 1] & (flag_italic | flag_bold | flag_strikethrough) != 0,
+        else => false,
+    };
 }
 
-fn trimAutolinkEnd(text: []const u8, start: usize, raw_end: usize) usize {
-    var end = raw_end;
-    while (end > start) {
-        switch (text[end - 1]) {
-            '.', ',', ':', ';', '!', '?' => end -= 1,
-            else => break,
-        }
-    }
-    return end;
+fn autolinkBoundaryAfter(flags: []const u8, text: []const u8, index: usize, hi: usize) bool {
+    if (index == hi) return true;
+    if (isUnicodeWhitespace(codepointAt(text, index) orelse return false)) return true;
+    return switch (text[index]) {
+        ')', '}', ']', '.', '!', '?', ',', ';' => true,
+        '*', '_', '~' => flags[index] & (flag_italic | flag_bold | flag_strikethrough) != 0,
+        else => false,
+    };
 }
 
-fn markUrlAutolink(flags: []u8, text: []const u8, start: usize, hi: usize) usize {
-    var end = start;
-    while (end < hi and !isUnicodeWhitespace(codepointAt(text, end) orelse ' ') and
-        text[end] != '<' and text[end] != '>')
-    {
-        const length = std.unicode.utf8ByteSequenceLength(text[end]) catch 1;
-        end += @min(length, hi - end);
-    }
-    end = trimAutolinkEnd(text, start, end);
-    if (end > start) markRange(flags, start, end, flag_link);
-    return @max(end, start + 1);
-}
-
-fn isEmailLocalByte(byte: u8) bool {
-    return std.ascii.isAlphanumeric(byte) or
-        std.mem.indexOfScalar(u8, ".!#$%&'*+/=?^_`{|}~-", byte) != null;
-}
-
-fn markEmailAutolink(flags: []u8, text: []const u8, start: usize, hi: usize) ?usize {
+fn scanAutolinkHost(text: []const u8, start: usize, hi: usize) ?usize {
     var cursor = start;
-    while (cursor < hi and isEmailLocalByte(text[cursor])) cursor += 1;
-    if (cursor == start or cursor >= hi or text[cursor] != '@') return null;
-    cursor += 1;
-    const domain_start = cursor;
-    var saw_dot = false;
+    var components: usize = 0;
+    while (cursor < hi and std.ascii.isAlphanumeric(text[cursor])) {
+        components += 1;
+        cursor += 1;
+        while (cursor < hi) {
+            if (std.ascii.isAlphanumeric(text[cursor])) {
+                cursor += 1;
+            } else if ((text[cursor] == '-' or text[cursor] == '_') and
+                cursor + 1 < hi and std.ascii.isAlphanumeric(text[cursor - 1]) and
+                std.ascii.isAlphanumeric(text[cursor + 1]))
+            {
+                cursor += 1;
+            } else {
+                break;
+            }
+        }
+        if (cursor >= hi or text[cursor] != '.' or cursor + 1 >= hi or
+            !std.ascii.isAlphanumeric(text[cursor + 1]))
+        {
+            break;
+        }
+        cursor += 1;
+    }
+    if (components < 2) return null;
+    return cursor;
+}
+
+fn scanAutolinkPart(
+    text: []const u8,
+    start: usize,
+    hi: usize,
+    allowed: []const u8,
+) ?usize {
+    var cursor = start;
+    var count: usize = 0;
+    var paren_depth: usize = 0;
     while (cursor < hi) {
         const byte = text[cursor];
-        if (std.ascii.isAlphanumeric(byte) or byte == '-') {
+        if (std.ascii.isAlphanumeric(byte) or std.mem.indexOfScalar(u8, allowed, byte) != null) {
+            count += 1;
             cursor += 1;
-        } else if (byte == '.' and cursor > domain_start and cursor + 1 < hi and
-            std.ascii.isAlphanumeric(text[cursor + 1]))
-        {
-            saw_dot = true;
+        } else if (byte == '(') {
+            paren_depth += 1;
+            count += 1;
+            cursor += 1;
+        } else if (byte == ')' and paren_depth > 0) {
+            paren_depth -= 1;
+            count += 1;
             cursor += 1;
         } else {
             break;
         }
     }
-    if (!saw_dot or cursor == domain_start or text[cursor - 1] == '-') return null;
-    markRange(flags, start, cursor, flag_link);
+    if (count == 0 or paren_depth != 0) return null;
     return cursor;
+}
+
+fn scanUrlAutolink(text: []const u8, start: usize, prefix_len: usize, hi: usize) ?usize {
+    var cursor = scanAutolinkHost(text, start + prefix_len, hi) orelse return null;
+    if (cursor < hi and text[cursor] == '/') {
+        cursor = scanAutolinkPart(text, cursor, hi, "/._+-") orelse return null;
+    }
+    if (cursor < hi and text[cursor] == '?') {
+        if (scanAutolinkPart(text, cursor + 1, hi, "&.-+_=")) |query_end| {
+            cursor = query_end;
+        }
+    }
+    if (cursor < hi and text[cursor] == '#') {
+        cursor = scanAutolinkPart(text, cursor + 1, hi, ".-+_") orelse return null;
+    }
+    return cursor;
+}
+
+fn scanEmailAutolink(text: []const u8, start: usize, hi: usize) ?usize {
+    if (!std.ascii.isAlphanumeric(text[start])) return null;
+    var cursor = start + 1;
+    while (cursor < hi) {
+        if (std.ascii.isAlphanumeric(text[cursor])) {
+            cursor += 1;
+        } else if (std.mem.indexOfScalar(u8, ".-_+", text[cursor]) != null and
+            cursor + 1 < hi and std.ascii.isAlphanumeric(text[cursor - 1]) and
+            std.ascii.isAlphanumeric(text[cursor + 1]))
+        {
+            cursor += 1;
+        } else {
+            break;
+        }
+    }
+    if (cursor >= hi or text[cursor] != '@') return null;
+    return scanAutolinkHost(text, cursor + 1, hi);
 }
 
 fn markPermissiveAutolinks(
@@ -796,17 +851,22 @@ fn markPermissiveAutolinks(
                 cursor + countRun(text, cursor, hi, '`');
             continue;
         }
-        if (autolinkBoundaryBefore(text, cursor, lo)) {
+        if (autolinkBoundaryBefore(flags, text, cursor, lo)) {
+            var end: ?usize = null;
             if (startsWithIgnoreCase(text, cursor, "https://") or
-                startsWithIgnoreCase(text, cursor, "http://") or
-                startsWithIgnoreCase(text, cursor, "www."))
+                startsWithIgnoreCase(text, cursor, "http://"))
             {
-                cursor = markUrlAutolink(flags, text, cursor, hi);
-                continue;
+                const prefix_len: usize = if (startsWithIgnoreCase(text, cursor, "https://")) 8 else 7;
+                end = scanUrlAutolink(text, cursor, prefix_len, hi);
+            } else if (startsWithIgnoreCase(text, cursor, "www.")) {
+                end = scanUrlAutolink(text, cursor, 0, hi);
+            } else if (std.ascii.isAlphanumeric(text[cursor])) {
+                end = scanEmailAutolink(text, cursor, hi);
             }
-            if (std.ascii.isAlphanumeric(text[cursor])) {
-                if (markEmailAutolink(flags, text, cursor, hi)) |end| {
-                    cursor = end;
+            if (end) |link_end| {
+                if (autolinkBoundaryAfter(flags, text, link_end, hi)) {
+                    markRange(flags, cursor, link_end, flag_link);
+                    cursor = link_end;
                     continue;
                 }
             }
@@ -827,7 +887,6 @@ fn analyzeInlineRange(
 ) void {
     if (start >= end) return;
     prepareInlinePairs(delimiter_pairs, delimiter_stack, source, start, end);
-    markPermissiveAutolinks(flags, delimiter_pairs, source, start, end);
     prepareInlineLinks(
         link_states,
         link_dest_ends,
@@ -847,6 +906,7 @@ fn analyzeInlineRange(
         end,
         0,
     );
+    markPermissiveAutolinks(flags, delimiter_pairs, source, start, end);
 }
 
 fn linkCandidateAt(
@@ -1144,8 +1204,7 @@ fn startsParagraphInterrupt(source: []const u8, pos: usize, line_end: usize) boo
     while (body < line_end and source[body] == ' ') body += 1;
     if (body >= line_end or body - pos >= 4) return false;
 
-    if (source[body] == '>') return body + 1 == line_end or
-        source[body + 1] == ' ' or source[body + 1] == '\t';
+    if (source[body] == '>') return true;
 
     if (source[body] == '-' or source[body] == '+' or source[body] == '*') {
         if (body + 1 < line_end and
@@ -1166,7 +1225,11 @@ fn startsParagraphInterrupt(source: []const u8, pos: usize, line_end: usize) boo
         digits_end + 1 < line_end and
         (source[digits_end + 1] == ' ' or source[digits_end + 1] == '\t'))
     {
-        return true;
+        var list_start: usize = 0;
+        for (source[body..digits_end]) |digit| {
+            list_start = list_start * 10 + digit - '0';
+        }
+        return list_start == 1;
     }
 
     return isThematicLine(source, body, line_end);
@@ -3731,6 +3794,22 @@ test "analyzeSource styles GFM permissive autolinks" {
     try std.testing.expectEqual(@as(usize, 3), linked_segments);
 }
 
+test "analyzeSource matches permissive autolink boundaries and host grammar" {
+    const invalid_source = "foo:https://example.com http://x www.";
+    const invalid_spans = try analyzeSource(std.testing.allocator, invalid_source);
+    defer std.testing.allocator.free(invalid_spans);
+    for (invalid_spans) |span| try std.testing.expect(!span.style.link);
+
+    const emphasized_source = "*https://example.com*";
+    const emphasized_spans = try analyzeSource(std.testing.allocator, emphasized_source);
+    defer std.testing.allocator.free(emphasized_spans);
+    var saw_emphasized_link = false;
+    for (emphasized_spans) |span| {
+        if (span.style.italic and span.style.link) saw_emphasized_link = true;
+    }
+    try std.testing.expect(saw_emphasized_link);
+}
+
 test "analyzeSource bounds malformed angle destination scans" {
     var source: std.ArrayList(u8) = .empty;
     defer source.deinit(std.testing.allocator);
@@ -3835,6 +3914,26 @@ test "analyzeSource stops inline spans at paragraph-interrupting blocks" {
     defer std.testing.allocator.free(spans);
 
     for (spans) |span| try std.testing.expect(!span.style.italic);
+}
+
+test "analyzeSource matches quote and ordered-list paragraph interruption" {
+    const quote_source = "*foo\n>bar*";
+    const quote_spans = try analyzeSource(std.testing.allocator, quote_source);
+    defer std.testing.allocator.free(quote_spans);
+    for (quote_spans) |span| try std.testing.expect(!span.style.italic);
+
+    const ordered_source = "*foo\n2. bar*";
+    const ordered_spans = try analyzeSource(std.testing.allocator, ordered_source);
+    defer std.testing.allocator.free(ordered_spans);
+    var saw_ordered_continuation = false;
+    for (ordered_spans) |span| {
+        if (span.style.italic and
+            std.mem.indexOf(u8, ordered_source[span.start..span.end], "bar") != null)
+        {
+            saw_ordered_continuation = true;
+        }
+    }
+    try std.testing.expect(saw_ordered_continuation);
 }
 
 test "analyzeSource distinguishes indented code from paragraph continuation" {
