@@ -15,8 +15,8 @@ without restarting the TUI.
 - A successful switch keeps the visible transcript and explicitly reports that
   server-side conversation history was reset.
 - A successful selection becomes the default model/reasoning pair in
-  `~/.vivi/settings.json`; the helper's second PTY observes that persisted pair
-  as already active.
+  `~/.vivi/settings.json`; the helper's second Vivi process in the same PTY
+  observes that persisted pair as already active.
 - The footer shows the active model at the far right and updates after a
   successful selection.
 
@@ -33,13 +33,14 @@ Enter to select a model. Escape dismisses either menu.
 ```
 
 The recipe filters for `gpt-5.6-luna` by default. Its single recorded PTY
-session switches to and persists that hosted model through `/model`, sends a
-deterministic prompt, and captures the
-menu, persisted-default status, streamed answer, and shutdown.
-The run uses an isolated home under the evidence directory, with only the
-Copilot credential directory linked through, so verification never modifies
-the user's real `~/.vivi/settings.json`. `VIVI_VALIDATION_MODEL` can select a
-different hosted model when model-switch coverage explicitly requires it.
+starts two Vivi processes: the first switches to and persists that hosted
+model through `/model`, and the second confirms the persisted selection,
+sends a deterministic prompt, and captures the menu, persisted-default status,
+streamed answer, and shutdown. The run uses an isolated home under the
+evidence directory and passes an authenticated `gh auth token`, so verification
+never modifies the user's real `~/.vivi/settings.json`.
+`VIVI_VALIDATION_MODEL` can select a different hosted model when model-switch
+coverage explicitly requires it.
 
 ## Gotchas
 

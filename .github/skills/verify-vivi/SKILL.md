@@ -54,7 +54,7 @@ looks questionable:
 .github/skills/verify-vivi/bin/verify-vivi doctor
 ```
 
-It requires Zig, asciinema, `agg`, `script`, Expect, FFmpeg/FFprobe, GitHub
+It requires Zig, asciinema 3.x, `agg`, `script`, Expect, FFmpeg/FFprobe, GitHub
 CLI with an available `gh auth token`, and GitHub Copilot CLI; builds Vivi;
 checks the installed Vivi, asciinema, `agg`, and Copilot versions; records a
 temporary asciinema session and renders it with `agg` as a smoke GIF; and

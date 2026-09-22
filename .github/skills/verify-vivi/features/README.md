@@ -7,7 +7,7 @@ then use the matching feature file as the recipe.
 ## Baseline preconditions
 
 - Build from the repository root with `zig build`.
-- Put Zig 0.16.x, asciinema, `agg`, `script`, and GitHub
+- Put Zig 0.16.x, asciinema 3.x, `agg`, `script`, and GitHub
   Copilot CLI on `PATH`. Override the default binary names with
   `VIVI_ASCIINEMA` and `VIVI_AGG` when they live elsewhere.
 - Authenticate GitHub Copilot CLI before driving `vivi chat`.

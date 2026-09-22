@@ -40,6 +40,22 @@ require_command() {
     }
 }
 
+require_asciinema_v3() {
+    version_output=$("$asciinema_command" --version 2>/dev/null) || {
+        printf 'unable to read asciinema version: %s\n' "$asciinema_command" >&2
+        exit 1
+    }
+    version=${version_output##* }
+    case "$version" in
+        3.*) ;;
+        *)
+            printf 'verification requires asciinema 3.x; found %s\n' \
+                "$version_output" >&2
+            exit 1
+            ;;
+    esac
+}
+
 validate_run_id() {
     case "${1:-}" in
         ""|*[!A-Za-z0-9._-]*)
@@ -120,6 +136,7 @@ doctor() {
     require_command gh
     require_command ffmpeg
     require_command ffprobe
+    require_asciinema_v3
     gh auth token >/dev/null || {
         printf 'gh must be authenticated for isolated Vivi verification homes\n' >&2
         exit 1
@@ -380,6 +397,7 @@ prepare_pty_command() {
     if test "${VIVI_SKIP_RECORDING:-0}" = 1; then
         run_command=$inner
     else
+        require_asciinema_v3
         run_command=$(recorded_pty_command "$cast" "$title" "$inner")
     fi
 }
@@ -1349,16 +1367,22 @@ chat_shutdown() {
     rm -f "$cast"
     pty_command="stty cols 100 rows 30; exec '$binary' chat"
     prepare_pty_command "$cast" chat-shutdown "$pty_command"
-    (
+    if (
         sleep 8
         printf '\003'
     ) | script_pty "$run_dir/chat-shutdown.terminal.log" "$run_command"
+    then
+        status=0
+    else
+        status=$?
+    fi
     finish_recording "$1" chat-shutdown
     normalize_transcript \
         "$run_dir/chat-shutdown.terminal.log" \
         "$run_dir/chat-shutdown.normalized.txt"
     require_visual_artifacts "$run_dir" chat-shutdown
     {
+        printf 'exit=%s\n' "$status"
         if test "${VIVI_SKIP_RECORDING:-0}" = 1; then
             printf 'frames_extracted=no\ncontact_sheet_nonempty=no\n'
         else
@@ -1366,6 +1390,7 @@ chat_shutdown() {
         fi
         printf 'shutdown=ctrl-c\n'
     } >"$run_dir/chat-shutdown.assertions.txt"
+    test "$status" -eq 0
 }
 
 cleanup() {
