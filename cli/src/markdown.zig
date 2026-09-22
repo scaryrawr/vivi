@@ -1535,18 +1535,52 @@ fn quoteLineHasContent(source: []const u8, pos: usize, line_end: usize) bool {
     return body < line_end;
 }
 
-fn fenceBody(source: []const u8, pos: usize, line_end: usize) usize {
+const FenceContext = struct {
+    quote_depth: usize,
+    body_column: usize,
+
+    fn eql(self: FenceContext, other: FenceContext) bool {
+        return self.quote_depth == other.quote_depth and
+            self.body_column == other.body_column;
+    }
+};
+
+const FenceLine = struct {
+    body: usize,
+    context: FenceContext,
+};
+
+fn fenceLine(source: []const u8, pos: usize, line_end: usize) FenceLine {
     const indent = leadingIndent(source, pos, line_end);
-    if (indent.columns >= 4) return pos + indent.bytes;
+    if (indent.columns >= 4) {
+        return .{
+            .body = pos + indent.bytes,
+            .context = .{ .quote_depth = 0, .body_column = indent.columns },
+        };
+    }
     var cursor = pos + indent.bytes;
+    var quote_depth: usize = 0;
+    var body_column = indent.columns;
 
     while (cursor < line_end and source[cursor] == '>') {
+        quote_depth += 1;
+        body_column += 1;
         cursor += 1;
         if (cursor < line_end and (source[cursor] == ' ' or source[cursor] == '\t')) {
+            body_column += 1;
             cursor += 1;
         }
         const nested_indent = leadingIndent(source, cursor, line_end);
-        if (nested_indent.columns >= 4) return cursor + nested_indent.bytes;
+        if (nested_indent.columns >= 4) {
+            return .{
+                .body = cursor + nested_indent.bytes,
+                .context = .{
+                    .quote_depth = quote_depth,
+                    .body_column = body_column + nested_indent.columns,
+                },
+            };
+        }
+        body_column += nested_indent.columns;
         cursor += nested_indent.bytes;
     }
 
@@ -1555,6 +1589,7 @@ fn fenceBody(source: []const u8, pos: usize, line_end: usize) usize {
         cursor + 1 < line_end and
         (source[cursor + 1] == ' ' or source[cursor + 1] == '\t'))
     {
+        body_column += 2;
         cursor += 2;
     } else {
         const digits_start = cursor;
@@ -1567,6 +1602,7 @@ fn fenceBody(source: []const u8, pos: usize, line_end: usize) usize {
             (source[cursor] == '.' or source[cursor] == ')') and
             (source[cursor + 1] == ' ' or source[cursor + 1] == '\t'))
         {
+            body_column += cursor + 2 - digits_start;
             cursor += 2;
         } else {
             cursor = digits_start;
@@ -1574,8 +1610,14 @@ fn fenceBody(source: []const u8, pos: usize, line_end: usize) usize {
     }
 
     const content_indent = leadingIndent(source, cursor, line_end);
-    if (content_indent.columns <= 3) cursor += content_indent.bytes;
-    return cursor;
+    if (content_indent.columns <= 3) {
+        body_column += content_indent.columns;
+        cursor += content_indent.bytes;
+    }
+    return .{
+        .body = cursor,
+        .context = .{ .quote_depth = quote_depth, .body_column = body_column },
+    };
 }
 
 const InlineContainer = enum {
@@ -1598,15 +1640,31 @@ fn isTableDelimiterCell(cell: []const u8) bool {
     return true;
 }
 
+fn findTableSeparator(source: []const u8, start: usize, end: usize) ?usize {
+    var cursor = start;
+    while (cursor < end) {
+        switch (source[cursor]) {
+            '\\' => cursor += escapedByteCount(source, cursor, end),
+            '`' => {
+                if (findCodeSpanEnd(source, cursor, end)) |code_end| {
+                    cursor = code_end;
+                } else {
+                    cursor += countRun(source, cursor, end, '`');
+                }
+            },
+            '|' => return cursor,
+            else => cursor += 1,
+        }
+    }
+    return null;
+}
+
 fn isTableDelimiterRow(source: []const u8, start: usize, end: usize) bool {
-    if (std.mem.indexOfScalar(u8, source[start..end], '|') == null) return false;
+    if (findTableSeparator(source, start, end) == null) return false;
     var cursor = start;
     var cells: usize = 0;
     while (cursor <= end) {
-        const separator = if (std.mem.indexOfScalar(u8, source[cursor..end], '|')) |offset|
-            cursor + offset
-        else
-            end;
+        const separator = findTableSeparator(source, cursor, end) orelse end;
         const cell = source[cursor..@min(separator, end)];
         var nonblank = false;
         for (cell) |byte| {
@@ -1639,10 +1697,7 @@ fn analyzeTableCells(
 ) void {
     var cursor = start;
     while (cursor <= end) {
-        const separator = if (std.mem.indexOfScalar(u8, source[cursor..end], '|')) |offset|
-            cursor + offset
-        else
-            end;
+        const separator = findTableSeparator(source, cursor, end) orelse end;
         if (cursor < separator) {
             analyzeInlineRange(
                 flags,
@@ -1692,6 +1747,7 @@ pub fn analyzeSource(
 
     var fence: u8 = 0;
     var fence_len: usize = 0;
+    var fence_context: FenceContext = .{ .quote_depth = 0, .body_column = 0 };
     var inline_start: ?usize = null;
     var inline_container: InlineContainer = .plain;
     var table_mode = false;
@@ -1701,22 +1757,24 @@ pub fn analyzeSource(
         const line = lineSpan(source, pos);
         const indent = leadingIndent(source, pos, line.end);
         const body = pos + indent.bytes;
-        const fence_body = fenceBody(source, pos, line.end);
-        if (table_mode and body < line.end and
-            std.mem.indexOfScalar(u8, source[pos..line.end], '|') == null)
+        const fence_line = fenceLine(source, pos, line.end);
+        if (table_mode and
+            (body == line.end or findTableSeparator(source, pos, line.end) == null))
         {
             table_mode = false;
         }
 
         if (fence != 0) {
             markRange(flags, pos, line.end, flag_code);
-            if (fence_body < line.end and source[fence_body] == fence) {
-                const run = countRun(source, fence_body, line.end, fence);
+            if (fence_line.context.eql(fence_context) and
+                fence_line.body < line.end and source[fence_line.body] == fence)
+            {
+                const run = countRun(source, fence_line.body, line.end, fence);
                 if (run >= fence_len) {
                     // A closing fence may only be followed by whitespace; text
                     // like ```not-a-close keeps the block open, as md4c does.
                     var trailing_ok = true;
-                    var closer = fence_body + run;
+                    var closer = fence_line.body + run;
                     while (closer < line.end) : (closer += 1) {
                         if (source[closer] != ' ' and source[closer] != '\t') {
                             trailing_ok = false;
@@ -1742,9 +1800,9 @@ pub fn analyzeSource(
                 );
                 inline_start = null;
             }
-        } else if (fence_body < line.end and
-            (source[fence_body] == '`' or source[fence_body] == '~') and
-            validFenceOpener(source, fence_body, line.end, source[fence_body]))
+        } else if (fence_line.body < line.end and
+            (source[fence_line.body] == '`' or source[fence_line.body] == '~') and
+            validFenceOpener(source, fence_line.body, line.end, source[fence_line.body]))
         {
             if (inline_start) |start| {
                 analyzeInlineRange(
@@ -1761,8 +1819,9 @@ pub fn analyzeSource(
                 );
                 inline_start = null;
             }
-            fence = source[fence_body];
-            fence_len = countRun(source, fence_body, line.end, source[fence_body]);
+            fence = source[fence_line.body];
+            fence_len = countRun(source, fence_line.body, line.end, source[fence_line.body]);
+            fence_context = fence_line.context;
             markRange(flags, pos, line.end, flag_code);
         } else if (isTableDelimiterRow(source, pos, line.end)) {
             if (inline_start) |start| {
@@ -1801,9 +1860,7 @@ pub fn analyzeSource(
                 inline_start = null;
             }
             table_mode = true;
-        } else if (table_mode and
-            std.mem.indexOfScalar(u8, source[pos..line.end], '|') != null)
-        {
+        } else if (table_mode and findTableSeparator(source, pos, line.end) != null) {
             analyzeTableCells(
                 flags,
                 delimiter_roles,
@@ -1924,7 +1981,10 @@ pub fn analyzeSource(
                 }
             }
         } else {
-            if (inline_start == null) inline_start = pos;
+            if (inline_start == null) {
+                inline_start = pos;
+                inline_container = .plain;
+            }
         }
         previous_line_start = pos;
         pos = line.next;
@@ -4106,6 +4166,63 @@ test "analyzeSource recognizes fenced code inside block containers" {
     try std.testing.expect(saw_code_body);
 }
 
+test "analyzeSource requires matching fence container context" {
+    const top_level_source = "```\ncode\n> ```\n*still code*\n```\n*after*";
+    const top_level_spans = try analyzeSource(std.testing.allocator, top_level_source);
+    defer std.testing.allocator.free(top_level_spans);
+
+    var saw_top_level_code = false;
+    var saw_top_level_after = false;
+    for (top_level_spans) |span| {
+        const text = top_level_source[span.start..span.end];
+        if (span.style.code and std.mem.eql(u8, text, "*still code*")) {
+            saw_top_level_code = true;
+            try std.testing.expect(!span.style.italic);
+        }
+        if (span.style.italic and std.mem.eql(u8, text, "*after*")) {
+            saw_top_level_after = true;
+        }
+    }
+    try std.testing.expect(saw_top_level_code and saw_top_level_after);
+
+    const quoted_source = "> ```\n> code\n```\n> *still code*\n> ```\n*after*";
+    const quoted_spans = try analyzeSource(std.testing.allocator, quoted_source);
+    defer std.testing.allocator.free(quoted_spans);
+
+    var saw_quoted_code = false;
+    var saw_quoted_after = false;
+    for (quoted_spans) |span| {
+        const text = quoted_source[span.start..span.end];
+        if (span.style.code and
+            std.mem.indexOf(u8, text, "still code") != null)
+        {
+            saw_quoted_code = true;
+            try std.testing.expect(!span.style.italic);
+        }
+        if (span.style.italic and std.mem.eql(u8, text, "*after*")) {
+            saw_quoted_after = true;
+        }
+    }
+    try std.testing.expect(saw_quoted_code and saw_quoted_after);
+
+    const list_source = "- ```\n  code\n  ```\n*after*";
+    const list_spans = try analyzeSource(std.testing.allocator, list_source);
+    defer std.testing.allocator.free(list_spans);
+
+    var saw_list_code = false;
+    var saw_list_after = false;
+    for (list_spans) |span| {
+        const text = list_source[span.start..span.end];
+        if (span.style.code and std.mem.eql(u8, text, "  code")) {
+            saw_list_code = true;
+        }
+        if (span.style.italic and std.mem.eql(u8, text, "*after*")) {
+            saw_list_after = true;
+        }
+    }
+    try std.testing.expect(saw_list_code and saw_list_after);
+}
+
 test "analyzeSource preserves inline styles inside ATX headings" {
     const source = "# *Title* and [link](https://example.com)";
     const spans = try analyzeSource(std.testing.allocator, source);
@@ -4684,6 +4801,49 @@ test "analyzeSource keeps emphasis from crossing GFM table cells" {
     for (spans) |span| try std.testing.expect(!span.style.italic);
 }
 
+test "analyzeSource ignores escaped and code span pipes in tables" {
+    const source =
+        "| `a|b` | *escaped \\| pipe* |\n" ++
+        "| --- | --- |\n" ++
+        "| body | row |";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var saw_code = false;
+    var saw_emphasis = false;
+    for (spans) |span| {
+        const text = source[span.start..span.end];
+        if (span.style.code and std.mem.eql(u8, text, "`a|b`")) saw_code = true;
+        if (span.style.italic and
+            std.mem.eql(u8, text, "*escaped \\| pipe*"))
+        {
+            saw_emphasis = true;
+        }
+    }
+    try std.testing.expect(saw_code and saw_emphasis);
+}
+
+test "analyzeSource ends table mode at blank lines" {
+    const source =
+        "| head |\n" ++
+        "| --- |\n" ++
+        "| body |\n" ++
+        "\n" ++
+        "*foo | bar*";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var saw_emphasis = false;
+    for (spans) |span| {
+        if (span.style.italic and
+            std.mem.eql(u8, source[span.start..span.end], "*foo | bar*"))
+        {
+            saw_emphasis = true;
+        }
+    }
+    try std.testing.expect(saw_emphasis);
+}
+
 test "analyzeSource distinguishes indented code from paragraph continuation" {
     const code_source = "    *code*";
     const code_spans = try analyzeSource(std.testing.allocator, code_source);
@@ -4735,6 +4895,22 @@ test "analyzeSource marks setext heading contents" {
         }
     }
     try std.testing.expect(saw_heading_emphasis);
+}
+
+test "analyzeSource resets container state for later setext headings" {
+    const source = "- item\n\nTitle\n===";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var saw_heading = false;
+    for (spans) |span| {
+        if (span.style.heading and
+            std.mem.indexOf(u8, source[span.start..span.end], "Title") != null)
+        {
+            saw_heading = true;
+        }
+    }
+    try std.testing.expect(saw_heading);
 }
 
 test "analyzeSource enforces link destination nesting limit" {
