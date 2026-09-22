@@ -1437,6 +1437,12 @@ fn startsListItem(source: []const u8, pos: usize, line_end: usize) bool {
         (source[digits_end + 1] == ' ' or source[digits_end + 1] == '\t');
 }
 
+fn startsQuoteLine(source: []const u8, pos: usize, line_end: usize) bool {
+    const indent = leadingIndent(source, pos, line_end);
+    const body = pos + indent.bytes;
+    return body < line_end and indent.columns < 4 and source[body] == '>';
+}
+
 /// Analyzes Markdown source without rewriting any bytes: returned spans
 /// cover the original text (syntax markers included) so a live editor can
 /// style its buffer in place while cursor and wrap offsets stay exact.
@@ -1468,6 +1474,7 @@ pub fn analyzeSource(
     var fence: u8 = 0;
     var fence_len: usize = 0;
     var inline_start: ?usize = null;
+    var inline_quote = false;
     var pos: usize = 0;
     while (pos < source.len) {
         const line = lineSpan(source, pos);
@@ -1549,36 +1556,40 @@ pub fn analyzeSource(
         } else if (inline_start == null and indent.columns >= 4) {
             markRange(flags, pos, line.end, flag_code);
         } else if (startsParagraphInterrupt(source, pos, line.end)) {
-            if (inline_start) |start| {
-                analyzeInlineRange(
-                    flags,
-                    delimiter_roles,
-                    delimiter_pairs,
-                    delimiter_stack,
-                    emphasis_openers,
-                    link_states,
-                    link_dest_ends,
-                    source,
-                    start,
-                    pos,
-                );
-                inline_start = null;
-            }
-            if (startsListItem(source, pos, line.end)) {
-                inline_start = pos;
-            } else {
-                analyzeInlineRange(
-                    flags,
-                    delimiter_roles,
-                    delimiter_pairs,
-                    delimiter_stack,
-                    emphasis_openers,
-                    link_states,
-                    link_dest_ends,
-                    source,
-                    pos,
-                    line.end,
-                );
+            const quote_line = startsQuoteLine(source, pos, line.end);
+            if (!(quote_line and inline_start != null and inline_quote)) {
+                if (inline_start) |start| {
+                    analyzeInlineRange(
+                        flags,
+                        delimiter_roles,
+                        delimiter_pairs,
+                        delimiter_stack,
+                        emphasis_openers,
+                        link_states,
+                        link_dest_ends,
+                        source,
+                        start,
+                        pos,
+                    );
+                    inline_start = null;
+                }
+                if (quote_line or startsListItem(source, pos, line.end)) {
+                    inline_start = pos;
+                    inline_quote = quote_line;
+                } else {
+                    analyzeInlineRange(
+                        flags,
+                        delimiter_roles,
+                        delimiter_pairs,
+                        delimiter_stack,
+                        emphasis_openers,
+                        link_states,
+                        link_dest_ends,
+                        source,
+                        pos,
+                        line.end,
+                    );
+                }
             }
         } else if (indent.columns <= 3 and source[body] == '#') {
             const hashes = countRun(source, body, line.end, '#');
@@ -1620,7 +1631,10 @@ pub fn analyzeSource(
                 );
                 markRange(flags, pos, line.end, flag_heading);
             } else {
-                if (inline_start == null) inline_start = pos;
+                if (inline_start == null) {
+                    inline_start = pos;
+                    inline_quote = false;
+                }
             }
         } else {
             if (inline_start == null) inline_start = pos;
@@ -4253,6 +4267,21 @@ test "analyzeSource matches quote and ordered-list paragraph interruption" {
 
 test "analyzeSource preserves inline spans across list continuations" {
     const source = "- *foo\n  bar*";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+    var saw_continuation = false;
+    for (spans) |span| {
+        if (span.style.italic and
+            std.mem.indexOf(u8, source[span.start..span.end], "bar") != null)
+        {
+            saw_continuation = true;
+        }
+    }
+    try std.testing.expect(saw_continuation);
+}
+
+test "analyzeSource preserves inline spans across quote continuations" {
+    const source = "> *foo\n> bar*";
     const spans = try analyzeSource(std.testing.allocator, source);
     defer std.testing.allocator.free(spans);
     var saw_continuation = false;
