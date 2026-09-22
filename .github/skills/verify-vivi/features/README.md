@@ -7,9 +7,9 @@ then use the matching feature file as the recipe.
 ## Baseline preconditions
 
 - Build from the repository root with `zig build`.
-- Put Zig 0.16.x, a VHS release that writes recordings, `script`, and GitHub
-  Copilot CLI on `PATH`. VHS 0.12.0 is known to exit without writing output;
-  pass a working binary with `VIVI_VHS=/path/to/vhs`.
+- Put Zig 0.16.x, asciinema 3.x, `agg`, `script`, and GitHub
+  Copilot CLI on `PATH`. Override the default binary names with
+  `VIVI_ASCIINEMA` and `VIVI_AGG` when they live elsewhere.
 - Authenticate GitHub Copilot CLI before driving `vivi chat`.
 - Hosted validation uses `copilot/gpt-5.6-luna` by default. Override it with
   `VIVI_VALIDATION_MODEL=copilot/<model-id>` only when the validation itself
@@ -21,7 +21,8 @@ then use the matching feature file as the recipe.
 
 ## Driving conventions
 
-- Start each TUI drive in its own VHS or `script` PTY.
+- Start each TUI drive in its own `script` PTY; asciinema records it and
+  `agg` renders the GIF.
 - Use literal command names, header text, transcript labels, and key chords
   from these recipes.
 - Use Ctrl-C once for normal shutdown and a second time only after the UI shows

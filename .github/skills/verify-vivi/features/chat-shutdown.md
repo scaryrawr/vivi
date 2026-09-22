@@ -26,8 +26,8 @@ Preconditions:
 
 - **Drive idle shutdown.** Run
   `.github/skills/verify-vivi/bin/verify-vivi chat-shutdown <run-id>`.
-  VHS captures the TUI, waits for readiness, presses Ctrl-C, and extracts the
-  visual proof frames.
+  The recorded session shows the TUI, waits for readiness, presses Ctrl-C, and
+  extracts the visual proof frames.
 - **Inspect frames.** Review `chat-shutdown.contact-sheet.png` and the
   individual frames for a readable idle layout, intact composer accent, and a
   clean return to the shell without stale alternate-screen content. Complete

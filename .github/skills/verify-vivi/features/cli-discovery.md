@@ -35,8 +35,8 @@ Preconditions:
   `default=` fields, and all three exit statuses are `0`.
 - **Capture the default-command chat.** Run
   `.github/skills/verify-vivi/bin/verify-vivi chat-default <run-id>`.
-  It drives bare `./zig-out/bin/vivi` (no `chat` word) in a VHS plus
-  `script` PTY, submits a deterministic prompt, asserts the distinct
+  It drives bare `./zig-out/bin/vivi` (no `chat` word) in an
+  asciinema-recorded `script` PTY, submits a deterministic prompt, asserts the distinct
   `VIVI_DEFAULT_OK` response streams, the session title appears, and
   Ctrl-C exits cleanly (`exit=0` in `chat-default.assertions.txt`).
 - **Capture an implicit-flag chat.** Run
