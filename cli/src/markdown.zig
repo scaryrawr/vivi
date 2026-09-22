@@ -2,6 +2,7 @@ const std = @import("std");
 const backend = @import("vivi_backend");
 const highlight = backend.syntax;
 const vaxis = @import("vaxis");
+const md4c_unicode_punctuation = @import("md4c_unicode_punctuation.zig");
 const c = @cImport({
     @cInclude("md4c.h");
     @cInclude("entity.h");
@@ -306,6 +307,1773 @@ pub fn combineStyle(base: vaxis.Style, markdown: Style) vaxis.Style {
     if (markdown.code) result.bg = .{ .index = 236 };
     if (markdown.syntax) |syntax| result.fg = syntaxColor(syntax);
     return result;
+}
+
+/// A style range expressed over the original Markdown source. The bytes in
+/// [start, end) keep their literal content (syntax markers included) so an
+/// editor can style its buffer in place without moving the cursor: identical
+/// bytes mean identical wrap positions and cursor offsets.
+pub const SourceSpan = struct {
+    start: usize,
+    end: usize,
+    style: Style,
+};
+
+const flag_bold: u8 = 1 << 0;
+const flag_italic: u8 = 1 << 1;
+const flag_strikethrough: u8 = 1 << 2;
+const flag_code: u8 = 1 << 3;
+const flag_heading: u8 = 1 << 4;
+const flag_link: u8 = 1 << 5;
+const delimiter_opener: u8 = 1 << 0;
+const delimiter_closer: u8 = 1 << 1;
+
+const max_code_span_delimiter = 32;
+const max_source_analysis_bytes = 256 * 1024;
+
+const EmphasisOpener = struct {
+    marker: u8 = 0,
+    start: usize = 0,
+    run: usize = 0,
+    original_mod3: u2 = 0,
+    can_close: bool = false,
+    previous_same: usize = std.math.maxInt(usize),
+};
+
+const PendingDelimiter = struct {
+    start: usize,
+    marker: u8,
+    run: usize,
+    original_mod3: u2,
+    can_open: bool,
+    can_close: bool,
+};
+
+fn markRange(flags: []u8, start: usize, end: usize, bits: u8) void {
+    if (start >= end or start >= flags.len) return;
+    const stop = @min(end, flags.len);
+    for (flags[start..stop]) |*slot| slot.* |= bits;
+}
+
+fn styleFromFlags(bits: u8) Style {
+    return .{
+        .bold = bits & flag_bold != 0,
+        .italic = bits & flag_italic != 0,
+        .strikethrough = bits & flag_strikethrough != 0,
+        .code = bits & flag_code != 0,
+        .heading = bits & flag_heading != 0,
+        .link = bits & flag_link != 0,
+    };
+}
+
+fn countRun(text: []const u8, from: usize, limit: usize, byte: u8) usize {
+    var n: usize = 0;
+    while (from + n < limit and text[from + n] == byte) n += 1;
+    return n;
+}
+
+fn isSpaceByte(byte: u8) bool {
+    return byte == ' ' or byte == '\t' or byte == '\r' or byte == '\n';
+}
+
+fn isUnicodePunctuation(codepoint: u21) bool {
+    return md4c_unicode_punctuation.contains(codepoint);
+}
+
+fn codepointAt(text: []const u8, index: usize) ?u21 {
+    if (index >= text.len) return null;
+    const length = std.unicode.utf8ByteSequenceLength(text[index]) catch return null;
+    if (index + length > text.len) return null;
+    return std.unicode.utf8Decode(text[index..][0..length]) catch null;
+}
+
+fn codepointBefore(text: []const u8, index: usize) ?u21 {
+    if (index == 0 or index > text.len) return null;
+    var start = index - 1;
+    while (start > 0 and (text[start] & 0xc0) == 0x80) start -= 1;
+    return codepointAt(text, start);
+}
+
+const CharacterClass = enum { whitespace, punctuation, other };
+
+fn characterClass(codepoint: ?u21) CharacterClass {
+    const value = codepoint orelse return .whitespace;
+    if (isUnicodeWhitespace(value)) return .whitespace;
+    return if (isUnicodePunctuation(value)) .punctuation else .other;
+}
+
+fn isUnicodeWhitespace(codepoint: u21) bool {
+    return switch (codepoint) {
+        0x09...0x0d,
+        0x20,
+        0x00a0,
+        0x1680,
+        0x2000...0x200a,
+        0x202f,
+        0x205f,
+        0x3000,
+        => true,
+        else => false,
+    };
+}
+
+fn escapedByteCount(text: []const u8, index: usize, hi: usize) usize {
+    if (index + 1 < hi and text[index] == '\\' and text[index + 1] < 0x80 and
+        std.ascii.isPunctuation(text[index + 1]))
+    {
+        return 2;
+    }
+    return 1;
+}
+
+const DelimiterFlanking = struct {
+    left: bool,
+    right: bool,
+};
+
+fn delimiterFlanking(before: CharacterClass, after: CharacterClass) DelimiterFlanking {
+    return .{
+        .left = after != .whitespace and
+            (before == .whitespace or before == .punctuation or after != .punctuation),
+        .right = before != .whitespace and
+            (after == .whitespace or after == .punctuation or before != .punctuation),
+    };
+}
+
+fn delimiterMarkerSlot(marker: u8) usize {
+    return switch (marker) {
+        '*' => 0,
+        '_' => 1,
+        '~' => 2,
+        else => unreachable,
+    };
+}
+
+fn delimiterCloserClass(marker: u8, original_mod3: u2, can_open: bool, run: usize) usize {
+    if (marker == '~') return if (run == 1) 0 else 1;
+    return @as(usize, original_mod3) * 2 + @intFromBool(can_open);
+}
+
+/// Scans inline Markdown for one line, OR-ing style bits into the absolute
+/// positions of `flags`. Unmatched markers are left unstyled (literal).
+fn scanInline(
+    flags: []u8,
+    delimiter_roles: []u8,
+    delimiter_pairs: []const usize,
+    link_states: []const u8,
+    link_dest_ends: []const usize,
+    emphasis_openers: []EmphasisOpener,
+    text: []const u8,
+    lo: usize,
+    hi: usize,
+    depth: u8,
+) void {
+    var i = lo;
+    const opener_stack = emphasis_openers[lo..hi];
+    const no_opener = std.math.maxInt(usize);
+    var opener_tops: [3]usize = @splat(no_opener);
+    var opener_lower_bounds: [3][6]usize = @splat(@splat(no_opener));
+    var emphasis_depth: usize = 0;
+    var pending_delimiter: ?PendingDelimiter = null;
+
+    while (i < hi) {
+        switch (text[i]) {
+            '\\' => {
+                i += escapedByteCount(text, i, hi);
+            },
+            '`' => {
+                const code_span_end = findCodeSpanEnd(text, i, hi);
+                if (code_span_end) |end| markRange(flags, i, end, flag_code);
+                i = code_span_end orelse i + countRun(text, i, hi, '`');
+            },
+            '[', '!' => {
+                const image = text[i] == '!' and i + 1 < hi and text[i + 1] == '[';
+                if (!image and text[i] != '[') {
+                    i += 1;
+                    continue;
+                }
+                const label_open = if (image) i + 1 else i;
+                if (link_states[label_open] != 0) {
+                    const link: LinkMatch = .{
+                        .label_close = delimiter_pairs[label_open],
+                        .dest_end = link_dest_ends[label_open],
+                    };
+                    if (!image and link_states[label_open] == 2) {
+                        markRange(flags, i, link.dest_end + 1, flag_link);
+                    }
+                    if (depth < 4) {
+                        scanInline(
+                            flags,
+                            delimiter_roles,
+                            delimiter_pairs,
+                            link_states,
+                            link_dest_ends,
+                            emphasis_openers,
+                            text,
+                            label_open + 1,
+                            link.label_close,
+                            depth + 2,
+                        );
+                    }
+                    i = link.dest_end + 1;
+                } else {
+                    i += if (image) 1 else 1;
+                }
+            },
+            '*', '_', '~' => {
+                const marker = text[i];
+                const pending = if (pending_delimiter) |value|
+                    if (value.start == i and value.marker == marker) value else null
+                else
+                    null;
+                pending_delimiter = null;
+                const run = if (pending) |value| value.run else countRun(text, i, hi, marker);
+                if (marker == '~' and run > 2) {
+                    i += run;
+                    continue;
+                }
+                const before = characterClass(if (i > lo) codepointBefore(text, i) else null);
+                const after = characterClass(if (i + run < hi) codepointAt(text, i + run) else null);
+                const flanking = delimiterFlanking(before, after);
+                const can_open = if (pending) |value|
+                    value.can_open
+                else if (marker == '~')
+                    before != .other
+                else
+                    flanking.left and
+                        (marker == '*' or !flanking.right or before == .punctuation);
+                const delimiter_can_close = if (pending) |value|
+                    value.can_close
+                else if (marker == '~')
+                    after != .other
+                else
+                    flanking.right and
+                        (marker == '*' or !flanking.left or after == .punctuation);
+                const original_mod3: u2 = if (pending) |value|
+                    value.original_mod3
+                else
+                    @intCast(run % 3);
+
+                var opener_index: ?usize = null;
+                if (delimiter_can_close) {
+                    const marker_slot = delimiterMarkerSlot(marker);
+                    const closer_class = delimiterCloserClass(
+                        marker,
+                        original_mod3,
+                        can_open,
+                        run,
+                    );
+                    const initial_candidate = opener_tops[marker_slot];
+                    const lower_bound = opener_lower_bounds[marker_slot][closer_class];
+                    var candidate_index = initial_candidate;
+                    while (candidate_index != no_opener) {
+                        const candidate = opener_stack[candidate_index];
+                        if (lower_bound != no_opener and candidate.start <= lower_bound) break;
+                        if (marker == '~' and candidate.run != run) {
+                            candidate_index = candidate.previous_same;
+                            continue;
+                        }
+                        const rule_of_three_allows_close = marker == '~' or
+                            !((candidate.can_close or can_open) and
+                                (@as(usize, candidate.original_mod3) +
+                                    @as(usize, original_mod3)) % 3 == 0 and
+                                (candidate.original_mod3 != 0 or original_mod3 != 0));
+                        if (rule_of_three_allows_close) {
+                            opener_index = candidate_index;
+                            break;
+                        }
+                        candidate_index = candidate.previous_same;
+                    }
+                    if (opener_index == null) {
+                        opener_lower_bounds[marker_slot][closer_class] =
+                            if (initial_candidate == no_opener)
+                                i
+                            else
+                                opener_stack[initial_candidate].start;
+                    }
+                }
+
+                if (opener_index) |candidate_index| {
+                    var opener = &opener_stack[candidate_index];
+                    emphasis_depth = candidate_index + 1;
+                    if (marker == '~') {
+                        markRange(flags, opener.start, i + run, flag_strikethrough);
+                        markRange(delimiter_roles, opener.start, opener.start + run, delimiter_opener);
+                        markRange(delimiter_roles, i, i + run, delimiter_closer);
+                        if (depth < 4) {
+                            scanInline(
+                                flags,
+                                delimiter_roles,
+                                delimiter_pairs,
+                                link_states,
+                                link_dest_ends,
+                                emphasis_openers,
+                                text,
+                                opener.start + run,
+                                i,
+                                depth + 2,
+                            );
+                        }
+                        emphasis_depth = candidate_index;
+                        for (&opener_tops) |*top| {
+                            while (top.* != no_opener and top.* >= emphasis_depth) {
+                                top.* = opener_stack[top.*].previous_same;
+                            }
+                        }
+                        i += run;
+                        continue;
+                    }
+                    const consumed = @min(run, opener.run);
+                    const opener_start = opener.start + opener.run - consumed;
+                    if (consumed >= 2) markRange(flags, opener_start, i + consumed, flag_bold);
+                    if (consumed % 2 == 1) markRange(flags, opener_start, i + consumed, flag_italic);
+                    markRange(
+                        delimiter_roles,
+                        opener_start,
+                        opener_start + consumed,
+                        delimiter_opener,
+                    );
+                    markRange(delimiter_roles, i, i + consumed, delimiter_closer);
+                    opener.run -= consumed;
+                    if (opener.run == 0) emphasis_depth = candidate_index;
+                    for (&opener_tops) |*top| {
+                        while (top.* != no_opener and top.* >= emphasis_depth) {
+                            top.* = opener_stack[top.*].previous_same;
+                        }
+                    }
+                    if (consumed < run) {
+                        pending_delimiter = .{
+                            .start = i + consumed,
+                            .marker = marker,
+                            .run = run - consumed,
+                            .original_mod3 = original_mod3,
+                            .can_open = can_open,
+                            .can_close = delimiter_can_close,
+                        };
+                    }
+                    i += consumed;
+                } else if (can_open) {
+                    const marker_slot = delimiterMarkerSlot(marker);
+                    opener_stack[emphasis_depth] = .{
+                        .marker = marker,
+                        .start = i,
+                        .run = run,
+                        .original_mod3 = original_mod3,
+                        .can_close = delimiter_can_close,
+                        .previous_same = opener_tops[marker_slot],
+                    };
+                    opener_tops[marker_slot] = emphasis_depth;
+                    emphasis_depth += 1;
+                    i += run;
+                } else {
+                    i += run;
+                }
+            },
+            else => i += 1,
+        }
+    }
+}
+
+const LinkMatch = struct { label_close: usize, dest_end: usize };
+const LinkCandidate = struct {
+    match: LinkMatch,
+    destination: []const u8,
+};
+
+fn findCodeSpanEnd(text: []const u8, start: usize, hi: usize) ?usize {
+    const run = countRun(text, start, hi, '`');
+    if (run > max_code_span_delimiter) return null;
+    var cursor = start + run;
+    while (cursor + run <= hi) {
+        if (text[cursor] != '`') {
+            cursor += 1;
+            continue;
+        }
+        const closer_run = countRun(text, cursor, hi, '`');
+        if (closer_run == run and cursor > start + run) return cursor + run;
+        cursor += @max(closer_run, 1);
+    }
+    return null;
+}
+
+fn pairDelimiters(
+    pairs: []usize,
+    stack: []usize,
+    text: []const u8,
+    lo: usize,
+    hi: usize,
+    open: u8,
+    close: u8,
+) void {
+    const dirty_bit: usize = @as(usize, 1) << (@bitSizeOf(usize) - 1);
+    const index_mask: usize = ~dirty_bit;
+    var depth: usize = 0;
+    var angle_scan_from = lo;
+    var angle_scan_end: ?usize = null;
+    var i = lo;
+    while (i < hi) {
+        if (text[i] == '\\') {
+            i += escapedByteCount(text, i, hi);
+            continue;
+        }
+        if (text[i] == '`') {
+            i = findCodeSpanEnd(text, i, hi) orelse i + countRun(text, i, hi, '`');
+            continue;
+        }
+        if (open == '(' and text[i] == '<' and depth > 0) {
+            if (stack[depth - 1] & dirty_bit == 0) {
+                if (angle_scan_from <= i) {
+                    var angle_end = i + 1;
+                    while (angle_end < hi and text[angle_end] != '>') {
+                        angle_end += escapedByteCount(text, angle_end, hi);
+                    }
+                    angle_scan_end = if (angle_end < hi) angle_end else null;
+                    angle_scan_from = if (angle_end < hi) angle_end + 1 else hi;
+                }
+                if (angle_scan_end) |angle_end| {
+                    stack[depth - 1] |= dirty_bit;
+                    i = angle_end + 1;
+                    continue;
+                }
+            }
+        }
+        if (open == '(' and depth > 0 and
+            (text[i] == '"' or text[i] == '\'') and
+            i > (stack[depth - 1] & index_mask) + 1 and isLinkWhitespace(text[i - 1]))
+        {
+            const quote = text[i];
+            var quote_end = i + 1;
+            while (quote_end < hi and text[quote_end] != quote) {
+                quote_end += escapedByteCount(text, quote_end, hi);
+            }
+            if (quote_end < hi) {
+                i = quote_end + 1;
+                continue;
+            }
+        }
+        if (open == '(' and depth > 0 and !isLinkWhitespace(text[i])) {
+            stack[depth - 1] |= dirty_bit;
+        }
+        if (text[i] == open) {
+            stack[depth] = i;
+            depth += 1;
+        } else if (text[i] == close and depth > 0) {
+            depth -= 1;
+            pairs[stack[depth] & index_mask] = i;
+        }
+        i += 1;
+    }
+}
+
+fn prepareInlinePairs(
+    pairs: []usize,
+    stack: []usize,
+    text: []const u8,
+    lo: usize,
+    hi: usize,
+) void {
+    pairDelimiters(pairs, stack, text, lo, hi, '[', ']');
+    pairDelimiters(pairs, stack, text, lo, hi, '(', ')');
+}
+
+fn startsWithIgnoreCase(text: []const u8, index: usize, prefix: []const u8) bool {
+    return index + prefix.len <= text.len and
+        std.ascii.eqlIgnoreCase(text[index .. index + prefix.len], prefix);
+}
+
+fn autolinkBoundaryBefore(
+    delimiter_roles: []const u8,
+    text: []const u8,
+    index: usize,
+    lo: usize,
+) bool {
+    if (index == lo) return true;
+    if (isUnicodeWhitespace(codepointBefore(text, index) orelse return false)) return true;
+    return switch (text[index - 1]) {
+        '(', '[', '{' => true,
+        '*', '_', '~' => delimiter_roles[index - 1] & delimiter_opener != 0,
+        else => false,
+    };
+}
+
+fn autolinkBoundaryAfter(
+    delimiter_roles: []const u8,
+    text: []const u8,
+    index: usize,
+    hi: usize,
+) bool {
+    if (index == hi) return true;
+    if (isUnicodeWhitespace(codepointAt(text, index) orelse return false)) return true;
+    return switch (text[index]) {
+        ')', '}', ']', '.', '!', '?', ',', ';' => true,
+        '*', '_', '~' => delimiter_roles[index] & delimiter_closer != 0,
+        else => false,
+    };
+}
+
+fn scanAutolinkComponent(
+    text: []const u8,
+    start: usize,
+    hi: usize,
+    start_char: ?u8,
+    delimiter: ?u8,
+    allowed_inside: []const u8,
+    allowed_anywhere: []const u8,
+    minimum_components: usize,
+    optional_end: ?u8,
+) ?usize {
+    var cursor = start;
+    if (start_char) |byte| {
+        if (cursor >= hi or text[cursor] != byte) return start;
+        if (minimum_components > 0 and
+            (cursor + 1 >= hi or !std.ascii.isAlphanumeric(text[cursor + 1])))
+        {
+            return start;
+        }
+        cursor += 1;
+    }
+
+    var components: usize = 0;
+    var component_length: usize = 0;
+    var paren_depth: usize = 0;
+    while (cursor < hi) {
+        const byte = text[cursor];
+        if (std.ascii.isAlphanumeric(byte) or
+            std.mem.indexOfScalar(u8, allowed_anywhere, byte) != null)
+        {
+            if (components == 0) components += 1;
+            component_length += 1;
+            cursor += 1;
+        } else if (component_length > 0 and delimiter != null and byte == delimiter.? and
+            cursor + 1 < hi and
+            (std.ascii.isAlphanumeric(text[cursor + 1]) or
+                std.mem.indexOfScalar(u8, allowed_anywhere, text[cursor + 1]) != null))
+        {
+            components += 1;
+            component_length = 0;
+            cursor += 1;
+        } else if (std.mem.indexOfScalar(u8, allowed_inside, byte) != null and
+            ((cursor > start and
+                (std.ascii.isAlphanumeric(text[cursor - 1]) or text[cursor - 1] == ')')) or
+                byte == '(') and
+            ((cursor + 1 < hi and
+                (std.ascii.isAlphanumeric(text[cursor + 1]) or text[cursor + 1] == '(')) or
+                byte == ')'))
+        {
+            if (byte == '(') {
+                paren_depth += 1;
+            } else if (byte == ')') {
+                if (paren_depth == 0) break;
+                paren_depth -= 1;
+            }
+            component_length += 1;
+            cursor += 1;
+        } else {
+            break;
+        }
+    }
+    if (optional_end) |byte| {
+        if (cursor < hi and text[cursor] == byte) cursor += 1;
+    }
+    if (components < minimum_components or paren_depth != 0) return null;
+    return cursor;
+}
+
+fn scanUrlAutolink(text: []const u8, start: usize, prefix_len: usize, hi: usize) ?usize {
+    var cursor = scanAutolinkComponent(
+        text,
+        start + prefix_len,
+        hi,
+        null,
+        '.',
+        ".-_",
+        "",
+        2,
+        null,
+    ) orelse return null;
+    if (cursor < hi and text[cursor] == '/') {
+        cursor = scanAutolinkComponent(
+            text,
+            cursor,
+            hi,
+            '/',
+            '/',
+            "/._",
+            "+-",
+            0,
+            '/',
+        ) orelse return null;
+    }
+    if (cursor < hi and text[cursor] == '?') {
+        cursor = scanAutolinkComponent(
+            text,
+            cursor,
+            hi,
+            '?',
+            '&',
+            "&.-+_=()",
+            "",
+            1,
+            null,
+        ) orelse return null;
+    }
+    if (cursor < hi and text[cursor] == '#') {
+        cursor = scanAutolinkComponent(
+            text,
+            cursor,
+            hi,
+            '#',
+            null,
+            ".-+_",
+            "",
+            1,
+            null,
+        ) orelse return null;
+    }
+    return cursor;
+}
+
+fn scanEmailAutolink(text: []const u8, start: usize, hi: usize) ?usize {
+    if (!std.ascii.isAlphanumeric(text[start])) return null;
+    var cursor = start + 1;
+    while (cursor < hi) {
+        if (std.ascii.isAlphanumeric(text[cursor])) {
+            cursor += 1;
+        } else if (std.mem.indexOfScalar(u8, ".-_+", text[cursor]) != null and
+            cursor + 1 < hi and std.ascii.isAlphanumeric(text[cursor - 1]) and
+            std.ascii.isAlphanumeric(text[cursor + 1]))
+        {
+            cursor += 1;
+        } else {
+            break;
+        }
+    }
+    if (cursor >= hi or text[cursor] != '@') return null;
+    return scanAutolinkComponent(
+        text,
+        cursor + 1,
+        hi,
+        null,
+        '.',
+        ".-_",
+        "",
+        2,
+        null,
+    );
+}
+
+fn scanAngleAutolink(text: []const u8, start: usize, hi: usize) ?usize {
+    var close = start + 1;
+    while (close < hi and text[close] != '>') {
+        if (text[close] == '<' or
+            isUnicodeWhitespace(codepointAt(text, close) orelse return null))
+        {
+            return null;
+        }
+        close += 1;
+    }
+    if (close >= hi) return null;
+
+    const contents_start = start + 1;
+    const contents_end = close;
+    if (safeSourceUri(text[contents_start..contents_end])) {
+        var scheme_end = contents_start + 1;
+        while (scheme_end < contents_end and scheme_end - contents_start <= 31) {
+            const byte = text[scheme_end];
+            if (byte == ':' and scheme_end - contents_start >= 2) return close + 1;
+            if (!std.ascii.isAlphanumeric(byte) and byte != '+' and byte != '-' and byte != '.') {
+                break;
+            }
+            scheme_end += 1;
+        }
+    }
+
+    var cursor = contents_start;
+    while (cursor < contents_end and
+        (std.ascii.isAlphanumeric(text[cursor]) or
+            std.mem.indexOfScalar(u8, ".!#$%&'*+/=?^_`{|}~-", text[cursor]) != null))
+    {
+        cursor += 1;
+    }
+    if (cursor == contents_start or cursor >= contents_end or text[cursor] != '@') return null;
+    cursor += 1;
+    var label_length: usize = 0;
+    while (cursor < contents_end) : (cursor += 1) {
+        const byte = text[cursor];
+        if (std.ascii.isAlphanumeric(byte)) {
+            label_length += 1;
+        } else if (byte == '-' and label_length > 0) {
+            label_length += 1;
+        } else if (byte == '.' and label_length > 0 and text[cursor - 1] != '-') {
+            label_length = 0;
+        } else {
+            return null;
+        }
+        if (label_length > 63) return null;
+    }
+    if (label_length == 0 or text[contents_end - 1] == '-') return null;
+    return close + 1;
+}
+
+fn markPermissiveAutolinks(
+    flags: []u8,
+    delimiter_roles: []const u8,
+    delimiter_pairs: []const usize,
+    link_states: []const u8,
+    link_dest_ends: []const usize,
+    text: []const u8,
+    lo: usize,
+    hi: usize,
+) void {
+    var cursor = lo;
+    while (cursor < hi) {
+        const label_open = if (text[cursor] == '[')
+            cursor
+        else if (text[cursor] == '!' and cursor + 1 < hi and text[cursor + 1] == '[')
+            cursor + 1
+        else
+            null;
+        if (label_open) |open_index| {
+            if (link_states[open_index] != 0) {
+                cursor = link_dest_ends[open_index] + 1;
+                continue;
+            }
+        }
+        if (text[cursor] == '(' and cursor > lo and text[cursor - 1] == ']' and
+            delimiter_pairs[cursor] != std.math.maxInt(usize))
+        {
+            cursor = delimiter_pairs[cursor] + 1;
+            continue;
+        }
+        if (text[cursor] == '\\') {
+            cursor += escapedByteCount(text, cursor, hi);
+            continue;
+        }
+        if (text[cursor] == '`') {
+            cursor = findCodeSpanEnd(text, cursor, hi) orelse
+                cursor + countRun(text, cursor, hi, '`');
+            continue;
+        }
+        if (text[cursor] == '<') {
+            if (scanAngleAutolink(text, cursor, hi)) |angle_end| {
+                markRange(flags, cursor, angle_end, flag_link);
+                cursor = angle_end;
+                continue;
+            }
+        }
+        if (autolinkBoundaryBefore(delimiter_roles, text, cursor, lo)) {
+            var end: ?usize = null;
+            if (startsWithIgnoreCase(text, cursor, "https://") or
+                startsWithIgnoreCase(text, cursor, "http://"))
+            {
+                const prefix_len: usize = if (startsWithIgnoreCase(text, cursor, "https://")) 8 else 7;
+                end = scanUrlAutolink(text, cursor, prefix_len, hi);
+            } else if (startsWithIgnoreCase(text, cursor, "www.")) {
+                end = scanUrlAutolink(text, cursor, 0, hi);
+            } else if (std.ascii.isAlphanumeric(text[cursor])) {
+                end = scanEmailAutolink(text, cursor, hi);
+            }
+            if (end) |link_end| {
+                if (autolinkBoundaryAfter(delimiter_roles, text, link_end, hi)) {
+                    markRange(flags, cursor, link_end, flag_link);
+                    cursor = link_end;
+                    continue;
+                }
+            }
+        }
+        cursor += 1;
+    }
+}
+
+fn analyzeInlineRange(
+    flags: []u8,
+    delimiter_roles: []u8,
+    delimiter_pairs: []usize,
+    delimiter_stack: []usize,
+    emphasis_openers: []EmphasisOpener,
+    link_states: []u8,
+    link_dest_ends: []usize,
+    source: []const u8,
+    start: usize,
+    end: usize,
+) void {
+    if (start >= end) return;
+    prepareInlinePairs(delimiter_pairs, delimiter_stack, source, start, end);
+    prepareInlineLinks(
+        link_states,
+        link_dest_ends,
+        delimiter_pairs,
+        delimiter_stack,
+        source,
+        start,
+        end,
+    );
+    scanInline(
+        flags,
+        delimiter_roles,
+        delimiter_pairs,
+        link_states,
+        link_dest_ends,
+        emphasis_openers,
+        source,
+        start,
+        end,
+        0,
+    );
+    markPermissiveAutolinks(
+        flags,
+        delimiter_roles,
+        delimiter_pairs,
+        link_states,
+        link_dest_ends,
+        source,
+        start,
+        end,
+    );
+}
+
+fn linkCandidateAt(
+    delimiter_pairs: []const usize,
+    text: []const u8,
+    hi: usize,
+    label_open: usize,
+) ?LinkCandidate {
+    const label_close = delimiter_pairs[label_open];
+    if (label_close == std.math.maxInt(usize) or
+        label_close + 1 >= hi or
+        text[label_close + 1] != '(')
+    {
+        return null;
+    }
+    const dest_end = delimiter_pairs[label_close + 1];
+    const contents = if (dest_end != std.math.maxInt(usize))
+        parseInlineLinkContents(text, label_close + 2, dest_end)
+    else
+        null;
+    if (contents == null) return null;
+    return .{
+        .match = .{ .label_close = label_close, .dest_end = dest_end },
+        .destination = contents.?.destination,
+    };
+}
+
+fn prepareInlineLinks(
+    link_states: []u8,
+    link_dest_ends: []usize,
+    delimiter_pairs: []const usize,
+    next_valid_anchor: []usize,
+    text: []const u8,
+    lo: usize,
+    hi: usize,
+) void {
+    const none: usize = std.math.maxInt(usize);
+    var nearest_anchor: usize = none;
+    var cursor = hi;
+    while (cursor > lo) {
+        cursor -= 1;
+        next_valid_anchor[cursor] = nearest_anchor;
+        if (text[cursor] != '[') continue;
+        const candidate = linkCandidateAt(delimiter_pairs, text, hi, cursor) orelse continue;
+        const image = isImageLabelOpen(text, cursor, lo);
+        if (!image and nearest_anchor < candidate.match.label_close) continue;
+        link_states[cursor] = if (safeSourceUri(candidate.destination)) 2 else 1;
+        link_dest_ends[cursor] = candidate.match.dest_end;
+        if (!image) nearest_anchor = cursor;
+    }
+}
+
+fn linkAt(
+    delimiter_pairs: []const usize,
+    link_states: []const u8,
+    link_dest_ends: []const usize,
+    label_open: usize,
+) ?LinkMatch {
+    if (link_states[label_open] != 2) return null;
+    return .{
+        .label_close = delimiter_pairs[label_open],
+        .dest_end = link_dest_ends[label_open],
+    };
+}
+
+fn isEscapedAt(text: []const u8, index: usize, lo: usize) bool {
+    if (index == lo) return false;
+    var backslashes: usize = 0;
+    var cursor = index;
+    while (cursor > lo and text[cursor - 1] == '\\') {
+        backslashes += 1;
+        cursor -= 1;
+    }
+    return backslashes % 2 == 1;
+}
+
+fn isImageLabelOpen(text: []const u8, index: usize, lo: usize) bool {
+    return index > lo and text[index - 1] == '!' and
+        !isEscapedAt(text, index - 1, lo);
+}
+
+fn isLinkWhitespace(byte: u8) bool {
+    return byte == ' ' or byte == '\t' or byte == '\r' or byte == '\n';
+}
+
+const UriSafetyScan = struct {
+    prefix: [8]u8 = @splat(0),
+    prefix_len: usize = 0,
+    total_len: usize = 0,
+    safe: bool = true,
+
+    fn feed(self: *UriSafetyScan, bytes: []const u8) void {
+        for (bytes) |byte| {
+            if (byte < 0x20 or byte == 0x7f) self.safe = false;
+            if (self.prefix_len < self.prefix.len) {
+                self.prefix[self.prefix_len] = byte;
+                self.prefix_len += 1;
+            }
+            self.total_len += 1;
+        }
+    }
+
+    fn feedCodepoint(self: *UriSafetyScan, codepoint: u32) void {
+        var buffer: [4]u8 = undefined;
+        const length = std.unicode.utf8Encode(
+            normalizedCodepoint(codepoint),
+            &buffer,
+        ) catch return;
+        self.feed(buffer[0..length]);
+    }
+};
+
+fn feedSourceEntity(scan: *UriSafetyScan, entity: []const u8) void {
+    if (entity.len > 3 and entity[0] == '&' and entity[1] == '#') {
+        const hexadecimal = entity[2] == 'x' or entity[2] == 'X';
+        const digits = entity[if (hexadecimal) 3 else 2 .. entity.len - 1];
+        const codepoint = std.fmt.parseInt(
+            u32,
+            digits,
+            if (hexadecimal) 16 else 10,
+        ) catch {
+            scan.feed(entity);
+            return;
+        };
+        scan.feedCodepoint(codepoint);
+        return;
+    }
+
+    const found = c.entity_lookup(entity.ptr, entity.len);
+    if (found) |entry| {
+        scan.feedCodepoint(entry[0].codepoints[0]);
+        if (entry[0].codepoints[1] != 0) {
+            scan.feedCodepoint(entry[0].codepoints[1]);
+        }
+    } else {
+        scan.feed(entity);
+    }
+}
+
+fn safeSourceUri(raw: []const u8) bool {
+    var scan: UriSafetyScan = .{};
+    var cursor: usize = 0;
+    while (cursor < raw.len) {
+        if (raw[cursor] == '\\' and escapedByteCount(raw, cursor, raw.len) == 2) {
+            scan.feed(raw[cursor + 1 .. cursor + 2]);
+            cursor += 2;
+            continue;
+        }
+        if (raw[cursor] == '&') {
+            const entity_limit = @min(raw.len, cursor + 51);
+            if (std.mem.indexOfScalarPos(u8, raw[0..entity_limit], cursor + 1, ';')) |semicolon| {
+                feedSourceEntity(&scan, raw[cursor .. semicolon + 1]);
+                cursor = semicolon + 1;
+                continue;
+            }
+        }
+        scan.feed(raw[cursor .. cursor + 1]);
+        cursor += 1;
+    }
+    if (!scan.safe) return false;
+
+    const schemes = [_][]const u8{ "https://", "http://", "mailto:" };
+    for (schemes) |scheme| {
+        if (scan.total_len >= scheme.len and scan.prefix_len >= scheme.len and
+            std.ascii.eqlIgnoreCase(scan.prefix[0..scheme.len], scheme))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn skipLinkWhitespace(text: []const u8, cursor: *usize, end: usize) void {
+    while (cursor.* < end and isLinkWhitespace(text[cursor.*])) cursor.* += 1;
+}
+
+const InlineLinkContents = struct {
+    destination: []const u8,
+};
+
+fn parseInlineLinkContents(text: []const u8, start: usize, end: usize) ?InlineLinkContents {
+    var cursor = start;
+    skipLinkWhitespace(text, &cursor, end);
+    var destination: []const u8 = undefined;
+
+    if (cursor < end and text[cursor] == '<') {
+        cursor += 1;
+        const destination_start = cursor;
+        while (cursor < end and text[cursor] != '>') {
+            if (text[cursor] == '\n' or text[cursor] == '\r' or text[cursor] == '<') return null;
+            cursor += escapedByteCount(text, cursor, end);
+        }
+        if (cursor >= end) return null;
+        destination = text[destination_start..cursor];
+        cursor += 1;
+    } else {
+        const destination_start = cursor;
+        var nesting_depth: usize = 0;
+        while (cursor < end and !isLinkWhitespace(text[cursor])) {
+            if (text[cursor] < 0x20) return null;
+            const escaped_count = escapedByteCount(text, cursor, end);
+            if (escaped_count == 2) {
+                cursor += escaped_count;
+                continue;
+            }
+            if (text[cursor] == '(') {
+                nesting_depth += 1;
+                if (nesting_depth > 32) return null;
+            } else if (text[cursor] == ')') {
+                if (nesting_depth == 0) return null;
+                nesting_depth -= 1;
+            }
+            cursor += 1;
+        }
+        if (nesting_depth != 0) return null;
+        destination = text[destination_start..cursor];
+    }
+
+    if (cursor == end) return .{ .destination = destination };
+    const whitespace_start = cursor;
+    skipLinkWhitespace(text, &cursor, end);
+    if (cursor == whitespace_start) return null;
+    if (cursor == end) return .{ .destination = destination };
+
+    const title_close: u8 = switch (text[cursor]) {
+        '"' => '"',
+        '\'' => '\'',
+        '(' => ')',
+        else => return null,
+    };
+    cursor += 1;
+    while (cursor < end and text[cursor] != title_close) {
+        cursor += escapedByteCount(text, cursor, end);
+    }
+    if (cursor >= end) return null;
+    cursor += 1;
+    skipLinkWhitespace(text, &cursor, end);
+    if (cursor != end) return null;
+    return .{ .destination = destination };
+}
+
+fn lineSpan(text: []const u8, from: usize) struct { end: usize, next: usize } {
+    const newline = std.mem.indexOfScalarPos(u8, text, from, '\n') orelse text.len;
+    var end = newline;
+    if (end > from and text[end - 1] == '\r') end -= 1;
+    return .{ .end = end, .next = newline +| 1 };
+}
+
+fn validFenceOpener(source: []const u8, body: usize, line_end: usize, marker: u8) bool {
+    const run = countRun(source, body, line_end, marker);
+    if (run < 3) return false;
+    return marker != '`' or
+        std.mem.indexOfScalar(u8, source[body + run .. line_end], '`') == null;
+}
+
+const LeadingIndent = struct {
+    bytes: usize,
+    columns: usize,
+};
+
+fn leadingIndent(source: []const u8, pos: usize, line_end: usize) LeadingIndent {
+    var cursor = pos;
+    var columns: usize = 0;
+    while (cursor < line_end) : (cursor += 1) {
+        switch (source[cursor]) {
+            ' ' => columns += 1,
+            '\t' => columns = (columns + 4) & ~@as(usize, 3),
+            else => break,
+        }
+    }
+    return .{ .bytes = cursor - pos, .columns = columns };
+}
+
+fn isSetextUnderline(source: []const u8, pos: usize, line_end: usize) bool {
+    const indent = leadingIndent(source, pos, line_end);
+    if (indent.columns > 3 or pos + indent.bytes >= line_end) return false;
+    const marker = source[pos + indent.bytes];
+    if (marker != '=' and marker != '-') return false;
+    var count: usize = 0;
+    for (source[pos + indent.bytes .. line_end]) |byte| {
+        if (byte == marker) {
+            count += 1;
+        } else if (byte != ' ' and byte != '\t') {
+            return false;
+        }
+    }
+    return count > 0;
+}
+
+fn isThematicLine(source: []const u8, body: usize, line_end: usize) bool {
+    if (body >= line_end) return false;
+    const marker = source[body];
+    if (marker != '*' and marker != '-' and marker != '_') return false;
+    var count: usize = 0;
+    var cursor = body;
+    while (cursor < line_end) : (cursor += 1) {
+        if (source[cursor] == marker) {
+            count += 1;
+        } else if (source[cursor] != ' ' and source[cursor] != '\t') {
+            return false;
+        }
+    }
+    return count >= 3;
+}
+
+fn startsParagraphInterrupt(source: []const u8, pos: usize, line_end: usize) bool {
+    const indent = leadingIndent(source, pos, line_end);
+    const body = pos + indent.bytes;
+    if (body >= line_end or indent.columns >= 4) return false;
+
+    if (source[body] == '>') return true;
+
+    if (source[body] == '-' or source[body] == '+' or source[body] == '*') {
+        if (body + 1 < line_end and
+            (source[body + 1] == ' ' or source[body + 1] == '\t'))
+        {
+            return true;
+        }
+    }
+
+    var digits_end = body;
+    while (digits_end < line_end and digits_end - body < 9 and
+        std.ascii.isDigit(source[digits_end]))
+    {
+        digits_end += 1;
+    }
+    if (digits_end > body and digits_end < line_end and
+        (source[digits_end] == '.' or source[digits_end] == ')') and
+        digits_end + 1 < line_end and
+        (source[digits_end + 1] == ' ' or source[digits_end + 1] == '\t'))
+    {
+        var list_start: usize = 0;
+        for (source[body..digits_end]) |digit| {
+            list_start = list_start * 10 + digit - '0';
+        }
+        return list_start == 1;
+    }
+
+    return isThematicLine(source, body, line_end);
+}
+
+fn startsListItem(source: []const u8, pos: usize, line_end: usize) bool {
+    const indent = leadingIndent(source, pos, line_end);
+    const body = pos + indent.bytes;
+    if (body >= line_end or indent.columns >= 4 or isThematicLine(source, body, line_end)) {
+        return false;
+    }
+    if (source[body] == '-' or source[body] == '+' or source[body] == '*') {
+        return body + 1 < line_end and
+            (source[body + 1] == ' ' or source[body + 1] == '\t');
+    }
+    var digits_end = body;
+    while (digits_end < line_end and digits_end - body < 9 and
+        std.ascii.isDigit(source[digits_end]))
+    {
+        digits_end += 1;
+    }
+    return digits_end > body and digits_end < line_end and
+        (source[digits_end] == '.' or source[digits_end] == ')') and
+        digits_end + 1 < line_end and
+        (source[digits_end + 1] == ' ' or source[digits_end + 1] == '\t');
+}
+
+fn isBlankListMarker(source: []const u8, pos: usize, line_end: usize) bool {
+    const indent = leadingIndent(source, pos, line_end);
+    var cursor = pos + indent.bytes;
+    if (cursor >= line_end or indent.columns >= 4) return false;
+    if (source[cursor] == '-' or source[cursor] == '+' or source[cursor] == '*') {
+        cursor += 1;
+    } else {
+        const digits_start = cursor;
+        while (cursor < line_end and cursor - digits_start < 9 and
+            std.ascii.isDigit(source[cursor]))
+        {
+            cursor += 1;
+        }
+        if (cursor == digits_start or cursor >= line_end or
+            (source[cursor] != '.' and source[cursor] != ')'))
+        {
+            return false;
+        }
+        cursor += 1;
+    }
+    if (cursor >= line_end or (source[cursor] != ' ' and source[cursor] != '\t')) {
+        return false;
+    }
+    while (cursor < line_end and (source[cursor] == ' ' or source[cursor] == '\t')) {
+        cursor += 1;
+    }
+    return cursor == line_end;
+}
+
+fn startsQuoteLine(source: []const u8, pos: usize, line_end: usize) bool {
+    const indent = leadingIndent(source, pos, line_end);
+    const body = pos + indent.bytes;
+    return body < line_end and indent.columns < 4 and source[body] == '>';
+}
+
+fn quoteLineHasContent(source: []const u8, pos: usize, line_end: usize) bool {
+    const indent = leadingIndent(source, pos, line_end);
+    var body = pos + indent.bytes + 1;
+    if (body < line_end and (source[body] == ' ' or source[body] == '\t')) body += 1;
+    return body < line_end;
+}
+
+const FenceContext = struct {
+    quote_depth: usize,
+    body_column: usize,
+    list_marker: bool,
+
+    fn matches(self: FenceContext, line: FenceLine) bool {
+        if (self.quote_depth != line.context.quote_depth or
+            line.context.list_marker)
+        {
+            return false;
+        }
+        if (!self.list_marker) return !line.code_indented;
+        return line.context.body_column >= self.body_column and
+            line.context.body_column <= self.body_column + 3;
+    }
+};
+
+const FenceLine = struct {
+    body: usize,
+    context: FenceContext,
+    code_indented: bool,
+};
+
+fn fenceLine(source: []const u8, pos: usize, line_end: usize) FenceLine {
+    const indent = leadingIndent(source, pos, line_end);
+    if (indent.columns >= 4) {
+        return .{
+            .body = pos + indent.bytes,
+            .context = .{
+                .quote_depth = 0,
+                .body_column = indent.columns,
+                .list_marker = false,
+            },
+            .code_indented = true,
+        };
+    }
+    var cursor = pos + indent.bytes;
+    var quote_depth: usize = 0;
+    var body_column = indent.columns;
+
+    while (cursor < line_end and source[cursor] == '>') {
+        quote_depth += 1;
+        body_column += 1;
+        cursor += 1;
+        if (cursor < line_end and (source[cursor] == ' ' or source[cursor] == '\t')) {
+            body_column += 1;
+            cursor += 1;
+        }
+        const nested_indent = leadingIndent(source, cursor, line_end);
+        if (nested_indent.columns >= 4) {
+            return .{
+                .body = cursor + nested_indent.bytes,
+                .context = .{
+                    .quote_depth = quote_depth,
+                    .body_column = body_column + nested_indent.columns,
+                    .list_marker = false,
+                },
+                .code_indented = true,
+            };
+        }
+        body_column += nested_indent.columns;
+        cursor += nested_indent.bytes;
+    }
+
+    var list_marker = false;
+    if (cursor < line_end and
+        (source[cursor] == '-' or source[cursor] == '+' or source[cursor] == '*') and
+        cursor + 1 < line_end and
+        (source[cursor + 1] == ' ' or source[cursor + 1] == '\t'))
+    {
+        list_marker = true;
+        body_column += 2;
+        cursor += 2;
+    } else {
+        const digits_start = cursor;
+        while (cursor < line_end and cursor - digits_start < 9 and
+            std.ascii.isDigit(source[cursor]))
+        {
+            cursor += 1;
+        }
+        if (cursor > digits_start and cursor + 1 < line_end and
+            (source[cursor] == '.' or source[cursor] == ')') and
+            (source[cursor + 1] == ' ' or source[cursor + 1] == '\t'))
+        {
+            list_marker = true;
+            body_column += cursor + 2 - digits_start;
+            cursor += 2;
+        } else {
+            cursor = digits_start;
+        }
+    }
+
+    const content_indent = leadingIndent(source, cursor, line_end);
+    if (content_indent.columns <= 3) {
+        body_column += content_indent.columns;
+        cursor += content_indent.bytes;
+    }
+    return .{
+        .body = cursor,
+        .context = .{
+            .quote_depth = quote_depth,
+            .body_column = body_column,
+            .list_marker = list_marker,
+        },
+        .code_indented = false,
+    };
+}
+
+const InlineContainer = enum {
+    plain,
+    list,
+    quote,
+};
+
+fn isTableDelimiterCell(cell: []const u8) bool {
+    var start: usize = 0;
+    var end = cell.len;
+    while (start < end and (cell[start] == ' ' or cell[start] == '\t')) start += 1;
+    while (end > start and (cell[end - 1] == ' ' or cell[end - 1] == '\t')) end -= 1;
+    if (start < end and cell[start] == ':') start += 1;
+    if (end > start and cell[end - 1] == ':') end -= 1;
+    if (end - start < 3) return false;
+    for (cell[start..end]) |byte| {
+        if (byte != '-') return false;
+    }
+    return true;
+}
+
+fn findTableSeparator(source: []const u8, start: usize, end: usize) ?usize {
+    var cursor = start;
+    while (cursor < end) {
+        switch (source[cursor]) {
+            '\\' => cursor += escapedByteCount(source, cursor, end),
+            '`' => {
+                if (findCodeSpanEnd(source, cursor, end)) |code_end| {
+                    cursor = code_end;
+                } else {
+                    cursor += countRun(source, cursor, end, '`');
+                }
+            },
+            '|' => return cursor,
+            else => cursor += 1,
+        }
+    }
+    return null;
+}
+
+fn isTableDelimiterRow(source: []const u8, start: usize, end: usize) bool {
+    if (findTableSeparator(source, start, end) == null) return false;
+    var cursor = start;
+    var cells: usize = 0;
+    while (cursor <= end) {
+        const separator = findTableSeparator(source, cursor, end) orelse end;
+        const cell = source[cursor..@min(separator, end)];
+        var nonblank = false;
+        for (cell) |byte| {
+            if (byte != ' ' and byte != '\t') {
+                nonblank = true;
+                break;
+            }
+        }
+        if (nonblank) {
+            if (!isTableDelimiterCell(cell)) return false;
+            cells += 1;
+        }
+        if (separator >= end) break;
+        cursor = separator + 1;
+    }
+    return cells > 0;
+}
+
+fn analyzeTableCells(
+    flags: []u8,
+    delimiter_roles: []u8,
+    delimiter_pairs: []usize,
+    delimiter_stack: []usize,
+    emphasis_openers: []EmphasisOpener,
+    link_states: []u8,
+    link_dest_ends: []usize,
+    source: []const u8,
+    start: usize,
+    end: usize,
+) void {
+    var cursor = start;
+    while (cursor <= end) {
+        const separator = findTableSeparator(source, cursor, end) orelse end;
+        if (cursor < separator) {
+            analyzeInlineRange(
+                flags,
+                delimiter_roles,
+                delimiter_pairs,
+                delimiter_stack,
+                emphasis_openers,
+                link_states,
+                link_dest_ends,
+                source,
+                cursor,
+                separator,
+            );
+        }
+        if (separator >= end) break;
+        cursor = separator + 1;
+    }
+}
+
+/// Analyzes Markdown source without rewriting any bytes: returned spans
+/// cover the original text (syntax markers included) so a live editor can
+/// style its buffer in place while cursor and wrap offsets stay exact.
+pub fn analyzeSource(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+) ![]SourceSpan {
+    if (source.len == 0 or source.len > max_source_analysis_bytes) return &.{};
+    const flags = try allocator.alloc(u8, source.len);
+    defer allocator.free(flags);
+    @memset(flags, 0);
+    const delimiter_roles = try allocator.alloc(u8, source.len);
+    defer allocator.free(delimiter_roles);
+    @memset(delimiter_roles, 0);
+    const delimiter_pairs = try allocator.alloc(usize, source.len);
+    defer allocator.free(delimiter_pairs);
+    @memset(delimiter_pairs, std.math.maxInt(usize));
+    const delimiter_stack = try allocator.alloc(usize, source.len);
+    defer allocator.free(delimiter_stack);
+    const emphasis_openers = try allocator.alloc(EmphasisOpener, source.len);
+    defer allocator.free(emphasis_openers);
+    const link_states = try allocator.alloc(u8, source.len);
+    defer allocator.free(link_states);
+    @memset(link_states, 0);
+    const link_dest_ends = try allocator.alloc(usize, source.len);
+    defer allocator.free(link_dest_ends);
+    @memset(link_dest_ends, std.math.maxInt(usize));
+
+    var fence: u8 = 0;
+    var fence_len: usize = 0;
+    var fence_context: FenceContext = .{
+        .quote_depth = 0,
+        .body_column = 0,
+        .list_marker = false,
+    };
+    var inline_start: ?usize = null;
+    var inline_container: InlineContainer = .plain;
+    var inline_container_column: usize = 0;
+    var table_mode = false;
+    var previous_line_start: usize = 0;
+    var pos: usize = 0;
+    while (pos < source.len) {
+        const line = lineSpan(source, pos);
+        const indent = leadingIndent(source, pos, line.end);
+        const body = pos + indent.bytes;
+        const fence_line = fenceLine(source, pos, line.end);
+        const list_fence_opener = fence_line.code_indented and
+            inline_start != null and inline_container == .list and
+            fence_line.context.body_column >= inline_container_column and
+            fence_line.context.body_column <= inline_container_column + 3;
+        if (table_mode and
+            (body == line.end or findTableSeparator(source, pos, line.end) == null))
+        {
+            table_mode = false;
+        }
+
+        if (fence != 0) {
+            markRange(flags, pos, line.end, flag_code);
+            if (fence_context.matches(fence_line) and
+                fence_line.body < line.end and source[fence_line.body] == fence)
+            {
+                const run = countRun(source, fence_line.body, line.end, fence);
+                if (run >= fence_len) {
+                    // A closing fence may only be followed by whitespace; text
+                    // like ```not-a-close keeps the block open, as md4c does.
+                    var trailing_ok = true;
+                    var closer = fence_line.body + run;
+                    while (closer < line.end) : (closer += 1) {
+                        if (source[closer] != ' ' and source[closer] != '\t') {
+                            trailing_ok = false;
+                            break;
+                        }
+                    }
+                    if (trailing_ok) fence = 0;
+                }
+            }
+        } else if (body == line.end) {
+            if (inline_start) |start| {
+                analyzeInlineRange(
+                    flags,
+                    delimiter_roles,
+                    delimiter_pairs,
+                    delimiter_stack,
+                    emphasis_openers,
+                    link_states,
+                    link_dest_ends,
+                    source,
+                    start,
+                    pos,
+                );
+                inline_start = null;
+            }
+        } else if ((!fence_line.code_indented or list_fence_opener) and
+            fence_line.body < line.end and
+            (source[fence_line.body] == '`' or source[fence_line.body] == '~') and
+            validFenceOpener(source, fence_line.body, line.end, source[fence_line.body]))
+        {
+            if (inline_start) |start| {
+                analyzeInlineRange(
+                    flags,
+                    delimiter_roles,
+                    delimiter_pairs,
+                    delimiter_stack,
+                    emphasis_openers,
+                    link_states,
+                    link_dest_ends,
+                    source,
+                    start,
+                    pos,
+                );
+                inline_start = null;
+            }
+            fence = source[fence_line.body];
+            fence_len = countRun(source, fence_line.body, line.end, source[fence_line.body]);
+            fence_context = if (list_fence_opener)
+                .{
+                    .quote_depth = fence_line.context.quote_depth,
+                    .body_column = inline_container_column,
+                    .list_marker = true,
+                }
+            else
+                fence_line.context;
+            markRange(flags, pos, line.end, flag_code);
+        } else if (inline_start != null and
+            inline_container == .plain and
+            inline_start.? == previous_line_start and
+            isTableDelimiterRow(source, pos, line.end))
+        {
+            if (inline_start) |start| {
+                var header_end = pos;
+                while (header_end > previous_line_start and
+                    (source[header_end - 1] == '\n' or source[header_end - 1] == '\r'))
+                {
+                    header_end -= 1;
+                }
+                if (start < previous_line_start) {
+                    analyzeInlineRange(
+                        flags,
+                        delimiter_roles,
+                        delimiter_pairs,
+                        delimiter_stack,
+                        emphasis_openers,
+                        link_states,
+                        link_dest_ends,
+                        source,
+                        start,
+                        previous_line_start,
+                    );
+                }
+                analyzeTableCells(
+                    flags,
+                    delimiter_roles,
+                    delimiter_pairs,
+                    delimiter_stack,
+                    emphasis_openers,
+                    link_states,
+                    link_dest_ends,
+                    source,
+                    previous_line_start,
+                    header_end,
+                );
+                inline_start = null;
+            }
+            table_mode = true;
+        } else if (table_mode and findTableSeparator(source, pos, line.end) != null) {
+            analyzeTableCells(
+                flags,
+                delimiter_roles,
+                delimiter_pairs,
+                delimiter_stack,
+                emphasis_openers,
+                link_states,
+                link_dest_ends,
+                source,
+                pos,
+                line.end,
+            );
+        } else if (inline_start != null and inline_container == .plain and
+            !isBlankListMarker(source, pos, line.end) and
+            isSetextUnderline(source, pos, line.end))
+        {
+            const start = inline_start.?;
+            analyzeInlineRange(
+                flags,
+                delimiter_roles,
+                delimiter_pairs,
+                delimiter_stack,
+                emphasis_openers,
+                link_states,
+                link_dest_ends,
+                source,
+                start,
+                pos,
+            );
+            markRange(flags, start, line.end, flag_heading);
+            inline_start = null;
+        } else if (inline_start == null and indent.columns >= 4) {
+            markRange(flags, pos, line.end, flag_code);
+        } else if (startsParagraphInterrupt(source, pos, line.end) and
+            !(inline_start != null and isBlankListMarker(source, pos, line.end)))
+        {
+            const quote_line = startsQuoteLine(source, pos, line.end);
+            const quote_has_content = !quote_line or quoteLineHasContent(source, pos, line.end);
+            if (!(quote_line and quote_has_content and
+                inline_start != null and inline_container == .quote))
+            {
+                if (inline_start) |start| {
+                    analyzeInlineRange(
+                        flags,
+                        delimiter_roles,
+                        delimiter_pairs,
+                        delimiter_stack,
+                        emphasis_openers,
+                        link_states,
+                        link_dest_ends,
+                        source,
+                        start,
+                        pos,
+                    );
+                    inline_start = null;
+                }
+                if ((quote_line and quote_has_content) or startsListItem(source, pos, line.end)) {
+                    inline_start = pos;
+                    inline_container = if (quote_line) .quote else .list;
+                    inline_container_column = if (inline_container == .list)
+                        fence_line.context.body_column
+                    else
+                        0;
+                } else if (!quote_line) {
+                    analyzeInlineRange(
+                        flags,
+                        delimiter_roles,
+                        delimiter_pairs,
+                        delimiter_stack,
+                        emphasis_openers,
+                        link_states,
+                        link_dest_ends,
+                        source,
+                        pos,
+                        line.end,
+                    );
+                }
+            }
+        } else if (indent.columns <= 3 and source[body] == '#') {
+            const hashes = countRun(source, body, line.end, '#');
+            const at_end = body + hashes >= line.end;
+            const next = if (at_end) '\n' else source[body + hashes];
+            if (hashes >= 1 and hashes <= 6 and (at_end or next == ' ' or next == '\t')) {
+                if (inline_start) |start| {
+                    analyzeInlineRange(
+                        flags,
+                        delimiter_roles,
+                        delimiter_pairs,
+                        delimiter_stack,
+                        emphasis_openers,
+                        link_states,
+                        link_dest_ends,
+                        source,
+                        start,
+                        pos,
+                    );
+                    inline_start = null;
+                }
+                var heading_contents = body + hashes;
+                while (heading_contents < line.end and
+                    (source[heading_contents] == ' ' or source[heading_contents] == '\t'))
+                {
+                    heading_contents += 1;
+                }
+                analyzeInlineRange(
+                    flags,
+                    delimiter_roles,
+                    delimiter_pairs,
+                    delimiter_stack,
+                    emphasis_openers,
+                    link_states,
+                    link_dest_ends,
+                    source,
+                    heading_contents,
+                    line.end,
+                );
+                markRange(flags, pos, line.end, flag_heading);
+            } else {
+                if (inline_start == null) {
+                    inline_start = pos;
+                    inline_container = .plain;
+                    inline_container_column = 0;
+                }
+            }
+        } else {
+            if (inline_start == null) {
+                inline_start = pos;
+                inline_container = .plain;
+                inline_container_column = 0;
+            }
+        }
+        previous_line_start = pos;
+        pos = line.next;
+    }
+    if (inline_start) |start| {
+        analyzeInlineRange(
+            flags,
+            delimiter_roles,
+            delimiter_pairs,
+            delimiter_stack,
+            emphasis_openers,
+            link_states,
+            link_dest_ends,
+            source,
+            start,
+            source.len,
+        );
+    }
+
+    var spans: std.ArrayList(SourceSpan) = .empty;
+    errdefer spans.deinit(allocator);
+    var i: usize = 0;
+    while (i < source.len) {
+        if (flags[i] == 0) {
+            i += 1;
+            continue;
+        }
+        const start = i;
+        i += 1;
+        // Include UTF-8 continuation bytes so spans never split a code point.
+        while (i < source.len and
+            (flags[i] == flags[start] or (source[i] & 0xc0) == 0x80)) i += 1;
+        try spans.append(allocator, .{
+            .start = start,
+            .end = i,
+            .style = styleFromFlags(flags[start]),
+        });
+    }
+    return spans.toOwnedSlice(allocator);
 }
 
 fn syntaxColor(token: highlight.Token) vaxis.Color {
@@ -2337,4 +4105,1056 @@ test "narrow tables render as stacked header values" {
         std.mem.indexOf(u8, rendered.items, "Role:\nEngineer") != null,
     );
     try std.testing.expect(std.mem.indexOf(u8, rendered.items, "┌") == null);
+}
+
+test "analyzeSource styles emphasis code and links in place" {
+    const source = "**bold** and *em* and `code` and [link](https://example.com) end";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var saw_bold = false;
+    var saw_italic = false;
+    var saw_code = false;
+    var saw_link = false;
+    var prev_end: usize = 0;
+    for (spans) |span| {
+        try std.testing.expect(span.start >= prev_end);
+        try std.testing.expect(span.end <= source.len);
+        prev_end = span.end;
+        const text = source[span.start..span.end];
+        if (span.style.bold and std.mem.eql(u8, text, "**bold**")) saw_bold = true;
+        if (span.style.italic and std.mem.eql(u8, text, "*em*")) saw_italic = true;
+        if (span.style.code and std.mem.eql(u8, text, "`code`")) saw_code = true;
+        if (span.style.link and std.mem.eql(u8, text, "[link](https://example.com)")) saw_link = true;
+    }
+    try std.testing.expect(saw_bold and saw_italic and saw_code and saw_link);
+}
+
+test "analyzeSource keeps emphasis nesting intact" {
+    const source = "**a *b* c**";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var saw_bold = false;
+    var saw_italic = false;
+    for (spans) |span| {
+        const text = source[span.start..span.end];
+        if (span.style.bold) saw_bold = true;
+        if (span.style.italic and std.mem.indexOf(u8, text, "b") != null) saw_italic = true;
+    }
+    try std.testing.expect(saw_bold and saw_italic);
+}
+
+test "analyzeSource styles deeply nested emphasis" {
+    const source = "*a _b *c _d *e _f *g _h *i* h_ g* f_ e* d_ c* b_ a*";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+    var saw_innermost = false;
+    for (spans) |span| {
+        if (span.style.italic and
+            std.mem.indexOf(u8, source[span.start..span.end], "i") != null)
+        {
+            saw_innermost = true;
+        }
+    }
+    try std.testing.expect(saw_innermost);
+}
+
+test "analyzeSource does not style image syntax as a link" {
+    const source = "![*alt*](https://example.com)";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var saw_alt_emphasis = false;
+    for (spans) |span| {
+        try std.testing.expect(!span.style.link);
+        if (span.style.italic and
+            std.mem.indexOf(u8, source[span.start..span.end], "alt") != null)
+        {
+            saw_alt_emphasis = true;
+        }
+    }
+    try std.testing.expect(saw_alt_emphasis);
+
+    const url_alt_source = "![https://example.com](https://image.example)";
+    const url_alt_spans = try analyzeSource(std.testing.allocator, url_alt_source);
+    defer std.testing.allocator.free(url_alt_spans);
+    for (url_alt_spans) |span| try std.testing.expect(!span.style.link);
+}
+
+test "analyzeSource marks headings and fenced code" {
+    const source = "# Title\n\n```zig\nconst x = 1;\n```\nplain text";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var saw_heading = false;
+    var saw_fence_open = false;
+    var saw_fence_body = false;
+    for (spans) |span| {
+        const text = source[span.start..span.end];
+        if (span.style.heading and std.mem.eql(u8, text, "# Title")) saw_heading = true;
+        if (span.style.code and std.mem.eql(u8, text, "```zig")) saw_fence_open = true;
+        if (span.style.code and std.mem.eql(u8, text, "const x = 1;")) saw_fence_body = true;
+    }
+    try std.testing.expect(saw_heading and saw_fence_open and saw_fence_body);
+}
+
+test "analyzeSource recognizes fenced code inside block containers" {
+    const source = "> ~~~\n> *not emphasis*\n> ~~~";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var saw_code_body = false;
+    for (spans) |span| {
+        try std.testing.expect(!span.style.italic);
+        if (span.style.code and
+            std.mem.indexOf(u8, source[span.start..span.end], "not emphasis") != null)
+        {
+            saw_code_body = true;
+        }
+    }
+    try std.testing.expect(saw_code_body);
+}
+
+test "analyzeSource requires matching fence container context" {
+    const top_level_source = "```\ncode\n> ```\n*still code*\n```\n*after*";
+    const top_level_spans = try analyzeSource(std.testing.allocator, top_level_source);
+    defer std.testing.allocator.free(top_level_spans);
+
+    var saw_top_level_code = false;
+    var saw_top_level_after = false;
+    for (top_level_spans) |span| {
+        const text = top_level_source[span.start..span.end];
+        if (span.style.code and std.mem.eql(u8, text, "*still code*")) {
+            saw_top_level_code = true;
+            try std.testing.expect(!span.style.italic);
+        }
+        if (span.style.italic and std.mem.eql(u8, text, "*after*")) {
+            saw_top_level_after = true;
+        }
+    }
+    try std.testing.expect(saw_top_level_code and saw_top_level_after);
+
+    const quoted_source = "> ```\n> code\n```\n> *still code*\n> ```\n*after*";
+    const quoted_spans = try analyzeSource(std.testing.allocator, quoted_source);
+    defer std.testing.allocator.free(quoted_spans);
+
+    var saw_quoted_code = false;
+    var saw_quoted_after = false;
+    for (quoted_spans) |span| {
+        const text = quoted_source[span.start..span.end];
+        if (span.style.code and
+            std.mem.indexOf(u8, text, "still code") != null)
+        {
+            saw_quoted_code = true;
+            try std.testing.expect(!span.style.italic);
+        }
+        if (span.style.italic and std.mem.eql(u8, text, "*after*")) {
+            saw_quoted_after = true;
+        }
+    }
+    try std.testing.expect(saw_quoted_code and saw_quoted_after);
+
+    const list_source = "- ```\n  code\n  ```\n*after*";
+    const list_spans = try analyzeSource(std.testing.allocator, list_source);
+    defer std.testing.allocator.free(list_spans);
+
+    var saw_list_code = false;
+    var saw_list_after = false;
+    for (list_spans) |span| {
+        const text = list_source[span.start..span.end];
+        if (span.style.code and std.mem.eql(u8, text, "  code")) {
+            saw_list_code = true;
+        }
+        if (span.style.italic and std.mem.eql(u8, text, "*after*")) {
+            saw_list_after = true;
+        }
+    }
+    try std.testing.expect(saw_list_code and saw_list_after);
+
+    const indented_source = "  ```\ncode\n```\n*after*";
+    const indented_spans = try analyzeSource(std.testing.allocator, indented_source);
+    defer std.testing.allocator.free(indented_spans);
+
+    var saw_indented_after = false;
+    for (indented_spans) |span| {
+        if (span.style.italic and
+            std.mem.eql(u8, indented_source[span.start..span.end], "*after*"))
+        {
+            saw_indented_after = true;
+        }
+    }
+    try std.testing.expect(saw_indented_after);
+
+    const over_indented_source =
+        "```\ncode\n    ```\n*still code*\n```\n*after*";
+    const over_indented_spans = try analyzeSource(
+        std.testing.allocator,
+        over_indented_source,
+    );
+    defer std.testing.allocator.free(over_indented_spans);
+
+    var saw_over_indented_code = false;
+    var saw_over_indented_after = false;
+    for (over_indented_spans) |span| {
+        const text = over_indented_source[span.start..span.end];
+        if (span.style.code and std.mem.eql(u8, text, "*still code*")) {
+            saw_over_indented_code = true;
+        }
+        if (span.style.italic and std.mem.eql(u8, text, "*after*")) {
+            saw_over_indented_after = true;
+        }
+    }
+    try std.testing.expect(saw_over_indented_code and saw_over_indented_after);
+}
+
+test "analyzeSource preserves inline styles inside ATX headings" {
+    const source = "# *Title* and [link](https://example.com)";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var saw_heading_italic = false;
+    var saw_heading_link = false;
+    for (spans) |span| {
+        const text = source[span.start..span.end];
+        if (span.style.heading and span.style.italic and
+            std.mem.indexOf(u8, text, "Title") != null)
+        {
+            saw_heading_italic = true;
+        }
+        if (span.style.heading and span.style.link and
+            std.mem.indexOf(u8, text, "link") != null)
+        {
+            saw_heading_link = true;
+        }
+    }
+    try std.testing.expect(saw_heading_italic);
+    try std.testing.expect(saw_heading_link);
+}
+
+test "analyzeSource leaves unmatched markers and snake_case unstyled" {
+    const spans = try analyzeSource(std.testing.allocator, "snake_case_name and **unclosed and a * b *\n");
+    defer std.testing.allocator.free(spans);
+    try std.testing.expectEqual(@as(usize, 0), spans.len);
+}
+
+test "analyzeSource applies the underscore flanking rule like md4c" {
+    const source = "_foo_bar_ and snake_case_name";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    try std.testing.expectEqual(@as(usize, 1), spans.len);
+    try std.testing.expect(spans[0].style.italic);
+    try std.testing.expect(std.mem.eql(u8, source[spans[0].start..spans[0].end], "_foo_bar_"));
+
+    const punct = "start _emphasis,_ end";
+    const punct_spans = try analyzeSource(std.testing.allocator, punct);
+    defer std.testing.allocator.free(punct_spans);
+    var saw_close = false;
+    for (punct_spans) |span| {
+        const text = punct[span.start..span.end];
+        if (span.style.italic and std.mem.indexOf(u8, text, "emphasis") != null) saw_close = true;
+    }
+    try std.testing.expect(saw_close);
+}
+
+test "analyzeSource applies Unicode punctuation flanking" {
+    const source = "_foo_—bar and _baz_˂qux";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var saw_em_dash = false;
+    var saw_modifier = false;
+    for (spans) |span| {
+        const text = source[span.start..span.end];
+        if (span.style.italic and std.mem.eql(u8, text, "_foo_")) saw_em_dash = true;
+        if (span.style.italic and std.mem.eql(u8, text, "_baz_")) saw_modifier = true;
+    }
+    try std.testing.expect(saw_em_dash);
+    try std.testing.expect(saw_modifier);
+}
+
+test "analyzeSource applies Unicode whitespace flanking" {
+    const source = "_foo_\u{00a0}bar";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    try std.testing.expectEqual(@as(usize, 1), spans.len);
+    try std.testing.expect(spans[0].style.italic);
+    try std.testing.expectEqualStrings("_foo_", source[spans[0].start..spans[0].end]);
+}
+
+test "analyzeSource applies GFM tilde delimiter rules" {
+    const source = "~one~ and ~~two~~ and ~~escaped\\~~";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var saw_single = false;
+    var saw_double = false;
+    var saw_escaped = false;
+    for (spans) |span| {
+        const text = source[span.start..span.end];
+        if (span.style.strikethrough and std.mem.eql(u8, text, "~one~")) saw_single = true;
+        if (span.style.strikethrough and std.mem.eql(u8, text, "~~two~~")) saw_double = true;
+        if (span.style.strikethrough and std.mem.indexOf(u8, text, "escaped") != null) {
+            saw_escaped = true;
+        }
+    }
+    try std.testing.expect(saw_single);
+    try std.testing.expect(saw_double);
+    try std.testing.expect(!saw_escaped);
+}
+
+test "analyzeSource finds the latest eligible opener with the same marker" {
+    const source = "*foo _bar* baz_";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var saw_star_span = false;
+    var styled_baz = false;
+    for (spans) |span| {
+        const text = source[span.start..span.end];
+        if (span.style.italic and std.mem.indexOf(u8, text, "foo") != null) {
+            saw_star_span = true;
+        }
+        if (span.style.italic and std.mem.indexOf(u8, text, "baz") != null) styled_baz = true;
+    }
+    try std.testing.expect(saw_star_span);
+    try std.testing.expect(!styled_baz);
+}
+
+test "analyzeSource validates inline link destination and title grammar" {
+    const source = "[bad](a b) [good](https://e.test/a \"title\")";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var saw_bad = false;
+    var saw_good = false;
+    for (spans) |span| {
+        const text = source[span.start..span.end];
+        if (span.style.link and std.mem.indexOf(u8, text, "[bad]") != null) saw_bad = true;
+        if (span.style.link and std.mem.indexOf(u8, text, "[good]") != null) saw_good = true;
+    }
+    try std.testing.expect(!saw_bad);
+    try std.testing.expect(saw_good);
+}
+
+test "analyzeSource ignores parentheses inside quoted link titles" {
+    const source = "[x](https://e.test \"a ) b\")";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    try std.testing.expectEqual(@as(usize, 1), spans.len);
+    try std.testing.expect(spans[0].style.link);
+    try std.testing.expectEqualStrings(source, source[spans[0].start..spans[0].end]);
+}
+
+test "analyzeSource requires whitespace before angle destination titles" {
+    const source = "[x](<https://e.test>\"title\")";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+    for (spans) |span| try std.testing.expect(!span.style.link);
+}
+
+test "analyzeSource rejects outer links overlapping nested links" {
+    const source = "[outer [inner](https://i)](https://o)";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    try std.testing.expectEqual(@as(usize, 1), spans.len);
+    try std.testing.expect(spans[0].style.link);
+    try std.testing.expectEqualStrings(
+        "[inner](https://i)",
+        source[spans[0].start..spans[0].end],
+    );
+
+    const image_source = "[outer ![image](https://i)](https://o)";
+    const image_spans = try analyzeSource(std.testing.allocator, image_source);
+    defer std.testing.allocator.free(image_spans);
+    try std.testing.expect(image_spans.len > 0);
+    try std.testing.expect(image_spans[0].style.link);
+    try std.testing.expectEqual(@as(usize, 0), image_spans[0].start);
+    try std.testing.expectEqual(image_source.len, image_spans[image_spans.len - 1].end);
+}
+
+test "analyzeSource suppresses autolinks inside unsafe explicit links" {
+    const source = "[https://example.com](/relative)";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+    for (spans) |span| try std.testing.expect(!span.style.link);
+}
+
+test "analyzeSource hides markup inside unsafe link destinations" {
+    const source = "[x](javascript:*foo*)";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+    for (spans) |span| try std.testing.expect(!span.style.italic);
+}
+
+test "analyzeSource resolves deeply nested link candidates once" {
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(std.testing.allocator);
+    try source.appendSlice(std.testing.allocator, "[leaf](https://e)");
+    for (0..128) |_| {
+        var wrapped: std.ArrayList(u8) = .empty;
+        errdefer wrapped.deinit(std.testing.allocator);
+        try wrapped.appendSlice(std.testing.allocator, "[x ");
+        try wrapped.appendSlice(std.testing.allocator, source.items);
+        try wrapped.appendSlice(std.testing.allocator, "](https://e)");
+        source.deinit(std.testing.allocator);
+        source = wrapped;
+    }
+
+    const spans = try analyzeSource(std.testing.allocator, source.items);
+    defer std.testing.allocator.free(spans);
+    try std.testing.expectEqual(@as(usize, 1), spans.len);
+    try std.testing.expect(spans[0].style.link);
+    try std.testing.expectEqualStrings(
+        "[leaf](https://e)",
+        source.items[spans[0].start..spans[0].end],
+    );
+}
+
+test "analyzeSource ignores brackets inside code span link labels" {
+    const source = "[`]`](https://example.com)";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var saw_link = false;
+    var saw_code = false;
+    for (spans) |span| {
+        const text = source[span.start..span.end];
+        if (span.style.link and std.mem.indexOf(u8, text, "https://") != null) saw_link = true;
+        if (span.style.code and std.mem.indexOf(u8, text, "`]`") != null) saw_code = true;
+    }
+    try std.testing.expect(saw_link);
+    try std.testing.expect(saw_code);
+}
+
+test "analyzeSource backslashes escape only ASCII punctuation" {
+    const source = "[invalid](foo\\ bar) [valid](https://e.test/foo\\(bar\\))";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var saw_invalid = false;
+    var saw_valid = false;
+    for (spans) |span| {
+        const text = source[span.start..span.end];
+        if (span.style.link and std.mem.indexOf(u8, text, "invalid") != null) saw_invalid = true;
+        if (span.style.link and std.mem.indexOf(u8, text, "valid") != null) saw_valid = true;
+    }
+    try std.testing.expect(!saw_invalid);
+    try std.testing.expect(saw_valid);
+}
+
+test "analyzeSource applies safe URI policy to links" {
+    const source = "[unsafe](javascript:alert(1)) [encoded](jav&#x61;script:alert(1)) [safe](https://e.test)";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var saw_unsafe = false;
+    var saw_encoded = false;
+    var saw_safe = false;
+    for (spans) |span| {
+        const text = source[span.start..span.end];
+        if (span.style.link and std.mem.indexOf(u8, text, "unsafe") != null) saw_unsafe = true;
+        if (span.style.link and std.mem.indexOf(u8, text, "encoded") != null) saw_encoded = true;
+        if (span.style.link and std.mem.indexOf(u8, text, "safe") != null) saw_safe = true;
+    }
+    try std.testing.expect(!saw_unsafe);
+    try std.testing.expect(!saw_encoded);
+    try std.testing.expect(saw_safe);
+}
+
+test "analyzeSource bounds URI entity scans" {
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(std.testing.allocator);
+    try source.appendSlice(std.testing.allocator, "[x](https://e.test/");
+    try source.appendNTimes(std.testing.allocator, '&', 8_000);
+    try source.append(std.testing.allocator, ')');
+
+    const spans = try analyzeSource(std.testing.allocator, source.items);
+    defer std.testing.allocator.free(spans);
+    try std.testing.expectEqual(@as(usize, 1), spans.len);
+    try std.testing.expect(spans[0].style.link);
+}
+
+test "analyzeSource styles GFM permissive autolinks" {
+    const source = "https://example.com www.example.com user@example.com";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var linked_segments: usize = 0;
+    for (spans) |span| {
+        if (span.style.link) linked_segments += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), linked_segments);
+}
+
+test "analyzeSource matches permissive autolink boundaries and host grammar" {
+    const invalid_source = "foo:https://example.com http://x www.";
+    const invalid_spans = try analyzeSource(std.testing.allocator, invalid_source);
+    defer std.testing.allocator.free(invalid_spans);
+    for (invalid_spans) |span| try std.testing.expect(!span.style.link);
+
+    const emphasized_source = "*https://example.com*";
+    const emphasized_spans = try analyzeSource(std.testing.allocator, emphasized_source);
+    defer std.testing.allocator.free(emphasized_spans);
+    var saw_emphasized_link = false;
+    for (emphasized_spans) |span| {
+        if (span.style.italic and span.style.link) saw_emphasized_link = true;
+    }
+    try std.testing.expect(saw_emphasized_link);
+
+    const parenthesized_path = try analyzeSource(
+        std.testing.allocator,
+        "https://example.com/()",
+    );
+    defer std.testing.allocator.free(parenthesized_path);
+    for (parenthesized_path) |span| try std.testing.expect(!span.style.link);
+
+    const trailing_period_source = "https://example.com/foo.";
+    const trailing_period_spans = try analyzeSource(
+        std.testing.allocator,
+        trailing_period_source,
+    );
+    defer std.testing.allocator.free(trailing_period_spans);
+    var saw_trimmed_path = false;
+    for (trailing_period_spans) |span| {
+        if (span.style.link) {
+            try std.testing.expectEqualStrings(
+                "https://example.com/foo",
+                trailing_period_source[span.start..span.end],
+            );
+            saw_trimmed_path = true;
+        }
+    }
+    try std.testing.expect(saw_trimmed_path);
+}
+
+test "analyzeSource styles safe angle autolinks" {
+    const source =
+        "<https://example.com> <mailto:user@example.com> " ++
+        "<https://localhost> <http://x:8080>";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var linked_segments: usize = 0;
+    for (spans) |span| {
+        if (span.style.link) linked_segments += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 4), linked_segments);
+}
+
+test "analyzeSource requires resolved delimiter directions at autolink boundaries" {
+    const source = "*foo*https://example.com https://example.com*foo*";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+    for (spans) |span| try std.testing.expect(!span.style.link);
+}
+
+test "analyzeSource bounds malformed angle destination scans" {
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(std.testing.allocator);
+    try source.append(std.testing.allocator, '(');
+    try source.appendNTimes(std.testing.allocator, ' ', 8_000);
+    try source.appendNTimes(std.testing.allocator, '<', 8_000);
+
+    const spans = try analyzeSource(std.testing.allocator, source.items);
+    defer std.testing.allocator.free(spans);
+    try std.testing.expectEqual(@as(usize, 0), spans.len);
+}
+
+test "analyzeSource falls back to plain text for oversized input" {
+    const source = try std.testing.allocator.alloc(u8, max_source_analysis_bytes + 1);
+    defer std.testing.allocator.free(source);
+    @memset(source, '*');
+
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+    try std.testing.expectEqual(@as(usize, 0), spans.len);
+}
+
+test "analyzeSource bounds mixed-marker delimiter scans" {
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(std.testing.allocator);
+    for (0..2_000) |_| try source.appendSlice(std.testing.allocator, "*a ");
+    for (0..2_000) |_| try source.appendSlice(std.testing.allocator, "a_ ");
+
+    const spans = try analyzeSource(std.testing.allocator, source.items);
+    defer std.testing.allocator.free(spans);
+    try std.testing.expectEqual(@as(usize, 0), spans.len);
+}
+
+test "analyzeSource bounds same-marker delimiter scans" {
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(std.testing.allocator);
+    for (0..2_000) |_| try source.appendSlice(std.testing.allocator, "*a ");
+    for (0..2_000) |_| try source.appendSlice(std.testing.allocator, "a**b ");
+
+    const spans = try analyzeSource(std.testing.allocator, source.items);
+    defer std.testing.allocator.free(spans);
+}
+
+test "analyzeSource bounds nested malformed angle destinations" {
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(std.testing.allocator);
+    for (0..8_000) |_| try source.appendSlice(std.testing.allocator, "(<");
+
+    const spans = try analyzeSource(std.testing.allocator, source.items);
+    defer std.testing.allocator.free(spans);
+    try std.testing.expectEqual(@as(usize, 0), spans.len);
+}
+
+test "analyzeSource permits parentheses inside angle link destinations" {
+    const source = "[x](<https://e.test/a(b>)";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    try std.testing.expectEqual(@as(usize, 1), spans.len);
+    try std.testing.expect(spans[0].style.link);
+    try std.testing.expectEqualStrings(source, source[spans[0].start..spans[0].end]);
+}
+
+test "analyzeSource preserves partially consumed delimiter runs" {
+    const source = "***foo** bar*";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var saw_bold_italic = false;
+    var saw_outer_italic = false;
+    for (spans) |span| {
+        const text = source[span.start..span.end];
+        if (span.style.bold and span.style.italic and std.mem.indexOf(u8, text, "foo") != null) {
+            saw_bold_italic = true;
+        }
+        if (!span.style.bold and span.style.italic and std.mem.indexOf(u8, text, "bar") != null) {
+            saw_outer_italic = true;
+        }
+    }
+    try std.testing.expect(saw_bold_italic);
+    try std.testing.expect(saw_outer_italic);
+}
+
+test "analyzeSource preserves the original delimiter modulo after splitting" {
+    const source = "a***b**c**d";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var saw_bold_b = false;
+    var saw_italic_c = false;
+    for (spans) |span| {
+        const text = source[span.start..span.end];
+        if (span.style.bold and std.mem.indexOf(u8, text, "b") != null) saw_bold_b = true;
+        if (span.style.italic and std.mem.indexOf(u8, text, "c") != null) saw_italic_c = true;
+    }
+    try std.testing.expect(saw_bold_b);
+    try std.testing.expect(saw_italic_c);
+}
+
+test "analyzeSource preserves residual closer delimiter metadata" {
+    const source = "**foo***bar**baz*";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var saw_bar_italic = false;
+    var saw_baz_italic = false;
+    for (spans) |span| {
+        const text = source[span.start..span.end];
+        if (span.style.italic and std.mem.indexOf(u8, text, "bar") != null) {
+            saw_bar_italic = true;
+        }
+        if (span.style.italic and std.mem.indexOf(u8, text, "baz") != null) {
+            saw_baz_italic = true;
+        }
+    }
+    try std.testing.expect(saw_bar_italic);
+    try std.testing.expect(!saw_baz_italic);
+}
+
+test "analyzeSource styles inline spans across soft line breaks" {
+    const source = "*foo\nbar* and [multi\nline](https://example.com)";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var saw_multiline_emphasis = false;
+    var saw_multiline_link = false;
+    for (spans) |span| {
+        const text = source[span.start..span.end];
+        if (span.style.italic and std.mem.indexOf(u8, text, "foo") != null) {
+            saw_multiline_emphasis = true;
+        }
+        if (span.style.link and std.mem.indexOf(u8, text, "multi") != null) {
+            saw_multiline_link = true;
+        }
+    }
+    try std.testing.expect(saw_multiline_emphasis);
+    try std.testing.expect(saw_multiline_link);
+}
+
+test "analyzeSource stops inline spans at paragraph-interrupting blocks" {
+    const source = "*foo\n- bar*";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    for (spans) |span| try std.testing.expect(!span.style.italic);
+}
+
+test "analyzeSource matches quote and ordered-list paragraph interruption" {
+    const quote_source = "*foo\n>bar*";
+    const quote_spans = try analyzeSource(std.testing.allocator, quote_source);
+    defer std.testing.allocator.free(quote_spans);
+    for (quote_spans) |span| try std.testing.expect(!span.style.italic);
+
+    const ordered_source = "*foo\n2. bar*";
+    const ordered_spans = try analyzeSource(std.testing.allocator, ordered_source);
+    defer std.testing.allocator.free(ordered_spans);
+    var saw_ordered_continuation = false;
+    for (ordered_spans) |span| {
+        if (span.style.italic and
+            std.mem.indexOf(u8, ordered_source[span.start..span.end], "bar") != null)
+        {
+            saw_ordered_continuation = true;
+        }
+    }
+    try std.testing.expect(saw_ordered_continuation);
+}
+
+test "analyzeSource keeps blank list markers inside active paragraphs" {
+    const source = "*foo\n- \nbar*";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+    var saw_continuation = false;
+    for (spans) |span| {
+        if (span.style.italic and
+            std.mem.indexOf(u8, source[span.start..span.end], "bar") != null)
+        {
+            saw_continuation = true;
+        }
+    }
+    try std.testing.expect(saw_continuation);
+}
+
+test "analyzeSource preserves inline spans across list continuations" {
+    const source = "- *foo\n  bar*";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+    var saw_continuation = false;
+    for (spans) |span| {
+        if (span.style.italic and
+            std.mem.indexOf(u8, source[span.start..span.end], "bar") != null)
+        {
+            saw_continuation = true;
+        }
+    }
+    try std.testing.expect(saw_continuation);
+}
+
+test "analyzeSource preserves inline spans across quote continuations" {
+    const source = "> *foo\n> bar*";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+    var saw_continuation = false;
+    for (spans) |span| {
+        if (span.style.italic and
+            std.mem.indexOf(u8, source[span.start..span.end], "bar") != null)
+        {
+            saw_continuation = true;
+        }
+    }
+    try std.testing.expect(saw_continuation);
+}
+
+test "analyzeSource ends quoted paragraphs at blank quote lines" {
+    const source = "> *foo\n>\n> bar*";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+    for (spans) |span| try std.testing.expect(!span.style.italic);
+}
+
+test "analyzeSource does not promote setext headings across containers" {
+    const source = "- item\n---\n\n> quote\n---";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+    for (spans) |span| try std.testing.expect(!span.style.heading);
+}
+
+test "analyzeSource keeps emphasis from crossing GFM table cells" {
+    const source = "| *a |\n| --- |\n| b* |";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+    for (spans) |span| try std.testing.expect(!span.style.italic);
+}
+
+test "analyzeSource ignores escaped and code span pipes in tables" {
+    const source =
+        "| `a|b` | *escaped \\| pipe* |\n" ++
+        "| --- | --- |\n" ++
+        "| body | row |";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var saw_code = false;
+    var saw_emphasis = false;
+    for (spans) |span| {
+        const text = source[span.start..span.end];
+        if (span.style.code and std.mem.eql(u8, text, "`a|b`")) saw_code = true;
+        if (span.style.italic and
+            std.mem.eql(u8, text, "*escaped \\| pipe*"))
+        {
+            saw_emphasis = true;
+        }
+    }
+    try std.testing.expect(saw_code and saw_emphasis);
+}
+
+test "analyzeSource ends table mode at blank lines" {
+    const source =
+        "| head |\n" ++
+        "| --- |\n" ++
+        "| body |\n" ++
+        "\n" ++
+        "*foo | bar*";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var saw_emphasis = false;
+    for (spans) |span| {
+        if (span.style.italic and
+            std.mem.eql(u8, source[span.start..span.end], "*foo | bar*"))
+        {
+            saw_emphasis = true;
+        }
+    }
+    try std.testing.expect(saw_emphasis);
+}
+
+test "analyzeSource requires a one-line header before table delimiters" {
+    const source = "| --- |\n*foo|bar*";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var saw_emphasis = false;
+    for (spans) |span| {
+        if (span.style.italic and
+            std.mem.eql(u8, source[span.start..span.end], "*foo|bar*"))
+        {
+            saw_emphasis = true;
+        }
+    }
+    try std.testing.expect(saw_emphasis);
+}
+
+test "analyzeSource distinguishes indented code from paragraph continuation" {
+    const code_source = "    *code*";
+    const code_spans = try analyzeSource(std.testing.allocator, code_source);
+    defer std.testing.allocator.free(code_spans);
+    try std.testing.expectEqual(@as(usize, 1), code_spans.len);
+    try std.testing.expect(code_spans[0].style.code);
+    try std.testing.expect(!code_spans[0].style.italic);
+
+    const paragraph_source = "*foo\n    bar*";
+    const paragraph_spans = try analyzeSource(std.testing.allocator, paragraph_source);
+    defer std.testing.allocator.free(paragraph_spans);
+    var saw_continuation = false;
+    for (paragraph_spans) |span| {
+        if (span.style.italic and
+            std.mem.indexOf(u8, paragraph_source[span.start..span.end], "bar") != null)
+        {
+            saw_continuation = true;
+        }
+    }
+    try std.testing.expect(saw_continuation);
+}
+
+test "analyzeSource expands tabs for indentation and ends paragraphs at blank lines" {
+    const tab_source = "\t*code*";
+    const tab_spans = try analyzeSource(std.testing.allocator, tab_source);
+    defer std.testing.allocator.free(tab_spans);
+    try std.testing.expectEqual(@as(usize, 1), tab_spans.len);
+    try std.testing.expect(tab_spans[0].style.code);
+    try std.testing.expect(!tab_spans[0].style.italic);
+
+    const blank_source = "*foo\n    \nbar*";
+    const blank_spans = try analyzeSource(std.testing.allocator, blank_source);
+    defer std.testing.allocator.free(blank_spans);
+    for (blank_spans) |span| try std.testing.expect(!span.style.italic);
+}
+
+test "analyzeSource marks setext heading contents" {
+    const source = "*Title*\n===";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var saw_heading_emphasis = false;
+    for (spans) |span| {
+        const text = source[span.start..span.end];
+        if (span.style.heading and span.style.italic and
+            std.mem.indexOf(u8, text, "Title") != null)
+        {
+            saw_heading_emphasis = true;
+        }
+    }
+    try std.testing.expect(saw_heading_emphasis);
+}
+
+test "analyzeSource resets container state for later setext headings" {
+    const source = "- item\n\nTitle\n===";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var saw_heading = false;
+    for (spans) |span| {
+        if (span.style.heading and
+            std.mem.indexOf(u8, source[span.start..span.end], "Title") != null)
+        {
+            saw_heading = true;
+        }
+    }
+    try std.testing.expect(saw_heading);
+}
+
+test "analyzeSource enforces link destination nesting limit" {
+    var valid: std.ArrayList(u8) = .empty;
+    defer valid.deinit(std.testing.allocator);
+    try valid.appendSlice(std.testing.allocator, "[ok](https://e.test/");
+    try valid.appendNTimes(std.testing.allocator, '(', 32);
+    try valid.append(std.testing.allocator, 'x');
+    try valid.appendNTimes(std.testing.allocator, ')', 32);
+    try valid.append(std.testing.allocator, ')');
+    const valid_spans = try analyzeSource(std.testing.allocator, valid.items);
+    defer std.testing.allocator.free(valid_spans);
+    try std.testing.expectEqual(@as(usize, 1), valid_spans.len);
+    try std.testing.expect(valid_spans[0].style.link);
+
+    var invalid: std.ArrayList(u8) = .empty;
+    defer invalid.deinit(std.testing.allocator);
+    try invalid.appendSlice(std.testing.allocator, "[bad](https://e.test/");
+    try invalid.appendNTimes(std.testing.allocator, '(', 33);
+    try invalid.append(std.testing.allocator, 'x');
+    try invalid.appendNTimes(std.testing.allocator, ')', 33);
+    try invalid.append(std.testing.allocator, ')');
+    const invalid_spans = try analyzeSource(std.testing.allocator, invalid.items);
+    defer std.testing.allocator.free(invalid_spans);
+    for (invalid_spans) |span| try std.testing.expect(!span.style.link);
+}
+
+test "analyzeSource rejects backtick fences with backticks in the info string" {
+    const source = "```zig`bad\nplain\n```\nafter";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    for (spans) |span| {
+        const text = source[span.start..span.end];
+        if (std.mem.indexOf(u8, text, "plain") != null) {
+            try std.testing.expect(!span.style.code);
+        }
+    }
+}
+
+test "analyzeSource treats four-space fence markers as indented code" {
+    const source = "    ```\n*plain*";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var saw_indented_code = false;
+    var saw_plain_emphasis = false;
+    for (spans) |span| {
+        const text = source[span.start..span.end];
+        if (span.style.code and std.mem.eql(u8, text, "    ```")) {
+            saw_indented_code = true;
+        }
+        if (span.style.italic and std.mem.eql(u8, text, "*plain*")) {
+            saw_plain_emphasis = true;
+        }
+    }
+    try std.testing.expect(saw_indented_code and saw_plain_emphasis);
+
+    const list_source =
+        "- item\n    ```\n    code\n    ```\n*after*";
+    const list_spans = try analyzeSource(std.testing.allocator, list_source);
+    defer std.testing.allocator.free(list_spans);
+
+    var saw_list_code = false;
+    var saw_list_after = false;
+    for (list_spans) |span| {
+        const text = list_source[span.start..span.end];
+        if (span.style.code and std.mem.eql(u8, text, "    code")) {
+            saw_list_code = true;
+        }
+        if (span.style.italic and std.mem.eql(u8, text, "*after*")) {
+            saw_list_after = true;
+        }
+    }
+    try std.testing.expect(saw_list_code and saw_list_after);
+}
+
+test "analyzeSource scans unmatched link openers once" {
+    const source = try std.testing.allocator.alloc(u8, 8_000);
+    defer std.testing.allocator.free(source);
+    @memset(source, '[');
+
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+    try std.testing.expectEqual(@as(usize, 0), spans.len);
+
+    const nested = "[[inner](https://example.com)";
+    const nested_spans = try analyzeSource(std.testing.allocator, nested);
+    defer std.testing.allocator.free(nested_spans);
+    try std.testing.expectEqual(@as(usize, 1), nested_spans.len);
+    try std.testing.expect(nested_spans[0].style.link);
+    try std.testing.expectEqualStrings(
+        "[inner](https://example.com)",
+        nested[nested_spans[0].start..nested_spans[0].end],
+    );
+}
+
+test "analyzeSource rejects inline code delimiters longer than md4c limit" {
+    const delimiter = "`" ** 33;
+    const source = delimiter ++ "code" ++ delimiter;
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    for (spans) |span| try std.testing.expect(!span.style.code);
+}
+
+test "analyzeSource fences close only on an equally long unannotated fence" {
+    const source = "````example\n```zig\ninside\n```\nstill inside\n````\nafter";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var saw_inside = false;
+    var saw_still = false;
+    for (spans) |span| {
+        const text = source[span.start..span.end];
+        if (span.style.code and std.mem.eql(u8, text, "inside")) saw_inside = true;
+        if (span.style.code and std.mem.eql(u8, text, "still inside")) saw_still = true;
+    }
+    try std.testing.expect(saw_inside and saw_still);
+
+    // Trailing text after a fence marker does not close the block.
+    const annotated_text = "```\ncode\n```not-a-close\nmore code\n```\ndone";
+    const annotated = try analyzeSource(std.testing.allocator, annotated_text);
+    defer std.testing.allocator.free(annotated);
+    var saw_more = false;
+    var saw_done_code = false;
+    for (annotated) |span| {
+        const text = annotated_text[span.start..span.end];
+        if (span.style.code and std.mem.eql(u8, text, "more code")) saw_more = true;
+        if (span.style.code and std.mem.eql(u8, text, "done")) saw_done_code = true;
+    }
+    try std.testing.expect(saw_more);
+    try std.testing.expect(!saw_done_code);
+}
+
+test "analyzeSource spans never split code points" {
+    const source = "héllo **wörld** ok";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+    for (spans) |span| {
+        try std.testing.expect((source[span.start] & 0xc0) != 0x80);
+        if (span.end < source.len) {
+            try std.testing.expect((source[span.end] & 0xc0) != 0x80);
+        }
+    }
 }

@@ -1165,6 +1165,132 @@ fn measureWrappedComposer(
     };
 }
 
+fn composerStyleAt(
+    spans: []const markdown.SourceSpan,
+    span_index: *usize,
+    offset: usize,
+    base_style: vaxis.Style,
+) vaxis.Style {
+    while (span_index.* < spans.len and spans[span_index.*].end <= offset) {
+        span_index.* += 1;
+    }
+    if (span_index.* < spans.len) {
+        const span = spans[span_index.*];
+        if (span.start <= offset and offset < span.end) {
+            return markdown.combineStyle(base_style, span.style);
+        }
+    }
+    return base_style;
+}
+
+/// Mirrors Window.print(.word) over the complete source so style boundaries
+/// cannot become unintended word boundaries.
+fn printStyledComposer(
+    window: vaxis.Window,
+    text: []const u8,
+    spans: []const markdown.SourceSpan,
+    base_style: vaxis.Style,
+) vaxis.Window.PrintResult {
+    if (window.width == 0) return .{ .row = 0, .col = 0, .overflow = true };
+
+    var row: u16 = 0;
+    var col: u16 = 0;
+    var soft_wrapped = false;
+    var span_index: usize = 0;
+    var pos: usize = 0;
+
+    while (pos < text.len) {
+        const line_end = std.mem.indexOfAnyPos(u8, text, pos, "\r\n") orelse text.len;
+        while (pos < line_end) {
+            if (text[pos] == ' ' or text[pos] == '\t') {
+                const whitespace_start = pos;
+                while (pos < line_end and (text[pos] == ' ' or text[pos] == '\t')) {
+                    pos += 1;
+                }
+                if (soft_wrapped) continue;
+
+                var whitespace = whitespace_start;
+                var wrapped = false;
+                while (whitespace < pos and !wrapped) : (whitespace += 1) {
+                    const count: usize = if (text[whitespace] == '\t') 8 else 1;
+                    const style = composerStyleAt(
+                        spans,
+                        &span_index,
+                        whitespace,
+                        base_style,
+                    );
+                    for (0..count) |_| {
+                        if (col >= window.width) {
+                            row +|= 1;
+                            col = 0;
+                            wrapped = true;
+                            break;
+                        }
+                        if (row >= window.height) {
+                            return .{ .row = row, .col = col, .overflow = true };
+                        }
+                        _ = window.printSegment(
+                            .{ .text = " ", .style = style },
+                            .{
+                                .row_offset = row,
+                                .col_offset = col,
+                                .wrap = .none,
+                            },
+                        );
+                        col += 1;
+                    }
+                }
+                continue;
+            }
+
+            const word_start = pos;
+            while (pos < line_end and text[pos] != ' ' and text[pos] != '\t') {
+                pos += 1;
+            }
+            const word_width = window.gwidth(text[word_start..pos]);
+            if (word_width + col > window.width and word_width < window.width) {
+                row +|= 1;
+                col = 0;
+            }
+
+            const word = text[word_start..pos];
+            var grapheme_iterator = vaxis.unicode.graphemeIterator(word);
+            while (grapheme_iterator.next()) |grapheme| {
+                const grapheme_start = word_start + grapheme.start;
+                const style = composerStyleAt(
+                    spans,
+                    &span_index,
+                    grapheme_start,
+                    base_style,
+                );
+                const result = window.printSegment(
+                    .{ .text = grapheme.bytes(word), .style = style },
+                    .{
+                        .row_offset = row,
+                        .col_offset = col,
+                        .wrap = .grapheme,
+                    },
+                );
+                row = result.row;
+                col = result.col;
+                if (result.overflow) return result;
+            }
+            soft_wrapped = word_width > 0 and col == 0;
+        }
+
+        if (line_end >= text.len) break;
+        pos = line_end + 1;
+        if (text[line_end] == '\r' and pos < text.len and text[pos] == '\n') {
+            pos += 1;
+        }
+        soft_wrapped = false;
+        row +|= 1;
+        col = 0;
+    }
+
+    return .{ .row = row, .col = col, .overflow = false };
+}
+
 const Region = struct {
     x: u16 = 0,
     y: u16 = 0,
@@ -1722,14 +1848,15 @@ const Projection = struct {
                             0,
                             0,
                         ),
-                    .user, .queued, .question => 1 +
-                        try counter.appendWrappedRange(
-                            allocators.result,
+                    .user, .queued, .question => @intFromBool(show_role) +
+                        try counter.appendMarkdownRangeAllocating(
+                            allocators,
                             entry_index,
                             message.text.items,
                             window,
-                            .body,
-                            2,
+                            @max(window.width -| 2, 1),
+                            null,
+                            .markdown,
                             0,
                             0,
                         ),
@@ -1814,17 +1941,20 @@ const Projection = struct {
                     );
                 },
                 .user, .queued, .question => {
-                    try self.lines.append(allocator, .{
-                        .kind = .role,
-                        .entry_index = entry_index,
-                    });
-                    try self.appendWrapped(
+                    if (show_role) {
+                        try self.lines.append(allocator, .{
+                            .kind = .role,
+                            .entry_index = entry_index,
+                        });
+                    }
+                    try self.appendMarkdown(
                         allocator,
                         entry_index,
                         message.text.items,
                         window,
-                        .body,
-                        2,
+                        @max(window.width -| 2, 1),
+                        null,
+                        .markdown,
                     );
                 },
                 .status => try self.appendWrapped(
@@ -2051,22 +2181,24 @@ const Projection = struct {
                 }
             },
             .user, .queued, .question => {
-                if (first == 0 and last > 0) {
+                const body_offset: usize = @intFromBool(show_role);
+                if (show_role and first == 0 and last > 0) {
                     try self.lines.append(allocators.result, .{
                         .kind = .role,
                         .entry_index = entry_index,
                     });
                 }
-                if (last > 1) {
-                    _ = try self.appendWrappedRange(
-                        allocators.result,
+                if (last > body_offset) {
+                    _ = try self.appendMarkdownRangeAllocating(
+                        allocators,
                         entry_index,
                         message.text.items,
                         window,
-                        .body,
-                        2,
-                        first -| 1,
-                        last - 1,
+                        @max(window.width -| 2, 1),
+                        null,
+                        .markdown,
+                        first -| body_offset,
+                        last -| body_offset,
                     );
                 }
             },
@@ -4598,25 +4730,7 @@ const ChatUi = struct {
                     .wrap = .none,
                 });
             },
-            .body => {
-                const message = entry.constMessage().?;
-                var segments = [_]vaxis.Segment{.{
-                    .text = message.text.items[line.start..line.end],
-                    .style = if (message.role == .reasoning)
-                        .{
-                            .fg = reasoning_color,
-                            .dim = true,
-                            .italic = true,
-                        }
-                    else
-                        .{},
-                }};
-                _ = window.print(&segments, .{
-                    .row_offset = row,
-                    .col_offset = if (window.width >= 4) 2 else 0,
-                    .wrap = .none,
-                });
-            },
+            .body => unreachable,
             .markdown => {
                 const message = entry.constMessage().?;
                 const base_style: vaxis.Style =
@@ -4910,9 +5024,10 @@ const ChatUi = struct {
         });
         const text_style = vaxis.Style{ .bg = composer_background };
         if (self.phase.acceptsComposerInput()) {
+            const contents = self.composer_display[self.composer_display_index].items;
             const measure = measureWrappedComposer(
                 content,
-                self.composer_display[self.composer_display_index].items,
+                contents,
                 self.input.byteOffsetToCursor(),
             );
             const scroll_rows = if (measure.cursor_row >= content.height)
@@ -4923,11 +5038,32 @@ const ChatUi = struct {
                 .y_off = -@as(i17, @intCast(scroll_rows)),
                 .height = measure.rows,
             });
-            var segments = [_]vaxis.Segment{.{
-                .text = self.composer_display[self.composer_display_index].items,
-                .style = text_style,
-            }};
-            _ = drawing.print(&segments, .{ .wrap = .word });
+            // Render inline Markdown styling over the exact composer bytes so
+            // cursor and wrap positions are unchanged; fall back to plain text
+            // on any analysis failure.
+            var printed = false;
+            if (contents.len > 0) {
+                const analysis = markdown.analyzeSource(self.allocator, contents);
+                if (analysis) |source_spans| {
+                    defer self.allocator.free(source_spans);
+                    if (source_spans.len > 0) {
+                        _ = printStyledComposer(
+                            drawing,
+                            contents,
+                            source_spans,
+                            text_style,
+                        );
+                        printed = true;
+                    }
+                } else |_| {}
+            }
+            if (!printed) {
+                var segments = [_]vaxis.Segment{.{
+                    .text = contents,
+                    .style = text_style,
+                }};
+                _ = drawing.print(&segments, .{ .wrap = .word });
+            }
             drawing.showCursor(measure.cursor_col, measure.cursor_row);
             if (self.focused_tool != null) drawing.hideCursor();
         } else {
@@ -8385,6 +8521,97 @@ test "left clicking a transcript link opens it in the default browser" {
 
 var captured_uri: ?[]const u8 = null;
 
+test "user, queued, and question messages render Markdown with registered links" {
+    var ui: ChatUi = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .input = TextInput.init(std.testing.allocator),
+        .cwd = try std.testing.allocator.dupe(u8, "."),
+    };
+    defer ui.deinit();
+    try ui.transcript.append(
+        std.testing.allocator,
+        .user,
+        "visit [bing](https://bing.com) **boldly**",
+    );
+    try ui.transcript.append(
+        std.testing.allocator,
+        .queued,
+        "queued *emphasis* here",
+    );
+    try ui.transcript.append(
+        std.testing.allocator,
+        .question,
+        "question `code` here",
+    );
+
+    var screen = try vaxis.Screen.init(std.testing.allocator, .{
+        .rows = 16,
+        .cols = 60,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(std.testing.allocator);
+    const window: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = screen.width,
+        .height = screen.height,
+        .screen = &screen,
+    };
+    var maybe_projection = try ui.draw(window);
+    defer if (maybe_projection) |*value| value.deinit(std.testing.allocator);
+    const projection = &maybe_projection.?;
+
+    // All three roles must project through the Markdown path, never plain body.
+    var markdown_lines: usize = 0;
+    for (projection.lines.items) |line| {
+        try std.testing.expect(line.kind != .body);
+        if (line.kind == .markdown) markdown_lines += 1;
+    }
+    try std.testing.expect(markdown_lines >= 3);
+
+    // Styling must actually be parsed: literal markup markers are consumed.
+    var rendered_text: std.ArrayList(u8) = .empty;
+    defer rendered_text.deinit(std.testing.allocator);
+    for (0..screen.height) |row| {
+        for (0..screen.width) |column| {
+            const cell = screen.readCell(@intCast(column), @intCast(row)).?;
+            try rendered_text.appendSlice(std.testing.allocator, cell.char.grapheme);
+        }
+    }
+    const flat = rendered_text.items;
+    try std.testing.expect(std.mem.indexOf(u8, flat, "[bing]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, flat, "**boldly**") == null);
+    try std.testing.expect(std.mem.indexOf(u8, flat, "bing") != null);
+
+    // The user-role link must register a clickable hit that opens the URI.
+    captured_uri = null;
+    ui.open_uri_hook = struct {
+        fn capture(_: *ChatUi, uri: []const u8) void {
+            captured_uri = uri;
+        }
+    }.capture;
+    var opened = false;
+    for (ui.link_hits.items) |hit| {
+        if (std.mem.eql(u8, hit.uri, "https://bing.com")) {
+            opened = true;
+            _ = ui.handleMouse(.{
+                .col = @intCast(ui.last_transcript_region.x + hit.col_start + 1),
+                .row = @intCast(ui.last_transcript_region.y + hit.row),
+                .button = .left,
+                .mods = .{},
+                .type = .press,
+            });
+        }
+    }
+    try std.testing.expect(opened);
+    try std.testing.expect(captured_uri != null);
+    try std.testing.expectEqualStrings("https://bing.com", captured_uri.?);
+}
+
 test "renderer arenas preserve screen borrows and stabilize after warmup" {
     var ui: ChatUi = .{
         .allocator = std.testing.allocator,
@@ -8520,6 +8747,107 @@ test "wrapped composer measures cursor within a word moved to the next row" {
     try std.testing.expectEqual(@as(u16, 2), measure.rows);
     try std.testing.expectEqual(@as(u16, 1), measure.cursor_row);
     try std.testing.expectEqual(@as(u16, 3), measure.cursor_col);
+}
+
+test "styled composer wraps words across style boundaries" {
+    const source = "abcdefgh`ij`kl";
+    const spans = try markdown.analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var screen = try vaxis.Screen.init(std.testing.allocator, .{
+        .rows = 3,
+        .cols = 10,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(std.testing.allocator);
+    const window: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = screen.width,
+        .height = screen.height,
+        .screen = &screen,
+    };
+
+    var plain_segment = [_]vaxis.Segment{.{ .text = source }};
+    const plain = window.print(
+        &plain_segment,
+        .{ .wrap = .word, .commit = false },
+    );
+    const styled = printStyledComposer(window, source, spans, .{});
+    try std.testing.expectEqual(plain.row, styled.row);
+    try std.testing.expectEqual(plain.col, styled.col);
+
+    for ("abcdefgh`i", 0..) |byte, column| {
+        try std.testing.expectEqualStrings(
+            &.{byte},
+            screen.readCell(@intCast(column), 0).?.char.grapheme,
+        );
+    }
+    for ("j`kl", 0..) |byte, column| {
+        try std.testing.expectEqualStrings(
+            &.{byte},
+            screen.readCell(@intCast(column), 1).?.char.grapheme,
+        );
+    }
+    try std.testing.expectEqual(
+        composer_background,
+        screen.readCell(8, 0).?.style.bg,
+    );
+    try std.testing.expectEqual(
+        composer_background,
+        screen.readCell(0, 1).?.style.bg,
+    );
+    try std.testing.expect(!std.meta.eql(
+        composer_background,
+        screen.readCell(2, 1).?.style.bg,
+    ));
+}
+
+test "styled composer preserves graphemes across style boundaries" {
+    const source = "`a`\u{0301}b";
+    const spans = try markdown.analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var screen = try vaxis.Screen.init(std.testing.allocator, .{
+        .rows = 2,
+        .cols = 10,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(std.testing.allocator);
+    const window: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = screen.width,
+        .height = screen.height,
+        .screen = &screen,
+    };
+
+    var plain_segment = [_]vaxis.Segment{.{ .text = source }};
+    const plain = window.print(
+        &plain_segment,
+        .{ .wrap = .word, .commit = false },
+    );
+    const styled = printStyledComposer(window, source, spans, .{});
+    try std.testing.expectEqual(plain.row, styled.row);
+    try std.testing.expectEqual(plain.col, styled.col);
+    try std.testing.expectEqualStrings(
+        "`\u{0301}",
+        screen.readCell(2, 0).?.char.grapheme,
+    );
+    try std.testing.expectEqual(
+        composer_background,
+        screen.readCell(2, 0).?.style.bg,
+    );
+    try std.testing.expectEqualStrings(
+        "b",
+        screen.readCell(3, 0).?.char.grapheme,
+    );
 }
 
 test "composer word wraps and grows instead of scrolling horizontally" {
