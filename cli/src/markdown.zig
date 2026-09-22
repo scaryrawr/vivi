@@ -331,6 +331,7 @@ const EmphasisOpener = struct {
     marker: u8 = 0,
     start: usize = 0,
     run: usize = 0,
+    can_close: bool = false,
 };
 
 fn markRange(flags: []u8, start: usize, end: usize, bits: u8) void {
@@ -390,7 +391,7 @@ fn scanInline(
 ) void {
     var i = lo;
     var emphasis_openers: [emphasis_stack_limit]EmphasisOpener =
-        @splat(.{ .marker = 0, .start = 0, .run = 0 });
+        @splat(.{ .marker = 0, .start = 0, .run = 0, .can_close = false });
     var emphasis_depth: usize = 0;
 
     while (i < hi) {
@@ -467,22 +468,39 @@ fn scanInline(
                     (marker == '*' or !flanking.right or isPunctByte(before));
                 const delimiter_can_close = flanking.right and
                     (marker == '*' or !flanking.left or isPunctByte(after));
+                const opener = if (emphasis_depth > 0)
+                    &emphasis_openers[emphasis_depth - 1]
+                else
+                    null;
+                const rule_of_three_allows_close = if (opener) |candidate|
+                    !((candidate.can_close or can_open) and
+                        (candidate.run + run) % 3 == 0 and
+                        (candidate.run % 3 != 0 or run % 3 != 0))
+                else
+                    false;
                 const can_close = emphasis_depth > 0 and
-                    emphasis_openers[emphasis_depth - 1].marker == marker and
-                    i > emphasis_openers[emphasis_depth - 1].start + emphasis_openers[emphasis_depth - 1].run and
-                    delimiter_can_close;
+                    opener.?.marker == marker and
+                    i > opener.?.start + opener.?.run and
+                    delimiter_can_close and
+                    rule_of_three_allows_close;
 
                 if (can_close) {
-                    const opener = emphasis_openers[emphasis_depth - 1];
-                    const closer_run = @min(run, opener.run);
-                    if (closer_run >= 2) markRange(flags, opener.start, i + closer_run, flag_bold);
-                    if (closer_run == 1 or opener.run >= 3) {
-                        markRange(flags, opener.start, i + closer_run, flag_italic);
+                    const consumed = @min(run, opener.?.run);
+                    const opener_start = opener.?.start + opener.?.run - consumed;
+                    if (consumed >= 2) markRange(flags, opener_start, i + consumed, flag_bold);
+                    if (consumed % 2 == 1) {
+                        markRange(flags, opener_start, i + consumed, flag_italic);
                     }
-                    emphasis_depth -= 1;
-                    i += closer_run;
+                    opener.?.run -= consumed;
+                    if (opener.?.run == 0) emphasis_depth -= 1;
+                    i += consumed;
                 } else if (can_open and emphasis_depth < emphasis_stack_limit) {
-                    emphasis_openers[emphasis_depth] = .{ .marker = marker, .start = i, .run = run };
+                    emphasis_openers[emphasis_depth] = .{
+                        .marker = marker,
+                        .start = i,
+                        .run = run,
+                        .can_close = delimiter_can_close,
+                    };
                     emphasis_depth += 1;
                     i += run;
                 } else {
@@ -534,6 +552,19 @@ fn prepareInlinePairs(
     pairDelimiters(pairs, stack, text, lo, hi, '(', ')');
 }
 
+fn analyzeInlineRange(
+    flags: []u8,
+    delimiter_pairs: []usize,
+    delimiter_stack: []usize,
+    source: []const u8,
+    start: usize,
+    end: usize,
+) void {
+    if (start >= end) return;
+    prepareInlinePairs(delimiter_pairs, delimiter_stack, source, start, end);
+    scanInline(flags, delimiter_pairs, source, start, end, 0);
+}
+
 fn linkAt(
     delimiter_pairs: []const usize,
     text: []const u8,
@@ -568,6 +599,13 @@ fn lineSpan(text: []const u8, from: usize) struct { end: usize, next: usize } {
     return .{ .end = end, .next = newline +| 1 };
 }
 
+fn validFenceOpener(source: []const u8, body: usize, line_end: usize, marker: u8) bool {
+    const run = countRun(source, body, line_end, marker);
+    if (run < 3) return false;
+    return marker != '`' or
+        std.mem.indexOfScalar(u8, source[body + run .. line_end], '`') == null;
+}
+
 /// Analyzes Markdown source without rewriting any bytes: returned spans
 /// cover the original text (syntax markers included) so a live editor can
 /// style its buffer in place while cursor and wrap offsets stay exact.
@@ -587,6 +625,7 @@ pub fn analyzeSource(
 
     var fence: u8 = 0;
     var fence_len: usize = 0;
+    var inline_start: ?usize = null;
     var pos: usize = 0;
     while (pos < source.len) {
         const line = lineSpan(source, pos);
@@ -613,8 +652,19 @@ pub fn analyzeSource(
             }
         } else if (body < line.end and
             (source[body] == '`' or source[body] == '~') and
-            countRun(source, body, line.end, source[body]) >= 3)
+            validFenceOpener(source, body, line.end, source[body]))
         {
+            if (inline_start) |start| {
+                analyzeInlineRange(
+                    flags,
+                    delimiter_pairs,
+                    delimiter_stack,
+                    source,
+                    start,
+                    pos,
+                );
+                inline_start = null;
+            }
             fence = source[body];
             fence_len = countRun(source, body, line.end, source[body]);
             markRange(flags, pos, line.end, flag_code);
@@ -623,16 +673,47 @@ pub fn analyzeSource(
             const at_end = body + hashes >= line.end;
             const next = if (at_end) '\n' else source[body + hashes];
             if (hashes >= 1 and hashes <= 6 and (at_end or next == ' ' or next == '\t')) {
+                if (inline_start) |start| {
+                    analyzeInlineRange(
+                        flags,
+                        delimiter_pairs,
+                        delimiter_stack,
+                        source,
+                        start,
+                        pos,
+                    );
+                    inline_start = null;
+                }
                 markRange(flags, pos, line.end, flag_heading);
             } else {
-                prepareInlinePairs(delimiter_pairs, delimiter_stack, source, pos, line.end);
-                scanInline(flags, delimiter_pairs, source, pos, line.end, 0);
+                if (inline_start == null) inline_start = pos;
+            }
+        } else if (body == line.end) {
+            if (inline_start) |start| {
+                analyzeInlineRange(
+                    flags,
+                    delimiter_pairs,
+                    delimiter_stack,
+                    source,
+                    start,
+                    pos,
+                );
+                inline_start = null;
             }
         } else {
-            prepareInlinePairs(delimiter_pairs, delimiter_stack, source, pos, line.end);
-            scanInline(flags, delimiter_pairs, source, pos, line.end, 0);
+            if (inline_start == null) inline_start = pos;
         }
         pos = line.next;
+    }
+    if (inline_start) |start| {
+        analyzeInlineRange(
+            flags,
+            delimiter_pairs,
+            delimiter_stack,
+            source,
+            start,
+            source.len,
+        );
     }
 
     var spans: std.ArrayList(SourceSpan) = .empty;
@@ -2767,6 +2848,59 @@ test "analyzeSource applies the underscore flanking rule like md4c" {
         if (span.style.italic and std.mem.indexOf(u8, text, "emphasis") != null) saw_close = true;
     }
     try std.testing.expect(saw_close);
+}
+
+test "analyzeSource preserves partially consumed delimiter runs" {
+    const source = "***foo** bar*";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var saw_bold_italic = false;
+    var saw_outer_italic = false;
+    for (spans) |span| {
+        const text = source[span.start..span.end];
+        if (span.style.bold and span.style.italic and std.mem.indexOf(u8, text, "foo") != null) {
+            saw_bold_italic = true;
+        }
+        if (!span.style.bold and span.style.italic and std.mem.indexOf(u8, text, "bar") != null) {
+            saw_outer_italic = true;
+        }
+    }
+    try std.testing.expect(saw_bold_italic);
+    try std.testing.expect(saw_outer_italic);
+}
+
+test "analyzeSource styles inline spans across soft line breaks" {
+    const source = "*foo\nbar* and [multi\nline](https://example.com)";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var saw_multiline_emphasis = false;
+    var saw_multiline_link = false;
+    for (spans) |span| {
+        const text = source[span.start..span.end];
+        if (span.style.italic and std.mem.indexOf(u8, text, "foo") != null) {
+            saw_multiline_emphasis = true;
+        }
+        if (span.style.link and std.mem.indexOf(u8, text, "multi") != null) {
+            saw_multiline_link = true;
+        }
+    }
+    try std.testing.expect(saw_multiline_emphasis);
+    try std.testing.expect(saw_multiline_link);
+}
+
+test "analyzeSource rejects backtick fences with backticks in the info string" {
+    const source = "```zig`bad\nplain\n```\nafter";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    for (spans) |span| {
+        const text = source[span.start..span.end];
+        if (std.mem.indexOf(u8, text, "plain") != null) {
+            try std.testing.expect(!span.style.code);
+        }
+    }
 }
 
 test "analyzeSource scans unmatched link openers once" {
