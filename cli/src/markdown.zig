@@ -727,83 +727,124 @@ fn autolinkBoundaryAfter(flags: []const u8, text: []const u8, index: usize, hi: 
     };
 }
 
-fn scanAutolinkHost(text: []const u8, start: usize, hi: usize) ?usize {
-    var cursor = start;
-    var components: usize = 0;
-    while (cursor < hi and std.ascii.isAlphanumeric(text[cursor])) {
-        components += 1;
-        cursor += 1;
-        while (cursor < hi) {
-            if (std.ascii.isAlphanumeric(text[cursor])) {
-                cursor += 1;
-            } else if ((text[cursor] == '-' or text[cursor] == '_') and
-                cursor + 1 < hi and std.ascii.isAlphanumeric(text[cursor - 1]) and
-                std.ascii.isAlphanumeric(text[cursor + 1]))
-            {
-                cursor += 1;
-            } else {
-                break;
-            }
-        }
-        if (cursor >= hi or text[cursor] != '.' or cursor + 1 >= hi or
-            !std.ascii.isAlphanumeric(text[cursor + 1]))
-        {
-            break;
-        }
-        cursor += 1;
-    }
-    if (components < 2) return null;
-    return cursor;
-}
-
-fn scanAutolinkPart(
+fn scanAutolinkComponent(
     text: []const u8,
     start: usize,
     hi: usize,
-    allowed: []const u8,
-    allow_parentheses: bool,
+    start_char: ?u8,
+    delimiter: ?u8,
+    allowed_inside: []const u8,
+    allowed_anywhere: []const u8,
+    minimum_components: usize,
+    optional_end: ?u8,
 ) ?usize {
     var cursor = start;
-    var count: usize = 0;
+    if (start_char) |byte| {
+        if (cursor >= hi or text[cursor] != byte) return start;
+        if (minimum_components > 0 and
+            (cursor + 1 >= hi or !std.ascii.isAlphanumeric(text[cursor + 1])))
+        {
+            return start;
+        }
+        cursor += 1;
+    }
+
+    var components: usize = 0;
+    var component_length: usize = 0;
     var paren_depth: usize = 0;
     while (cursor < hi) {
         const byte = text[cursor];
-        if (std.ascii.isAlphanumeric(byte) or std.mem.indexOfScalar(u8, allowed, byte) != null) {
-            count += 1;
-            cursor += 1;
-        } else if (allow_parentheses and byte == '(' and cursor + 1 < hi and
-            (std.ascii.isAlphanumeric(text[cursor + 1]) or text[cursor + 1] == '('))
+        if (std.ascii.isAlphanumeric(byte) or
+            std.mem.indexOfScalar(u8, allowed_anywhere, byte) != null)
         {
-            paren_depth += 1;
-            count += 1;
+            if (components == 0) components += 1;
+            component_length += 1;
             cursor += 1;
-        } else if (allow_parentheses and byte == ')' and paren_depth > 0 and
-            cursor > start and
-            (std.ascii.isAlphanumeric(text[cursor - 1]) or text[cursor - 1] == ')'))
+        } else if (component_length > 0 and delimiter != null and byte == delimiter.? and
+            cursor + 1 < hi and
+            (std.ascii.isAlphanumeric(text[cursor + 1]) or
+                std.mem.indexOfScalar(u8, allowed_anywhere, text[cursor + 1]) != null))
         {
-            paren_depth -= 1;
-            count += 1;
+            components += 1;
+            component_length = 0;
+            cursor += 1;
+        } else if (std.mem.indexOfScalar(u8, allowed_inside, byte) != null and
+            ((cursor > start and
+                (std.ascii.isAlphanumeric(text[cursor - 1]) or text[cursor - 1] == ')')) or
+                byte == '(') and
+            ((cursor + 1 < hi and
+                (std.ascii.isAlphanumeric(text[cursor + 1]) or text[cursor + 1] == '(')) or
+                byte == ')'))
+        {
+            if (byte == '(') {
+                paren_depth += 1;
+            } else if (byte == ')') {
+                if (paren_depth == 0) break;
+                paren_depth -= 1;
+            }
+            component_length += 1;
             cursor += 1;
         } else {
             break;
         }
     }
-    if (count == 0 or paren_depth != 0) return null;
+    if (optional_end) |byte| {
+        if (cursor < hi and text[cursor] == byte) cursor += 1;
+    }
+    if (components < minimum_components or paren_depth != 0) return null;
     return cursor;
 }
 
 fn scanUrlAutolink(text: []const u8, start: usize, prefix_len: usize, hi: usize) ?usize {
-    var cursor = scanAutolinkHost(text, start + prefix_len, hi) orelse return null;
+    var cursor = scanAutolinkComponent(
+        text,
+        start + prefix_len,
+        hi,
+        null,
+        '.',
+        ".-_",
+        "",
+        2,
+        null,
+    ) orelse return null;
     if (cursor < hi and text[cursor] == '/') {
-        cursor = scanAutolinkPart(text, cursor, hi, "/._+-", false) orelse return null;
+        cursor = scanAutolinkComponent(
+            text,
+            cursor,
+            hi,
+            '/',
+            '/',
+            "/._",
+            "+-",
+            0,
+            '/',
+        ) orelse return null;
     }
     if (cursor < hi and text[cursor] == '?') {
-        if (scanAutolinkPart(text, cursor + 1, hi, "&.-+_=", true)) |query_end| {
-            cursor = query_end;
-        }
+        cursor = scanAutolinkComponent(
+            text,
+            cursor,
+            hi,
+            '?',
+            '&',
+            "&.-+_=()",
+            "",
+            1,
+            null,
+        ) orelse return null;
     }
     if (cursor < hi and text[cursor] == '#') {
-        cursor = scanAutolinkPart(text, cursor + 1, hi, ".-+_", false) orelse return null;
+        cursor = scanAutolinkComponent(
+            text,
+            cursor,
+            hi,
+            '#',
+            null,
+            ".-+_",
+            "",
+            1,
+            null,
+        ) orelse return null;
     }
     return cursor;
 }
@@ -824,18 +865,69 @@ fn scanEmailAutolink(text: []const u8, start: usize, hi: usize) ?usize {
         }
     }
     if (cursor >= hi or text[cursor] != '@') return null;
-    return scanAutolinkHost(text, cursor + 1, hi);
+    return scanAutolinkComponent(
+        text,
+        cursor + 1,
+        hi,
+        null,
+        '.',
+        ".-_",
+        "",
+        2,
+        null,
+    );
+}
+
+fn scanAngleAutolink(text: []const u8, start: usize, hi: usize) ?usize {
+    var close = start + 1;
+    while (close < hi and text[close] != '>') {
+        if (text[close] == '<' or
+            isUnicodeWhitespace(codepointAt(text, close) orelse return null))
+        {
+            return null;
+        }
+        close += 1;
+    }
+    if (close >= hi) return null;
+
+    const contents_start = start + 1;
+    const contents_end = close;
+    var parsed_end: ?usize = null;
+    if (startsWithIgnoreCase(text, contents_start, "https://")) {
+        parsed_end = scanUrlAutolink(text, contents_start, 8, contents_end);
+    } else if (startsWithIgnoreCase(text, contents_start, "http://")) {
+        parsed_end = scanUrlAutolink(text, contents_start, 7, contents_end);
+    } else if (startsWithIgnoreCase(text, contents_start, "mailto:")) {
+        parsed_end = scanEmailAutolink(text, contents_start + 7, contents_end);
+    } else {
+        parsed_end = scanEmailAutolink(text, contents_start, contents_end);
+    }
+    if (parsed_end != contents_end) return null;
+    return close + 1;
 }
 
 fn markPermissiveAutolinks(
     flags: []u8,
     delimiter_pairs: []const usize,
+    link_states: []const u8,
+    link_dest_ends: []const usize,
     text: []const u8,
     lo: usize,
     hi: usize,
 ) void {
     var cursor = lo;
     while (cursor < hi) {
+        if (text[cursor] == '!' and cursor + 1 < hi and text[cursor + 1] == '[') {
+            if (linkAt(
+                delimiter_pairs,
+                link_states,
+                link_dest_ends,
+                cursor + 1,
+            )) |image| {
+                cursor = image.dest_end + 1;
+                continue;
+            }
+        }
         if (text[cursor] == '(' and cursor > lo and text[cursor - 1] == ']' and
             delimiter_pairs[cursor] != std.math.maxInt(usize))
         {
@@ -850,6 +942,13 @@ fn markPermissiveAutolinks(
             cursor = findCodeSpanEnd(text, cursor, hi) orelse
                 cursor + countRun(text, cursor, hi, '`');
             continue;
+        }
+        if (text[cursor] == '<') {
+            if (scanAngleAutolink(text, cursor, hi)) |angle_end| {
+                markRange(flags, cursor, angle_end, flag_link);
+                cursor = angle_end;
+                continue;
+            }
         }
         if (autolinkBoundaryBefore(flags, text, cursor, lo)) {
             var end: ?usize = null;
@@ -908,7 +1007,15 @@ fn analyzeInlineRange(
         end,
         0,
     );
-    markPermissiveAutolinks(flags, delimiter_pairs, source, start, end);
+    markPermissiveAutolinks(
+        flags,
+        delimiter_pairs,
+        link_states,
+        link_dest_ends,
+        source,
+        start,
+        end,
+    );
 }
 
 fn linkCandidateAt(
@@ -3560,6 +3667,11 @@ test "analyzeSource does not style image syntax as a link" {
         }
     }
     try std.testing.expect(saw_alt_emphasis);
+
+    const url_alt_source = "![https://example.com](https://image.example)";
+    const url_alt_spans = try analyzeSource(std.testing.allocator, url_alt_source);
+    defer std.testing.allocator.free(url_alt_spans);
+    for (url_alt_spans) |span| try std.testing.expect(!span.style.link);
 }
 
 test "analyzeSource marks headings and fenced code" {
@@ -3862,6 +3974,36 @@ test "analyzeSource matches permissive autolink boundaries and host grammar" {
     );
     defer std.testing.allocator.free(parenthesized_path);
     for (parenthesized_path) |span| try std.testing.expect(!span.style.link);
+
+    const trailing_period_source = "https://example.com/foo.";
+    const trailing_period_spans = try analyzeSource(
+        std.testing.allocator,
+        trailing_period_source,
+    );
+    defer std.testing.allocator.free(trailing_period_spans);
+    var saw_trimmed_path = false;
+    for (trailing_period_spans) |span| {
+        if (span.style.link) {
+            try std.testing.expectEqualStrings(
+                "https://example.com/foo",
+                trailing_period_source[span.start..span.end],
+            );
+            saw_trimmed_path = true;
+        }
+    }
+    try std.testing.expect(saw_trimmed_path);
+}
+
+test "analyzeSource styles safe angle autolinks" {
+    const source = "<https://example.com> <mailto:user@example.com>";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var linked_segments: usize = 0;
+    for (spans) |span| {
+        if (span.style.link) linked_segments += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), linked_segments);
 }
 
 test "analyzeSource bounds malformed angle destination scans" {
