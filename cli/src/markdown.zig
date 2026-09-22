@@ -2,6 +2,7 @@ const std = @import("std");
 const backend = @import("vivi_backend");
 const highlight = backend.syntax;
 const vaxis = @import("vaxis");
+const md4c_unicode_punctuation = @import("md4c_unicode_punctuation.zig");
 const c = @cImport({
     @cInclude("md4c.h");
     @cInclude("entity.h");
@@ -362,66 +363,7 @@ fn isSpaceByte(byte: u8) bool {
 }
 
 fn isUnicodePunctuation(codepoint: u21) bool {
-    if (codepoint <= 0x7f) return std.ascii.isPunctuation(@intCast(codepoint));
-    return switch (codepoint) {
-        0x00a1...0x00a9,
-        0x00ab...0x00ac,
-        0x00ae...0x00b1,
-        0x00b4,
-        0x00b6...0x00b8,
-        0x00bb,
-        0x00bf,
-        0x00d7,
-        0x00f7,
-        0x037e,
-        0x0387,
-        0x055a...0x055f,
-        0x0589...0x058a,
-        0x05be,
-        0x05c0,
-        0x05c3,
-        0x05c6,
-        0x05f3...0x05f4,
-        0x0606...0x060f,
-        0x061b,
-        0x061d...0x061f,
-        0x066a...0x066d,
-        0x06d4,
-        0x0964...0x0965,
-        0x0e4f,
-        0x0e5a...0x0e5b,
-        0x0f01...0x0f17,
-        0x104a...0x104f,
-        0x1360...0x1368,
-        0x166d...0x166e,
-        0x169b...0x169c,
-        0x1800...0x180a,
-        0x2010...0x2027,
-        0x2030...0x205e,
-        0x207a...0x207e,
-        0x208a...0x208e,
-        0x20a0...0x20cf,
-        0x2100...0x214f,
-        0x2190...0x2429,
-        0x2440...0x244a,
-        0x249c...0x24e9,
-        0x2500...0x2775,
-        0x2794...0x2bff,
-        0x2e00...0x2e7f,
-        0x3001...0x303f,
-        0x309b...0x309c,
-        0x30a0,
-        0x30fb,
-        0xfe10...0xfe6b,
-        0xff01...0xff0f,
-        0xff1a...0xff20,
-        0xff3b...0xff40,
-        0xff5b...0xff65,
-        0xffe0...0xffee,
-        0x1f000...0x1faff,
-        => true,
-        else => false,
-    };
+    return md4c_unicode_punctuation.contains(codepoint);
 }
 
 fn codepointAt(text: []const u8, index: usize) ?u21 {
@@ -657,6 +599,25 @@ fn pairDelimiters(
             i = findCodeSpanEnd(text, i, hi) orelse i + countRun(text, i, hi, '`');
             continue;
         }
+        if (open == '(' and text[i] == '<' and depth > 0) {
+            var only_whitespace = true;
+            for (text[stack[depth - 1] + 1 .. i]) |byte| {
+                if (!isLinkWhitespace(byte)) {
+                    only_whitespace = false;
+                    break;
+                }
+            }
+            if (only_whitespace) {
+                var angle_end = i + 1;
+                while (angle_end < hi and text[angle_end] != '>') {
+                    angle_end += escapedByteCount(text, angle_end, hi);
+                }
+                if (angle_end < hi) {
+                    i = angle_end + 1;
+                    continue;
+                }
+            }
+        }
         if (text[i] == open) {
             stack[depth] = i;
             depth += 1;
@@ -706,8 +667,12 @@ fn linkAt(
         return null;
     }
     const dest_end = delimiter_pairs[label_close + 1];
-    if (dest_end == std.math.maxInt(usize) or
-        !validInlineLinkContents(text, label_close + 2, dest_end) or
+    const contents = if (dest_end != std.math.maxInt(usize))
+        parseInlineLinkContents(text, label_close + 2, dest_end)
+    else
+        null;
+    if (contents == null or
+        !safeSourceUri(contents.?.destination) or
         labelContainsNestedLink(delimiter_pairs, text, label_open + 1, label_close))
     {
         return null;
@@ -747,47 +712,143 @@ fn isLinkWhitespace(byte: u8) bool {
     return byte == ' ' or byte == '\t' or byte == '\r' or byte == '\n';
 }
 
+const UriSafetyScan = struct {
+    prefix: [8]u8 = @splat(0),
+    prefix_len: usize = 0,
+    total_len: usize = 0,
+    safe: bool = true,
+
+    fn feed(self: *UriSafetyScan, bytes: []const u8) void {
+        for (bytes) |byte| {
+            if (byte < 0x20 or byte == 0x7f) self.safe = false;
+            if (self.prefix_len < self.prefix.len) {
+                self.prefix[self.prefix_len] = byte;
+                self.prefix_len += 1;
+            }
+            self.total_len += 1;
+        }
+    }
+
+    fn feedCodepoint(self: *UriSafetyScan, codepoint: u32) void {
+        var buffer: [4]u8 = undefined;
+        const length = std.unicode.utf8Encode(
+            normalizedCodepoint(codepoint),
+            &buffer,
+        ) catch return;
+        self.feed(buffer[0..length]);
+    }
+};
+
+fn feedSourceEntity(scan: *UriSafetyScan, entity: []const u8) void {
+    if (entity.len > 3 and entity[0] == '&' and entity[1] == '#') {
+        const hexadecimal = entity[2] == 'x' or entity[2] == 'X';
+        const digits = entity[if (hexadecimal) 3 else 2 .. entity.len - 1];
+        const codepoint = std.fmt.parseInt(
+            u32,
+            digits,
+            if (hexadecimal) 16 else 10,
+        ) catch {
+            scan.feed(entity);
+            return;
+        };
+        scan.feedCodepoint(codepoint);
+        return;
+    }
+
+    const found = c.entity_lookup(entity.ptr, entity.len);
+    if (found) |entry| {
+        scan.feedCodepoint(entry[0].codepoints[0]);
+        if (entry[0].codepoints[1] != 0) {
+            scan.feedCodepoint(entry[0].codepoints[1]);
+        }
+    } else {
+        scan.feed(entity);
+    }
+}
+
+fn safeSourceUri(raw: []const u8) bool {
+    var scan: UriSafetyScan = .{};
+    var cursor: usize = 0;
+    while (cursor < raw.len) {
+        if (raw[cursor] == '\\' and escapedByteCount(raw, cursor, raw.len) == 2) {
+            scan.feed(raw[cursor + 1 .. cursor + 2]);
+            cursor += 2;
+            continue;
+        }
+        if (raw[cursor] == '&') {
+            if (std.mem.indexOfScalarPos(u8, raw, cursor + 1, ';')) |semicolon| {
+                feedSourceEntity(&scan, raw[cursor .. semicolon + 1]);
+                cursor = semicolon + 1;
+                continue;
+            }
+        }
+        scan.feed(raw[cursor .. cursor + 1]);
+        cursor += 1;
+    }
+    if (!scan.safe) return false;
+
+    const schemes = [_][]const u8{ "https://", "http://", "mailto:" };
+    for (schemes) |scheme| {
+        if (scan.total_len >= scheme.len and scan.prefix_len >= scheme.len and
+            std.ascii.eqlIgnoreCase(scan.prefix[0..scheme.len], scheme))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 fn skipLinkWhitespace(text: []const u8, cursor: *usize, end: usize) void {
     while (cursor.* < end and isLinkWhitespace(text[cursor.*])) cursor.* += 1;
 }
 
-fn validInlineLinkContents(text: []const u8, start: usize, end: usize) bool {
+const InlineLinkContents = struct {
+    destination: []const u8,
+};
+
+fn parseInlineLinkContents(text: []const u8, start: usize, end: usize) ?InlineLinkContents {
     var cursor = start;
     skipLinkWhitespace(text, &cursor, end);
+    var destination: []const u8 = undefined;
 
     if (cursor < end and text[cursor] == '<') {
         cursor += 1;
+        const destination_start = cursor;
         while (cursor < end and text[cursor] != '>') {
-            if (text[cursor] == '\n' or text[cursor] == '\r' or text[cursor] == '<') return false;
+            if (text[cursor] == '\n' or text[cursor] == '\r' or text[cursor] == '<') return null;
             cursor += escapedByteCount(text, cursor, end);
         }
-        if (cursor >= end) return false;
+        if (cursor >= end) return null;
+        destination = text[destination_start..cursor];
         cursor += 1;
     } else {
+        const destination_start = cursor;
         while (cursor < end and !isLinkWhitespace(text[cursor])) {
-            if (text[cursor] < 0x20) return false;
+            if (text[cursor] < 0x20) return null;
             cursor += escapedByteCount(text, cursor, end);
         }
+        destination = text[destination_start..cursor];
     }
 
-    if (cursor == end) return true;
+    if (cursor == end) return .{ .destination = destination };
     skipLinkWhitespace(text, &cursor, end);
-    if (cursor == end) return true;
+    if (cursor == end) return .{ .destination = destination };
 
     const title_close: u8 = switch (text[cursor]) {
         '"' => '"',
         '\'' => '\'',
         '(' => ')',
-        else => return false,
+        else => return null,
     };
     cursor += 1;
     while (cursor < end and text[cursor] != title_close) {
         cursor += escapedByteCount(text, cursor, end);
     }
-    if (cursor >= end) return false;
+    if (cursor >= end) return null;
     cursor += 1;
     skipLinkWhitespace(text, &cursor, end);
-    return cursor == end;
+    if (cursor != end) return null;
+    return .{ .destination = destination };
 }
 
 fn lineSpan(text: []const u8, from: usize) struct { end: usize, next: usize } {
@@ -3049,13 +3110,19 @@ test "analyzeSource applies the underscore flanking rule like md4c" {
 }
 
 test "analyzeSource applies Unicode punctuation flanking" {
-    const source = "_foo_—bar";
+    const source = "_foo_—bar and _baz_˂qux";
     const spans = try analyzeSource(std.testing.allocator, source);
     defer std.testing.allocator.free(spans);
 
-    try std.testing.expectEqual(@as(usize, 1), spans.len);
-    try std.testing.expect(spans[0].style.italic);
-    try std.testing.expectEqualStrings("_foo_", source[spans[0].start..spans[0].end]);
+    var saw_em_dash = false;
+    var saw_modifier = false;
+    for (spans) |span| {
+        const text = source[span.start..span.end];
+        if (span.style.italic and std.mem.eql(u8, text, "_foo_")) saw_em_dash = true;
+        if (span.style.italic and std.mem.eql(u8, text, "_baz_")) saw_modifier = true;
+    }
+    try std.testing.expect(saw_em_dash);
+    try std.testing.expect(saw_modifier);
 }
 
 test "analyzeSource applies Unicode whitespace flanking" {
@@ -3108,7 +3175,7 @@ test "analyzeSource finds the latest eligible opener with the same marker" {
 }
 
 test "analyzeSource validates inline link destination and title grammar" {
-    const source = "[bad](a b) [good](a \"title\")";
+    const source = "[bad](a b) [good](https://e.test/a \"title\")";
     const spans = try analyzeSource(std.testing.allocator, source);
     defer std.testing.allocator.free(spans);
 
@@ -3161,7 +3228,7 @@ test "analyzeSource ignores brackets inside code span link labels" {
 }
 
 test "analyzeSource backslashes escape only ASCII punctuation" {
-    const source = "[invalid](foo\\ bar) [valid](foo\\(bar\\))";
+    const source = "[invalid](foo\\ bar) [valid](https://e.test/foo\\(bar\\))";
     const spans = try analyzeSource(std.testing.allocator, source);
     defer std.testing.allocator.free(spans);
 
@@ -3174,6 +3241,35 @@ test "analyzeSource backslashes escape only ASCII punctuation" {
     }
     try std.testing.expect(!saw_invalid);
     try std.testing.expect(saw_valid);
+}
+
+test "analyzeSource applies safe URI policy to links" {
+    const source = "[unsafe](javascript:alert(1)) [encoded](jav&#x61;script:alert(1)) [safe](https://e.test)";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var saw_unsafe = false;
+    var saw_encoded = false;
+    var saw_safe = false;
+    for (spans) |span| {
+        const text = source[span.start..span.end];
+        if (span.style.link and std.mem.indexOf(u8, text, "unsafe") != null) saw_unsafe = true;
+        if (span.style.link and std.mem.indexOf(u8, text, "encoded") != null) saw_encoded = true;
+        if (span.style.link and std.mem.indexOf(u8, text, "safe") != null) saw_safe = true;
+    }
+    try std.testing.expect(!saw_unsafe);
+    try std.testing.expect(!saw_encoded);
+    try std.testing.expect(saw_safe);
+}
+
+test "analyzeSource permits parentheses inside angle link destinations" {
+    const source = "[x](<https://e.test/a(b>)";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    try std.testing.expectEqual(@as(usize, 1), spans.len);
+    try std.testing.expect(spans[0].style.link);
+    try std.testing.expectEqualStrings(source, source[spans[0].start..spans[0].end]);
 }
 
 test "analyzeSource preserves partially consumed delimiter runs" {
