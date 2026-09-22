@@ -905,10 +905,24 @@ fn parseInlineLinkContents(text: []const u8, start: usize, end: usize) ?InlineLi
         cursor += 1;
     } else {
         const destination_start = cursor;
+        var nesting_depth: usize = 0;
         while (cursor < end and !isLinkWhitespace(text[cursor])) {
             if (text[cursor] < 0x20) return null;
-            cursor += escapedByteCount(text, cursor, end);
+            const escaped_count = escapedByteCount(text, cursor, end);
+            if (escaped_count == 2) {
+                cursor += escaped_count;
+                continue;
+            }
+            if (text[cursor] == '(') {
+                nesting_depth += 1;
+                if (nesting_depth > 32) return null;
+            } else if (text[cursor] == ')') {
+                if (nesting_depth == 0) return null;
+                nesting_depth -= 1;
+            }
+            cursor += 1;
         }
+        if (nesting_depth != 0) return null;
         destination = text[destination_start..cursor];
     }
 
@@ -947,10 +961,32 @@ fn validFenceOpener(source: []const u8, body: usize, line_end: usize, marker: u8
         std.mem.indexOfScalar(u8, source[body + run .. line_end], '`') == null;
 }
 
-fn isThematicOrSetextLine(source: []const u8, body: usize, line_end: usize) bool {
+fn leadingSpaceCount(source: []const u8, pos: usize, line_end: usize) usize {
+    var body = pos;
+    while (body < line_end and source[body] == ' ') body += 1;
+    return body - pos;
+}
+
+fn isSetextUnderline(source: []const u8, pos: usize, line_end: usize) bool {
+    const indent = leadingSpaceCount(source, pos, line_end);
+    if (indent > 3 or pos + indent >= line_end) return false;
+    const marker = source[pos + indent];
+    if (marker != '=' and marker != '-') return false;
+    var count: usize = 0;
+    for (source[pos + indent .. line_end]) |byte| {
+        if (byte == marker) {
+            count += 1;
+        } else if (byte != ' ' and byte != '\t') {
+            return false;
+        }
+    }
+    return count > 0;
+}
+
+fn isThematicLine(source: []const u8, body: usize, line_end: usize) bool {
     if (body >= line_end) return false;
     const marker = source[body];
-    if (marker != '*' and marker != '-' and marker != '_' and marker != '=') return false;
+    if (marker != '*' and marker != '-' and marker != '_') return false;
     var count: usize = 0;
     var cursor = body;
     while (cursor < line_end) : (cursor += 1) {
@@ -960,15 +996,13 @@ fn isThematicOrSetextLine(source: []const u8, body: usize, line_end: usize) bool
             return false;
         }
     }
-    const minimum: usize = if (marker == '=') 1 else 3;
-    return count >= minimum;
+    return count >= 3;
 }
 
 fn startsParagraphInterrupt(source: []const u8, pos: usize, line_end: usize) bool {
     var body = pos;
     while (body < line_end and source[body] == ' ') body += 1;
-    const indent = body - pos;
-    if (indent >= 4 or body >= line_end) return indent >= 4;
+    if (body >= line_end or body - pos >= 4) return false;
 
     if (source[body] == '>') return body + 1 == line_end or
         source[body + 1] == ' ' or source[body + 1] == '\t';
@@ -995,7 +1029,7 @@ fn startsParagraphInterrupt(source: []const u8, pos: usize, line_end: usize) boo
         return true;
     }
 
-    return isThematicOrSetextLine(source, body, line_end);
+    return isThematicLine(source, body, line_end);
 }
 
 /// Analyzes Markdown source without rewriting any bytes: returned spans
@@ -1067,6 +1101,24 @@ pub fn analyzeSource(
             }
             fence = source[body];
             fence_len = countRun(source, body, line.end, source[body]);
+            markRange(flags, pos, line.end, flag_code);
+        } else if (inline_start != null and isSetextUnderline(source, pos, line.end)) {
+            const start = inline_start.?;
+            analyzeInlineRange(
+                flags,
+                delimiter_pairs,
+                delimiter_stack,
+                link_states,
+                link_dest_ends,
+                source,
+                start,
+                pos,
+            );
+            markRange(flags, start, line.end, flag_heading);
+            inline_start = null;
+        } else if (inline_start == null and
+            leadingSpaceCount(source, pos, line.end) >= 4)
+        {
             markRange(flags, pos, line.end, flag_code);
         } else if (startsParagraphInterrupt(source, pos, line.end)) {
             if (inline_start) |start| {
@@ -3599,6 +3651,70 @@ test "analyzeSource stops inline spans at paragraph-interrupting blocks" {
     defer std.testing.allocator.free(spans);
 
     for (spans) |span| try std.testing.expect(!span.style.italic);
+}
+
+test "analyzeSource distinguishes indented code from paragraph continuation" {
+    const code_source = "    *code*";
+    const code_spans = try analyzeSource(std.testing.allocator, code_source);
+    defer std.testing.allocator.free(code_spans);
+    try std.testing.expectEqual(@as(usize, 1), code_spans.len);
+    try std.testing.expect(code_spans[0].style.code);
+    try std.testing.expect(!code_spans[0].style.italic);
+
+    const paragraph_source = "*foo\n    bar*";
+    const paragraph_spans = try analyzeSource(std.testing.allocator, paragraph_source);
+    defer std.testing.allocator.free(paragraph_spans);
+    var saw_continuation = false;
+    for (paragraph_spans) |span| {
+        if (span.style.italic and
+            std.mem.indexOf(u8, paragraph_source[span.start..span.end], "bar") != null)
+        {
+            saw_continuation = true;
+        }
+    }
+    try std.testing.expect(saw_continuation);
+}
+
+test "analyzeSource marks setext heading contents" {
+    const source = "*Title*\n===";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var saw_heading_emphasis = false;
+    for (spans) |span| {
+        const text = source[span.start..span.end];
+        if (span.style.heading and span.style.italic and
+            std.mem.indexOf(u8, text, "Title") != null)
+        {
+            saw_heading_emphasis = true;
+        }
+    }
+    try std.testing.expect(saw_heading_emphasis);
+}
+
+test "analyzeSource enforces link destination nesting limit" {
+    var valid: std.ArrayList(u8) = .empty;
+    defer valid.deinit(std.testing.allocator);
+    try valid.appendSlice(std.testing.allocator, "[ok](https://e.test/");
+    try valid.appendNTimes(std.testing.allocator, '(', 32);
+    try valid.append(std.testing.allocator, 'x');
+    try valid.appendNTimes(std.testing.allocator, ')', 32);
+    try valid.append(std.testing.allocator, ')');
+    const valid_spans = try analyzeSource(std.testing.allocator, valid.items);
+    defer std.testing.allocator.free(valid_spans);
+    try std.testing.expectEqual(@as(usize, 1), valid_spans.len);
+    try std.testing.expect(valid_spans[0].style.link);
+
+    var invalid: std.ArrayList(u8) = .empty;
+    defer invalid.deinit(std.testing.allocator);
+    try invalid.appendSlice(std.testing.allocator, "[bad](https://e.test/");
+    try invalid.appendNTimes(std.testing.allocator, '(', 33);
+    try invalid.append(std.testing.allocator, 'x');
+    try invalid.appendNTimes(std.testing.allocator, ')', 33);
+    try invalid.append(std.testing.allocator, ')');
+    const invalid_spans = try analyzeSource(std.testing.allocator, invalid.items);
+    defer std.testing.allocator.free(invalid_spans);
+    for (invalid_spans) |span| try std.testing.expect(!span.style.link);
 }
 
 test "analyzeSource rejects backtick fences with backticks in the info string" {
