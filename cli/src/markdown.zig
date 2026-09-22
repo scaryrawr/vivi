@@ -337,6 +337,15 @@ const EmphasisOpener = struct {
     can_close: bool = false,
 };
 
+const PendingDelimiter = struct {
+    start: usize,
+    marker: u8,
+    run: usize,
+    original_mod3: u2,
+    can_open: bool,
+    can_close: bool,
+};
+
 fn markRange(flags: []u8, start: usize, end: usize, bits: u8) void {
     if (start >= end or start >= flags.len) return;
     const stop = @min(end, flags.len);
@@ -450,6 +459,7 @@ fn scanInline(
             .can_close = false,
         });
     var emphasis_depth: usize = 0;
+    var pending_delimiter: ?PendingDelimiter = null;
 
     while (i < hi) {
         switch (text[i]) {
@@ -494,7 +504,12 @@ fn scanInline(
             },
             '*', '_', '~' => {
                 const marker = text[i];
-                const run = countRun(text, i, hi, marker);
+                const pending = if (pending_delimiter) |value|
+                    if (value.start == i and value.marker == marker) value else null
+                else
+                    null;
+                pending_delimiter = null;
+                const run = if (pending) |value| value.run else countRun(text, i, hi, marker);
                 if (marker == '~' and run > 2) {
                     i += run;
                     continue;
@@ -502,16 +517,24 @@ fn scanInline(
                 const before = characterClass(if (i > lo) codepointBefore(text, i) else null);
                 const after = characterClass(if (i + run < hi) codepointAt(text, i + run) else null);
                 const flanking = delimiterFlanking(before, after);
-                const can_open = if (marker == '~')
+                const can_open = if (pending) |value|
+                    value.can_open
+                else if (marker == '~')
                     before != .other
                 else
                     flanking.left and
                         (marker == '*' or !flanking.right or before == .punctuation);
-                const delimiter_can_close = if (marker == '~')
+                const delimiter_can_close = if (pending) |value|
+                    value.can_close
+                else if (marker == '~')
                     after != .other
                 else
                     flanking.right and
                         (marker == '*' or !flanking.left or after == .punctuation);
+                const original_mod3: u2 = if (pending) |value|
+                    value.original_mod3
+                else
+                    @intCast(run % 3);
 
                 var opener_index: ?usize = null;
                 if (delimiter_can_close) {
@@ -526,8 +549,8 @@ fn scanInline(
                         }
                         const rule_of_three_allows_close = marker == '~' or
                             !((candidate.can_close or can_open) and
-                                (candidate.original_mod3 + run % 3) % 3 == 0 and
-                                (candidate.original_mod3 != 0 or run % 3 != 0));
+                                (candidate.original_mod3 + original_mod3) % 3 == 0 and
+                                (candidate.original_mod3 != 0 or original_mod3 != 0));
                         if (rule_of_three_allows_close) {
                             opener_index = candidate_index;
                             break;
@@ -562,6 +585,16 @@ fn scanInline(
                     if (consumed % 2 == 1) markRange(flags, opener_start, i + consumed, flag_italic);
                     opener.run -= consumed;
                     if (opener.run == 0) emphasis_depth = candidate_index;
+                    if (consumed < run) {
+                        pending_delimiter = .{
+                            .start = i + consumed,
+                            .marker = marker,
+                            .run = run - consumed,
+                            .original_mod3 = original_mod3,
+                            .can_open = can_open,
+                            .can_close = delimiter_can_close,
+                        };
+                    }
                     i += consumed;
                 } else if (can_open) {
                     if (emphasis_depth >= emphasis_stack_limit) return;
@@ -569,7 +602,7 @@ fn scanInline(
                         .marker = marker,
                         .start = i,
                         .run = run,
-                        .original_mod3 = @intCast(run % 3),
+                        .original_mod3 = original_mod3,
                         .can_close = delimiter_can_close,
                     };
                     emphasis_depth += 1;
@@ -610,6 +643,8 @@ fn pairDelimiters(
     open: u8,
     close: u8,
 ) void {
+    const dirty_bit: usize = @as(usize, 1) << (@bitSizeOf(usize) - 1);
+    const index_mask: usize = ~dirty_bit;
     var depth: usize = 0;
     var i = lo;
     while (i < hi) {
@@ -622,19 +657,13 @@ fn pairDelimiters(
             continue;
         }
         if (open == '(' and text[i] == '<' and depth > 0) {
-            var only_whitespace = true;
-            for (text[stack[depth - 1] + 1 .. i]) |byte| {
-                if (!isLinkWhitespace(byte)) {
-                    only_whitespace = false;
-                    break;
-                }
-            }
-            if (only_whitespace) {
+            if (stack[depth - 1] & dirty_bit == 0) {
                 var angle_end = i + 1;
                 while (angle_end < hi and text[angle_end] != '>') {
                     angle_end += escapedByteCount(text, angle_end, hi);
                 }
                 if (angle_end < hi) {
+                    stack[depth - 1] |= dirty_bit;
                     i = angle_end + 1;
                     continue;
                 }
@@ -642,7 +671,7 @@ fn pairDelimiters(
         }
         if (open == '(' and depth > 0 and
             (text[i] == '"' or text[i] == '\'') and
-            i > stack[depth - 1] + 1 and isLinkWhitespace(text[i - 1]))
+            i > (stack[depth - 1] & index_mask) + 1 and isLinkWhitespace(text[i - 1]))
         {
             const quote = text[i];
             var quote_end = i + 1;
@@ -654,12 +683,15 @@ fn pairDelimiters(
                 continue;
             }
         }
+        if (open == '(' and depth > 0 and !isLinkWhitespace(text[i])) {
+            stack[depth - 1] |= dirty_bit;
+        }
         if (text[i] == open) {
             stack[depth] = i;
             depth += 1;
         } else if (text[i] == close and depth > 0) {
             depth -= 1;
-            pairs[stack[depth]] = i;
+            pairs[stack[depth] & index_mask] = i;
         }
         i += 1;
     }
@@ -676,6 +708,113 @@ fn prepareInlinePairs(
     pairDelimiters(pairs, stack, text, lo, hi, '(', ')');
 }
 
+fn startsWithIgnoreCase(text: []const u8, index: usize, prefix: []const u8) bool {
+    return index + prefix.len <= text.len and
+        std.ascii.eqlIgnoreCase(text[index .. index + prefix.len], prefix);
+}
+
+fn autolinkBoundaryBefore(text: []const u8, index: usize, lo: usize) bool {
+    if (index == lo) return true;
+    return characterClass(codepointBefore(text, index)) != .other;
+}
+
+fn trimAutolinkEnd(text: []const u8, start: usize, raw_end: usize) usize {
+    var end = raw_end;
+    while (end > start) {
+        switch (text[end - 1]) {
+            '.', ',', ':', ';', '!', '?' => end -= 1,
+            else => break,
+        }
+    }
+    return end;
+}
+
+fn markUrlAutolink(flags: []u8, text: []const u8, start: usize, hi: usize) usize {
+    var end = start;
+    while (end < hi and !isUnicodeWhitespace(codepointAt(text, end) orelse ' ') and
+        text[end] != '<' and text[end] != '>')
+    {
+        const length = std.unicode.utf8ByteSequenceLength(text[end]) catch 1;
+        end += @min(length, hi - end);
+    }
+    end = trimAutolinkEnd(text, start, end);
+    if (end > start) markRange(flags, start, end, flag_link);
+    return @max(end, start + 1);
+}
+
+fn isEmailLocalByte(byte: u8) bool {
+    return std.ascii.isAlphanumeric(byte) or
+        std.mem.indexOfScalar(u8, ".!#$%&'*+/=?^_`{|}~-", byte) != null;
+}
+
+fn markEmailAutolink(flags: []u8, text: []const u8, start: usize, hi: usize) ?usize {
+    var cursor = start;
+    while (cursor < hi and isEmailLocalByte(text[cursor])) cursor += 1;
+    if (cursor == start or cursor >= hi or text[cursor] != '@') return null;
+    cursor += 1;
+    const domain_start = cursor;
+    var saw_dot = false;
+    while (cursor < hi) {
+        const byte = text[cursor];
+        if (std.ascii.isAlphanumeric(byte) or byte == '-') {
+            cursor += 1;
+        } else if (byte == '.' and cursor > domain_start and cursor + 1 < hi and
+            std.ascii.isAlphanumeric(text[cursor + 1]))
+        {
+            saw_dot = true;
+            cursor += 1;
+        } else {
+            break;
+        }
+    }
+    if (!saw_dot or cursor == domain_start or text[cursor - 1] == '-') return null;
+    markRange(flags, start, cursor, flag_link);
+    return cursor;
+}
+
+fn markPermissiveAutolinks(
+    flags: []u8,
+    delimiter_pairs: []const usize,
+    text: []const u8,
+    lo: usize,
+    hi: usize,
+) void {
+    var cursor = lo;
+    while (cursor < hi) {
+        if (text[cursor] == '(' and cursor > lo and text[cursor - 1] == ']' and
+            delimiter_pairs[cursor] != std.math.maxInt(usize))
+        {
+            cursor = delimiter_pairs[cursor] + 1;
+            continue;
+        }
+        if (text[cursor] == '\\') {
+            cursor += escapedByteCount(text, cursor, hi);
+            continue;
+        }
+        if (text[cursor] == '`') {
+            cursor = findCodeSpanEnd(text, cursor, hi) orelse
+                cursor + countRun(text, cursor, hi, '`');
+            continue;
+        }
+        if (autolinkBoundaryBefore(text, cursor, lo)) {
+            if (startsWithIgnoreCase(text, cursor, "https://") or
+                startsWithIgnoreCase(text, cursor, "http://") or
+                startsWithIgnoreCase(text, cursor, "www."))
+            {
+                cursor = markUrlAutolink(flags, text, cursor, hi);
+                continue;
+            }
+            if (std.ascii.isAlphanumeric(text[cursor])) {
+                if (markEmailAutolink(flags, text, cursor, hi)) |end| {
+                    cursor = end;
+                    continue;
+                }
+            }
+        }
+        cursor += 1;
+    }
+}
+
 fn analyzeInlineRange(
     flags: []u8,
     delimiter_pairs: []usize,
@@ -688,6 +827,7 @@ fn analyzeInlineRange(
 ) void {
     if (start >= end) return;
     prepareInlinePairs(delimiter_pairs, delimiter_stack, source, start, end);
+    markPermissiveAutolinks(flags, delimiter_pairs, source, start, end);
     prepareInlineLinks(
         link_states,
         link_dest_ends,
@@ -3579,6 +3719,30 @@ test "analyzeSource bounds URI entity scans" {
     try std.testing.expect(spans[0].style.link);
 }
 
+test "analyzeSource styles GFM permissive autolinks" {
+    const source = "https://example.com www.example.com user@example.com";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var linked_segments: usize = 0;
+    for (spans) |span| {
+        if (span.style.link) linked_segments += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), linked_segments);
+}
+
+test "analyzeSource bounds malformed angle destination scans" {
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(std.testing.allocator);
+    try source.append(std.testing.allocator, '(');
+    try source.appendNTimes(std.testing.allocator, ' ', 8_000);
+    try source.appendNTimes(std.testing.allocator, '<', 8_000);
+
+    const spans = try analyzeSource(std.testing.allocator, source.items);
+    defer std.testing.allocator.free(spans);
+    try std.testing.expectEqual(@as(usize, 0), spans.len);
+}
+
 test "analyzeSource permits parentheses inside angle link destinations" {
     const source = "[x](<https://e.test/a(b>)";
     const spans = try analyzeSource(std.testing.allocator, source);
@@ -3623,6 +3787,26 @@ test "analyzeSource preserves the original delimiter modulo after splitting" {
     }
     try std.testing.expect(saw_bold_b);
     try std.testing.expect(saw_italic_c);
+}
+
+test "analyzeSource preserves residual closer delimiter metadata" {
+    const source = "**foo***bar**baz*";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var saw_bar_italic = false;
+    var saw_baz_italic = false;
+    for (spans) |span| {
+        const text = source[span.start..span.end];
+        if (span.style.italic and std.mem.indexOf(u8, text, "bar") != null) {
+            saw_bar_italic = true;
+        }
+        if (span.style.italic and std.mem.indexOf(u8, text, "baz") != null) {
+            saw_baz_italic = true;
+        }
+    }
+    try std.testing.expect(saw_bar_italic);
+    try std.testing.expect(!saw_baz_italic);
 }
 
 test "analyzeSource styles inline spans across soft line breaks" {
