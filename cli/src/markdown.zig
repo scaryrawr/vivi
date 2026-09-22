@@ -1823,7 +1823,11 @@ pub fn analyzeSource(
             fence_len = countRun(source, fence_line.body, line.end, source[fence_line.body]);
             fence_context = fence_line.context;
             markRange(flags, pos, line.end, flag_code);
-        } else if (isTableDelimiterRow(source, pos, line.end)) {
+        } else if (inline_start != null and
+            inline_container == .plain and
+            inline_start.? == previous_line_start and
+            isTableDelimiterRow(source, pos, line.end))
+        {
             if (inline_start) |start| {
                 var header_end = pos;
                 while (header_end > previous_line_start and
@@ -4837,6 +4841,22 @@ test "analyzeSource ends table mode at blank lines" {
     for (spans) |span| {
         if (span.style.italic and
             std.mem.eql(u8, source[span.start..span.end], "*foo | bar*"))
+        {
+            saw_emphasis = true;
+        }
+    }
+    try std.testing.expect(saw_emphasis);
+}
+
+test "analyzeSource requires a one-line header before table delimiters" {
+    const source = "| --- |\n*foo|bar*";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var saw_emphasis = false;
+    for (spans) |span| {
+        if (span.style.italic and
+            std.mem.eql(u8, source[span.start..span.end], "*foo|bar*"))
         {
             saw_emphasis = true;
         }
