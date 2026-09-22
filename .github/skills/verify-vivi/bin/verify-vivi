@@ -349,7 +349,7 @@ script_launch_command() {
 
 script_pty() {
     script_launch_command "$1" "$2" || return 1
-    eval "$launch_command"
+    eval "exec $launch_command"
 }
 
 recorded_pty_command() {
@@ -365,6 +365,18 @@ prepare_pty_command() {
     cast=$1
     title=$2
     inner=$3
+    run_dir=${cast%/*}
+    rm -f \
+        "$run_dir/$title.cast" \
+        "$run_dir/$title.gif" \
+        "$run_dir/$title.contact-sheet.png" \
+        "$run_dir/$title.frames.txt" \
+        "$run_dir/$title.visual-review.md" \
+        "$run_dir/$title.visual-blocker.txt" \
+        "$run_dir/$title.terminal.log" \
+        "$run_dir/$title.normalized.txt" \
+        "$run_dir/$title.assertions.txt"
+    rm -rf "$run_dir/$title.frames"
     if test "${VIVI_SKIP_RECORDING:-0}" = 1; then
         run_command=$inner
     else
@@ -1370,7 +1382,19 @@ cleanup() {
         rm -f "$run_dir/pty.pid"
     fi
     find "$run_dir" -name '*.input' -delete 2>/dev/null || true
-    find "$run_dir" -name '*.pty.log' -type f -size 0 -delete
+    find "$run_dir" -type f -size 0 \
+        \( \
+        -name '*.terminal.log' -o \
+        -name '*.normalized.txt' -o \
+        -name '*.assertions.txt' -o \
+        -name '*.cast' -o \
+        -name '*.gif' -o \
+        -name '*.frames.txt' -o \
+        -name '*.contact-sheet.png' -o \
+        -name 'frame-*.png' -o \
+        -name '*.visual-review.md' -o \
+        -name '*.visual-blocker.txt' \
+        \) -delete
 }
 
 chat_async_bash() {
