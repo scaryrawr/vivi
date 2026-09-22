@@ -332,6 +332,7 @@ const EmphasisOpener = struct {
     marker: u8 = 0,
     start: usize = 0,
     run: usize = 0,
+    original_mod3: u2 = 0,
     can_close: bool = false,
 };
 
@@ -431,6 +432,8 @@ fn delimiterFlanking(before: CharacterClass, after: CharacterClass) DelimiterFla
 fn scanInline(
     flags: []u8,
     delimiter_pairs: []const usize,
+    link_states: []const u8,
+    link_dest_ends: []const usize,
     text: []const u8,
     lo: usize,
     hi: usize,
@@ -438,7 +441,13 @@ fn scanInline(
 ) void {
     var i = lo;
     var emphasis_openers: [emphasis_stack_limit]EmphasisOpener =
-        @splat(.{ .marker = 0, .start = 0, .run = 0, .can_close = false });
+        @splat(.{
+            .marker = 0,
+            .start = 0,
+            .run = 0,
+            .original_mod3 = 0,
+            .can_close = false,
+        });
     var emphasis_depth: usize = 0;
 
     while (i < hi) {
@@ -458,12 +467,19 @@ fn scanInline(
                     continue;
                 }
                 const label_open = if (image) i + 1 else i;
-                if (linkAt(delimiter_pairs, text, hi, label_open)) |link| {
+                if (linkAt(
+                    delimiter_pairs,
+                    link_states,
+                    link_dest_ends,
+                    label_open,
+                )) |link| {
                     markRange(flags, i, link.dest_end + 1, flag_link);
                     if (depth < 4) {
                         scanInline(
                             flags,
                             delimiter_pairs,
+                            link_states,
+                            link_dest_ends,
                             text,
                             label_open + 1,
                             link.label_close,
@@ -509,8 +525,8 @@ fn scanInline(
                         }
                         const rule_of_three_allows_close = marker == '~' or
                             !((candidate.can_close or can_open) and
-                                (candidate.run + run) % 3 == 0 and
-                                (candidate.run % 3 != 0 or run % 3 != 0));
+                                (candidate.original_mod3 + run % 3) % 3 == 0 and
+                                (candidate.original_mod3 != 0 or run % 3 != 0));
                         if (rule_of_three_allows_close) {
                             opener_index = candidate_index;
                             break;
@@ -527,6 +543,8 @@ fn scanInline(
                             scanInline(
                                 flags,
                                 delimiter_pairs,
+                                link_states,
+                                link_dest_ends,
                                 text,
                                 opener.start + run,
                                 i,
@@ -549,6 +567,7 @@ fn scanInline(
                         .marker = marker,
                         .start = i,
                         .run = run,
+                        .original_mod3 = @intCast(run % 3),
                         .can_close = delimiter_can_close,
                     };
                     emphasis_depth += 1;
@@ -644,16 +663,36 @@ fn analyzeInlineRange(
     flags: []u8,
     delimiter_pairs: []usize,
     delimiter_stack: []usize,
+    link_states: []u8,
+    link_dest_ends: []usize,
     source: []const u8,
     start: usize,
     end: usize,
 ) void {
     if (start >= end) return;
     prepareInlinePairs(delimiter_pairs, delimiter_stack, source, start, end);
-    scanInline(flags, delimiter_pairs, source, start, end, 0);
+    prepareInlineLinks(
+        link_states,
+        link_dest_ends,
+        delimiter_pairs,
+        delimiter_stack,
+        source,
+        start,
+        end,
+    );
+    scanInline(
+        flags,
+        delimiter_pairs,
+        link_states,
+        link_dest_ends,
+        source,
+        start,
+        end,
+        0,
+    );
 }
 
-fn linkAt(
+fn linkCandidateAt(
     delimiter_pairs: []const usize,
     text: []const u8,
     hi: usize,
@@ -672,40 +711,65 @@ fn linkAt(
     else
         null;
     if (contents == null or
-        !safeSourceUri(contents.?.destination) or
-        labelContainsNestedLink(delimiter_pairs, text, label_open + 1, label_close))
+        !safeSourceUri(contents.?.destination))
     {
         return null;
     }
     return .{ .label_close = label_close, .dest_end = dest_end };
 }
 
-fn labelContainsNestedLink(
+fn prepareInlineLinks(
+    link_states: []u8,
+    link_dest_ends: []usize,
     delimiter_pairs: []const usize,
+    next_valid_anchor: []usize,
     text: []const u8,
-    start: usize,
-    end: usize,
-) bool {
-    var cursor = start;
-    while (cursor < end) {
-        if (text[cursor] == '\\') {
-            cursor += escapedByteCount(text, cursor, end);
-            continue;
-        }
-        if (text[cursor] == '`') {
-            cursor = findCodeSpanEnd(text, cursor, end) orelse
-                cursor + countRun(text, cursor, end, '`');
-            continue;
-        }
-        if (text[cursor] == '[' and
-            (cursor == start or text[cursor - 1] != '!') and
-            linkAt(delimiter_pairs, text, end, cursor) != null)
-        {
-            return true;
-        }
-        cursor += 1;
+    lo: usize,
+    hi: usize,
+) void {
+    const none: usize = std.math.maxInt(usize);
+    var nearest_anchor: usize = none;
+    var cursor = hi;
+    while (cursor > lo) {
+        cursor -= 1;
+        next_valid_anchor[cursor] = nearest_anchor;
+        if (text[cursor] != '[') continue;
+        const candidate = linkCandidateAt(delimiter_pairs, text, hi, cursor) orelse continue;
+        const image = isImageLabelOpen(text, cursor, lo);
+        if (!image and nearest_anchor < candidate.label_close) continue;
+        link_states[cursor] = 1;
+        link_dest_ends[cursor] = candidate.dest_end;
+        if (!image) nearest_anchor = cursor;
     }
-    return false;
+}
+
+fn linkAt(
+    delimiter_pairs: []const usize,
+    link_states: []const u8,
+    link_dest_ends: []const usize,
+    label_open: usize,
+) ?LinkMatch {
+    if (link_states[label_open] == 0) return null;
+    return .{
+        .label_close = delimiter_pairs[label_open],
+        .dest_end = link_dest_ends[label_open],
+    };
+}
+
+fn isEscapedAt(text: []const u8, index: usize, lo: usize) bool {
+    if (index == lo) return false;
+    var backslashes: usize = 0;
+    var cursor = index;
+    while (cursor > lo and text[cursor - 1] == '\\') {
+        backslashes += 1;
+        cursor -= 1;
+    }
+    return backslashes % 2 == 1;
+}
+
+fn isImageLabelOpen(text: []const u8, index: usize, lo: usize) bool {
+    return index > lo and text[index - 1] == '!' and
+        !isEscapedAt(text, index - 1, lo);
 }
 
 fn isLinkWhitespace(byte: u8) bool {
@@ -881,6 +945,12 @@ pub fn analyzeSource(
     @memset(delimiter_pairs, std.math.maxInt(usize));
     const delimiter_stack = try allocator.alloc(usize, source.len);
     defer allocator.free(delimiter_stack);
+    const link_states = try allocator.alloc(u8, source.len);
+    defer allocator.free(link_states);
+    @memset(link_states, 0);
+    const link_dest_ends = try allocator.alloc(usize, source.len);
+    defer allocator.free(link_dest_ends);
+    @memset(link_dest_ends, std.math.maxInt(usize));
 
     var fence: u8 = 0;
     var fence_len: usize = 0;
@@ -918,6 +988,8 @@ pub fn analyzeSource(
                     flags,
                     delimiter_pairs,
                     delimiter_stack,
+                    link_states,
+                    link_dest_ends,
                     source,
                     start,
                     pos,
@@ -937,6 +1009,8 @@ pub fn analyzeSource(
                         flags,
                         delimiter_pairs,
                         delimiter_stack,
+                        link_states,
+                        link_dest_ends,
                         source,
                         start,
                         pos,
@@ -953,6 +1027,8 @@ pub fn analyzeSource(
                     flags,
                     delimiter_pairs,
                     delimiter_stack,
+                    link_states,
+                    link_dest_ends,
                     source,
                     start,
                     pos,
@@ -969,6 +1045,8 @@ pub fn analyzeSource(
             flags,
             delimiter_pairs,
             delimiter_stack,
+            link_states,
+            link_dest_ends,
             source,
             start,
             source.len,
@@ -3211,6 +3289,30 @@ test "analyzeSource rejects outer links overlapping nested links" {
     try std.testing.expectEqual(image_source.len, image_spans[image_spans.len - 1].end);
 }
 
+test "analyzeSource resolves deeply nested link candidates once" {
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(std.testing.allocator);
+    try source.appendSlice(std.testing.allocator, "[leaf](https://e)");
+    for (0..128) |_| {
+        var wrapped: std.ArrayList(u8) = .empty;
+        errdefer wrapped.deinit(std.testing.allocator);
+        try wrapped.appendSlice(std.testing.allocator, "[x ");
+        try wrapped.appendSlice(std.testing.allocator, source.items);
+        try wrapped.appendSlice(std.testing.allocator, "](https://e)");
+        source.deinit(std.testing.allocator);
+        source = wrapped;
+    }
+
+    const spans = try analyzeSource(std.testing.allocator, source.items);
+    defer std.testing.allocator.free(spans);
+    try std.testing.expectEqual(@as(usize, 1), spans.len);
+    try std.testing.expect(spans[0].style.link);
+    try std.testing.expectEqualStrings(
+        "[leaf](https://e)",
+        source.items[spans[0].start..spans[0].end],
+    );
+}
+
 test "analyzeSource ignores brackets inside code span link labels" {
     const source = "[`]`](https://example.com)";
     const spans = try analyzeSource(std.testing.allocator, source);
@@ -3290,6 +3392,22 @@ test "analyzeSource preserves partially consumed delimiter runs" {
     }
     try std.testing.expect(saw_bold_italic);
     try std.testing.expect(saw_outer_italic);
+}
+
+test "analyzeSource preserves the original delimiter modulo after splitting" {
+    const source = "a***b**c**d";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var saw_bold_b = false;
+    var saw_italic_c = false;
+    for (spans) |span| {
+        const text = source[span.start..span.end];
+        if (span.style.bold and std.mem.indexOf(u8, text, "b") != null) saw_bold_b = true;
+        if (span.style.italic and std.mem.indexOf(u8, text, "c") != null) saw_italic_c = true;
+    }
+    try std.testing.expect(saw_bold_b);
+    try std.testing.expect(saw_italic_c);
 }
 
 test "analyzeSource styles inline spans across soft line breaks" {
