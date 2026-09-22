@@ -361,8 +361,89 @@ fn isSpaceByte(byte: u8) bool {
     return byte == ' ' or byte == '\t' or byte == '\r' or byte == '\n';
 }
 
-fn isPunctByte(byte: u8) bool {
-    return byte < 0x80 and std.ascii.isPunctuation(byte);
+fn isUnicodePunctuation(codepoint: u21) bool {
+    if (codepoint <= 0x7f) return std.ascii.isPunctuation(@intCast(codepoint));
+    return switch (codepoint) {
+        0x00a1...0x00a9,
+        0x00ab...0x00ac,
+        0x00ae...0x00b1,
+        0x00b4,
+        0x00b6...0x00b8,
+        0x00bb,
+        0x00bf,
+        0x00d7,
+        0x00f7,
+        0x037e,
+        0x0387,
+        0x055a...0x055f,
+        0x0589...0x058a,
+        0x05be,
+        0x05c0,
+        0x05c3,
+        0x05c6,
+        0x05f3...0x05f4,
+        0x0606...0x060f,
+        0x061b,
+        0x061d...0x061f,
+        0x066a...0x066d,
+        0x06d4,
+        0x0964...0x0965,
+        0x0e4f,
+        0x0e5a...0x0e5b,
+        0x0f01...0x0f17,
+        0x104a...0x104f,
+        0x1360...0x1368,
+        0x166d...0x166e,
+        0x169b...0x169c,
+        0x1800...0x180a,
+        0x2010...0x2027,
+        0x2030...0x205e,
+        0x207a...0x207e,
+        0x208a...0x208e,
+        0x20a0...0x20cf,
+        0x2100...0x214f,
+        0x2190...0x2429,
+        0x2440...0x244a,
+        0x249c...0x24e9,
+        0x2500...0x2775,
+        0x2794...0x2bff,
+        0x2e00...0x2e7f,
+        0x3001...0x303f,
+        0x309b...0x309c,
+        0x30a0,
+        0x30fb,
+        0xfe10...0xfe6b,
+        0xff01...0xff0f,
+        0xff1a...0xff20,
+        0xff3b...0xff40,
+        0xff5b...0xff65,
+        0xffe0...0xffee,
+        0x1f000...0x1faff,
+        => true,
+        else => false,
+    };
+}
+
+fn codepointAt(text: []const u8, index: usize) ?u21 {
+    if (index >= text.len) return null;
+    const length = std.unicode.utf8ByteSequenceLength(text[index]) catch return null;
+    if (index + length > text.len) return null;
+    return std.unicode.utf8Decode(text[index..][0..length]) catch null;
+}
+
+fn codepointBefore(text: []const u8, index: usize) ?u21 {
+    if (index == 0 or index > text.len) return null;
+    var start = index - 1;
+    while (start > 0 and (text[start] & 0xc0) == 0x80) start -= 1;
+    return codepointAt(text, start);
+}
+
+const CharacterClass = enum { whitespace, punctuation, other };
+
+fn characterClass(codepoint: ?u21) CharacterClass {
+    const value = codepoint orelse return .whitespace;
+    if (value == ' ' or value == '\t' or value == '\r' or value == '\n') return .whitespace;
+    return if (isUnicodePunctuation(value)) .punctuation else .other;
 }
 
 const DelimiterFlanking = struct {
@@ -370,12 +451,12 @@ const DelimiterFlanking = struct {
     right: bool,
 };
 
-fn delimiterFlanking(before: u8, after: u8) DelimiterFlanking {
+fn delimiterFlanking(before: CharacterClass, after: CharacterClass) DelimiterFlanking {
     return .{
-        .left = !isSpaceByte(after) and
-            (isSpaceByte(before) or isPunctByte(before) or !isPunctByte(after)),
-        .right = !isSpaceByte(before) and
-            (isSpaceByte(after) or isPunctByte(after) or !isPunctByte(before)),
+        .left = after != .whitespace and
+            (before == .whitespace or before == .punctuation or after != .punctuation),
+        .right = before != .whitespace and
+            (after == .whitespace or after == .punctuation or before != .punctuation),
     };
 }
 
@@ -442,57 +523,74 @@ fn scanInline(
                     i += if (image) 1 else 1;
                 }
             },
-            '~' => {
-                if (i + 1 < hi and text[i + 1] == '~' and (i + 2 >= hi or text[i + 2] != '~')) {
-                    const closed = findDouble(text, i + 2, hi, '~');
-                    if (closed) |at| {
-                        markRange(flags, i, at + 2, flag_strikethrough);
-                        if (depth < 4) {
-                            scanInline(flags, delimiter_pairs, text, i + 2, at, depth + 2);
-                        }
-                        i = at + 2;
-                    } else {
-                        i += 2;
-                    }
-                } else {
-                    i += 1;
-                }
-            },
-            '*', '_' => {
+            '*', '_', '~' => {
                 const marker = text[i];
                 const run = countRun(text, i, hi, marker);
-                const before = if (i > lo) text[i - 1] else '\n';
-                const after = if (i + run < hi) text[i + run] else '\n';
+                if (marker == '~' and run > 2) {
+                    i += run;
+                    continue;
+                }
+                const before = characterClass(if (i > lo) codepointBefore(text, i) else null);
+                const after = characterClass(if (i + run < hi) codepointAt(text, i + run) else null);
                 const flanking = delimiterFlanking(before, after);
-                const can_open = flanking.left and
-                    (marker == '*' or !flanking.right or isPunctByte(before));
-                const delimiter_can_close = flanking.right and
-                    (marker == '*' or !flanking.left or isPunctByte(after));
-                const opener = if (emphasis_depth > 0)
-                    &emphasis_openers[emphasis_depth - 1]
+                const can_open = if (marker == '~')
+                    before != .other
                 else
-                    null;
-                const rule_of_three_allows_close = if (opener) |candidate|
-                    !((candidate.can_close or can_open) and
-                        (candidate.run + run) % 3 == 0 and
-                        (candidate.run % 3 != 0 or run % 3 != 0))
+                    flanking.left and
+                        (marker == '*' or !flanking.right or before == .punctuation);
+                const delimiter_can_close = if (marker == '~')
+                    after != .other
                 else
-                    false;
-                const can_close = emphasis_depth > 0 and
-                    opener.?.marker == marker and
-                    i > opener.?.start + opener.?.run and
-                    delimiter_can_close and
-                    rule_of_three_allows_close;
+                    flanking.right and
+                        (marker == '*' or !flanking.left or after == .punctuation);
 
-                if (can_close) {
-                    const consumed = @min(run, opener.?.run);
-                    const opener_start = opener.?.start + opener.?.run - consumed;
-                    if (consumed >= 2) markRange(flags, opener_start, i + consumed, flag_bold);
-                    if (consumed % 2 == 1) {
-                        markRange(flags, opener_start, i + consumed, flag_italic);
+                var opener_index: ?usize = null;
+                if (delimiter_can_close) {
+                    var candidate_index = emphasis_depth;
+                    while (candidate_index > 0) {
+                        candidate_index -= 1;
+                        const candidate = emphasis_openers[candidate_index];
+                        if (candidate.marker != marker or
+                            (marker == '~' and candidate.run != run))
+                        {
+                            continue;
+                        }
+                        const rule_of_three_allows_close = marker == '~' or
+                            !((candidate.can_close or can_open) and
+                                (candidate.run + run) % 3 == 0 and
+                                (candidate.run % 3 != 0 or run % 3 != 0));
+                        if (rule_of_three_allows_close) {
+                            opener_index = candidate_index;
+                            break;
+                        }
                     }
-                    opener.?.run -= consumed;
-                    if (opener.?.run == 0) emphasis_depth -= 1;
+                }
+
+                if (opener_index) |candidate_index| {
+                    var opener = &emphasis_openers[candidate_index];
+                    emphasis_depth = candidate_index + 1;
+                    if (marker == '~') {
+                        markRange(flags, opener.start, i + run, flag_strikethrough);
+                        if (depth < 4) {
+                            scanInline(
+                                flags,
+                                delimiter_pairs,
+                                text,
+                                opener.start + run,
+                                i,
+                                depth + 2,
+                            );
+                        }
+                        emphasis_depth = candidate_index;
+                        i += run;
+                        continue;
+                    }
+                    const consumed = @min(run, opener.run);
+                    const opener_start = opener.start + opener.run - consumed;
+                    if (consumed >= 2) markRange(flags, opener_start, i + consumed, flag_bold);
+                    if (consumed % 2 == 1) markRange(flags, opener_start, i + consumed, flag_italic);
+                    opener.run -= consumed;
+                    if (opener.run == 0) emphasis_depth = candidate_index;
                     i += consumed;
                 } else if (can_open and emphasis_depth < emphasis_stack_limit) {
                     emphasis_openers[emphasis_depth] = .{
@@ -579,17 +677,62 @@ fn linkAt(
         return null;
     }
     const dest_end = delimiter_pairs[label_close + 1];
-    if (dest_end == std.math.maxInt(usize)) return null;
+    if (dest_end == std.math.maxInt(usize) or
+        !validInlineLinkContents(text, label_close + 2, dest_end))
+    {
+        return null;
+    }
     return .{ .label_close = label_close, .dest_end = dest_end };
 }
 
-fn findDouble(text: []const u8, from: usize, hi: usize, byte: u8) ?usize {
-    var j = from;
-    while (j + 1 < hi) {
-        if (text[j] == byte and text[j + 1] == byte) return j;
-        j += 1;
+fn isLinkWhitespace(byte: u8) bool {
+    return byte == ' ' or byte == '\t' or byte == '\r' or byte == '\n';
+}
+
+fn skipLinkWhitespace(text: []const u8, cursor: *usize, end: usize) void {
+    while (cursor.* < end and isLinkWhitespace(text[cursor.*])) cursor.* += 1;
+}
+
+fn validInlineLinkContents(text: []const u8, start: usize, end: usize) bool {
+    var cursor = start;
+    skipLinkWhitespace(text, &cursor, end);
+
+    if (cursor < end and text[cursor] == '<') {
+        cursor += 1;
+        while (cursor < end and text[cursor] != '>') {
+            if (text[cursor] == '\n' or text[cursor] == '\r' or text[cursor] == '<') return false;
+            if (text[cursor] == '\\' and cursor + 1 < end) cursor += 1;
+            cursor += 1;
+        }
+        if (cursor >= end) return false;
+        cursor += 1;
+    } else {
+        while (cursor < end and !isLinkWhitespace(text[cursor])) {
+            if (text[cursor] < 0x20) return false;
+            if (text[cursor] == '\\' and cursor + 1 < end) cursor += 1;
+            cursor += 1;
+        }
     }
-    return null;
+
+    if (cursor == end) return true;
+    skipLinkWhitespace(text, &cursor, end);
+    if (cursor == end) return true;
+
+    const title_close: u8 = switch (text[cursor]) {
+        '"' => '"',
+        '\'' => '\'',
+        '(' => ')',
+        else => return false,
+    };
+    cursor += 1;
+    while (cursor < end and text[cursor] != title_close) {
+        if (text[cursor] == '\\' and cursor + 1 < end) cursor += 1;
+        cursor += 1;
+    }
+    if (cursor >= end) return false;
+    cursor += 1;
+    skipLinkWhitespace(text, &cursor, end);
+    return cursor == end;
 }
 
 fn lineSpan(text: []const u8, from: usize) struct { end: usize, next: usize } {
@@ -2848,6 +2991,71 @@ test "analyzeSource applies the underscore flanking rule like md4c" {
         if (span.style.italic and std.mem.indexOf(u8, text, "emphasis") != null) saw_close = true;
     }
     try std.testing.expect(saw_close);
+}
+
+test "analyzeSource applies Unicode punctuation flanking" {
+    const source = "_foo_—bar";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    try std.testing.expectEqual(@as(usize, 1), spans.len);
+    try std.testing.expect(spans[0].style.italic);
+    try std.testing.expectEqualStrings("_foo_", source[spans[0].start..spans[0].end]);
+}
+
+test "analyzeSource applies GFM tilde delimiter rules" {
+    const source = "~one~ and ~~two~~ and ~~escaped\\~~";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var saw_single = false;
+    var saw_double = false;
+    var saw_escaped = false;
+    for (spans) |span| {
+        const text = source[span.start..span.end];
+        if (span.style.strikethrough and std.mem.eql(u8, text, "~one~")) saw_single = true;
+        if (span.style.strikethrough and std.mem.eql(u8, text, "~~two~~")) saw_double = true;
+        if (span.style.strikethrough and std.mem.indexOf(u8, text, "escaped") != null) {
+            saw_escaped = true;
+        }
+    }
+    try std.testing.expect(saw_single);
+    try std.testing.expect(saw_double);
+    try std.testing.expect(!saw_escaped);
+}
+
+test "analyzeSource finds the latest eligible opener with the same marker" {
+    const source = "*foo _bar* baz_";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var saw_star_span = false;
+    var styled_baz = false;
+    for (spans) |span| {
+        const text = source[span.start..span.end];
+        if (span.style.italic and std.mem.indexOf(u8, text, "foo") != null) {
+            saw_star_span = true;
+        }
+        if (span.style.italic and std.mem.indexOf(u8, text, "baz") != null) styled_baz = true;
+    }
+    try std.testing.expect(saw_star_span);
+    try std.testing.expect(!styled_baz);
+}
+
+test "analyzeSource validates inline link destination and title grammar" {
+    const source = "[bad](a b) [good](a \"title\")";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var saw_bad = false;
+    var saw_good = false;
+    for (spans) |span| {
+        const text = source[span.start..span.end];
+        if (span.style.link and std.mem.indexOf(u8, text, "[bad]") != null) saw_bad = true;
+        if (span.style.link and std.mem.indexOf(u8, text, "[good]") != null) saw_good = true;
+    }
+    try std.testing.expect(!saw_bad);
+    try std.testing.expect(saw_good);
 }
 
 test "analyzeSource preserves partially consumed delimiter runs" {
