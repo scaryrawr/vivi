@@ -563,7 +563,8 @@ fn scanInline(
                     opener.run -= consumed;
                     if (opener.run == 0) emphasis_depth = candidate_index;
                     i += consumed;
-                } else if (can_open and emphasis_depth < emphasis_stack_limit) {
+                } else if (can_open) {
+                    if (emphasis_depth >= emphasis_stack_limit) return;
                     emphasis_openers[emphasis_depth] = .{
                         .marker = marker,
                         .start = i,
@@ -637,6 +638,20 @@ fn pairDelimiters(
                     i = angle_end + 1;
                     continue;
                 }
+            }
+        }
+        if (open == '(' and depth > 0 and
+            (text[i] == '"' or text[i] == '\'') and
+            i > stack[depth - 1] + 1 and isLinkWhitespace(text[i - 1]))
+        {
+            const quote = text[i];
+            var quote_end = i + 1;
+            while (quote_end < hi and text[quote_end] != quote) {
+                quote_end += escapedByteCount(text, quote_end, hi);
+            }
+            if (quote_end < hi) {
+                i = quote_end + 1;
+                continue;
             }
         }
         if (text[i] == open) {
@@ -842,7 +857,8 @@ fn safeSourceUri(raw: []const u8) bool {
             continue;
         }
         if (raw[cursor] == '&') {
-            if (std.mem.indexOfScalarPos(u8, raw, cursor + 1, ';')) |semicolon| {
+            const entity_limit = @min(raw.len, cursor + 51);
+            if (std.mem.indexOfScalarPos(u8, raw[0..entity_limit], cursor + 1, ';')) |semicolon| {
                 feedSourceEntity(&scan, raw[cursor .. semicolon + 1]);
                 cursor = semicolon + 1;
                 continue;
@@ -931,6 +947,57 @@ fn validFenceOpener(source: []const u8, body: usize, line_end: usize, marker: u8
         std.mem.indexOfScalar(u8, source[body + run .. line_end], '`') == null;
 }
 
+fn isThematicOrSetextLine(source: []const u8, body: usize, line_end: usize) bool {
+    if (body >= line_end) return false;
+    const marker = source[body];
+    if (marker != '*' and marker != '-' and marker != '_' and marker != '=') return false;
+    var count: usize = 0;
+    var cursor = body;
+    while (cursor < line_end) : (cursor += 1) {
+        if (source[cursor] == marker) {
+            count += 1;
+        } else if (source[cursor] != ' ' and source[cursor] != '\t') {
+            return false;
+        }
+    }
+    const minimum: usize = if (marker == '=') 1 else 3;
+    return count >= minimum;
+}
+
+fn startsParagraphInterrupt(source: []const u8, pos: usize, line_end: usize) bool {
+    var body = pos;
+    while (body < line_end and source[body] == ' ') body += 1;
+    const indent = body - pos;
+    if (indent >= 4 or body >= line_end) return indent >= 4;
+
+    if (source[body] == '>') return body + 1 == line_end or
+        source[body + 1] == ' ' or source[body + 1] == '\t';
+
+    if (source[body] == '-' or source[body] == '+' or source[body] == '*') {
+        if (body + 1 < line_end and
+            (source[body + 1] == ' ' or source[body + 1] == '\t'))
+        {
+            return true;
+        }
+    }
+
+    var digits_end = body;
+    while (digits_end < line_end and digits_end - body < 9 and
+        std.ascii.isDigit(source[digits_end]))
+    {
+        digits_end += 1;
+    }
+    if (digits_end > body and digits_end < line_end and
+        (source[digits_end] == '.' or source[digits_end] == ')') and
+        digits_end + 1 < line_end and
+        (source[digits_end + 1] == ' ' or source[digits_end + 1] == '\t'))
+    {
+        return true;
+    }
+
+    return isThematicOrSetextLine(source, body, line_end);
+}
+
 /// Analyzes Markdown source without rewriting any bytes: returned spans
 /// cover the original text (syntax markers included) so a live editor can
 /// style its buffer in place while cursor and wrap offsets stay exact.
@@ -1001,6 +1068,30 @@ pub fn analyzeSource(
             fence = source[body];
             fence_len = countRun(source, body, line.end, source[body]);
             markRange(flags, pos, line.end, flag_code);
+        } else if (startsParagraphInterrupt(source, pos, line.end)) {
+            if (inline_start) |start| {
+                analyzeInlineRange(
+                    flags,
+                    delimiter_pairs,
+                    delimiter_stack,
+                    link_states,
+                    link_dest_ends,
+                    source,
+                    start,
+                    pos,
+                );
+                inline_start = null;
+            }
+            analyzeInlineRange(
+                flags,
+                delimiter_pairs,
+                delimiter_stack,
+                link_states,
+                link_dest_ends,
+                source,
+                pos,
+                line.end,
+            );
         } else if (body < line.end and source[body] == '#') {
             const hashes = countRun(source, body, line.end, '#');
             const at_end = body + hashes >= line.end;
@@ -3162,6 +3253,13 @@ test "analyzeSource keeps emphasis nesting intact" {
     try std.testing.expect(saw_bold and saw_italic);
 }
 
+test "analyzeSource leaves overflowed emphasis nesting unstyled" {
+    const source = "*a _b *c _d *e _f *g _h *i* h_ g* f_ e* d_ c* b_ a*";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+    try std.testing.expectEqual(@as(usize, 0), spans.len);
+}
+
 test "analyzeSource marks headings and fenced code" {
     const source = "# Title\n\n```zig\nconst x = 1;\n```\nplain text";
     const spans = try analyzeSource(std.testing.allocator, source);
@@ -3310,6 +3408,16 @@ test "analyzeSource validates inline link destination and title grammar" {
     try std.testing.expect(saw_good);
 }
 
+test "analyzeSource ignores parentheses inside quoted link titles" {
+    const source = "[x](https://e.test \"a ) b\")";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    try std.testing.expectEqual(@as(usize, 1), spans.len);
+    try std.testing.expect(spans[0].style.link);
+    try std.testing.expectEqualStrings(source, source[spans[0].start..spans[0].end]);
+}
+
 test "analyzeSource rejects outer links overlapping nested links" {
     const source = "[outer [inner](https://i)](https://o)";
     const spans = try analyzeSource(std.testing.allocator, source);
@@ -3406,6 +3514,19 @@ test "analyzeSource applies safe URI policy to links" {
     try std.testing.expect(saw_safe);
 }
 
+test "analyzeSource bounds URI entity scans" {
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(std.testing.allocator);
+    try source.appendSlice(std.testing.allocator, "[x](https://e.test/");
+    try source.appendNTimes(std.testing.allocator, '&', 8_000);
+    try source.append(std.testing.allocator, ')');
+
+    const spans = try analyzeSource(std.testing.allocator, source.items);
+    defer std.testing.allocator.free(spans);
+    try std.testing.expectEqual(@as(usize, 1), spans.len);
+    try std.testing.expect(spans[0].style.link);
+}
+
 test "analyzeSource permits parentheses inside angle link destinations" {
     const source = "[x](<https://e.test/a(b>)";
     const spans = try analyzeSource(std.testing.allocator, source);
@@ -3470,6 +3591,14 @@ test "analyzeSource styles inline spans across soft line breaks" {
     }
     try std.testing.expect(saw_multiline_emphasis);
     try std.testing.expect(saw_multiline_link);
+}
+
+test "analyzeSource stops inline spans at paragraph-interrupting blocks" {
+    const source = "*foo\n- bar*";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    for (spans) |span| try std.testing.expect(!span.style.italic);
 }
 
 test "analyzeSource rejects backtick fences with backticks in the info string" {
