@@ -442,8 +442,32 @@ const CharacterClass = enum { whitespace, punctuation, other };
 
 fn characterClass(codepoint: ?u21) CharacterClass {
     const value = codepoint orelse return .whitespace;
-    if (value == ' ' or value == '\t' or value == '\r' or value == '\n') return .whitespace;
+    if (isUnicodeWhitespace(value)) return .whitespace;
     return if (isUnicodePunctuation(value)) .punctuation else .other;
+}
+
+fn isUnicodeWhitespace(codepoint: u21) bool {
+    return switch (codepoint) {
+        0x09...0x0d,
+        0x20,
+        0x00a0,
+        0x1680,
+        0x2000...0x200a,
+        0x202f,
+        0x205f,
+        0x3000,
+        => true,
+        else => false,
+    };
+}
+
+fn escapedByteCount(text: []const u8, index: usize, hi: usize) usize {
+    if (index + 1 < hi and text[index] == '\\' and text[index + 1] < 0x80 and
+        std.ascii.isPunctuation(text[index + 1]))
+    {
+        return 2;
+    }
+    return 1;
 }
 
 const DelimiterFlanking = struct {
@@ -478,26 +502,12 @@ fn scanInline(
     while (i < hi) {
         switch (text[i]) {
             '\\' => {
-                i += if (i + 1 < hi) 2 else 1;
+                i += escapedByteCount(text, i, hi);
             },
             '`' => {
-                const run = countRun(text, i, hi, '`');
-                var j = i + run;
-                var closed: ?usize = null;
-                while (j + run <= hi) {
-                    if (text[j] != '`') {
-                        j += 1;
-                        continue;
-                    }
-                    const crun = countRun(text, j, hi, '`');
-                    if (crun == run and j > i + run) {
-                        closed = j;
-                        break;
-                    }
-                    j += @max(crun, 1);
-                }
-                if (closed) |at| markRange(flags, i, at + run, flag_code);
-                i = if (closed) |at| at + run else i + run;
+                const code_span_end = findCodeSpanEnd(text, i, hi);
+                if (code_span_end) |end| markRange(flags, i, end, flag_code);
+                i = code_span_end orelse i + countRun(text, i, hi, '`');
             },
             '[', '!' => {
                 const image = text[i] == '!' and i + 1 < hi and text[i + 1] == '[';
@@ -612,6 +622,21 @@ fn scanInline(
 
 const LinkMatch = struct { label_close: usize, dest_end: usize };
 
+fn findCodeSpanEnd(text: []const u8, start: usize, hi: usize) ?usize {
+    const run = countRun(text, start, hi, '`');
+    var cursor = start + run;
+    while (cursor + run <= hi) {
+        if (text[cursor] != '`') {
+            cursor += 1;
+            continue;
+        }
+        const closer_run = countRun(text, cursor, hi, '`');
+        if (closer_run == run and cursor > start + run) return cursor + run;
+        cursor += @max(closer_run, 1);
+    }
+    return null;
+}
+
 fn pairDelimiters(
     pairs: []usize,
     stack: []usize,
@@ -625,7 +650,11 @@ fn pairDelimiters(
     var i = lo;
     while (i < hi) {
         if (text[i] == '\\') {
-            i += if (i + 1 < hi) 2 else 1;
+            i += escapedByteCount(text, i, hi);
+            continue;
+        }
+        if (text[i] == '`') {
+            i = findCodeSpanEnd(text, i, hi) orelse i + countRun(text, i, hi, '`');
             continue;
         }
         if (text[i] == open) {
@@ -678,11 +707,40 @@ fn linkAt(
     }
     const dest_end = delimiter_pairs[label_close + 1];
     if (dest_end == std.math.maxInt(usize) or
-        !validInlineLinkContents(text, label_close + 2, dest_end))
+        !validInlineLinkContents(text, label_close + 2, dest_end) or
+        labelContainsNestedLink(delimiter_pairs, text, label_open + 1, label_close))
     {
         return null;
     }
     return .{ .label_close = label_close, .dest_end = dest_end };
+}
+
+fn labelContainsNestedLink(
+    delimiter_pairs: []const usize,
+    text: []const u8,
+    start: usize,
+    end: usize,
+) bool {
+    var cursor = start;
+    while (cursor < end) {
+        if (text[cursor] == '\\') {
+            cursor += escapedByteCount(text, cursor, end);
+            continue;
+        }
+        if (text[cursor] == '`') {
+            cursor = findCodeSpanEnd(text, cursor, end) orelse
+                cursor + countRun(text, cursor, end, '`');
+            continue;
+        }
+        if (text[cursor] == '[' and
+            (cursor == start or text[cursor - 1] != '!') and
+            linkAt(delimiter_pairs, text, end, cursor) != null)
+        {
+            return true;
+        }
+        cursor += 1;
+    }
+    return false;
 }
 
 fn isLinkWhitespace(byte: u8) bool {
@@ -701,16 +759,14 @@ fn validInlineLinkContents(text: []const u8, start: usize, end: usize) bool {
         cursor += 1;
         while (cursor < end and text[cursor] != '>') {
             if (text[cursor] == '\n' or text[cursor] == '\r' or text[cursor] == '<') return false;
-            if (text[cursor] == '\\' and cursor + 1 < end) cursor += 1;
-            cursor += 1;
+            cursor += escapedByteCount(text, cursor, end);
         }
         if (cursor >= end) return false;
         cursor += 1;
     } else {
         while (cursor < end and !isLinkWhitespace(text[cursor])) {
             if (text[cursor] < 0x20) return false;
-            if (text[cursor] == '\\' and cursor + 1 < end) cursor += 1;
-            cursor += 1;
+            cursor += escapedByteCount(text, cursor, end);
         }
     }
 
@@ -726,8 +782,7 @@ fn validInlineLinkContents(text: []const u8, start: usize, end: usize) bool {
     };
     cursor += 1;
     while (cursor < end and text[cursor] != title_close) {
-        if (text[cursor] == '\\' and cursor + 1 < end) cursor += 1;
-        cursor += 1;
+        cursor += escapedByteCount(text, cursor, end);
     }
     if (cursor >= end) return false;
     cursor += 1;
@@ -3003,6 +3058,16 @@ test "analyzeSource applies Unicode punctuation flanking" {
     try std.testing.expectEqualStrings("_foo_", source[spans[0].start..spans[0].end]);
 }
 
+test "analyzeSource applies Unicode whitespace flanking" {
+    const source = "_foo_\u{00a0}bar";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    try std.testing.expectEqual(@as(usize, 1), spans.len);
+    try std.testing.expect(spans[0].style.italic);
+    try std.testing.expectEqualStrings("_foo_", source[spans[0].start..spans[0].end]);
+}
+
 test "analyzeSource applies GFM tilde delimiter rules" {
     const source = "~one~ and ~~two~~ and ~~escaped\\~~";
     const spans = try analyzeSource(std.testing.allocator, source);
@@ -3056,6 +3121,59 @@ test "analyzeSource validates inline link destination and title grammar" {
     }
     try std.testing.expect(!saw_bad);
     try std.testing.expect(saw_good);
+}
+
+test "analyzeSource rejects outer links overlapping nested links" {
+    const source = "[outer [inner](https://i)](https://o)";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    try std.testing.expectEqual(@as(usize, 1), spans.len);
+    try std.testing.expect(spans[0].style.link);
+    try std.testing.expectEqualStrings(
+        "[inner](https://i)",
+        source[spans[0].start..spans[0].end],
+    );
+
+    const image_source = "[outer ![image](https://i)](https://o)";
+    const image_spans = try analyzeSource(std.testing.allocator, image_source);
+    defer std.testing.allocator.free(image_spans);
+    try std.testing.expect(image_spans.len > 0);
+    try std.testing.expect(image_spans[0].style.link);
+    try std.testing.expectEqual(@as(usize, 0), image_spans[0].start);
+    try std.testing.expectEqual(image_source.len, image_spans[image_spans.len - 1].end);
+}
+
+test "analyzeSource ignores brackets inside code span link labels" {
+    const source = "[`]`](https://example.com)";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var saw_link = false;
+    var saw_code = false;
+    for (spans) |span| {
+        const text = source[span.start..span.end];
+        if (span.style.link and std.mem.indexOf(u8, text, "https://") != null) saw_link = true;
+        if (span.style.code and std.mem.indexOf(u8, text, "`]`") != null) saw_code = true;
+    }
+    try std.testing.expect(saw_link);
+    try std.testing.expect(saw_code);
+}
+
+test "analyzeSource backslashes escape only ASCII punctuation" {
+    const source = "[invalid](foo\\ bar) [valid](foo\\(bar\\))";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+
+    var saw_invalid = false;
+    var saw_valid = false;
+    for (spans) |span| {
+        const text = source[span.start..span.end];
+        if (span.style.link and std.mem.indexOf(u8, text, "invalid") != null) saw_invalid = true;
+        if (span.style.link and std.mem.indexOf(u8, text, "valid") != null) saw_valid = true;
+    }
+    try std.testing.expect(!saw_invalid);
+    try std.testing.expect(saw_valid);
 }
 
 test "analyzeSource preserves partially consumed delimiter runs" {
