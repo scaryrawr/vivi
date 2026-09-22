@@ -448,6 +448,11 @@ fn delimiterMarkerSlot(marker: u8) usize {
     };
 }
 
+fn delimiterCloserClass(marker: u8, original_mod3: u2, can_open: bool, run: usize) usize {
+    if (marker == '~') return if (run == 1) 0 else 1;
+    return @as(usize, original_mod3) * 2 + @intFromBool(can_open);
+}
+
 /// Scans inline Markdown for one line, OR-ing style bits into the absolute
 /// positions of `flags`. Unmatched markers are left unstyled (literal).
 fn scanInline(
@@ -466,6 +471,7 @@ fn scanInline(
     const opener_stack = emphasis_openers[lo..hi];
     const no_opener = std.math.maxInt(usize);
     var opener_tops: [3]usize = @splat(no_opener);
+    var opener_lower_bounds: [3][6]usize = @splat(@splat(no_opener));
     var emphasis_depth: usize = 0;
     var pending_delimiter: ?PendingDelimiter = null;
 
@@ -486,13 +492,14 @@ fn scanInline(
                     continue;
                 }
                 const label_open = if (image) i + 1 else i;
-                if (linkAt(
-                    delimiter_pairs,
-                    link_states,
-                    link_dest_ends,
-                    label_open,
-                )) |link| {
-                    if (!image) markRange(flags, i, link.dest_end + 1, flag_link);
+                if (link_states[label_open] != 0) {
+                    const link: LinkMatch = .{
+                        .label_close = delimiter_pairs[label_open],
+                        .dest_end = link_dest_ends[label_open],
+                    };
+                    if (!image and link_states[label_open] == 2) {
+                        markRange(flags, i, link.dest_end + 1, flag_link);
+                    }
                     if (depth < 4) {
                         scanInline(
                             flags,
@@ -548,22 +555,40 @@ fn scanInline(
 
                 var opener_index: ?usize = null;
                 if (delimiter_can_close) {
-                    var candidate_index = opener_tops[delimiterMarkerSlot(marker)];
+                    const marker_slot = delimiterMarkerSlot(marker);
+                    const closer_class = delimiterCloserClass(
+                        marker,
+                        original_mod3,
+                        can_open,
+                        run,
+                    );
+                    const initial_candidate = opener_tops[marker_slot];
+                    const lower_bound = opener_lower_bounds[marker_slot][closer_class];
+                    var candidate_index = initial_candidate;
                     while (candidate_index != no_opener) {
                         const candidate = opener_stack[candidate_index];
+                        if (lower_bound != no_opener and candidate.start <= lower_bound) break;
                         if (marker == '~' and candidate.run != run) {
                             candidate_index = candidate.previous_same;
                             continue;
                         }
                         const rule_of_three_allows_close = marker == '~' or
                             !((candidate.can_close or can_open) and
-                                (candidate.original_mod3 + original_mod3) % 3 == 0 and
+                                (@as(usize, candidate.original_mod3) +
+                                    @as(usize, original_mod3)) % 3 == 0 and
                                 (candidate.original_mod3 != 0 or original_mod3 != 0));
                         if (rule_of_three_allows_close) {
                             opener_index = candidate_index;
                             break;
                         }
                         candidate_index = candidate.previous_same;
+                    }
+                    if (opener_index == null) {
+                        opener_lower_bounds[marker_slot][closer_class] =
+                            if (initial_candidate == no_opener)
+                                i
+                            else
+                                opener_stack[initial_candidate].start;
                     }
                 }
 
@@ -682,6 +707,8 @@ fn pairDelimiters(
     const dirty_bit: usize = @as(usize, 1) << (@bitSizeOf(usize) - 1);
     const index_mask: usize = ~dirty_bit;
     var depth: usize = 0;
+    var angle_scan_from = lo;
+    var angle_scan_end: ?usize = null;
     var i = lo;
     while (i < hi) {
         if (text[i] == '\\') {
@@ -694,11 +721,15 @@ fn pairDelimiters(
         }
         if (open == '(' and text[i] == '<' and depth > 0) {
             if (stack[depth - 1] & dirty_bit == 0) {
-                var angle_end = i + 1;
-                while (angle_end < hi and text[angle_end] != '>') {
-                    angle_end += escapedByteCount(text, angle_end, hi);
+                if (angle_scan_from <= i) {
+                    var angle_end = i + 1;
+                    while (angle_end < hi and text[angle_end] != '>') {
+                        angle_end += escapedByteCount(text, angle_end, hi);
+                    }
+                    angle_scan_end = if (angle_end < hi) angle_end else null;
+                    angle_scan_from = if (angle_end < hi) angle_end + 1 else hi;
                 }
-                if (angle_end < hi) {
+                if (angle_scan_end) |angle_end| {
                     stack[depth - 1] |= dirty_bit;
                     i = angle_end + 1;
                     continue;
@@ -1467,6 +1498,13 @@ fn startsQuoteLine(source: []const u8, pos: usize, line_end: usize) bool {
     return body < line_end and indent.columns < 4 and source[body] == '>';
 }
 
+fn quoteLineHasContent(source: []const u8, pos: usize, line_end: usize) bool {
+    const indent = leadingIndent(source, pos, line_end);
+    var body = pos + indent.bytes + 1;
+    if (body < line_end and (source[body] == ' ' or source[body] == '\t')) body += 1;
+    return body < line_end;
+}
+
 const InlineContainer = enum {
     plain,
     list,
@@ -1589,7 +1627,10 @@ pub fn analyzeSource(
             markRange(flags, pos, line.end, flag_code);
         } else if (startsParagraphInterrupt(source, pos, line.end)) {
             const quote_line = startsQuoteLine(source, pos, line.end);
-            if (!(quote_line and inline_start != null and inline_container == .quote)) {
+            const quote_has_content = !quote_line or quoteLineHasContent(source, pos, line.end);
+            if (!(quote_line and quote_has_content and
+                inline_start != null and inline_container == .quote))
+            {
                 if (inline_start) |start| {
                     analyzeInlineRange(
                         flags,
@@ -1605,10 +1646,10 @@ pub fn analyzeSource(
                     );
                     inline_start = null;
                 }
-                if (quote_line or startsListItem(source, pos, line.end)) {
+                if ((quote_line and quote_has_content) or startsListItem(source, pos, line.end)) {
                     inline_start = pos;
                     inline_container = if (quote_line) .quote else .list;
-                } else {
+                } else if (!quote_line) {
                     analyzeInlineRange(
                         flags,
                         delimiter_roles,
@@ -4009,6 +4050,13 @@ test "analyzeSource suppresses autolinks inside unsafe explicit links" {
     for (spans) |span| try std.testing.expect(!span.style.link);
 }
 
+test "analyzeSource hides markup inside unsafe link destinations" {
+    const source = "[x](javascript:*foo*)";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+    for (spans) |span| try std.testing.expect(!span.style.italic);
+}
+
 test "analyzeSource resolves deeply nested link candidates once" {
     var source: std.ArrayList(u8) = .empty;
     defer source.deinit(std.testing.allocator);
@@ -4194,6 +4242,26 @@ test "analyzeSource bounds mixed-marker delimiter scans" {
     try std.testing.expectEqual(@as(usize, 0), spans.len);
 }
 
+test "analyzeSource bounds same-marker delimiter scans" {
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(std.testing.allocator);
+    for (0..2_000) |_| try source.appendSlice(std.testing.allocator, "*a ");
+    for (0..2_000) |_| try source.appendSlice(std.testing.allocator, "a**b ");
+
+    const spans = try analyzeSource(std.testing.allocator, source.items);
+    defer std.testing.allocator.free(spans);
+}
+
+test "analyzeSource bounds nested malformed angle destinations" {
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(std.testing.allocator);
+    for (0..8_000) |_| try source.appendSlice(std.testing.allocator, "(<");
+
+    const spans = try analyzeSource(std.testing.allocator, source.items);
+    defer std.testing.allocator.free(spans);
+    try std.testing.expectEqual(@as(usize, 0), spans.len);
+}
+
 test "analyzeSource permits parentheses inside angle link destinations" {
     const source = "[x](<https://e.test/a(b>)";
     const spans = try analyzeSource(std.testing.allocator, source);
@@ -4336,6 +4404,13 @@ test "analyzeSource preserves inline spans across quote continuations" {
         }
     }
     try std.testing.expect(saw_continuation);
+}
+
+test "analyzeSource ends quoted paragraphs at blank quote lines" {
+    const source = "> *foo\n>\n> bar*";
+    const spans = try analyzeSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(spans);
+    for (spans) |span| try std.testing.expect(!span.style.italic);
 }
 
 test "analyzeSource does not promote setext headings across containers" {
