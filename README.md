@@ -16,27 +16,26 @@ Release binaries include the Bun runtime.
 
 ```sh
 vivi
-vivi chat
-vivi --model copilot/gpt-5.6-luna --reasoning high
+vivi --model gpt-5.6-luna --reasoning-effort high
 vivi --model omlx/Qwen3.5-9B
 vivi models
 ```
 
-Running `vivi` with no command launches Copilot. `chat` is a compatibility
-alias. All unrecognized arguments pass directly to Copilot CLI. Vivi also
-translates its former `copilot/<model>` identifiers and `--reasoning` flag to
-Copilot's native syntax.
+Running `vivi` with no command launches Copilot. Apart from Vivi's `models`,
+`--help`, and `--version`, arguments pass directly to Copilot CLI. Use
+`copilot --help` to see its native options and commands.
 
 Vivi loads the last model and reasoning selection from
-`~/.vivi/settings.json`. Explicit `--model` or `--reasoning` arguments win.
+`~/.vivi/settings.json`. Explicit `--model` or `--reasoning-effort` arguments win.
 Changing the model or reasoning effort through Copilot's `/model` flow updates
 the Vivi setting for the next new session. Resumed sessions retain their own
-saved model configuration.
+saved model configuration. Earlier Vivi settings are migrated to the current
+schema, including hosted model IDs saved with a `copilot/` prefix.
 
 Copilot's BYOK model registry does not currently expose supported reasoning
 levels to the built-in model picker. For local models, use `/reasoning` to show
 the current effort or `/reasoning high` to change it. The launcher flags
-`--reasoning` and `--reasoning-effort` remain available for startup selection.
+`--reasoning-effort` remains available for startup selection.
 
 Vivi stores its persistent Copilot profile under `~/.vivi/copilot`. This keeps
 Vivi sessions, permissions, plugins, and authentication separate from a normal
@@ -64,11 +63,15 @@ process-scoped, and removed after Copilot exits.
 
 Vivi enables Copilot's experimental extension runtime automatically because
 current Copilot CLI releases gate extension discovery behind `--experimental`.
+The extensions are authored in TypeScript and compiled into self-contained
+`extension.mjs` files before building Vivi. Their package dependencies are
+bundled into those files; only Copilot's extension SDK remains a runtime import.
 
 - `vivi-system-prompt` applies Vivi's compact coding-agent policy while
   preserving safety, environment, repository, and runtime instructions.
 - `vivi-basic-tools` replaces overlapping Copilot built-ins with Vivi's
-  `read`, `bash`, `edit`, and `write` implementations.
+  `read`, `bash`, `edit`, and `write` implementations. Their JSON Schema tool
+  parameters are defined with TypeBox.
 - `vivi-local-model-policy` blocks subagent and factory orchestration while a
   discovered local model is selected by declaring built-in exclusions when the
   extension joins the session.
@@ -84,6 +87,10 @@ bun run check
 bun run build
 ./dist/vivi --help
 ```
+
+`bun run build` builds the extensions first, then embeds them in the compiled
+launcher. `bun run test` builds the extensions before running tests, including
+profile materialization tests. Generated files under `dist/` are not committed.
 
 Architecture and ownership decisions are documented in
 [`docs/architecture.md`](docs/architecture.md).

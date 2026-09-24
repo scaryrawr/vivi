@@ -8,7 +8,7 @@ session.
 - Build from the repository root with `bun run build`.
 - Put Bun, `script`, GitHub CLI, and GitHub Copilot CLI on `PATH`.
 - Authenticate GitHub CLI before credentialed drives.
-- Hosted validation uses `copilot/gpt-5.6-luna` by default.
+- Hosted validation uses `gpt-6-luna` by default.
 - Give every verification attempt a unique run ID.
 
 ## Driving conventions
@@ -40,7 +40,7 @@ user-visible behavior. It then uses exactly four H2 sections in this order:
 ## Features
 
 - [CLI discovery](./cli-discovery.md) covers help, version, local model
-  discovery, and argument compatibility.
+  discovery, and native argument forwarding.
 - [Streaming chat](./streaming-chat.md) covers a real Copilot PTY launched
   through Vivi.
 - [Local models](./omlx-models.md) covers pre-start provider discovery and

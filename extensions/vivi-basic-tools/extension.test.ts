@@ -19,7 +19,8 @@ mock.module("@github/copilot-sdk/extension", () => ({
   },
 }));
 
-await import("./extension.mjs");
+// @ts-expect-error Generated ESM is built before tests and has no declaration file.
+await import("../../dist/extensions/vivi-basic-tools/extension.mjs");
 
 afterAll(async () => {
   shutdown?.({} as never);
@@ -28,6 +29,67 @@ afterAll(async () => {
 test("registers the four Vivi tools as built-in replacements", () => {
   expect(tools.map(({ name }) => name)).toEqual(["read", "bash", "edit", "write"]);
   expect(tools.every(({ overridesBuiltInTool }) => overridesBuiltInTool === true)).toBe(true);
+});
+
+test("publishes the existing JSON Schema contracts", () => {
+  expect(schema("read")).toEqual({
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      path: { type: "string", minLength: 1 },
+      offset: { type: "integer", minimum: 1 },
+      limit: { type: "integer", minimum: 1 },
+    },
+    required: ["path"],
+  });
+  expect(schema("bash")).toEqual({
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      action: {
+        type: "string",
+        enum: ["run", "start", "list", "read", "write", "stop"],
+        default: "run",
+      },
+      command: { type: "string", minLength: 1 },
+      timeout: { type: "number", exclusiveMinimum: 0, maximum: 600 },
+      shell_id: { type: "string", pattern: "^bash_[0-9A-Fa-f]{32}$" },
+      max_bytes: { type: "integer", minimum: 1, maximum: 32768 },
+      wait_ms: { type: "integer", minimum: 0, maximum: 5000 },
+      data: { type: "string" },
+      encoding: { type: "string", enum: ["utf8", "base64"] },
+    },
+  });
+  expect(schema("edit")).toEqual({
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      path: { type: "string", minLength: 1 },
+      edits: {
+        type: "array",
+        minItems: 1,
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            oldText: { type: "string", minLength: 1 },
+            newText: { type: "string" },
+          },
+          required: ["oldText", "newText"],
+        },
+      },
+    },
+    required: ["path", "edits"],
+  });
+  expect(schema("write")).toEqual({
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      path: { type: "string", minLength: 1 },
+      content: { type: "string" },
+    },
+    required: ["path", "content"],
+  });
 });
 
 test("reads selected lines and writes and edits exact content", async () => {
@@ -106,4 +168,10 @@ async function call(name: string, arguments_: unknown) {
     textResultForLlm: string;
     resultType: string;
   };
+}
+
+function schema(name: string): unknown {
+  const parameters = tools.find((tool) => tool.name === name)?.parameters;
+  if (parameters === undefined) throw new Error(`Missing ${name} schema`);
+  return JSON.parse(JSON.stringify(parameters));
 }

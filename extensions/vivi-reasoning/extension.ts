@@ -1,9 +1,9 @@
 import { joinSession } from "@github/copilot-sdk/extension";
+import type { CopilotSession } from "@github/copilot-sdk";
 
 const REASONING_LEVELS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 
-/** @type {import("@github/copilot-sdk").CopilotSession} */
-let session;
+let session: CopilotSession;
 session = await joinSession({
   commands: [
     {

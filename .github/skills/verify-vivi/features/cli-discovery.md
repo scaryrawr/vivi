@@ -8,7 +8,7 @@ without starting Copilot.
 - `help-explicit` shows the command list with `--help`.
 - `version` prints the installed Vivi version.
 - `models-listed` reports discovered local providers.
-- `chat-listed` identifies `chat` as the compatibility launcher alias.
+- `native-args` leaves Copilot options and commands unchanged.
 
 ## How to get to it (user POV)
 

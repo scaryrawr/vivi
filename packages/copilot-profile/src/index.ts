@@ -1,16 +1,16 @@
 import { chmod, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { LocalProviderConfiguration } from "@vivi/provider-discovery";
-// @ts-expect-error Bun's text loader turns the extension source into a string.
-import basicToolsExtension from "../../../extensions/vivi-basic-tools/extension.mjs" with { type: "text" };
-// @ts-expect-error Bun's text loader turns the extension source into a string.
-import localModelPolicyExtension from "../../../extensions/vivi-local-model-policy/extension.mjs" with { type: "text" };
-// @ts-expect-error Bun's text loader turns the extension source into a string.
-import reasoningExtension from "../../../extensions/vivi-reasoning/extension.mjs" with { type: "text" };
-// @ts-expect-error Bun's text loader turns the extension source into a string.
-import systemPromptExtension from "../../../extensions/vivi-system-prompt/extension.mjs" with { type: "text" };
-// @ts-expect-error Bun's text loader turns the extension source into a string.
-import selectionPersistenceExtension from "../../../extensions/vivi-selection-persistence/extension.mjs" with { type: "text" };
+// @ts-expect-error Bun's text loader embeds the generated ESM as a string.
+import basicToolsExtension from "../../../dist/extensions/vivi-basic-tools/extension.mjs" with { type: "text" };
+// @ts-expect-error Bun's text loader embeds the generated ESM as a string.
+import localModelPolicyExtension from "../../../dist/extensions/vivi-local-model-policy/extension.mjs" with { type: "text" };
+// @ts-expect-error Bun's text loader embeds the generated ESM as a string.
+import reasoningExtension from "../../../dist/extensions/vivi-reasoning/extension.mjs" with { type: "text" };
+// @ts-expect-error Bun's text loader embeds the generated ESM as a string.
+import systemPromptExtension from "../../../dist/extensions/vivi-system-prompt/extension.mjs" with { type: "text" };
+// @ts-expect-error Bun's text loader embeds the generated ESM as a string.
+import selectionPersistenceExtension from "../../../dist/extensions/vivi-selection-persistence/extension.mjs" with { type: "text" };
 
 export interface PreparedCopilotProfile {
   environment: Record<string, string | undefined>;

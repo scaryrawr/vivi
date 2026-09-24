@@ -45,6 +45,12 @@ describe("prepareCopilotProfile", () => {
         "utf8",
       ),
     ).toContain("joinSession");
+    const localPolicy = await readFile(
+      join(copilotHome, "extensions", "vivi-local-model-policy", "extension.mjs"),
+      "utf8",
+    );
+    expect(localPolicy).toContain("VIVI_LOCAL_MODEL_IDS must be an array of model IDs");
+    expect(localPolicy).not.toContain('from "@sinclair/typebox"');
     expect(
       await readFile(
         join(copilotHome, "extensions", "vivi-selection-persistence", "extension.mjs"),

@@ -50,29 +50,20 @@ async function persistCurrentSelection() {
   await chmod(settingsPath, 0o600).catch(ignoreWindowsPermissionError);
 }
 
-/**
- * @param {string} reasoning
- */
-function normalizeReasoning(reasoning) {
+function normalizeReasoning(reasoning: string): string | null {
   const normalized = reasoning === "off" ? "none" : reasoning;
   return ["none", "minimal", "low", "medium", "high", "xhigh", "max"].includes(normalized)
     ? normalized
     : null;
 }
 
-/**
- * @param {unknown} error
- */
-async function logPersistenceFailure(error) {
+async function logPersistenceFailure(error: unknown): Promise<void> {
   await session.log(`Vivi could not persist the model selection: ${String(error)}`, {
     level: "warning",
     ephemeral: true,
   });
 }
 
-/**
- * @param {unknown} error
- */
-function ignoreWindowsPermissionError(error) {
+function ignoreWindowsPermissionError(error: unknown): void {
   if (process.platform !== "win32") throw error;
 }

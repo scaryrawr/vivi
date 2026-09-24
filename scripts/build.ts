@@ -1,6 +1,7 @@
 import { chmod, mkdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import packageMetadata from "../package.json";
+import { buildExtensions } from "./build-extensions.ts";
 
 const repositoryRoot = join(import.meta.dir, "..");
 const target = option("--target");
@@ -13,6 +14,7 @@ const output =
   );
 const version = option("--version") ?? packageMetadata.version;
 
+await buildExtensions();
 await mkdir(dirname(output), { recursive: true });
 const result = await Bun.build({
   entrypoints: [join(repositoryRoot, "apps/vivi/src/main.ts")],

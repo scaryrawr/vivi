@@ -43,7 +43,7 @@ Credentialed drives require `gh auth token`. The helper passes the token to the
 isolated Copilot process through `GH_TOKEN` and `GITHUB_TOKEN` without writing
 it to evidence.
 
-Use `VIVI_VALIDATION_MODEL=copilot/<model-id>` to override the default hosted
+Use `VIVI_VALIDATION_MODEL=<model-id>` to override the default hosted
 validation model.
 
 ## Evidence

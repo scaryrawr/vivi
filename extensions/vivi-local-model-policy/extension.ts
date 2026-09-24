@@ -1,4 +1,5 @@
 import { joinSession } from "@github/copilot-sdk/extension";
+import { parseLocalModelIds } from "./model-ids.ts";
 
 const LOCAL_MODEL_EXCLUDED_TOOLS = [
   "builtin:task",
@@ -16,17 +17,3 @@ const localModelActive = selectedModelId !== undefined && localModelIds.has(sele
 await joinSession({
   excludedTools: localModelActive ? LOCAL_MODEL_EXCLUDED_TOOLS : [],
 });
-
-/**
- * @param {string | undefined} value
- * @returns {string[]}
- */
-function parseLocalModelIds(value) {
-  if (value === undefined) return [];
-  try {
-    const parsed = JSON.parse(value);
-    return Array.isArray(parsed) ? parsed.filter((modelId) => typeof modelId === "string") : [];
-  } catch {
-    return [];
-  }
-}

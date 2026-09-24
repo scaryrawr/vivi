@@ -3,20 +3,20 @@ import { spawn } from "node:child_process";
 import { mkdir, open, readFile, stat, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { joinSession } from "@github/copilot-sdk/extension";
+import type { Tool } from "@github/copilot-sdk";
+import { Type } from "@sinclair/typebox";
 
-/** @typedef {import("node:child_process").ChildProcessWithoutNullStreams} BashChild */
-/** @typedef {{ kind: string, value: number | string | null }} BashExit */
-/**
- * @typedef {{
- *   shellId: string,
- *   child: BashChild,
- *   output: Buffer,
- *   droppedBytes: number,
- *   exited: boolean,
- *   exit: BashExit | null,
- *   changed: Array<() => void>,
- * }} BashSession
- */
+type BashChild = import("node:child_process").ChildProcessWithoutNullStreams;
+type BashExit = { kind: string; value: number | string | null };
+interface BashSession {
+  shellId: string;
+  child: BashChild;
+  output: Buffer;
+  droppedBytes: number;
+  exited: boolean;
+  exit: BashExit | null;
+  changed: Array<() => void>;
+}
 
 const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 const MAX_SESSIONS = 8;
@@ -27,24 +27,64 @@ const MAX_WRITE_BYTES = 16 * 1024;
 const DEFAULT_WAIT_MS = 100;
 const MAX_WAIT_MS = 5_000;
 const SHELL_ID = /^bash_[0-9a-f]{32}$/i;
-/** @type {Map<string, BashSession>} */
-const sessions = new Map();
+const sessions = new Map<string, BashSession>();
 
-const tools = [
+const ReadParameters = Type.Object(
+  {
+    path: Type.String({ minLength: 1 }),
+    offset: Type.Optional(Type.Integer({ minimum: 1 })),
+    limit: Type.Optional(Type.Integer({ minimum: 1 })),
+  },
+  { additionalProperties: false },
+);
+
+const BashParameters = Type.Object(
+  {
+    action: Type.Optional(
+      Type.String({ enum: ["run", "start", "list", "read", "write", "stop"], default: "run" }),
+    ),
+    command: Type.Optional(Type.String({ minLength: 1 })),
+    timeout: Type.Optional(Type.Number({ exclusiveMinimum: 0, maximum: 600 })),
+    shell_id: Type.Optional(Type.String({ pattern: "^bash_[0-9A-Fa-f]{32}$" })),
+    max_bytes: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_READ_BYTES })),
+    wait_ms: Type.Optional(Type.Integer({ minimum: 0, maximum: MAX_WAIT_MS })),
+    data: Type.Optional(Type.String()),
+    encoding: Type.Optional(Type.String({ enum: ["utf8", "base64"] })),
+  },
+  { additionalProperties: false },
+);
+
+const EditParameters = Type.Object(
+  {
+    path: Type.String({ minLength: 1 }),
+    edits: Type.Array(
+      Type.Object(
+        {
+          oldText: Type.String({ minLength: 1 }),
+          newText: Type.String(),
+        },
+        { additionalProperties: false },
+      ),
+      { minItems: 1 },
+    ),
+  },
+  { additionalProperties: false },
+);
+
+const WriteParameters = Type.Object(
+  {
+    path: Type.String({ minLength: 1 }),
+    content: Type.String(),
+  },
+  { additionalProperties: false },
+);
+
+const tools: Tool[] = [
   {
     name: "read",
     description:
       "Read UTF-8 text or a PNG, JPEG, GIF, or WebP image from a file. Images are returned as image content, not text. Paths may be absolute or relative to the workspace. For text only, offset is an optional 1-indexed first line and limit is an optional positive number of lines. Returns the selected text without Vivi-side truncation.",
-    parameters: {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        path: { type: "string", minLength: 1 },
-        offset: { type: "integer", minimum: 1 },
-        limit: { type: "integer", minimum: 1 },
-      },
-      required: ["path"],
-    },
+    parameters: ReadParameters,
     overridesBuiltInTool: true,
     handler: handleRead,
   },
@@ -52,24 +92,7 @@ const tools = [
     name: "bash",
     description:
       "Run commands or manage persistent Bash processes. action defaults to run. run requires command and accepts timeout (default 120 seconds, maximum 600). start requires command and returns a shell_id. list takes no other fields. read requires shell_id and accepts max_bytes (default 16384, maximum 32768) and wait_ms (default 100, maximum 5000). write requires shell_id and data, with encoding utf8 (default) or base64; decoded input may not exceed 16384 bytes. stop requires shell_id and is idempotent.",
-    parameters: {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        action: {
-          type: "string",
-          enum: ["run", "start", "list", "read", "write", "stop"],
-          default: "run",
-        },
-        command: { type: "string", minLength: 1 },
-        timeout: { type: "number", exclusiveMinimum: 0, maximum: 600 },
-        shell_id: { type: "string", pattern: "^bash_[0-9A-Fa-f]{32}$" },
-        max_bytes: { type: "integer", minimum: 1, maximum: MAX_READ_BYTES },
-        wait_ms: { type: "integer", minimum: 0, maximum: MAX_WAIT_MS },
-        data: { type: "string" },
-        encoding: { type: "string", enum: ["utf8", "base64"] },
-      },
-    },
+    parameters: BashParameters,
     overridesBuiltInTool: true,
     handler: handleBash,
   },
@@ -77,27 +100,7 @@ const tools = [
     name: "edit",
     description:
       "Edit one text file using exact replacements. Every oldText must be non-empty, occur exactly once in the original file, and not overlap another edit. All matches are planned before one write.",
-    parameters: {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        path: { type: "string", minLength: 1 },
-        edits: {
-          type: "array",
-          minItems: 1,
-          items: {
-            type: "object",
-            additionalProperties: false,
-            properties: {
-              oldText: { type: "string", minLength: 1 },
-              newText: { type: "string" },
-            },
-            required: ["oldText", "newText"],
-          },
-        },
-      },
-      required: ["path", "edits"],
-    },
+    parameters: EditParameters,
     overridesBuiltInTool: true,
     handler: handleEdit,
   },
@@ -105,15 +108,7 @@ const tools = [
     name: "write",
     description:
       "Create or overwrite a file with exact content. Paths may be absolute or relative to the workspace. Missing parent directories are created.",
-    parameters: {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        path: { type: "string", minLength: 1 },
-        content: { type: "string" },
-      },
-      required: ["path", "content"],
-    },
+    parameters: WriteParameters,
     overridesBuiltInTool: true,
     handler: handleWrite,
   },
@@ -126,9 +121,9 @@ const session = await joinSession({
 
 session.on("session.shutdown", stopAllSessions);
 
-/** @param {Record<string, unknown>} arguments_ */
-async function handleRead(arguments_) {
+async function handleRead(arguments_: unknown) {
   try {
+    assertArguments(arguments_);
     const path = resolvePath(requireString(arguments_, "path"));
     const offset = optionalPositiveInteger(arguments_, "offset") ?? 1;
     const limit = optionalPositiveInteger(arguments_, "limit") ?? Number.MAX_SAFE_INTEGER;
@@ -167,9 +162,9 @@ async function handleRead(arguments_) {
   }
 }
 
-/** @param {Record<string, unknown>} arguments_ */
-async function handleBash(arguments_) {
+async function handleBash(arguments_: unknown) {
   try {
+    assertArguments(arguments_);
     const action = optionalString(arguments_, "action") ?? "run";
     switch (action) {
       case "run":
@@ -213,9 +208,9 @@ async function handleBash(arguments_) {
   }
 }
 
-/** @param {Record<string, unknown>} arguments_ */
-async function handleEdit(arguments_) {
+async function handleEdit(arguments_: unknown) {
   try {
+    assertArguments(arguments_);
     const path = resolvePath(requireString(arguments_, "path"));
     const edits = arguments_.edits;
     if (!Array.isArray(edits) || edits.length === 0) throw new Error("EmptyEdits");
@@ -262,9 +257,9 @@ async function handleEdit(arguments_) {
   }
 }
 
-/** @param {Record<string, unknown>} arguments_ */
-async function handleWrite(arguments_) {
+async function handleWrite(arguments_: unknown) {
   try {
+    assertArguments(arguments_);
     const path = resolvePath(requireString(arguments_, "path"));
     const content = requireString(arguments_, "content", true);
     await mkdir(dirname(path), { recursive: true });
@@ -275,17 +270,12 @@ async function handleWrite(arguments_) {
   }
 }
 
-/**
- * @param {string} command
- * @param {number} timeoutSeconds
- */
-async function runBash(command, timeoutSeconds) {
+async function runBash(command: string, timeoutSeconds: number) {
   if (!Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0 || timeoutSeconds > 600) {
     throw new Error("InvalidTimeout");
   }
   const child = spawnBash(command);
-  /** @type {Buffer[]} */
-  const output = [];
+  const output: Buffer[] = [];
   child.stdout.on("data", (data) => output.push(Buffer.from(data)));
   child.stderr.on("data", (data) => output.push(Buffer.from(data)));
   const timedOut = await waitForExit(child, timeoutSeconds * 1000);
@@ -301,13 +291,11 @@ async function runBash(command, timeoutSeconds) {
   return failure(`${text}\n\nCommand exited with code ${child.exitCode}.`);
 }
 
-/** @param {string} command */
-async function startBash(command) {
+async function startBash(command: string) {
   if (sessions.size >= MAX_SESSIONS) throw new Error("TooManyBashSessions");
   const shellId = `bash_${randomBytes(16).toString("hex")}`;
   const child = spawnBash(command);
-  /** @type {BashSession} */
-  const state = {
+  const state: BashSession = {
     shellId,
     child,
     output: Buffer.alloc(0),
@@ -333,24 +321,14 @@ async function startBash(command) {
   return success(JSON.stringify(takeOutput(state, DEFAULT_READ_BYTES)));
 }
 
-/**
- * @param {BashSession} state
- * @param {number} maxBytes
- * @param {number} waitMs
- */
-async function readBash(state, maxBytes, waitMs) {
+async function readBash(state: BashSession, maxBytes: number, waitMs: number) {
   if (maxBytes > MAX_READ_BYTES) throw new Error("InvalidReadLimit");
   if (waitMs > MAX_WAIT_MS) throw new Error("InvalidWait");
   await waitForOutput(state, waitMs);
   return success(JSON.stringify(takeOutput(state, maxBytes)));
 }
 
-/**
- * @param {BashSession} state
- * @param {string} data
- * @param {string} encoding
- */
-function writeBash(state, data, encoding) {
+function writeBash(state: BashSession, data: string, encoding: string) {
   if (state.exited) throw new Error("ShellNotRunning");
   const bytes = decodeInput(data, encoding);
   if (bytes.length > MAX_WRITE_BYTES) throw new Error("InputTooLarge");
@@ -365,8 +343,7 @@ function writeBash(state, data, encoding) {
   );
 }
 
-/** @param {string} shellId */
-async function stopBash(shellId) {
+async function stopBash(shellId: string) {
   if (!SHELL_ID.test(shellId)) throw new Error("InvalidShellId");
   const state = sessions.get(shellId);
   if (state === undefined) {
@@ -384,11 +361,7 @@ function stopAllSessions() {
   sessions.clear();
 }
 
-/**
- * @param {string} command
- * @returns {BashChild}
- */
-function spawnBash(command) {
+function spawnBash(command: string): BashChild {
   if (command.length === 0 || command.includes("\0")) throw new Error("InvalidCommand");
   return spawn("bash", ["-c", `exec 2>&1\n${command}`], {
     cwd: process.cwd(),
@@ -397,11 +370,7 @@ function spawnBash(command) {
   });
 }
 
-/**
- * @param {BashSession} state
- * @param {Buffer | Uint8Array} chunk
- */
-function appendOutput(state, chunk) {
+function appendOutput(state: BashSession, chunk: Buffer | Uint8Array) {
   const combined = Buffer.concat([state.output, Buffer.from(chunk)]);
   if (combined.length <= MAX_OUTPUT_BYTES) {
     state.output = combined;
@@ -413,8 +382,7 @@ function appendOutput(state, chunk) {
   notifyChanged(state);
 }
 
-/** @param {BashSession} state */
-function snapshot(state) {
+function snapshot(state: BashSession) {
   return {
     shell_id: state.shellId,
     state: state.exited ? "exited" : "running",
@@ -424,11 +392,7 @@ function snapshot(state) {
   };
 }
 
-/**
- * @param {BashSession} state
- * @param {number} maxBytes
- */
-function takeOutput(state, maxBytes) {
+function takeOutput(state: BashSession, maxBytes: number) {
   const bytes = state.output.subarray(0, maxBytes);
   state.output = state.output.subarray(bytes.length);
   const decoded = tryDecodeUtf8(bytes);
@@ -443,11 +407,7 @@ function takeOutput(state, maxBytes) {
   };
 }
 
-/**
- * @param {BashSession} state
- * @param {number} waitMs
- */
-async function waitForOutput(state, waitMs) {
+async function waitForOutput(state: BashSession, waitMs: number) {
   if (state.output.length > 0 || state.exited || waitMs === 0) return;
   await new Promise((resolve_) => {
     let settled = false;
@@ -464,16 +424,11 @@ async function waitForOutput(state, waitMs) {
   });
 }
 
-/** @param {BashSession} state */
-function notifyChanged(state) {
+function notifyChanged(state: BashSession) {
   for (const resolve_ of state.changed.splice(0)) resolve_();
 }
 
-/**
- * @param {BashChild} child
- * @param {number} timeoutMs
- */
-async function waitForExit(child, timeoutMs) {
+async function waitForExit(child: BashChild, timeoutMs: number) {
   if (child.exitCode !== null || child.signalCode !== null) return false;
   return await new Promise((resolve_) => {
     const timeout = setTimeout(() => resolve_(true), timeoutMs);
@@ -484,8 +439,7 @@ async function waitForExit(child, timeoutMs) {
   });
 }
 
-/** @param {BashChild} child */
-async function terminateChild(child) {
+async function terminateChild(child: BashChild) {
   if (child.exitCode !== null || child.signalCode !== null) return;
   const pid = child.pid;
   if (pid === undefined) {
@@ -507,11 +461,7 @@ async function terminateChild(child) {
   }
 }
 
-/**
- * @param {string} path
- * @returns {Promise<string | undefined>}
- */
-async function detectImageFile(path) {
+async function detectImageFile(path: string): Promise<string | undefined> {
   const handle = await open(path, "r");
   try {
     const prefix = Buffer.alloc(12);
@@ -522,11 +472,7 @@ async function detectImageFile(path) {
   }
 }
 
-/**
- * @param {Buffer} bytes
- * @returns {string | undefined}
- */
-function detectImage(bytes) {
+function detectImage(bytes: Buffer): string | undefined {
   if (bytes.subarray(0, 8).equals(Buffer.from("\x89PNG\r\n\x1a\n", "binary"))) {
     return "image/png";
   }
@@ -543,29 +489,16 @@ function detectImage(bytes) {
   return undefined;
 }
 
-/**
- * @param {string} path
- * @returns {string}
- */
-function resolvePath(path) {
+function resolvePath(path: string): string {
   if (path.includes("\0")) throw new Error("InvalidPath");
   return isAbsolute(path) ? resolve(path) : resolve(process.cwd(), path);
 }
 
-/**
- * @param {string} value
- * @returns {string}
- */
-function normalizeLines(value) {
+function normalizeLines(value: string): string {
   return value.replaceAll("\r\n", "\n").replaceAll("\r", "\n");
 }
 
-/**
- * @param {Buffer} bytes
- * @param {string} message
- * @returns {string}
- */
-function decodeUtf8(bytes, message) {
+function decodeUtf8(bytes: Buffer, message: string): string {
   try {
     return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
   } catch {
@@ -573,11 +506,7 @@ function decodeUtf8(bytes, message) {
   }
 }
 
-/**
- * @param {Buffer} bytes
- * @returns {string | undefined}
- */
-function tryDecodeUtf8(bytes) {
+function tryDecodeUtf8(bytes: Buffer): string | undefined {
   try {
     return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
   } catch {
@@ -585,12 +514,7 @@ function tryDecodeUtf8(bytes) {
   }
 }
 
-/**
- * @param {string} data
- * @param {string} encoding
- * @returns {Buffer}
- */
-function decodeInput(data, encoding) {
+function decodeInput(data: string, encoding: string): Buffer {
   if (encoding === "utf8") return Buffer.from(data, "utf8");
   if (
     encoding !== "base64" ||
@@ -601,11 +525,7 @@ function decodeInput(data, encoding) {
   return Buffer.from(data, "base64");
 }
 
-/**
- * @param {Record<string, unknown>} arguments_
- * @returns {BashSession}
- */
-function requireShell(arguments_) {
+function requireShell(arguments_: Record<string, unknown>): BashSession {
   const shellId = requireString(arguments_, "shell_id");
   if (!SHELL_ID.test(shellId)) throw new Error("InvalidShellId");
   const state = sessions.get(shellId);
@@ -613,23 +533,19 @@ function requireShell(arguments_) {
   return state;
 }
 
-/**
- * @param {Record<string, unknown>} arguments_
- * @param {string[]} allowed
- */
-function requireOnly(arguments_, allowed) {
+function assertArguments(value: unknown): asserts value is Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("InvalidArguments");
+  }
+}
+
+function requireOnly(arguments_: Record<string, unknown>, allowed: string[]) {
   for (const key of Object.keys(arguments_)) {
     if (!allowed.includes(key)) throw new Error("UnexpectedBashArgument");
   }
 }
 
-/**
- * @param {Record<string, unknown>} value
- * @param {string} key
- * @param {boolean} [allowEmpty]
- * @returns {string}
- */
-function requireString(value, key, allowEmpty = false) {
+function requireString(value: Record<string, unknown>, key: string, allowEmpty = false): string {
   const field = value?.[key];
   if (typeof field !== "string" || (!allowEmpty && field.length === 0)) {
     throw new Error(`Invalid${capitalize(key)}`);
@@ -637,36 +553,21 @@ function requireString(value, key, allowEmpty = false) {
   return field;
 }
 
-/**
- * @param {Record<string, unknown>} value
- * @param {string} key
- * @returns {string | undefined}
- */
-function optionalString(value, key) {
+function optionalString(value: Record<string, unknown>, key: string): string | undefined {
   const field = value?.[key];
   if (field === undefined) return undefined;
   if (typeof field !== "string") throw new Error(`Invalid${capitalize(key)}`);
   return field;
 }
 
-/**
- * @param {Record<string, unknown>} value
- * @param {string} key
- * @returns {number | undefined}
- */
-function optionalNumber(value, key) {
+function optionalNumber(value: Record<string, unknown>, key: string): number | undefined {
   const field = value?.[key];
   if (field === undefined) return undefined;
   if (typeof field !== "number") throw new Error(`Invalid${capitalize(key)}`);
   return field;
 }
 
-/**
- * @param {Record<string, unknown>} value
- * @param {string} key
- * @returns {number | undefined}
- */
-function optionalPositiveInteger(value, key) {
+function optionalPositiveInteger(value: Record<string, unknown>, key: string): number | undefined {
   const field = value?.[key];
   if (field === undefined) return undefined;
   if (typeof field !== "number" || !Number.isSafeInteger(field) || field <= 0) {
@@ -675,12 +576,10 @@ function optionalPositiveInteger(value, key) {
   return field;
 }
 
-/**
- * @param {Record<string, unknown>} value
- * @param {string} key
- * @returns {number | undefined}
- */
-function optionalNonNegativeInteger(value, key) {
+function optionalNonNegativeInteger(
+  value: Record<string, unknown>,
+  key: string,
+): number | undefined {
   const field = value?.[key];
   if (field === undefined) return undefined;
   if (typeof field !== "number" || !Number.isSafeInteger(field) || field < 0) {
@@ -689,22 +588,18 @@ function optionalNonNegativeInteger(value, key) {
   return field;
 }
 
-/** @param {string} value */
-function capitalize(value) {
+function capitalize(value: string): string {
   return value.length === 0 ? value : `${value.charAt(0).toUpperCase()}${value.slice(1)}`;
 }
 
-/** @param {string} text */
-function success(text) {
+function success(text: string) {
   return { textResultForLlm: text, resultType: "success" };
 }
 
-/** @param {string} text */
-function failure(text) {
+function failure(text: string) {
   return { textResultForLlm: text, resultType: "failure", error: text };
 }
 
-/** @param {unknown} error */
-function errorMessage(error) {
+function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }

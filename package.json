@@ -10,11 +10,12 @@
   "type": "module",
   "scripts": {
     "build": "bun run scripts/build.ts",
-    "check": "bun run format:check && bun run lint && bun run typecheck && bun test && bun run build",
+    "build:extensions": "bun run scripts/build-extensions.ts",
+    "check": "bun run format:check && bun run lint && bun run typecheck && bun run test && bun run build",
     "format": "oxfmt --write .",
     "format:check": "oxfmt --check .",
     "lint": "oxlint .",
-    "test": "bun test",
+    "test": "bun run build:extensions && bun test",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {

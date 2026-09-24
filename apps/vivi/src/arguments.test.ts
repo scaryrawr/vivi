@@ -9,7 +9,7 @@ import {
 describe("parseArguments", () => {
   test("launches Copilot by default", () => {
     expect(parseArguments([])).toEqual({ kind: "launch", args: [] });
-    expect(parseArguments(["chat"])).toEqual({ kind: "launch", args: [] });
+    expect(parseArguments(["chat"])).toEqual({ kind: "launch", args: ["chat"] });
   });
 
   describe("applyDefaultSelection", () => {
@@ -58,7 +58,7 @@ describe("parseArguments", () => {
     test("omits reasoning when the selection uses the model default", () => {
       expect(
         applyDefaultSelection([], {
-          modelId: "copilot/gpt-5.6-luna",
+          modelId: "gpt-5.6-luna",
           reasoning: null,
         }),
       ).toEqual(["--model", "gpt-5.6-luna"]);
@@ -95,19 +95,19 @@ describe("parseArguments", () => {
     });
   });
 
-  test("translates Vivi model and reasoning arguments", () => {
+  test("forwards Copilot arguments without translating their values", () => {
     expect(
       parseArguments(["chat", "--model", "copilot/gpt-5.6-luna", "--reasoning", "off"]),
     ).toEqual({
       kind: "launch",
-      args: ["--model", "gpt-5.6-luna", "--reasoning-effort", "none"],
+      args: ["chat", "--model", "copilot/gpt-5.6-luna", "--reasoning", "off"],
     });
   });
 
   test("preserves local provider model identifiers", () => {
     expect(parseArguments(["--model=omlx/Qwen3.5", "--reasoning=high"])).toEqual({
       kind: "launch",
-      args: ["--model=omlx/Qwen3.5", "--reasoning-effort=high"],
+      args: ["--model=omlx/Qwen3.5", "--reasoning=high"],
     });
   });
 

@@ -102,7 +102,7 @@ function parseDocument(value: unknown): {
     return {
       version,
       defaultSelection:
-        model === null ? null : { modelId: validateModel(model), reasoning: "none" },
+        model === null ? null : { modelId: normalizeStoredModel(model), reasoning: "none" },
     };
   }
   if (version === 2) {
@@ -123,7 +123,7 @@ function parseDocument(value: unknown): {
 function parseSelection(value: unknown, legacy: boolean): DefaultSelection | null {
   if (value === null || value === undefined) return null;
   const selection = record(value, "default_selection");
-  const modelId = validateModel(string(selection.model_id, "model_id"));
+  const modelId = normalizeStoredModel(string(selection.model_id, "model_id"));
   if (!legacy && selection.reasoning === null) {
     return { modelId, reasoning: null };
   }
@@ -152,6 +152,11 @@ function validateModel(value: string): string {
     throw new Error("Invalid Vivi settings model");
   }
   return value;
+}
+
+function normalizeStoredModel(value: string): string {
+  validateModel(value);
+  return validateModel(value.startsWith("copilot/") ? value.slice("copilot/".length) : value);
 }
 
 function validateWriteId(value: unknown): void {

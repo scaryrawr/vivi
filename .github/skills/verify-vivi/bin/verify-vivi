@@ -4,7 +4,7 @@ set -eu
 repo_root=$(git rev-parse --show-toplevel)
 artifact_root="$repo_root/.verify/vivi"
 binary="$repo_root/dist/vivi"
-default_validation_model=copilot/gpt-5.6-luna
+default_validation_model=gpt-6-luna
 
 usage() {
     cat <<'EOF'
@@ -34,11 +34,11 @@ validate_run_id() {
 validation_model() {
     model=${VIVI_VALIDATION_MODEL:-$default_validation_model}
     case "$model" in
-        copilot/*) printf '%s\n' "${model#copilot/}" ;;
-        *)
-            printf 'VIVI_VALIDATION_MODEL must use copilot/<model-id>: %s\n' "$model" >&2
+        ""|copilot/*)
+            printf 'VIVI_VALIDATION_MODEL must use a native Copilot model ID: %s\n' "$model" >&2
             exit 2
             ;;
+        *) printf '%s\n' "$model" ;;
     esac
 }
 
@@ -108,16 +108,12 @@ cli_discovery() {
         printf 'help_exit=0\n'
         printf 'version_exit=0\n'
         printf 'models_exit=0\n'
-        printf 'help_contains_chat='
-        grep -q 'chat       Launch Copilot CLI.' "$run_dir/help.stdout" &&
-            printf 'yes\n' || printf 'no\n'
         printf 'help_contains_models='
         grep -q 'models     List discovered local provider models.' "$run_dir/help.stdout" &&
             printf 'yes\n' || printf 'no\n'
     } >"$run_dir/cli-discovery.assertions.txt"
 
     grep -q '^vivi ' "$run_dir/version.stdout"
-    grep -q 'chat       Launch Copilot CLI.' "$run_dir/help.stdout"
     grep -q 'models     List discovered local provider models.' "$run_dir/help.stdout"
 }
 
