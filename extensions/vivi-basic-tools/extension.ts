@@ -86,6 +86,7 @@ const tools: Tool[] = [
       "Read UTF-8 text or a PNG, JPEG, GIF, or WebP image from a file. Images are returned as image content, not text. Paths may be absolute or relative to the workspace. For text only, offset is an optional 1-indexed first line and limit is an optional positive number of lines. Returns the selected text without Vivi-side truncation.",
     parameters: ReadParameters,
     overridesBuiltInTool: true,
+    skipPermission: true,
     handler: handleRead,
   },
   {

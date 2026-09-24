@@ -29,6 +29,10 @@ afterAll(async () => {
 test("registers the four Vivi tools as built-in replacements", () => {
   expect(tools.map(({ name }) => name)).toEqual(["read", "bash", "edit", "write"]);
   expect(tools.every(({ overridesBuiltInTool }) => overridesBuiltInTool === true)).toBe(true);
+  expect(tools.find(({ name }) => name === "read")?.skipPermission).toBe(true);
+  expect(
+    tools.filter(({ name }) => name !== "read").every(({ skipPermission }) => !skipPermission),
+  ).toBe(true);
 });
 
 test("publishes the existing JSON Schema contracts", () => {
