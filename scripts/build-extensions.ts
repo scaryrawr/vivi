@@ -1,12 +1,7 @@
 import { join } from "node:path";
 
 const root = join(import.meta.dir, "..");
-const extensions = [
-  "vivi-basic-tools",
-  "vivi-reasoning",
-  "vivi-selection-persistence",
-  "vivi-system-prompt",
-] as const;
+const extensions = ["vivi-reasoning", "vivi-selection-persistence", "vivi-system-prompt"] as const;
 
 export async function buildExtensions(): Promise<void> {
   for (const name of extensions) {

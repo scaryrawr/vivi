@@ -2,8 +2,6 @@ import { chmod, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/
 import { dirname, join } from "node:path";
 import type { LocalProviderConfiguration } from "@vivi/provider-discovery";
 // @ts-expect-error Bun's text loader embeds the generated ESM as a string.
-import basicToolsExtension from "../../../dist/extensions/vivi-basic-tools/extension.mjs" with { type: "text" };
-// @ts-expect-error Bun's text loader embeds the generated ESM as a string.
 import reasoningExtension from "../../../dist/extensions/vivi-reasoning/extension.mjs" with { type: "text" };
 // @ts-expect-error Bun's text loader embeds the generated ESM as a string.
 import systemPromptExtension from "../../../dist/extensions/vivi-system-prompt/extension.mjs" with { type: "text" };
@@ -22,7 +20,6 @@ export interface PrepareCopilotProfileOptions {
 }
 
 const EXTENSIONS = {
-  "vivi-basic-tools": basicToolsExtension,
   "vivi-reasoning": reasoningExtension,
   "vivi-selection-persistence": selectionPersistenceExtension,
   "vivi-system-prompt": systemPromptExtension,
@@ -54,9 +51,11 @@ export async function prepareCopilotProfile(
       writeOwnedFile(join(copilotHome, "extensions", name, "extension.mjs"), source, 0o600),
     ),
   );
-  await rm(join(copilotHome, "extensions", "vivi-local-model-policy", "extension.mjs"), {
-    force: true,
-  });
+  await Promise.all(
+    ["vivi-basic-tools", "vivi-local-model-policy"].map((name) =>
+      rm(join(copilotHome, "extensions", name, "extension.mjs"), { force: true }),
+    ),
+  );
   await writeRuntimeOwner(ownerPath, { launcherPid: process.pid, childPid: null });
   await writeOwnedFile(providersPath, `${JSON.stringify(options.configuration, null, 2)}\n`, 0o600);
 

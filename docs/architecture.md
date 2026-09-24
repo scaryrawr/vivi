@@ -50,25 +50,21 @@ enables Copilot's experimental extension runtime. An explicit
 `--no-experimental` is rejected because it would silently disable Vivi's
 bundled behavior. TypeScript checks the sources, not the generated files.
 
-The system prompt extension replaces the preamble and tool instructions,
-removes inherited identity, tone, efficiency, code-change, guideline, and
-safety sections, and retains the dynamic working-directory context, repository,
-and runtime instructions.
+The system prompt extension replaces the preamble, removes inherited identity,
+tone, efficiency, code-change, guideline, safety, and tool-instruction sections,
+and retains the dynamic working-directory context, repository, and runtime
+instructions. Copilot supplies its built-in tool descriptions and parameter
+schemas independently of the system prompt.
 It also excludes subagent and factory orchestration for every model at
-`joinSession()`, without model detection. Custom tools can be registered
-through the same configuration. The basic-tools extension registers Vivi's
-`read`, `bash`, `edit`, and `write` tools and declaratively excludes overlapping
-Copilot built-ins. TypeBox defines their JSON Schema parameters without changing
-the SDK tool contract. The basic tools resolve relative paths and spawn shells
-against `session.rpc.metadata.snapshot().workingDirectory`, not the extension
-process's directory; this follows changes to the session cwd. Extensions do not
-perform provider discovery because
-`joinSession()` occurs after the initial session model registry is created.
-On launch, Vivi removes the previous model-specific policy's owned entrypoint
-from existing profiles. The selection persistence extension records model and
-reasoning changes in the versioned Vivi settings document. The reasoning
-extension supplies `/reasoning` because Copilot's BYOK provider schema cannot
-publish the supported-effort list required by the built-in model picker.
+`joinSession()`, without model detection. Vivi does not replace Copilot's
+built-in file or shell tools. Extensions do not perform provider discovery
+because `joinSession()` occurs after the initial session model registry is
+created. On launch, Vivi removes the previous model-specific policy and
+basic-tools entrypoints from existing profiles. The selection persistence
+extension records model and reasoning changes in the versioned Vivi settings
+document. The reasoning extension supplies `/reasoning` because Copilot's BYOK
+provider schema cannot publish the supported-effort list required by the
+built-in model picker.
 
 ## Process boundary
 

@@ -35,7 +35,7 @@ test("keeps project and runtime instructions but drops other SDK prompt sections
       code_change_rules: { action: "remove" },
       guidelines: { action: "remove" },
       safety: { action: "remove" },
-      tool_instructions: { action: "replace" },
+      tool_instructions: { action: "remove" },
       custom_instructions: { action: "preserve" },
       runtime_instructions: { action: "preserve" },
       last_instructions: { action: "preserve" },

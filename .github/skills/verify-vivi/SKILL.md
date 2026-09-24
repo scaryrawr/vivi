@@ -25,7 +25,7 @@ The executable is `./dist/vivi`.
 
 The doctor builds Vivi, checks Bun and Copilot CLI, launches a credentialed
 noninteractive prompt through Vivi, verifies the exact response
-`VIVI_DOCTOR_OK`, and confirms both bundled extensions were materialized.
+`VIVI_DOCTOR_OK`, and confirms the three bundled extensions were materialized.
 
 ## Drives
 

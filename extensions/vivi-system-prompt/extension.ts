@@ -27,11 +27,7 @@ await joinSession({
       code_change_rules: { action: "remove" },
       guidelines: { action: "remove" },
       safety: { action: "remove" },
-      tool_instructions: {
-        action: "replace",
-        content:
-          "Use Vivi's read, bash, edit, and write tools to inspect, change, and verify the repository.",
-      },
+      tool_instructions: { action: "remove" },
       custom_instructions: { action: "preserve" },
       runtime_instructions: { action: "preserve" },
       last_instructions: { action: "preserve" },

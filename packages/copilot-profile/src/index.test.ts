@@ -36,8 +36,8 @@ describe("prepareCopilotProfile", () => {
     expect(profile.environment.VIVI_LOCAL_MODEL_IDS).toBeUndefined();
     expect(profile.environment.VIVI_SELECTED_MODEL_ID).toBeUndefined();
     expect(
-      await readFile(join(copilotHome, "extensions", "vivi-basic-tools", "extension.mjs"), "utf8"),
-    ).toContain('name: "read"');
+      await Bun.file(join(copilotHome, "extensions", "vivi-basic-tools", "extension.mjs")).exists(),
+    ).toBe(false);
     expect(
       await readFile(
         join(copilotHome, "extensions", "vivi-system-prompt", "extension.mjs"),
@@ -95,7 +95,7 @@ describe("prepareCopilotProfile", () => {
     await profile.cleanup();
   });
 
-  test("removes the previously installed model-specific policy on launch", async () => {
+  test("removes obsolete Vivi extension entrypoints without touching other files", async () => {
     const root = await mkdtemp(join(tmpdir(), "vivi-profile-"));
     temporaryDirectories.push(root);
     const oldExtension = join(
@@ -106,13 +106,27 @@ describe("prepareCopilotProfile", () => {
       "vivi-local-model-policy",
       "extension.mjs",
     );
+    const oldBasicTools = join(
+      root,
+      ".vivi",
+      "copilot",
+      "extensions",
+      "vivi-basic-tools",
+      "extension.mjs",
+    );
+    const otherFile = join(root, ".vivi", "copilot", "extensions", "vivi-basic-tools", "notes.txt");
     await mkdir(join(oldExtension, ".."), { recursive: true });
+    await mkdir(join(oldBasicTools, ".."), { recursive: true });
     await writeFile(oldExtension, "await joinSession({ excludedTools: [] });\n");
+    await writeFile(oldBasicTools, "await joinSession({ tools: [] });\n");
+    await writeFile(otherFile, "keep\n");
     const profile = await prepareCopilotProfile({
       environment: { HOME: root },
       configuration: { providers: [], models: [] },
     });
     expect(await Bun.file(oldExtension).exists()).toBe(false);
+    expect(await Bun.file(oldBasicTools).exists()).toBe(false);
+    expect(await readFile(otherFile, "utf8")).toBe("keep\n");
     await profile.cleanup();
   });
 });
