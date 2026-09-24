@@ -89,7 +89,6 @@ doctor() {
     test "$output" = "VIVI_DOCTOR_OK"
     test -f "$home/copilot/extensions/vivi-system-prompt/extension.mjs"
     test -f "$home/copilot/extensions/vivi-basic-tools/extension.mjs"
-    test -f "$home/copilot/extensions/vivi-local-model-policy/extension.mjs"
     test -f "$home/copilot/extensions/vivi-reasoning/extension.mjs"
     test -f "$home/copilot/extensions/vivi-selection-persistence/extension.mjs"
     test -f "$home/settings.json"
@@ -155,7 +154,6 @@ chat_streaming() {
         printf 'extensions_materialized='
         if test -f "$home/copilot/extensions/vivi-system-prompt/extension.mjs" &&
             test -f "$home/copilot/extensions/vivi-basic-tools/extension.mjs" &&
-            test -f "$home/copilot/extensions/vivi-local-model-policy/extension.mjs" &&
             test -f "$home/copilot/extensions/vivi-reasoning/extension.mjs" &&
             test -f "$home/copilot/extensions/vivi-selection-persistence/extension.mjs"; then
             printf 'yes\n'
@@ -168,7 +166,6 @@ chat_streaming() {
     test "$status" -eq 0
     test -f "$home/copilot/extensions/vivi-system-prompt/extension.mjs"
     test -f "$home/copilot/extensions/vivi-basic-tools/extension.mjs"
-    test -f "$home/copilot/extensions/vivi-local-model-policy/extension.mjs"
     test -f "$home/copilot/extensions/vivi-reasoning/extension.mjs"
     test -f "$home/copilot/extensions/vivi-selection-persistence/extension.mjs"
     cleanup

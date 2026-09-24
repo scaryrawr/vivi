@@ -56,16 +56,6 @@ export function enableBundledExtensions(args: string[]): string[] {
   return ["--experimental", ...args];
 }
 
-export function selectedModel(args: string[]): string | undefined {
-  for (let index = 0; index < args.length; index += 1) {
-    const argument = args[index];
-    if (argument === "--") return undefined;
-    if (argument === "--model") return args[index + 1];
-    if (argument?.startsWith("--model=")) return argument.slice("--model=".length);
-  }
-  return undefined;
-}
-
 function hasOption(args: string[], option: string): boolean {
   for (const argument of args) {
     if (argument === "--") return false;

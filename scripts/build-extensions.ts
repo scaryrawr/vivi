@@ -3,7 +3,6 @@ import { join } from "node:path";
 const root = join(import.meta.dir, "..");
 const extensions = [
   "vivi-basic-tools",
-  "vivi-local-model-policy",
   "vivi-reasoning",
   "vivi-selection-persistence",
   "vivi-system-prompt",

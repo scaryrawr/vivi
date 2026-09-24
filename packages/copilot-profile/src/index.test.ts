@@ -18,7 +18,6 @@ describe("prepareCopilotProfile", () => {
     temporaryDirectories.push(root);
     const profile = await prepareCopilotProfile({
       environment: { HOME: root },
-      selectedModelId: "omlx/model",
       configuration: {
         providers: [
           {
@@ -34,8 +33,8 @@ describe("prepareCopilotProfile", () => {
     const copilotHome = join(root, ".vivi", "copilot");
     expect(profile.environment.COPILOT_HOME).toBe(copilotHome);
     expect(profile.environment.VIVI_SETTINGS_PATH).toBe(join(root, ".vivi", "settings.json"));
-    expect(profile.environment.VIVI_LOCAL_MODEL_IDS).toBe('["omlx/model"]');
-    expect(profile.environment.VIVI_SELECTED_MODEL_ID).toBe("omlx/model");
+    expect(profile.environment.VIVI_LOCAL_MODEL_IDS).toBeUndefined();
+    expect(profile.environment.VIVI_SELECTED_MODEL_ID).toBeUndefined();
     expect(
       await readFile(join(copilotHome, "extensions", "vivi-basic-tools", "extension.mjs"), "utf8"),
     ).toContain('name: "read"');
@@ -45,12 +44,6 @@ describe("prepareCopilotProfile", () => {
         "utf8",
       ),
     ).toContain("joinSession");
-    const localPolicy = await readFile(
-      join(copilotHome, "extensions", "vivi-local-model-policy", "extension.mjs"),
-      "utf8",
-    );
-    expect(localPolicy).toContain("VIVI_LOCAL_MODEL_IDS must be an array of model IDs");
-    expect(localPolicy).not.toContain('from "@sinclair/typebox"');
     expect(
       await readFile(
         join(copilotHome, "extensions", "vivi-selection-persistence", "extension.mjs"),
@@ -99,6 +92,27 @@ describe("prepareCopilotProfile", () => {
 
     expect(await Bun.file(join(deadRuntime, "providers.json")).exists()).toBe(false);
     expect(await Bun.file(join(liveRuntime, "providers.json")).exists()).toBe(true);
+    await profile.cleanup();
+  });
+
+  test("removes the previously installed model-specific policy on launch", async () => {
+    const root = await mkdtemp(join(tmpdir(), "vivi-profile-"));
+    temporaryDirectories.push(root);
+    const oldExtension = join(
+      root,
+      ".vivi",
+      "copilot",
+      "extensions",
+      "vivi-local-model-policy",
+      "extension.mjs",
+    );
+    await mkdir(join(oldExtension, ".."), { recursive: true });
+    await writeFile(oldExtension, "await joinSession({ excludedTools: [] });\n");
+    const profile = await prepareCopilotProfile({
+      environment: { HOME: root },
+      configuration: { providers: [], models: [] },
+    });
+    expect(await Bun.file(oldExtension).exists()).toBe(false);
     await profile.cleanup();
   });
 });

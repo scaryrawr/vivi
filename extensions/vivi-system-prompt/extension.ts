@@ -1,6 +1,14 @@
 import { joinSession } from "@github/copilot-sdk/extension";
 
 await joinSession({
+  excludedTools: [
+    "builtin:task",
+    "builtin:list_agents",
+    "builtin:read_agent",
+    "builtin:write_agent",
+    "builtin:run_factory",
+    "builtin:factories_manage",
+  ],
   systemMessage: {
     mode: "customize",
     sections: {
@@ -15,10 +23,10 @@ await joinSession({
       identity: { action: "remove" },
       tone: { action: "remove" },
       tool_efficiency: { action: "remove" },
-      environment_context: { action: "preserve" },
+      environment_context: { action: "remove" },
       code_change_rules: { action: "remove" },
       guidelines: { action: "remove" },
-      safety: { action: "preserve" },
+      safety: { action: "remove" },
       tool_instructions: {
         action: "replace",
         content:

@@ -1,10 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import {
-  applyDefaultSelection,
-  enableBundledExtensions,
-  parseArguments,
-  selectedModel,
-} from "./arguments.ts";
+import { applyDefaultSelection, enableBundledExtensions, parseArguments } from "./arguments.ts";
 
 describe("parseArguments", () => {
   test("launches Copilot by default", () => {
@@ -82,16 +77,6 @@ describe("parseArguments", () => {
       expect(() => enableBundledExtensions(["--no-experimental"])).toThrow(
         "Vivi requires Copilot's experimental extension runtime",
       );
-    });
-  });
-
-  describe("selectedModel", () => {
-    test("reads the effective Copilot model argument", () => {
-      expect(selectedModel(["--experimental", "--model", "omlx/local-model"])).toBe(
-        "omlx/local-model",
-      );
-      expect(selectedModel(["--model=gpt-5.6-luna"])).toBe("gpt-5.6-luna");
-      expect(selectedModel(["--", "--model", "omlx/not-an-option"])).toBeUndefined();
     });
   });
 

@@ -3,12 +3,7 @@ import { prepareCopilotProfile } from "@vivi/copilot-profile";
 import { discoverLocalProviders, type ProviderModelConfig } from "@vivi/provider-discovery";
 import { loadAndMigrateViviSettings } from "@vivi/settings";
 import packageMetadata from "../package.json";
-import {
-  applyDefaultSelection,
-  enableBundledExtensions,
-  parseArguments,
-  selectedModel,
-} from "./arguments.ts";
+import { applyDefaultSelection, enableBundledExtensions, parseArguments } from "./arguments.ts";
 
 declare const VIVI_VERSION: string | undefined;
 const VERSION = typeof VIVI_VERSION === "string" ? VIVI_VERSION : packageMetadata.version;
@@ -59,7 +54,6 @@ try {
   const profile = await prepareCopilotProfile({
     environment: process.env,
     configuration: discovery,
-    selectedModelId: selectedModel(childArgs),
   });
   try {
     const child = Bun.spawn([resolve(copilot), ...childArgs], {
