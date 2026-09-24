@@ -95,24 +95,48 @@ doctor() {
 }
 
 cli_discovery() {
+    require_command copilot
     run_dir=$(prepare_run "$1")
     build_vivi
+    home=$(mktemp -d "${TMPDIR:-/tmp}/vivi-cli-discovery.XXXXXX")
+    cleanup() {
+        rm -rf "$home"
+    }
+    trap cleanup EXIT INT TERM
 
     "$binary" --help >"$run_dir/help.stdout" 2>"$run_dir/help.stderr"
     "$binary" --version >"$run_dir/version.stdout" 2>"$run_dir/version.stderr"
     "$binary" models >"$run_dir/models.stdout" 2>"$run_dir/models.stderr"
+    VIVI_HOME="$home/vivi" "$binary" --no-auto-update help environment \
+        >"$run_dir/native-help.stdout" 2>"$run_dir/native-help.stderr"
+    COPILOT_HOME="$home/copilot" copilot --no-auto-update help environment \
+        >"$run_dir/copilot-help.stdout" 2>"$run_dir/copilot-help.stderr"
 
     {
         printf 'help_exit=0\n'
         printf 'version_exit=0\n'
         printf 'models_exit=0\n'
+        printf 'native_help_exit=0\n'
+        printf 'copilot_help_exit=0\n'
         printf 'help_contains_models='
         grep -q 'models     List discovered local provider models.' "$run_dir/help.stdout" &&
             printf 'yes\n' || printf 'no\n'
+        printf 'native_args_forwarded='
+        if cmp -s "$run_dir/native-help.stdout" "$run_dir/copilot-help.stdout" &&
+            cmp -s "$run_dir/native-help.stderr" "$run_dir/copilot-help.stderr"; then
+            printf 'yes\n'
+        else
+            printf 'no\n'
+        fi
     } >"$run_dir/cli-discovery.assertions.txt"
 
     grep -q '^vivi ' "$run_dir/version.stdout"
     grep -q 'models     List discovered local provider models.' "$run_dir/help.stdout"
+    grep -q 'COPILOT_ALLOW_ALL' "$run_dir/native-help.stdout"
+    cmp "$run_dir/native-help.stdout" "$run_dir/copilot-help.stdout"
+    cmp "$run_dir/native-help.stderr" "$run_dir/copilot-help.stderr"
+    cleanup
+    trap - EXIT INT TERM
 }
 
 chat_streaming() {
