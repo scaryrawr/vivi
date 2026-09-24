@@ -6,11 +6,13 @@ import type { SessionEventHandler, Tool } from "@github/copilot-sdk";
 import type { JoinSessionConfig } from "@github/copilot-sdk/extension";
 
 let tools: Tool[] = [];
+let excludedTools: JoinSessionConfig["excludedTools"];
 let shutdown: SessionEventHandler | undefined;
 
 mock.module("@github/copilot-sdk/extension", () => ({
   joinSession: async (config: JoinSessionConfig) => {
     tools = config.tools ?? [];
+    excludedTools = config.excludedTools;
     return {
       on: (event: string, handler: SessionEventHandler) => {
         if (event === "session.shutdown") shutdown = handler;
@@ -33,6 +35,7 @@ test("registers the four Vivi tools as built-in replacements", () => {
   expect(
     tools.filter(({ name }) => name !== "read").every(({ skipPermission }) => !skipPermission),
   ).toBe(true);
+  expect(excludedTools).toEqual(["builtin:bash", "builtin:edit"]);
 });
 
 test("publishes the existing JSON Schema contracts", () => {

@@ -1,3 +1,8 @@
+---
+name: verify-vivi
+description: Verify Vivi's compiled launcher and real Copilot CLI integration with isolated profile drives.
+---
+
 # Verify Vivi
 
 Drive the compiled Vivi launcher as a user would. Vivi delegates the terminal

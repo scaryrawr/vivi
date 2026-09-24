@@ -116,7 +116,7 @@ const tools: Tool[] = [
 ];
 
 const session = await joinSession({
-  excludedTools: ["builtin:read", "builtin:bash", "builtin:edit", "builtin:write"],
+  excludedTools: ["builtin:bash", "builtin:edit"],
   tools,
 });
 
