@@ -18,6 +18,7 @@ await joinSession({
     "builtin:str_replace_editor",
     "builtin:send_inbox",
     "builtin:sql",
+    "builtin:session_store_sql",
     "builtin:task_complete",
     "builtin:update_todo",
     "builtin:grep",

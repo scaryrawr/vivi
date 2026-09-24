@@ -30,11 +30,20 @@ test("applies the lightweight tool policy without checking the selected model", 
     "builtin:str_replace_editor",
     "builtin:send_inbox",
     "builtin:sql",
+    "builtin:session_store_sql",
     "builtin:task_complete",
     "builtin:update_todo",
     "builtin:grep",
     "builtin:glob",
   ]);
+  expect(joinConfig?.availableTools).toBeUndefined();
+  const excludedTools = joinConfig?.excludedTools;
+  if (!Array.isArray(excludedTools)) throw new Error("expected excluded tool names");
+  const names: string[] = excludedTools;
+  expect(names.every((name) => name.startsWith("builtin:"))).toBe(true);
+  for (const name of ["ask_user", "skill", "web_fetch", "view", "bash", "edit", "create"]) {
+    expect(names).not.toContain(`builtin:${name}`);
+  }
 });
 
 test("keeps project and runtime instructions but drops other SDK prompt sections", () => {

@@ -59,7 +59,9 @@ It also excludes subagent and factory orchestration for every model at
 `joinSession()`, without model detection. Vivi does not replace Copilot's
 built-in file or shell tools. It excludes unrelated Copilot built-ins with
 `builtin:`-qualified names, without restricting external extensions or MCP
-tools. Copilot's tool-search tools remain available to discover them.
+tools. Both `sql` and `session_store_sql` are excluded because Copilot exposes
+these as separate built-ins. Copilot's tool-search tools remain available to
+discover external tools.
 Extensions do not perform provider discovery because `joinSession()` occurs
 after the initial session model registry is created. On launch, Vivi removes
 the previous model-specific policy and basic-tools entrypoints from existing
