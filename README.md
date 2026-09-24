@@ -76,7 +76,9 @@ bundled into those files; only Copilot's extension SDK remains a runtime import.
   Vivi session.
 
 Vivi uses Copilot's built-in file and shell tools and their normal permission
-flow; it does not register replacement tools.
+flow; it does not register replacement tools. The system-prompt extension
+excludes unrelated built-in tools by name while leaving tool search, external
+extensions, and MCP tools available.
 
 ## Development
 

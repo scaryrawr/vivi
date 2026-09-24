@@ -57,14 +57,16 @@ instructions. Copilot supplies its built-in tool descriptions and parameter
 schemas independently of the system prompt.
 It also excludes subagent and factory orchestration for every model at
 `joinSession()`, without model detection. Vivi does not replace Copilot's
-built-in file or shell tools. Extensions do not perform provider discovery
-because `joinSession()` occurs after the initial session model registry is
-created. On launch, Vivi removes the previous model-specific policy and
-basic-tools entrypoints from existing profiles. The selection persistence
-extension records model and reasoning changes in the versioned Vivi settings
-document. The reasoning extension supplies `/reasoning` because Copilot's BYOK
-provider schema cannot publish the supported-effort list required by the
-built-in model picker.
+built-in file or shell tools. It excludes unrelated Copilot built-ins with
+`builtin:`-qualified names, without restricting external extensions or MCP
+tools. Copilot's tool-search tools remain available to discover them.
+Extensions do not perform provider discovery because `joinSession()` occurs
+after the initial session model registry is created. On launch, Vivi removes
+the previous model-specific policy and basic-tools entrypoints from existing
+profiles. The selection persistence extension records model and reasoning
+changes in the versioned Vivi settings document. The reasoning extension
+supplies `/reasoning` because Copilot's BYOK provider schema cannot publish
+the supported-effort list required by the built-in model picker.
 
 ## Process boundary
 
