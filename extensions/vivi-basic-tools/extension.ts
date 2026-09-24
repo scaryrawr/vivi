@@ -125,7 +125,7 @@ session.on("session.shutdown", stopAllSessions);
 async function handleRead(arguments_: unknown) {
   try {
     assertArguments(arguments_);
-    const path = resolvePath(requireString(arguments_, "path"));
+    const path = await resolvePath(requireString(arguments_, "path"));
     const offset = optionalPositiveInteger(arguments_, "offset") ?? 1;
     const limit = optionalPositiveInteger(arguments_, "limit") ?? Number.MAX_SAFE_INTEGER;
     const format = await detectImageFile(path);
@@ -212,7 +212,7 @@ async function handleBash(arguments_: unknown) {
 async function handleEdit(arguments_: unknown) {
   try {
     assertArguments(arguments_);
-    const path = resolvePath(requireString(arguments_, "path"));
+    const path = await resolvePath(requireString(arguments_, "path"));
     const edits = arguments_.edits;
     if (!Array.isArray(edits) || edits.length === 0) throw new Error("EmptyEdits");
     const raw = await readFile(path);
@@ -261,7 +261,7 @@ async function handleEdit(arguments_: unknown) {
 async function handleWrite(arguments_: unknown) {
   try {
     assertArguments(arguments_);
-    const path = resolvePath(requireString(arguments_, "path"));
+    const path = await resolvePath(requireString(arguments_, "path"));
     const content = requireString(arguments_, "content", true);
     await mkdir(dirname(path), { recursive: true });
     await writeFile(path, content, "utf8");
@@ -275,7 +275,7 @@ async function runBash(command: string, timeoutSeconds: number) {
   if (!Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0 || timeoutSeconds > 600) {
     throw new Error("InvalidTimeout");
   }
-  const child = spawnBash(command);
+  const child = await spawnBash(command);
   const output: Buffer[] = [];
   child.stdout.on("data", (data) => output.push(Buffer.from(data)));
   child.stderr.on("data", (data) => output.push(Buffer.from(data)));
@@ -295,7 +295,7 @@ async function runBash(command: string, timeoutSeconds: number) {
 async function startBash(command: string) {
   if (sessions.size >= MAX_SESSIONS) throw new Error("TooManyBashSessions");
   const shellId = `bash_${randomBytes(16).toString("hex")}`;
-  const child = spawnBash(command);
+  const child = await spawnBash(command);
   const state: BashSession = {
     shellId,
     child,
@@ -362,10 +362,10 @@ function stopAllSessions() {
   sessions.clear();
 }
 
-function spawnBash(command: string): BashChild {
+async function spawnBash(command: string): Promise<BashChild> {
   if (command.length === 0 || command.includes("\0")) throw new Error("InvalidCommand");
   return spawn("bash", ["-c", `exec 2>&1\n${command}`], {
-    cwd: process.cwd(),
+    cwd: await workingDirectory(),
     detached: process.platform !== "win32",
     stdio: ["pipe", "pipe", "pipe"],
   });
@@ -490,9 +490,13 @@ function detectImage(bytes: Buffer): string | undefined {
   return undefined;
 }
 
-function resolvePath(path: string): string {
+async function resolvePath(path: string): Promise<string> {
   if (path.includes("\0")) throw new Error("InvalidPath");
-  return isAbsolute(path) ? resolve(path) : resolve(process.cwd(), path);
+  return isAbsolute(path) ? resolve(path) : resolve(await workingDirectory(), path);
+}
+
+async function workingDirectory(): Promise<string> {
+  return (await session.rpc.metadata.snapshot()).workingDirectory;
 }
 
 function normalizeLines(value: string): string {

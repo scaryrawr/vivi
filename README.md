@@ -73,7 +73,8 @@ bundled into those files; only Copilot's extension SDK remains a runtime import.
 - `vivi-basic-tools` replaces overlapping Copilot built-ins with Vivi's
   `read`, `bash`, `edit`, and `write` implementations. Their JSON Schema tool
   parameters are defined with TypeBox. `read` runs without a permission prompt;
-  the other tools retain Copilot's permission flow.
+  the other tools retain Copilot's permission flow. Relative paths and Bash
+  commands use the current session working directory, including after `/cd`.
 - `vivi-reasoning` provides the `/reasoning` session command for models whose
   supported effort levels are not exposed by Copilot's model picker.
 - `vivi-selection-persistence` records model and reasoning changes for the next

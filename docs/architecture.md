@@ -51,14 +51,18 @@ enables Copilot's experimental extension runtime. An explicit
 bundled behavior. TypeScript checks the sources, not the generated files.
 
 The system prompt extension replaces the preamble and tool instructions,
-removes inherited identity, tone, efficiency, environment, code-change,
-guideline, and safety sections, and retains repository and runtime instructions.
+removes inherited identity, tone, efficiency, code-change, guideline, and
+safety sections, and retains the dynamic working-directory context, repository,
+and runtime instructions.
 It also excludes subagent and factory orchestration for every model at
 `joinSession()`, without model detection. Custom tools can be registered
 through the same configuration. The basic-tools extension registers Vivi's
 `read`, `bash`, `edit`, and `write` tools and declaratively excludes overlapping
 Copilot built-ins. TypeBox defines their JSON Schema parameters without changing
-the SDK tool contract. Extensions do not perform provider discovery because
+the SDK tool contract. The basic tools resolve relative paths and spawn shells
+against `session.rpc.metadata.snapshot().workingDirectory`, not the extension
+process's directory; this follows changes to the session cwd. Extensions do not
+perform provider discovery because
 `joinSession()` occurs after the initial session model registry is created.
 On launch, Vivi removes the previous model-specific policy's owned entrypoint
 from existing profiles. The selection persistence extension records model and

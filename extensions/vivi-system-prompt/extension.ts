@@ -23,7 +23,7 @@ await joinSession({
       identity: { action: "remove" },
       tone: { action: "remove" },
       tool_efficiency: { action: "remove" },
-      environment_context: { action: "remove" },
+      environment_context: { action: "preserve" },
       code_change_rules: { action: "remove" },
       guidelines: { action: "remove" },
       safety: { action: "remove" },
