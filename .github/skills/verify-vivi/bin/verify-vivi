@@ -4,7 +4,7 @@ set -eu
 repo_root=$(git rev-parse --show-toplevel)
 artifact_root="$repo_root/.verify/vivi"
 binary="$repo_root/dist/vivi"
-default_validation_model=copilot/gpt-5.6-luna
+default_validation_model=gpt-6-luna
 
 usage() {
     cat <<'EOF'
@@ -34,11 +34,11 @@ validate_run_id() {
 validation_model() {
     model=${VIVI_VALIDATION_MODEL:-$default_validation_model}
     case "$model" in
-        copilot/*) printf '%s\n' "${model#copilot/}" ;;
-        *)
-            printf 'VIVI_VALIDATION_MODEL must use copilot/<model-id>: %s\n' "$model" >&2
+        ""|copilot/*)
+            printf 'VIVI_VALIDATION_MODEL must use a native Copilot model ID: %s\n' "$model" >&2
             exit 2
             ;;
+        *) printf '%s\n' "$model" ;;
     esac
 }
 
@@ -88,8 +88,6 @@ doctor() {
     )
     test "$output" = "VIVI_DOCTOR_OK"
     test -f "$home/copilot/extensions/vivi-system-prompt/extension.mjs"
-    test -f "$home/copilot/extensions/vivi-basic-tools/extension.mjs"
-    test -f "$home/copilot/extensions/vivi-local-model-policy/extension.mjs"
     test -f "$home/copilot/extensions/vivi-reasoning/extension.mjs"
     test -f "$home/copilot/extensions/vivi-selection-persistence/extension.mjs"
     test -f "$home/settings.json"
@@ -97,28 +95,48 @@ doctor() {
 }
 
 cli_discovery() {
+    require_command copilot
     run_dir=$(prepare_run "$1")
     build_vivi
+    home=$(mktemp -d "${TMPDIR:-/tmp}/vivi-cli-discovery.XXXXXX")
+    cleanup() {
+        rm -rf "$home"
+    }
+    trap cleanup EXIT INT TERM
 
     "$binary" --help >"$run_dir/help.stdout" 2>"$run_dir/help.stderr"
     "$binary" --version >"$run_dir/version.stdout" 2>"$run_dir/version.stderr"
     "$binary" models >"$run_dir/models.stdout" 2>"$run_dir/models.stderr"
+    VIVI_HOME="$home/vivi" "$binary" --no-auto-update help environment \
+        >"$run_dir/native-help.stdout" 2>"$run_dir/native-help.stderr"
+    COPILOT_HOME="$home/copilot" copilot --no-auto-update help environment \
+        >"$run_dir/copilot-help.stdout" 2>"$run_dir/copilot-help.stderr"
 
     {
         printf 'help_exit=0\n'
         printf 'version_exit=0\n'
         printf 'models_exit=0\n'
-        printf 'help_contains_chat='
-        grep -q 'chat       Launch Copilot CLI.' "$run_dir/help.stdout" &&
-            printf 'yes\n' || printf 'no\n'
+        printf 'native_help_exit=0\n'
+        printf 'copilot_help_exit=0\n'
         printf 'help_contains_models='
         grep -q 'models     List discovered local provider models.' "$run_dir/help.stdout" &&
             printf 'yes\n' || printf 'no\n'
+        printf 'native_args_forwarded='
+        if cmp -s "$run_dir/native-help.stdout" "$run_dir/copilot-help.stdout" &&
+            cmp -s "$run_dir/native-help.stderr" "$run_dir/copilot-help.stderr"; then
+            printf 'yes\n'
+        else
+            printf 'no\n'
+        fi
     } >"$run_dir/cli-discovery.assertions.txt"
 
     grep -q '^vivi ' "$run_dir/version.stdout"
-    grep -q 'chat       Launch Copilot CLI.' "$run_dir/help.stdout"
     grep -q 'models     List discovered local provider models.' "$run_dir/help.stdout"
+    grep -q 'COPILOT_ALLOW_ALL' "$run_dir/native-help.stdout"
+    cmp "$run_dir/native-help.stdout" "$run_dir/copilot-help.stdout"
+    cmp "$run_dir/native-help.stderr" "$run_dir/copilot-help.stderr"
+    cleanup
+    trap - EXIT INT TERM
 }
 
 chat_streaming() {
@@ -158,8 +176,6 @@ chat_streaming() {
             printf 'yes\n' || printf 'no\n'
         printf 'extensions_materialized='
         if test -f "$home/copilot/extensions/vivi-system-prompt/extension.mjs" &&
-            test -f "$home/copilot/extensions/vivi-basic-tools/extension.mjs" &&
-            test -f "$home/copilot/extensions/vivi-local-model-policy/extension.mjs" &&
             test -f "$home/copilot/extensions/vivi-reasoning/extension.mjs" &&
             test -f "$home/copilot/extensions/vivi-selection-persistence/extension.mjs"; then
             printf 'yes\n'
@@ -171,8 +187,6 @@ chat_streaming() {
     grep -a -q 'VIVI_STREAM_OK' "$run_dir/chat-streaming.terminal.log"
     test "$status" -eq 0
     test -f "$home/copilot/extensions/vivi-system-prompt/extension.mjs"
-    test -f "$home/copilot/extensions/vivi-basic-tools/extension.mjs"
-    test -f "$home/copilot/extensions/vivi-local-model-policy/extension.mjs"
     test -f "$home/copilot/extensions/vivi-reasoning/extension.mjs"
     test -f "$home/copilot/extensions/vivi-selection-persistence/extension.mjs"
     cleanup

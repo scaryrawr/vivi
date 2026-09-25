@@ -3,30 +3,21 @@ import { prepareCopilotProfile } from "@vivi/copilot-profile";
 import { discoverLocalProviders, type ProviderModelConfig } from "@vivi/provider-discovery";
 import { loadAndMigrateViviSettings } from "@vivi/settings";
 import packageMetadata from "../package.json";
-import {
-  applyDefaultSelection,
-  enableBundledExtensions,
-  parseArguments,
-  selectedModel,
-} from "./arguments.ts";
+import { applyDefaultSelection, enableBundledExtensions, parseArguments } from "./arguments.ts";
 
 declare const VIVI_VERSION: string | undefined;
 const VERSION = typeof VIVI_VERSION === "string" ? VIVI_VERSION : packageMetadata.version;
 
-const HELP = `Usage: vivi [--help] [--version] [models [--json]] [chat] [COPILOT_OPTIONS]
+const HELP = `Usage: vivi [--help] [--version] [models [--json]] [COPILOT_OPTIONS]
 
 Vivi discovers local models, installs its bundled Copilot extensions, and
 launches GitHub Copilot CLI with an isolated Vivi profile.
 
 Commands:
   models     List discovered local provider models.
-  chat       Launch Copilot CLI. This is also the default command.
 
-Compatibility:
-  --model copilot/<id> is forwarded as --model <id>.
-  --reasoning <level> is forwarded as --reasoning-effort <level>.
-
-All other arguments are passed directly to GitHub Copilot CLI.
+All other arguments are passed directly to GitHub Copilot CLI. Run
+\`copilot --help\` for its options and commands.
 `;
 
 try {
@@ -63,7 +54,6 @@ try {
   const profile = await prepareCopilotProfile({
     environment: process.env,
     configuration: discovery,
-    selectedModelId: selectedModel(childArgs),
   });
   try {
     const child = Bun.spawn([resolve(copilot), ...childArgs], {

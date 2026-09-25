@@ -12,7 +12,7 @@ prompt in a PTY with inherited terminal I/O and streamed output.
 
 ## How to get to it (user POV)
 
-- Run `vivi`, `vivi chat`, or `vivi --model copilot/<model-id>`.
+- Run `vivi` or `vivi --model <model-id>`.
 - Or pass `-p <prompt>` for one-shot prompt mode.
 
 ## Driving it with verify-vivi

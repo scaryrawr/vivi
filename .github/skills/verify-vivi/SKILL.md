@@ -1,3 +1,8 @@
+---
+name: verify-vivi
+description: Verify Vivi's compiled launcher and real Copilot CLI integration with isolated profile drives.
+---
+
 # Verify Vivi
 
 Drive the compiled Vivi launcher as a user would. Vivi delegates the terminal
@@ -20,7 +25,7 @@ The executable is `./dist/vivi`.
 
 The doctor builds Vivi, checks Bun and Copilot CLI, launches a credentialed
 noninteractive prompt through Vivi, verifies the exact response
-`VIVI_DOCTOR_OK`, and confirms both bundled extensions were materialized.
+`VIVI_DOCTOR_OK`, and confirms the three bundled extensions were materialized.
 
 ## Drives
 
@@ -43,7 +48,7 @@ Credentialed drives require `gh auth token`. The helper passes the token to the
 isolated Copilot process through `GH_TOKEN` and `GITHUB_TOKEN` without writing
 it to evidence.
 
-Use `VIVI_VALIDATION_MODEL=copilot/<model-id>` to override the default hosted
+Use `VIVI_VALIDATION_MODEL=<model-id>` to override the default hosted
 validation model.
 
 ## Evidence

@@ -1,16 +1,12 @@
 import { chmod, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { LocalProviderConfiguration } from "@vivi/provider-discovery";
-// @ts-expect-error Bun's text loader turns the extension source into a string.
-import basicToolsExtension from "../../../extensions/vivi-basic-tools/extension.mjs" with { type: "text" };
-// @ts-expect-error Bun's text loader turns the extension source into a string.
-import localModelPolicyExtension from "../../../extensions/vivi-local-model-policy/extension.mjs" with { type: "text" };
-// @ts-expect-error Bun's text loader turns the extension source into a string.
-import reasoningExtension from "../../../extensions/vivi-reasoning/extension.mjs" with { type: "text" };
-// @ts-expect-error Bun's text loader turns the extension source into a string.
-import systemPromptExtension from "../../../extensions/vivi-system-prompt/extension.mjs" with { type: "text" };
-// @ts-expect-error Bun's text loader turns the extension source into a string.
-import selectionPersistenceExtension from "../../../extensions/vivi-selection-persistence/extension.mjs" with { type: "text" };
+// @ts-expect-error Bun's text loader embeds the generated ESM as a string.
+import reasoningExtension from "../../../dist/extensions/vivi-reasoning/extension.mjs" with { type: "text" };
+// @ts-expect-error Bun's text loader embeds the generated ESM as a string.
+import systemPromptExtension from "../../../dist/extensions/vivi-system-prompt/extension.mjs" with { type: "text" };
+// @ts-expect-error Bun's text loader embeds the generated ESM as a string.
+import selectionPersistenceExtension from "../../../dist/extensions/vivi-selection-persistence/extension.mjs" with { type: "text" };
 
 export interface PreparedCopilotProfile {
   environment: Record<string, string | undefined>;
@@ -21,12 +17,9 @@ export interface PreparedCopilotProfile {
 export interface PrepareCopilotProfileOptions {
   environment: NodeJS.ProcessEnv;
   configuration: LocalProviderConfiguration;
-  selectedModelId?: string;
 }
 
 const EXTENSIONS = {
-  "vivi-basic-tools": basicToolsExtension,
-  "vivi-local-model-policy": localModelPolicyExtension,
   "vivi-reasoning": reasoningExtension,
   "vivi-selection-persistence": selectionPersistenceExtension,
   "vivi-system-prompt": systemPromptExtension,
@@ -58,18 +51,19 @@ export async function prepareCopilotProfile(
       writeOwnedFile(join(copilotHome, "extensions", name, "extension.mjs"), source, 0o600),
     ),
   );
+  await Promise.all(
+    ["vivi-basic-tools", "vivi-local-model-policy"].map((name) =>
+      rm(join(copilotHome, "extensions", name, "extension.mjs"), { force: true }),
+    ),
+  );
   await writeRuntimeOwner(ownerPath, { launcherPid: process.pid, childPid: null });
   await writeOwnedFile(providersPath, `${JSON.stringify(options.configuration, null, 2)}\n`, 0o600);
-
-  const localModelIds = options.configuration.models.map(({ provider, id }) => `${provider}/${id}`);
 
   return {
     environment: {
       ...options.environment,
       COPILOT_HOME: copilotHome,
       COPILOT_PROVIDERS_CONFIG: providersPath,
-      VIVI_LOCAL_MODEL_IDS: JSON.stringify(localModelIds),
-      VIVI_SELECTED_MODEL_ID: options.selectedModelId,
       VIVI_SETTINGS_PATH: join(viviHome, "settings.json"),
     },
     trackChild: async (pid) => {

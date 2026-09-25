@@ -1,6 +1,29 @@
 import { joinSession } from "@github/copilot-sdk/extension";
 
 await joinSession({
+  excludedTools: [
+    "builtin:task",
+    "builtin:list_agents",
+    "builtin:read_agent",
+    "builtin:write_agent",
+    "builtin:run_factory",
+    "builtin:factories_manage",
+    "builtin:fetch_copilot_cli_documentation",
+    "builtin:context_board",
+    "builtin:create_pull_request",
+    "builtin:read_inbox",
+    "builtin:reply_to_comment",
+    "builtin:manage_schedule",
+    "builtin:apply_patch",
+    "builtin:str_replace_editor",
+    "builtin:send_inbox",
+    "builtin:sql",
+    "builtin:session_store_sql",
+    "builtin:task_complete",
+    "builtin:update_todo",
+    "builtin:grep",
+    "builtin:glob",
+  ],
   systemMessage: {
     mode: "customize",
     sections: {
@@ -18,12 +41,8 @@ await joinSession({
       environment_context: { action: "preserve" },
       code_change_rules: { action: "remove" },
       guidelines: { action: "remove" },
-      safety: { action: "preserve" },
-      tool_instructions: {
-        action: "replace",
-        content:
-          "Use Vivi's read, bash, edit, and write tools to inspect, change, and verify the repository.",
-      },
+      safety: { action: "remove" },
+      tool_instructions: { action: "remove" },
       custom_instructions: { action: "preserve" },
       runtime_instructions: { action: "preserve" },
       last_instructions: { action: "preserve" },

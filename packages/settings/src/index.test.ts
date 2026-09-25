@@ -44,7 +44,7 @@ describe("Vivi settings", () => {
     });
   });
 
-  test("loads version 1 with reasoning disabled", async () => {
+  test("migrates version 1 hosted model IDs to Copilot's native syntax", async () => {
     const root = await temporaryDirectory();
     const path = join(root, "settings.json");
     await writeFile(
@@ -54,10 +54,58 @@ describe("Vivi settings", () => {
         default_model: "copilot/model",
       }),
     );
-    expect((await loadSettings(path)).defaultSelection).toEqual({
-      modelId: "copilot/model",
+    expect((await loadAndMigrateViviSettings({ VIVI_HOME: root })).defaultSelection).toEqual({
+      modelId: "model",
       reasoning: "none",
     });
+    expect(JSON.parse(await readFile(path, "utf8"))).toMatchObject({
+      version: 3,
+      default_selection: { model_id: "model", reasoning: "none" },
+    });
+  });
+
+  test("migrates version 2 hosted model IDs to Copilot's native syntax", async () => {
+    const root = await temporaryDirectory();
+    const path = join(root, "settings.json");
+    await writeFile(
+      path,
+      JSON.stringify({
+        version: 2,
+        default_selection: { model_id: "copilot/model", reasoning: "off" },
+      }),
+    );
+    expect((await loadAndMigrateViviSettings({ VIVI_HOME: root })).defaultSelection).toEqual({
+      modelId: "model",
+      reasoning: "none",
+    });
+    expect(JSON.parse(await readFile(path, "utf8"))).toMatchObject({
+      version: 3,
+      default_selection: { model_id: "model", reasoning: "none" },
+    });
+  });
+
+  test("normalizes stored hosted model IDs without changing local IDs", async () => {
+    const root = await temporaryDirectory();
+    const path = join(root, "settings.json");
+    await writeFile(
+      path,
+      JSON.stringify({
+        version: 3,
+        default_selection: { model_id: "copilot/model", reasoning: null },
+      }),
+    );
+    expect((await loadSettings(path)).defaultSelection).toEqual({
+      modelId: "model",
+      reasoning: null,
+    });
+    await writeFile(
+      path,
+      JSON.stringify({
+        version: 3,
+        default_selection: { model_id: "copilot/", reasoning: null },
+      }),
+    );
+    await expect(loadSettings(path)).rejects.toThrow("Invalid Vivi settings model");
   });
 
   test("round trips all Copilot reasoning states", async () => {

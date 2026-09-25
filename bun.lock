@@ -21,14 +21,6 @@
         "@vivi/settings": "workspace:*",
       },
     },
-    "extensions/vivi-basic-tools": {
-      "name": "@vivi/extension-basic-tools",
-      "version": "0.1.0",
-    },
-    "extensions/vivi-local-model-policy": {
-      "name": "@vivi/extension-local-model-policy",
-      "version": "0.1.0",
-    },
     "extensions/vivi-reasoning": {
       "name": "@vivi/extension-reasoning",
       "version": "0.1.0",
@@ -235,10 +227,6 @@
     "@vivi/cli": ["@vivi/cli@workspace:apps/vivi"],
 
     "@vivi/copilot-profile": ["@vivi/copilot-profile@workspace:packages/copilot-profile"],
-
-    "@vivi/extension-basic-tools": ["@vivi/extension-basic-tools@workspace:extensions/vivi-basic-tools"],
-
-    "@vivi/extension-local-model-policy": ["@vivi/extension-local-model-policy@workspace:extensions/vivi-local-model-policy"],
 
     "@vivi/extension-reasoning": ["@vivi/extension-reasoning@workspace:extensions/vivi-reasoning"],
 

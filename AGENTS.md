@@ -12,7 +12,8 @@ and launches the upstream `copilot` executable.
   per-process configuration.
 - `packages/settings/` parses, migrates, and writes Vivi's versioned default
   model and reasoning selection.
-- `extensions/` contains independent Copilot CLI extensions.
+- `extensions/` contains independent TypeScript Copilot CLI extensions;
+  `scripts/build-extensions.ts` bundles them before the launcher build.
 - `scripts/build.ts` compiles the standalone cross-platform executable.
 
 Copilot CLI owns the terminal UI, authentication, permissions, sessions,

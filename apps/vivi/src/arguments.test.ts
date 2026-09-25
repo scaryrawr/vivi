@@ -1,15 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import {
-  applyDefaultSelection,
-  enableBundledExtensions,
-  parseArguments,
-  selectedModel,
-} from "./arguments.ts";
+import { applyDefaultSelection, enableBundledExtensions, parseArguments } from "./arguments.ts";
 
 describe("parseArguments", () => {
   test("launches Copilot by default", () => {
     expect(parseArguments([])).toEqual({ kind: "launch", args: [] });
-    expect(parseArguments(["chat"])).toEqual({ kind: "launch", args: [] });
+    expect(parseArguments(["chat"])).toEqual({ kind: "launch", args: ["chat"] });
   });
 
   describe("applyDefaultSelection", () => {
@@ -58,7 +53,7 @@ describe("parseArguments", () => {
     test("omits reasoning when the selection uses the model default", () => {
       expect(
         applyDefaultSelection([], {
-          modelId: "copilot/gpt-5.6-luna",
+          modelId: "gpt-5.6-luna",
           reasoning: null,
         }),
       ).toEqual(["--model", "gpt-5.6-luna"]);
@@ -85,29 +80,19 @@ describe("parseArguments", () => {
     });
   });
 
-  describe("selectedModel", () => {
-    test("reads the effective Copilot model argument", () => {
-      expect(selectedModel(["--experimental", "--model", "omlx/local-model"])).toBe(
-        "omlx/local-model",
-      );
-      expect(selectedModel(["--model=gpt-5.6-luna"])).toBe("gpt-5.6-luna");
-      expect(selectedModel(["--", "--model", "omlx/not-an-option"])).toBeUndefined();
-    });
-  });
-
-  test("translates Vivi model and reasoning arguments", () => {
+  test("forwards Copilot arguments without translating their values", () => {
     expect(
       parseArguments(["chat", "--model", "copilot/gpt-5.6-luna", "--reasoning", "off"]),
     ).toEqual({
       kind: "launch",
-      args: ["--model", "gpt-5.6-luna", "--reasoning-effort", "none"],
+      args: ["chat", "--model", "copilot/gpt-5.6-luna", "--reasoning", "off"],
     });
   });
 
   test("preserves local provider model identifiers", () => {
     expect(parseArguments(["--model=omlx/Qwen3.5", "--reasoning=high"])).toEqual({
       kind: "launch",
-      args: ["--model=omlx/Qwen3.5", "--reasoning-effort=high"],
+      args: ["--model=omlx/Qwen3.5", "--reasoning=high"],
     });
   });
 
