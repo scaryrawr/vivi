@@ -48,6 +48,68 @@ describe("parseArguments", () => {
         "--session-id=existing-session",
       ]);
       expect(applyDefaultSelection(["login"], selection)).toEqual(["login"]);
+      expect(applyDefaultSelection(["--no-auto-update", "login"], selection)).toEqual([
+        "--no-auto-update",
+        "login",
+      ]);
+      expect(applyDefaultSelection(["--no-color", "help", "environment"], selection)).toEqual([
+        "--no-color",
+        "help",
+        "environment",
+      ]);
+      expect(applyDefaultSelection(["--log-level", "login", "help"], selection)).toEqual([
+        "--log-level",
+        "login",
+        "help",
+      ]);
+      expect(applyDefaultSelection(["--log-level=login", "help"], selection)).toEqual([
+        "--log-level=login",
+        "help",
+      ]);
+      expect(
+        applyDefaultSelection(
+          ["--allow-tool", "login", "help", "--no-color", "sessions"],
+          selection,
+        ),
+      ).toEqual(["--allow-tool", "login", "help", "--no-color", "sessions"]);
+      expect(applyDefaultSelection(["--model", "login", "--prompt", "help"], selection)).toEqual([
+        "--model",
+        "login",
+        "--prompt",
+        "help",
+      ]);
+      expect(applyDefaultSelection(["--no-color", "workflow", "list"], selection)).toEqual([
+        "--no-color",
+        "workflow",
+        "list",
+      ]);
+    });
+
+    test("does not mistake option values for subcommands", () => {
+      expect(applyDefaultSelection(["--prompt", "login"], selection)).toEqual([
+        "--model",
+        "omlx/local-model",
+        "--reasoning-effort",
+        "medium",
+        "--prompt",
+        "login",
+      ]);
+      expect(applyDefaultSelection(["--log-level", "login"], selection)).toEqual([
+        "--model",
+        "omlx/local-model",
+        "--reasoning-effort",
+        "medium",
+        "--log-level",
+        "login",
+      ]);
+      expect(applyDefaultSelection(["--share", "login"], selection)).toEqual([
+        "--model",
+        "omlx/local-model",
+        "--reasoning-effort",
+        "medium",
+        "--share",
+        "login",
+      ]);
     });
 
     test("omits reasoning when the selection uses the model default", () => {

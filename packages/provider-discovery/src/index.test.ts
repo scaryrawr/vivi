@@ -72,6 +72,25 @@ describe("discoverLocalProviders", () => {
     });
     expect(configuration).toEqual({ providers: [], models: [] });
   });
+
+  test("accepts provider URLs ending in /v1 without duplicating the API prefix", async () => {
+    const requests: string[] = [];
+    const configuration = await discoverLocalProviders(
+      { OMLX_BASE_URL: "http://localhost:8000/v1/" },
+      async (input) => {
+        const url = String(input);
+        requests.push(url);
+        if (url === "http://localhost:8000/v1/models/status") {
+          return response({ models: [{ id: "local", model_type: "llm" }] });
+        }
+        throw new Error("unavailable");
+      },
+    );
+    expect(requests).toContain("http://localhost:8000/v1/models/status");
+    expect(configuration.providers.find(({ name }) => name === "omlx")?.baseUrl).toBe(
+      "http://localhost:8000/v1",
+    );
+  });
 });
 
 function response(body: unknown): Response {

@@ -9,6 +9,66 @@ export interface DefaultSelection {
   reasoning: string | null;
 }
 
+const COPILOT_COMMANDS = new Set([
+  "app",
+  "completion",
+  "help",
+  "init",
+  "instruction",
+  "login",
+  "logout",
+  "lsp",
+  "mcp",
+  "memories",
+  "plugin",
+  "sessions",
+  "skill",
+  "update",
+  "version",
+  "workflow",
+]);
+
+const OPTIONS_WITH_VALUES = new Set([
+  "-C",
+  "-i",
+  "-n",
+  "-p",
+  "--add-dir",
+  "--add-github-mcp-tool",
+  "--add-github-mcp-toolset",
+  "--additional-mcp-config",
+  "--agent",
+  "--attachment",
+  "--auto-tier",
+  "--context",
+  "--disable-mcp-server",
+  "--extension-sdk-path",
+  "--interactive",
+  "--log-dir",
+  "--log-level",
+  "--max-autopilot-continues",
+  "--mode",
+  "--model",
+  "--name",
+  "--output-format",
+  "--plugin-dir",
+  "--prompt",
+  "--reasoning-effort",
+  "--session-id",
+  "--stream",
+]);
+
+const OPTIONS_WITH_OPTIONAL_VALUES = new Set(["--bash-env", "--mouse", "--share"]);
+const OPTIONS_WITH_MULTIPLE_VALUES = new Set([
+  "--allow-tool",
+  "--allow-url",
+  "--available-tools",
+  "--deny-tool",
+  "--deny-url",
+  "--excluded-tools",
+  "--secret-env-vars",
+]);
+
 export function parseArguments(args: string[]): ViviCommand {
   if (args.length === 0) return { kind: "launch", args: [] };
   if (args.length === 1 && (args[0] === "--help" || args[0] === "-h")) {
@@ -84,25 +144,25 @@ function resumesSession(args: string[]): boolean {
 }
 
 function doesNotStartSession(args: string[]): boolean {
-  const command = args[0];
-  return (
-    command !== undefined &&
-    new Set([
-      "app",
-      "completion",
-      "help",
-      "init",
-      "instruction",
-      "login",
-      "logout",
-      "lsp",
-      "mcp",
-      "memories",
-      "plugin",
-      "sessions",
-      "skill",
-      "update",
-      "version",
-    ]).has(command)
-  );
+  for (let index = 0; index < args.length; index++) {
+    const argument = args[index];
+    if (argument === undefined) break;
+    if (argument === "--") return false;
+    if (OPTIONS_WITH_VALUES.has(argument)) {
+      index++;
+      continue;
+    }
+    if (OPTIONS_WITH_OPTIONAL_VALUES.has(argument) || OPTIONS_WITH_MULTIPLE_VALUES.has(argument)) {
+      while (true) {
+        const next = args[index + 1];
+        if (next === undefined || next.startsWith("-")) break;
+        index++;
+        if (!OPTIONS_WITH_MULTIPLE_VALUES.has(argument)) break;
+      }
+      continue;
+    }
+    if (argument.startsWith("-")) continue;
+    return COPILOT_COMMANDS.has(argument);
+  }
+  return false;
 }

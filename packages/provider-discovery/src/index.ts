@@ -285,7 +285,7 @@ async function fetchJson(
 }
 
 function baseUrl(value: string | undefined, fallback: string): string {
-  return (value ?? fallback).replace(/\/+$/, "");
+  return (value ?? fallback).replace(/\/+$/, "").replace(/\/v1$/, "");
 }
 
 function positiveInteger(value: unknown): number | undefined {

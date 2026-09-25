@@ -32,15 +32,13 @@ try {
     process.exit(0);
   }
 
-  const [discovery, settings] = await Promise.all([
-    discoverLocalProviders(process.env),
-    loadAndMigrateViviSettings(process.env),
-  ]);
+  const discovery = await discoverLocalProviders(process.env);
   if (command.kind === "models") {
     printModels(discovery.models, command.json);
     process.exit(0);
   }
 
+  const settings = await loadAndMigrateViviSettings(process.env);
   const copilot = process.env.VIVI_COPILOT_PATH ?? Bun.which("copilot");
   if (copilot === null || copilot === undefined) {
     throw new Error(
@@ -75,7 +73,10 @@ try {
       signals.map((signal) => [
         signal,
         () => {
-          child.kill(signal);
+          // Terminal SIGINT already reaches the foreground Copilot child on POSIX.
+          if (signal !== "SIGINT" || process.platform === "win32") {
+            child.kill(signal);
+          }
         },
       ]),
     );

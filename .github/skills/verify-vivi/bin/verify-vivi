@@ -57,6 +57,10 @@ auth_token() {
     gh auth token
 }
 
+shell_quote() {
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
 doctor() {
     require_command bun
     require_command copilot
@@ -106,7 +110,8 @@ cli_discovery() {
 
     "$binary" --help >"$run_dir/help.stdout" 2>"$run_dir/help.stderr"
     "$binary" --version >"$run_dir/version.stdout" 2>"$run_dir/version.stderr"
-    "$binary" models >"$run_dir/models.stdout" 2>"$run_dir/models.stderr"
+    VIVI_HOME="$home/vivi" "$binary" models \
+        >"$run_dir/models.stdout" 2>"$run_dir/models.stderr"
     VIVI_HOME="$home/vivi" "$binary" --no-auto-update help environment \
         >"$run_dir/native-help.stdout" 2>"$run_dir/native-help.stderr"
     COPILOT_HOME="$home/copilot" copilot --no-auto-update help environment \
@@ -139,6 +144,30 @@ cli_discovery() {
     trap - EXIT INT TERM
 }
 
+run_streaming_pty() {
+    case "$(uname -s)" in
+        Darwin)
+            script -q "$run_dir/chat-streaming.terminal.log" \
+                env GH_TOKEN="$token" GITHUB_TOKEN="$token" VIVI_HOME="$home" \
+                "$binary" --no-color --model "$model" \
+                -p 'Return the uppercase form of vivi_stream_ok and no other text.' \
+                >"$run_dir/chat-streaming.stdout" \
+                2>"$run_dir/chat-streaming.stderr"
+            ;;
+        Linux)
+            script -q -e -c \
+                "env GH_TOKEN=$(shell_quote "$token") GITHUB_TOKEN=$(shell_quote "$token") VIVI_HOME=$(shell_quote "$home") $(shell_quote "$binary") --no-color --model $(shell_quote "$model") -p 'Return the uppercase form of vivi_stream_ok and no other text.'" \
+                -- "$run_dir/chat-streaming.terminal.log" \
+                >"$run_dir/chat-streaming.stdout" \
+                2>"$run_dir/chat-streaming.stderr"
+            ;;
+        *)
+            printf 'chat-streaming requires BSD or util-linux script\n' >&2
+            return 1
+            ;;
+    esac
+}
+
 chat_streaming() {
     require_command script
     run_dir=$(prepare_run "$1")
@@ -153,17 +182,7 @@ chat_streaming() {
     }
     trap cleanup EXIT INT TERM
 
-    if script -q "$run_dir/chat-streaming.terminal.log" \
-        env \
-            GH_TOKEN="$token" \
-            GITHUB_TOKEN="$token" \
-            VIVI_HOME="$home" \
-            "$binary" \
-                --no-color \
-                --model "$model" \
-                -p 'Return the uppercase form of vivi_stream_ok and no other text.' \
-        >"$run_dir/chat-streaming.stdout" \
-        2>"$run_dir/chat-streaming.stderr"; then
+    if run_streaming_pty; then
         status=0
     else
         status=$?
