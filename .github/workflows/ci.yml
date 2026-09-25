@@ -8,7 +8,7 @@ on:
     branches:
       - main
     tags:
-      - 'v*'
+      - "v*"
   workflow_dispatch:
 
 permissions:
@@ -19,7 +19,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  linux:
+  check:
     name: Linux CLI
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -29,33 +29,17 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+      - name: Install Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          version: 0.16.0
+          bun-version: 1.4.2
 
-      - name: Check Zig and CLI
-        run: ./scripts/check-zig.sh
-
-      - name: Build release CLI
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-        run: |
-          zig build \
-              -Dtarget=x86_64-linux-gnu.2.17 \
-              -Doptimize=ReleaseSafe \
-              -Dversion="${GITHUB_REF_NAME#v}"
-
-      - name: Upload Linux CLI artifact
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: vivi-linux-x86_64
-          path: zig-out/bin/vivi
-          if-no-files-found: error
+      - run: bun install --frozen-lockfile
+      - run: bun run check
 
   windows:
     name: Windows CLI
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     timeout-minutes: 20
     steps:
       - name: Check out repository
@@ -63,39 +47,13 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+      - name: Install Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          version: 0.16.0
+          bun-version: 1.4.2
 
-      - name: Build Windows CLIs
-        run: |
-          zig build \
-              -Dtarget=x86_64-windows-gnu \
-              -Doptimize=ReleaseSafe \
-              -Dversion="${GITHUB_REF_NAME#v}" \
-              --prefix zig-out/cli/windows-x86_64
-          zig build \
-              -Dtarget=aarch64-windows-gnu \
-              -Doptimize=ReleaseSafe \
-              -Dversion="${GITHUB_REF_NAME#v}" \
-              --prefix zig-out/cli/windows-aarch64
-
-      - name: Upload Windows CLI artifact (x86_64)
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: vivi-windows-x86_64
-          path: zig-out/cli/windows-x86_64/bin/vivi.exe
-          if-no-files-found: error
-
-      - name: Upload Windows CLI artifact (ARM64)
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: vivi-windows-aarch64
-          path: zig-out/cli/windows-aarch64/bin/vivi.exe
-          if-no-files-found: error
+      - run: bun install --frozen-lockfile
+      - run: bun run check
 
   macos:
     name: macOS CLI
@@ -107,36 +65,68 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+      - name: Install Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          version: 0.16.0
+          bun-version: 1.4.2
 
-      - name: Check Zig and CLI
-        run: ./scripts/check-zig.sh
+      - run: bun install --frozen-lockfile
+      - run: bun run check
 
-      - name: Build release CLI
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-        run: |
-          sdk_path=$(xcrun --sdk macosx --show-sdk-path)
-          zig build \
-              --sysroot "$sdk_path" \
-              -Dmacos-sdk="$sdk_path" \
-              -Dtarget=aarch64-macos.14.0 \
-              -Doptimize=ReleaseSafe \
-              -Dversion="${GITHUB_REF_NAME#v}"
+  build:
+    name: Build ${{ matrix.name }}
+    needs: [check, windows, macos]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      matrix:
+        include:
+          - name: Linux x86_64
+            target: bun-linux-x64-baseline
+            artifact: vivi-linux-x86_64
+            output: vivi
+          - name: macOS ARM64
+            target: bun-darwin-arm64
+            artifact: vivi-macos-arm64
+            output: vivi
+          - name: Windows x86_64
+            target: bun-windows-x64-baseline
+            artifact: vivi-windows-x86_64
+            output: vivi.exe
+          - name: Windows ARM64
+            target: bun-windows-arm64
+            artifact: vivi-windows-arm64
+            output: vivi.exe
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - name: Upload macOS CLI artifact
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+      - name: Install Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.2
+
+      - run: bun install --frozen-lockfile
+      - name: Build executable
+        run: >-
+          bun run scripts/build.ts
+          --target=${{ matrix.target }}
+          --outfile=release/${{ matrix.artifact }}/${{ matrix.output }}
+          --version=${GITHUB_REF_NAME#v}
+
+      - name: Upload executable
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: vivi-macos-arm64
-          path: zig-out/bin/vivi
+          name: ${{ matrix.artifact }}
+          path: release/${{ matrix.artifact }}/${{ matrix.output }}
           if-no-files-found: error
 
   release:
     name: Release
-    needs: [linux, windows, macos]
+    needs: build
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
@@ -157,7 +147,7 @@ jobs:
           zip -qj "$assets/vivi-${version}-linux-x86_64.zip" "$dl/vivi-linux-x86_64/vivi"
           zip -qj "$assets/vivi-${version}-macos-arm64.zip" "$dl/vivi-macos-arm64/vivi"
           zip -qj "$assets/vivi-${version}-windows-x86_64.zip" "$dl/vivi-windows-x86_64/vivi.exe"
-          zip -qj "$assets/vivi-${version}-windows-aarch64.zip" "$dl/vivi-windows-aarch64/vivi.exe"
+          zip -qj "$assets/vivi-${version}-windows-arm64.zip" "$dl/vivi-windows-arm64/vivi.exe"
 
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2 (2.6.2)
         with:

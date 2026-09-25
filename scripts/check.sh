@@ -4,5 +4,5 @@ set -eu
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$repo_root"
 
-./scripts/check-zig.sh
-./scripts/check-cli-cross.sh
+bun install --frozen-lockfile
+bun run check
