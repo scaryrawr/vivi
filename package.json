@@ -1,0 +1,28 @@
+{
+  "name": "vivi",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*",
+    "extensions/*"
+  ],
+  "type": "module",
+  "scripts": {
+    "build": "bun run scripts/build.ts",
+    "build:extensions": "bun run scripts/build-extensions.ts",
+    "check": "bun run format:check && bun run lint && bun run typecheck && bun run test && bun run build",
+    "format": "oxfmt --write .",
+    "format:check": "oxfmt --check .",
+    "lint": "oxlint .",
+    "test": "bun run build:extensions && bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@github/copilot-sdk": "1.0.14",
+    "@types/bun": "1.4.2",
+    "oxfmt": "0.68.0",
+    "oxlint": "1.83.0",
+    "typescript": "7.0.2"
+  }
+}

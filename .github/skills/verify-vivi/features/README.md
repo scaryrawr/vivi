@@ -1,50 +1,29 @@
 # Vivi verification map
 
-This directory is the maintained source for verifying Vivi's user-facing CLI
-and libvaxis chat behavior. Read this index before driving the application,
-then use the matching feature file as the recipe.
+This directory verifies Vivi's launcher boundary and its delegated Copilot CLI
+session.
 
 ## Baseline preconditions
 
-- Build from the repository root with `zig build`.
-- Put Zig 0.16.x, asciinema 3.x, `agg`, `script`, and GitHub
-  Copilot CLI on `PATH`. Override the default binary names with
-  `VIVI_ASCIINEMA` and `VIVI_AGG` when they live elsewhere.
-- Authenticate GitHub Copilot CLI before driving `vivi chat`.
-- Hosted validation uses `copilot/gpt-5.6-luna` by default. Override it with
-  `VIVI_VALIDATION_MODEL=copilot/<model-id>` only when the validation itself
-  requires another hosted model.
-- Run `.github/skills/verify-vivi/bin/verify-vivi doctor`.
-- Give every verification attempt a unique run ID. Evidence belongs in
-  `.verify/vivi/<run-id>/`.
-- Never drive a TUI that was started in the user's existing terminal session.
+- Build from the repository root with `bun run build`.
+- Put Bun, `script`, GitHub CLI, and GitHub Copilot CLI on `PATH`.
+- Authenticate GitHub CLI before credentialed drives.
+- Hosted validation uses `gpt-6-luna` by default.
+- Give every verification attempt a unique run ID.
 
 ## Driving conventions
 
-- Start each TUI drive in its own `script` PTY; asciinema records it and
-  `agg` renders the GIF.
-- Use literal command names, header text, transcript labels, and key chords
-  from these recipes.
-- Use Ctrl-C once for normal shutdown and a second time only after the UI shows
-  `Stopping...`.
-- Multiple instances may run concurrently only in separate PTYs and run
-  directories. They still share the user's Copilot credential store.
-- Do not replace the Copilot service with a mock for end-to-end claims.
+- Start each session drive in its own `script` PTY.
+- Use the compiled `dist/vivi` executable.
+- Give each run its own isolated `VIVI_HOME`.
+- Do not replace Copilot CLI with a mock for end-to-end proof.
 
 ## Proof and skip reporting
 
-- Capture the typed action and the resulting screen.
-- TUI proof requires extracted frames, a contact sheet, a completed
-  visual-review checklist, a raw PTY transcript, and normalized terminal text
-  for stable assertions. GIF retention is optional and does not strengthen the
-  proof.
-- Noninteractive CLI proof requires stdout, stderr, and exit status.
+- Interactive proof requires a raw PTY transcript and explicit assertions.
+- Noninteractive proof requires stdout and stderr.
 - A streaming proof must assert a response token that was not present in the
   submitted prompt.
-- Preserve proof artifacts after cleanup.
-- Reject a captured session with clipped headers, broken borders, overlapping
-  regions, stale text, redraw corruption, or missing expected states even when
-  text assertions pass.
 - Report authentication, network, or Copilot service failures as unmet
   preconditions rather than as verified application behavior.
 
@@ -60,30 +39,9 @@ user-visible behavior. It then uses exactly four H2 sections in this order:
 
 ## Features
 
-- [CLI discovery](./cli-discovery.md) covers help, version, and chat command
-  discoverability.
-- [Streaming chat](./streaming-chat.md) covers composer input, submission,
-  streamed Copilot output, steering, queued follow-ups, and return to the
-  ready state.
-- [Composer image attachments](./attachments.md) covers AppKit clipboard
-  acquisition, private temporary-file tokens, hosted image submission,
-  workspace configuration, and isolated Copilot state.
-- [Async Bash](./async-bash.md) covers starting a PTY command, later input and
-  output, listing, idempotent stop, and visible tool activity.
-- [Markdown rendering](./markdown-rendering.md) covers headings, inline
-  emphasis and code, and readable table layout in assistant responses.
-- [Ask-user prompt](./ask-user.md) covers interactive questions, numbered
-  choices, answer entry, and resumed streaming.
-- [File picker](./file-picker.md) covers `@` completion, hidden files,
-  ignore rules, and VCS metadata exclusion.
-- [Chat shutdown](./chat-shutdown.md) covers cooperative Ctrl-C shutdown and
-  the explicit second-Ctrl-C escape path.
-- [OMLX models](./omlx-models.md) covers live model discovery, token-limit
-  detection, and an OMLX-backed chat session.
-- [Slash model menu](./slash-model-menu.md) covers slash completion, the model
-  picker, explicit hosted/local switching, and transcript/history behavior.
-- [Workspace customization](./workspace-customization.md) covers repository
-  instructions, project skill discovery, slash-menu visibility, and skill
-  invocation.
-- [Session resume](./session-resume.md) covers Copilot-owned session storage,
-  the `/resume` finder, and continued history across processes.
+- [CLI discovery](./cli-discovery.md) covers help, version, local model
+  discovery, and native argument forwarding.
+- [Streaming chat](./streaming-chat.md) covers a real Copilot PTY launched
+  through Vivi.
+- [Local models](./omlx-models.md) covers pre-start provider discovery and
+  generated registry behavior.

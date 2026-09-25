@@ -2,64 +2,87 @@
 
 ## Shape
 
-Vivi is a cross-platform Zig CLI with one authoritative backend. The CLI
-imports `vivi_backend` directly; there is no native host, web presentation,
-C ABI, daemon, or generic transport layer.
+Vivi is a Bun monorepo and standalone compiled launcher. It does not implement
+an agent runtime or terminal UI. GitHub Copilot CLI is the product runtime.
 
-`backend/src/root.zig` is the only production module allowed to import
-`copilot_sdk`. It adapts SDK models, sessions, commands, permissions, and tool
-events into owned domain values. SDK-free backend modules own conversation
-lifecycle, tools, settings, models, file picking, attachments, presentation,
-and PTY management.
+`apps/vivi` parses Vivi-owned commands, discovers local providers,
+prepares the profile, and starts `copilot` with inherited stdio.
 
-`cli/src/main.zig` owns command parsing and process setup.
-`cli/src/chat.zig` owns the libvaxis event loop, transcript, composer, menus,
-questions, tool disclosure, scrolling, and responsive terminal layout.
+`packages/provider-discovery` contains provider-specific HTTP adapters. Its
+output is a structural match for Copilot's named `providers` and `models`
+registry.
 
-## Conversation boundary
+`packages/copilot-profile` owns filesystem reconciliation. It may write only:
 
-`backend/src/conversation.zig` owns the worker, one-command mailbox, event
-queue, and lifecycle state. The libvaxis loop receives a payload-free wake,
-then transfers owned events from the backend into its private UI state. SDK
-objects and allocator lifetimes never cross onto the terminal UI thread.
+- Vivi's named directories under `<COPILOT_HOME>/extensions/`.
+- A private, process-scoped `providers.json`.
 
-Model replacement and session resume are transactional: Vivi prepares the
-candidate session and history before replacing the active session. Failures
-leave the current session and transcript intact.
+The provider registry is removed when the child process exits. Later launches
+also reap abandoned runtime directories after confirming that both the Vivi
+launcher and tracked Copilot child are gone. Copilot owns every other file in
+its home.
 
-## Tools and permissions
+`packages/settings` owns `~/.vivi/settings.json`. Version 3 stores the default
+model plus an optional reasoning-effort override. Versions 1 and 2 are parsed
+explicitly and rewritten as version 3 on the next launch.
 
-`backend/src/tools.zig` owns SDK-free `read`, `bash`, `edit`, and `write`
-behavior. `backend/src/root.zig` owns their SDK declarations and translates
-tool results, including typed image content.
+## Startup boundary
 
-Ambient workspace configuration and project skills are discoverable. MCP
-permission requests remain denied until the CLI has an explicit user approval
-boundary. Built-in or ambient server names are not trusted as provenance.
+Model discovery happens before Copilot starts so local models are present in
+the initial model picker. The launcher sets:
 
-## Platform support
+- `COPILOT_HOME` to `<VIVI_HOME>/copilot`.
+- `COPILOT_PROVIDERS_CONFIG` to the process-scoped registry.
+- `VIVI_SETTINGS_PATH` for selection persistence.
 
-The CLI builds for Windows, Linux, and macOS. Platform-specific code is limited
-to services required by the terminal product:
+Unavailable providers do not block startup. Discovery has a three-second
+timeout per provider and runs concurrently.
 
-- macOS clipboard image reads use AppKit.
-- Linux clipboard image reads use `wl-paste` or `xclip`.
-- Windows clipboard image reads use PowerShell.
-- POSIX async shells use `openpty`; Windows uses ConPTY.
+## Extension boundary
 
-These adapters remain private to the CLI/backend and do not imply a desktop
-application host.
+Extensions are TypeScript entrypoints in independent packages under
+`extensions/`. `scripts/build-extensions.ts` bundles each entrypoint and its
+package dependencies for Node into `dist/extensions/<name>/extension.mjs`,
+leaving `@github/copilot-sdk/extension` external for Copilot's extension
+runtime. The launcher build embeds those outputs as text assets. At startup,
+Vivi reconciles each bundled file into its own Copilot extension directory and
+enables Copilot's experimental extension runtime. An explicit
+`--no-experimental` is rejected because it would silently disable Vivi's
+bundled behavior. TypeScript checks the sources, not the generated files.
 
-## Persistence
+The system prompt extension replaces the preamble, removes inherited identity,
+tone, efficiency, code-change, guideline, safety, and tool-instruction sections,
+and retains the dynamic working-directory context, repository, and runtime
+instructions. Copilot supplies its built-in tool descriptions and parameter
+schemas independently of the system prompt.
+It also excludes subagent and factory orchestration for every model at
+`joinSession()`, without model detection. Vivi does not replace Copilot's
+built-in file or shell tools. It excludes unrelated Copilot built-ins with
+`builtin:`-qualified names, without restricting external extensions or MCP
+tools. Both `sql` and `session_store_sql` are excluded because Copilot exposes
+these as separate built-ins. Copilot's tool-search tools remain available to
+discover external tools.
+Extensions do not perform provider discovery because `joinSession()` occurs
+after the initial session model registry is created. On launch, Vivi removes
+the previous model-specific policy and basic-tools entrypoints from existing
+profiles. The selection persistence extension records model and reasoning
+changes in the versioned Vivi settings document. The reasoning extension
+supplies `/reasoning` because Copilot's BYOK provider schema cannot publish
+the supported-effort list required by the built-in model picker.
 
-Vivi stores settings in `~/.vivi/settings.json` and launches Copilot with
-`~/.vivi/copilot/` as its private runtime directory. Copilot CLI remains the
-authority for session storage. Settings writes are versioned, locked, and
-atomically replaced.
+## Process boundary
+
+Arguments not owned by Vivi pass directly to Copilot. The launcher inherits
+stdin, stdout, and stderr and returns Copilot's exit status. Legacy CLI
+aliases and flag translations are not supported; saved settings from earlier
+versions still migrate to native Copilot model IDs.
+
+For new sessions, the launcher supplies the persisted model and reasoning
+selection unless explicit arguments override them. Resume and connect commands
+retain the saved session's own model configuration.
 
 ## Verification
 
-`zig build test` covers backend and CLI behavior without credentials.
-`./scripts/check.sh` adds formatting, CLI smoke checks, and Linux/Windows
-cross-builds. User-visible TUI behavior is verified through the installed
-`zig-out/bin/vivi` executable in isolated PTY sessions.
+`bun run check` covers formatting, linting, type checking, unit tests, and the
+standalone build without credentials. End-to-end verification drives
+`dist/vivi` with the real Copilot CLI and an isolated `VIVI_HOME`.

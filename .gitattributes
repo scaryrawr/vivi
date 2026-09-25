@@ -1,3 +1,5 @@
+* text=auto eol=lf
+
 *.pbxproj text eol=lf
 *.xcconfig text eol=lf
 *.xcscheme text eol=lf
